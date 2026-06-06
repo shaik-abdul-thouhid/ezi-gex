@@ -19,21 +19,21 @@
 //!   those regions. `]`, `}`, `,`, `-` are ordinary literals at top level and
 //!   only become structural tokens in their own context.
 //!
-//! Comptime and runtime
-//! --------------------
-//! The same parsing core runs both ways; only storage differs.
-//!   * `parse`        — runtime: heap-allocates exactly-sized AST arrays.
-//!   * `parseComptime`/`compile` — comptime: writes into fixed comptime arrays
-//!     sized to an O(n) upper bound, then returns slices of comptime const data.
+//! Storage-agnostic
+//! ----------------
+//! The scanner never allocates and has no comptime/runtime mode switch. `scan`
+//! fills caller-provided `Buffers` (sized via `requiredSizes`) and returns an
+//! `Ast` that sub-slices them — the caller decides whether that storage is
+//! `ro_data`, the heap, an arena, or a stack buffer. The convenience layer that
+//! provisions buffers (heap `parse`, comptime `parseComptime`/`compile`) lives
+//! in compile.zig; it is the only place that knows comptime from runtime.
 //!
 //! Errors
 //! ------
 //! Failure is reported two ways at once (see error.zig): the Zig error
 //! `error.InvalidPattern` propagates, and a `Diagnostic` (code + byte span) is
 //! written to the caller's out-parameter. Printing is the caller's job —
-//! `Diagnostic.faultySlice(pattern)` and `Diagnostic.message()` give the pieces,
-//! `parseReporting` hands them to a caller-supplied context, and `compile`
-//! turns them into a `@compileError`.
+//! `Diagnostic.faultySlice(pattern)` and `Diagnostic.message()` give the pieces.
 
 const std = @import("std");
 
@@ -53,21 +53,11 @@ pub const Diagnostic = errors.Diagnostic;
 pub const ErrorCode = errors.ErrorCode;
 pub const Span = errors.Span;
 
-/// Error returned by the runtime entry points. `InvalidPattern` carries its
-/// detail in the `Diagnostic`; `OutOfMemory` comes from the allocator.
-pub const Error = errors.SyntaxError || std.mem.Allocator.Error;
-
-/// Result of the comptime entry point. Comptime code cannot thread an
-/// out-parameter the way runtime code does, so the diagnostic rides along here.
-pub const Outcome = union(enum) {
-    ok: Ast,
-    fail: Diagnostic,
-};
-
-/// The internal failure type: a malformed pattern, with detail in the
-/// Diagnostic. Allocation never happens inside the parsing core, so this is the
-/// only error the core can raise.
-const Fail = errors.SyntaxError; // error{InvalidPattern}
+/// The failure type the scanner raises: a malformed pattern, with detail in the
+/// `Diagnostic`. The scanner never allocates, so this is the only error it can
+/// raise. The comptime/runtime storage layer (compile.zig) widens this with
+/// `OutOfMemory` for its heap path.
+pub const Fail = errors.SyntaxError; // error{InvalidPattern}
 
 // ── Lexer support types ───────────────────────────────────────────────────────
 
@@ -1123,7 +1113,7 @@ pub fn requiredSizes(pattern_len: usize) Sizes {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Entry points
+// Storage-agnostic entry point
 // ════════════════════════════════════════════════════════════════════════════
 
 /// All backing storage the scanner needs, supplied by the caller. The first
@@ -1133,9 +1123,10 @@ pub fn requiredSizes(pattern_len: usize) Sizes {
 ///
 /// The scanner never allocates or frees and contains no comptime/runtime mode
 /// switch: it does not care whether these slices live in `ro_data` (comptime
-/// arrays) or on the heap. That is entirely the caller's decision — `parse`
-/// makes the heap choice, `parseComptime`/`compile` make the comptime choice,
-/// and a caller with special needs (arena, stack buffer, …) calls `scan`.
+/// arrays) or on the heap. That is entirely the caller's decision. The
+/// comptime/runtime convenience layer that provisions these buffers (heap vs
+/// ro_data) lives in compile.zig (`parse`, `parseComptime`, `compile`); a caller
+/// with special needs (arena, stack buffer, …) calls `scan` directly.
 pub const Buffers = struct {
     nodes: []ast.Node,
     children: []u32,
@@ -1178,144 +1169,9 @@ pub fn scan(pattern: []const u8, diag: *Diagnostic, buffers: Buffers) Fail!Ast {
     };
 }
 
-/// Parse `pattern` at runtime into a heap-allocated AST. A storage wrapper over
-/// `scan`: it provisions oversized scratch + AST buffers from `allocator`, runs
-/// the agnostic core, then copies the used portions into exactly-sized owned
-/// arrays and releases the scratch. On success the returned AST owns its arrays;
-/// free them with `Ast.deinit(allocator)`. On a malformed pattern,
-/// `error.InvalidPattern` is returned and `diag` carries the precise code and
-/// byte span (see error.zig).
-pub fn parse(allocator: std.mem.Allocator, pattern: []const u8, diag: *Diagnostic) Error!Ast {
-    const sizes = requiredSizes(pattern.len);
-
-    // Oversized backing storage. Released unconditionally on the way out; the
-    // exact-size AST arrays are duplicated from it on success.
-    const nodes = try allocator.alloc(ast.Node, sizes.nodes);
-    defer allocator.free(nodes);
-    const children = try allocator.alloc(u32, sizes.children);
-    defer allocator.free(children);
-    const items = try allocator.alloc(ast.ClassItem, sizes.class_items);
-    defer allocator.free(items);
-    const names = try allocator.alloc([]const u8, sizes.names);
-    defer allocator.free(names);
-    const seq = try allocator.alloc(u32, sizes.seq);
-    defer allocator.free(seq);
-    const alt = try allocator.alloc(u32, sizes.alt);
-    defer allocator.free(alt);
-    const frames = try allocator.alloc(Frame, sizes.frames);
-    defer allocator.free(frames);
-
-    const raw = try scan(pattern, diag, .{
-        .nodes = nodes,
-        .children = children,
-        .class_items = items,
-        .names = names,
-        .seq = seq,
-        .alt = alt,
-        .frames = frames,
-    });
-
-    const final_nodes = try allocator.dupe(ast.Node, raw.nodes);
-    errdefer allocator.free(final_nodes);
-    const final_children = if (raw.children.len == 0) &[_]u32{} else try allocator.dupe(u32, raw.children);
-    errdefer if (final_children.len != 0) allocator.free(final_children);
-    const final_items = if (raw.class_items.len == 0) &[_]ast.ClassItem{} else try allocator.dupe(ast.ClassItem, raw.class_items);
-    errdefer if (final_items.len != 0) allocator.free(final_items);
-    const final_names = if (raw.names.len == 0) &[_][]const u8{} else try allocator.dupe([]const u8, raw.names);
-
-    return Ast{
-        .nodes = final_nodes,
-        .children = final_children,
-        .class_items = final_items,
-        .names = final_names,
-        .root = raw.root,
-        .capture_count = raw.capture_count,
-        .flags = raw.flags,
-    };
-}
-
-/// Parse `pattern` at runtime, and on failure hand the diagnostic to a
-/// caller-supplied context before returning the error. `ctx` is anything with a
-///   `pub fn report(self, Diagnostic, pattern: []const u8) void`
-/// method — that is where the caller does its own formatting/printing. The
-/// allocation error path does not call `report` (there is no diagnostic for it).
-pub fn parseReporting(allocator: std.mem.Allocator, pattern: []const u8, ctx: anytype) Error!Ast {
-    var diag: Diagnostic = .{};
-    return parse(allocator, pattern, &diag) catch |e| {
-        if (e == error.InvalidPattern) ctx.report(diag, pattern);
-        return e;
-    };
-}
-
-/// Parse `pattern` at comptime. A storage wrapper over `scan`: it provisions the
-/// buffers as comptime arrays, runs the agnostic core, then copies the used
-/// portions into const arrays that land in `ro_data`. Returns `.ok` with an AST
-/// whose slices point at that const data, or `.fail` with the diagnostic.
-/// Callers that just want a hard compile error should use `compile`.
-pub fn parseComptime(comptime pattern: []const u8) Outcome {
-    // The quota is a CEILING on comptime backward-branches (a runaway-loop
-    // guard), not a cost — raising it is free unless the work reaches it, and
-    // the compiler stops at the actual work done. It must scale with the input
-    // (a fixed quota would reject large patterns), but the real cost is small:
-    // measured at well under ~25 branches/byte even for property-heavy patterns,
-    // since the scan is a single O(n) pass. 1000/byte is a ~40x safety margin.
-    // Saturate into u32 so an absurdly large comptime pattern fails with a clean
-    // "exceeded backwards branches" rather than an integer-overflow message.
-    const quota = @min(@as(u64, pattern.len) * 1000 + 1000, std.math.maxInt(u32));
-    @setEvalBranchQuota(@intCast(quota));
-    const sizes = comptime requiredSizes(pattern.len);
-
-    var nodes: [sizes.nodes]ast.Node = undefined;
-    var children: [sizes.children]u32 = undefined;
-    var items: [sizes.class_items]ast.ClassItem = undefined;
-    var names: [sizes.names][]const u8 = undefined;
-    var seq: [sizes.seq]u32 = undefined;
-    var alt: [sizes.alt]u32 = undefined;
-    var frames: [sizes.frames]Frame = undefined;
-    var diag: Diagnostic = .{};
-
-    const raw = scan(pattern, &diag, .{
-        .nodes = &nodes,
-        .children = &children,
-        .class_items = &items,
-        .names = &names,
-        .seq = &seq,
-        .alt = &alt,
-        .frames = &frames,
-    }) catch return .{ .fail = diag };
-
-    // Copy the used sub-slices into const arrays; `&` promotes them to ro_data
-    // so the returned AST outlives this function's comptime locals.
-    const final_nodes = raw.nodes[0..raw.nodes.len].*;
-    const final_children = raw.children[0..raw.children.len].*;
-    const final_items = raw.class_items[0..raw.class_items.len].*;
-    const final_names = raw.names[0..raw.names.len].*;
-
-    return .{ .ok = Ast{
-        .nodes = &final_nodes,
-        .children = &final_children,
-        .class_items = &final_items,
-        .names = &final_names,
-        .root = raw.root,
-        .capture_count = raw.capture_count,
-        .flags = raw.flags,
-    } };
-}
-
-/// Parse `pattern` at comptime, failing compilation with a located message if
-/// the pattern is invalid. This is the comptime analogue of "pretty-print the
-/// error": the build stops and the developer sees exactly what and where.
-pub fn compile(comptime pattern: []const u8) Ast {
-    comptime {
-        return switch (parseComptime(pattern)) {
-            .ok => |a| a,
-            .fail => |d| @compileError(std.fmt.comptimePrint(
-                "invalid regex: {s}\n  pattern: \"{s}\"\n  here:    \"{s}\" (bytes {d}..{d})",
-                .{ d.message(), pattern, d.faultySlice(pattern), d.span.start, d.span.end },
-            )),
-        };
-    }
-}
+// The comptime/runtime storage wrappers (`parse`, `parseReporting`,
+// `parseComptime`, `compile`) live in compile.zig — they are the only place that
+// decides where the AST is stored. The scanner above is storage-agnostic.
 
 // ════════════════════════════════════════════════════════════════════════════
 // Debug: s-expression serialization (used heavily by the tests)
@@ -1459,27 +1315,77 @@ fn writeCp(cp: CodePoint, w: *std.Io.Writer) std.Io.Writer.Error!void {
 
 const testing = std.testing;
 
-/// Parse at runtime and assert the AST renders to `expected`. Frees the AST.
+/// Heap-backed `Buffers` for tests, so the scanner can be exercised directly via
+/// `scan` without depending on the comptime/runtime layer in compile.zig. The
+/// returned `Ast` sub-slices these buffers, so read it before `deinit`.
+const TestArena = struct {
+    nodes: []ast.Node,
+    children: []u32,
+    items: []ast.ClassItem,
+    names: [][]const u8,
+    seq: []u32,
+    alt: []u32,
+    frames: []Frame,
+
+    fn init(pattern_len: usize) !TestArena {
+        const s = requiredSizes(pattern_len);
+        const gpa = testing.allocator;
+        return .{
+            .nodes = try gpa.alloc(ast.Node, s.nodes),
+            .children = try gpa.alloc(u32, s.children),
+            .items = try gpa.alloc(ast.ClassItem, s.class_items),
+            .names = try gpa.alloc([]const u8, s.names),
+            .seq = try gpa.alloc(u32, s.seq),
+            .alt = try gpa.alloc(u32, s.alt),
+            .frames = try gpa.alloc(Frame, s.frames),
+        };
+    }
+
+    fn buffers(self: *TestArena) Buffers {
+        return .{
+            .nodes = self.nodes,
+            .children = self.children,
+            .class_items = self.items,
+            .names = self.names,
+            .seq = self.seq,
+            .alt = self.alt,
+            .frames = self.frames,
+        };
+    }
+
+    fn deinit(self: *TestArena) void {
+        const gpa = testing.allocator;
+        gpa.free(self.nodes);
+        gpa.free(self.children);
+        gpa.free(self.items);
+        gpa.free(self.names);
+        gpa.free(self.seq);
+        gpa.free(self.alt);
+        gpa.free(self.frames);
+    }
+};
+
+/// Scan and assert the AST renders to `expected`.
 fn expectSexpr(pattern: []const u8, expected: []const u8) !void {
+    var arena = try TestArena.init(pattern.len);
+    defer arena.deinit();
     var diag: Diagnostic = .{};
-    const a = parse(testing.allocator, pattern, &diag) catch |e| {
+    const a = scan(pattern, &diag, arena.buffers()) catch |e| {
         std.debug.print("unexpected error {s} ({s}) parsing \"{s}\"\n", .{ @errorName(e), @tagName(diag.code), pattern });
         return e;
     };
-    defer a.deinit(testing.allocator);
-
     var buf: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try formatAst(a, &w);
     try testing.expectEqualStrings(expected, w.buffered());
 }
 
-/// Parse at runtime and assert it fails with exactly `code`.
+/// Scan and assert it fails with exactly `code`.
 fn expectError(pattern: []const u8, code: ErrorCode) !void {
+    var arena = try TestArena.init(pattern.len);
+    defer arena.deinit();
     var diag: Diagnostic = .{};
-    const result = parse(testing.allocator, pattern, &diag);
-    if (result) |a| {
-        a.deinit(testing.allocator);
+    if (scan(pattern, &diag, arena.buffers())) |_| {
         std.debug.print("expected error {s} for \"{s}\" but it parsed\n", .{ @tagName(code), pattern });
         return error.TestUnexpectedSuccess;
     } else |e| {
@@ -1648,9 +1554,10 @@ test "scoped inline flags become a group delta" {
 }
 
 test "global inline flags set the ast flags" {
+    var arena = try TestArena.init("(?i)abc".len);
+    defer arena.deinit();
     var diag: Diagnostic = .{};
-    const a = try parse(testing.allocator, "(?i)abc", &diag);
-    defer a.deinit(testing.allocator);
+    const a = try scan("(?i)abc", &diag, arena.buffers());
     try testing.expect(a.flags.case_insensitive);
     try testing.expect(!a.flags.multiline);
     try expectSexpr("(?i)abc", "(cat (lit a) (lit b) (lit c))");
@@ -1828,93 +1735,40 @@ test "nested groups, alternation, quantifiers" {
 }
 
 test "capture count is reported" {
+    var arena = try TestArena.init("(a)(?:b)(c(d))".len);
+    defer arena.deinit();
     var diag: Diagnostic = .{};
-    const a = try parse(testing.allocator, "(a)(?:b)(c(d))", &diag);
-    defer a.deinit(testing.allocator);
+    const a = try scan("(a)(?:b)(c(d))", &diag, arena.buffers());
     try testing.expectEqual(@as(u32, 3), a.capture_count);
 }
 
 test "deeply nested groups do not overflow (explicit stack, no recursion)" {
     const pattern = "((((((((((((((((a))))))))))))))))";
+    var arena = try TestArena.init(pattern.len);
+    defer arena.deinit();
     var diag: Diagnostic = .{};
-    const a = try parse(testing.allocator, pattern, &diag);
-    defer a.deinit(testing.allocator);
+    const a = try scan(pattern, &diag, arena.buffers());
     try testing.expectEqual(@as(u32, 16), a.capture_count);
 }
 
 // ── Diagnostic spans ────────────────────────────────────────────────────────
 
 test "diagnostic points at the faulty slice" {
+    var arena = try TestArena.init("ab\\qcd".len);
+    defer arena.deinit();
     var diag: Diagnostic = .{};
-    try testing.expectError(error.InvalidPattern, parse(testing.allocator, "ab\\qcd", &diag));
+    try testing.expectError(error.InvalidPattern, scan("ab\\qcd", &diag, arena.buffers()));
     try testing.expectEqual(ErrorCode.unsupported_escape, diag.code);
     try testing.expectEqualStrings("\\q", diag.faultySlice("ab\\qcd"));
 }
 
 test "diagnostic for unclosed group points at the paren" {
+    var arena = try TestArena.init("ab(cd".len);
+    defer arena.deinit();
     var diag: Diagnostic = .{};
-    try testing.expectError(error.InvalidPattern, parse(testing.allocator, "ab(cd", &diag));
+    try testing.expectError(error.InvalidPattern, scan("ab(cd", &diag, arena.buffers()));
     try testing.expectEqual(ErrorCode.unclosed_group, diag.code);
     try testing.expectEqualStrings("(", diag.faultySlice("ab(cd"));
-}
-
-// ── parseReporting ──────────────────────────────────────────────────────────
-
-const CollectCtx = struct {
-    code: ErrorCode = .none,
-    slice: []const u8 = "",
-    fn report(self: *CollectCtx, diag: Diagnostic, pattern: []const u8) void {
-        self.code = diag.code;
-        self.slice = diag.faultySlice(pattern);
-    }
-};
-
-test "parseReporting hands the diagnostic to the caller context" {
-    var ctx = CollectCtx{};
-    const r = parseReporting(testing.allocator, "a)", &ctx);
-    try testing.expectError(error.InvalidPattern, r);
-    try testing.expectEqual(ErrorCode.unmatched_close_paren, ctx.code);
-    try testing.expectEqualStrings(")", ctx.slice);
-}
-
-test "parseReporting does not invoke report on success" {
-    var ctx = CollectCtx{};
-    const a = try parseReporting(testing.allocator, "abc", &ctx);
-    defer a.deinit(testing.allocator);
-    try testing.expectEqual(ErrorCode.none, ctx.code);
-}
-
-// ── Comptime parity ──────────────────────────────────────────────────────────
-
-/// Render a comptime-built AST to a comptime string for comparison.
-fn comptimeSexpr(comptime pattern: []const u8) []const u8 {
-    comptime {
-        const a = compile(pattern);
-        var buf: [4096]u8 = undefined;
-        var w = std.Io.Writer.fixed(&buf);
-        formatAst(a, &w) catch unreachable;
-        const out = w.buffered();
-        const arr = out[0..out.len].*;
-        return &arr;
-    }
-}
-
-test "comptime parse matches runtime parse" {
-    try testing.expectEqualStrings("(cat (lit a) (rep 0 inf g (lit b)))", comptime comptimeSexpr("ab*"));
-    try testing.expectEqualStrings("(alt (lit a) (lit b))", comptime comptimeSexpr("a|b"));
-    try testing.expectEqualStrings("(cap 1 (alt (lit a) (lit b)))", comptime comptimeSexpr("(a|b)"));
-    try testing.expectEqualStrings("(cls a-z \\d)", comptime comptimeSexpr("[a-z\\d]"));
-}
-
-test "comptime parse surfaces diagnostics without compiling" {
-    const outcome = comptime parseComptime("a(b");
-    switch (outcome) {
-        .ok => return error.TestUnexpectedSuccess,
-        .fail => |d| {
-            try testing.expectEqual(ErrorCode.unclosed_group, d.code);
-            try comptime testing.expectEqualStrings("(", d.faultySlice("a(b"));
-        },
-    }
 }
 
 // ── Extra edge cases ────────────────────────────────────────────────────────
@@ -1933,17 +1787,19 @@ test "alternation with multiple multi-atom branches" {
 }
 
 test "scoped flags stay on the group and do not touch ast flags" {
+    var arena = try TestArena.init("(?i:a)b".len);
+    defer arena.deinit();
     var diag: Diagnostic = .{};
-    const a = try parse(testing.allocator, "(?i:a)b", &diag);
-    defer a.deinit(testing.allocator);
+    const a = try scan("(?i:a)b", &diag, arena.buffers());
     try testing.expect(!a.flags.case_insensitive); // scoped, not global
     try expectSexpr("(?i:a)b", "(cat (grp+i (lit a)) (lit b))");
 }
 
 test "global flags accumulate and clear" {
+    var arena = try TestArena.init("(?im)a".len);
+    defer arena.deinit();
     var diag: Diagnostic = .{};
-    const a = try parse(testing.allocator, "(?im)a", &diag);
-    defer a.deinit(testing.allocator);
+    const a = try scan("(?im)a", &diag, arena.buffers());
     try testing.expect(a.flags.case_insensitive);
     try testing.expect(a.flags.multiline);
     try testing.expect(!a.flags.dot_all);
@@ -1980,18 +1836,6 @@ test "scan can run on caller-owned stack buffers (storage-agnostic)" {
     var w = std.Io.Writer.fixed(&buf);
     try formatAst(a, &w);
     try testing.expectEqualStrings("(cat (lit a) (rep 0 inf g (cap 1 (alt (lit b) (lit c)))))", w.buffered());
-}
-
-test "comptime compiles a realistic, non-trivial pattern" {
-    // A ~70-byte email-ish pattern with named groups, classes, counted and
-    // unbounded quantifiers, and anchors — proves the comptime quota is ample
-    // for real patterns (measured cost is well under ~25 branches/byte).
-    const re = comptime compile(
-        "^(?<user>[A-Za-z0-9._%+-]+)@(?<host>[A-Za-z0-9.-]+)\\.(?<tld>[A-Za-z]{2,63})$",
-    );
-    try testing.expectEqual(@as(u32, 3), re.capture_count);
-    try testing.expectEqualStrings("user", re.names[0]);
-    try testing.expectEqualStrings("tld", re.names[2]);
 }
 
 test {

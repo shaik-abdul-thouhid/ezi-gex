@@ -1,10 +1,148 @@
 const std = @import("std");
-const Io = std.Io;
 
 const ezi_gex = @import("ezi_gex");
 
+// Until the `Regex`/`Compiled` front door lands, wire the pipeline by hand:
+// pattern → AST → HIR → Pike VM `Program`, then drive it through the
+// backend-agnostic `Engine` (isMatch/find/captures/findAll/count/split/replace).
+const PikeVM = ezi_gex.engine.backends.pikevm;
+const E = ezi_gex.engine.Engine(PikeVM);
+
 pub fn main(init: std.process.Init) !void {
-    _ = init;
+    const gpa = init.arena.allocator(); // arena: freed wholesale at exit
+
+    const pattern = "(\\w+)@(\\w+)\\.(\\w+)";
+    const input = "contact: alice@example.com and bob@test.org";
+
+    // ── compile: pattern → AST → HIR → program ───────────────────────────────
+    var diag: ezi_gex.Diagnostic = .{};
+    const ast = ezi_gex.parse(gpa, pattern, &diag) catch |err| {
+        std.debug.print("invalid regex: {s} at \"{s}\"\n", .{ diag.message(), diag.faultySlice(pattern) });
+        return err;
+    };
+    const hir = try ezi_gex.buildHir(gpa, ast, .{});
+    var program = try PikeVM.buildAlloc(gpa, hir, .{});
+    var scratch = try PikeVM.Scratch.init(gpa, &program);
+    const meta = ezi_gex.engine.Meta{ .capture_count = hir.capture_count };
+
+    std.debug.print("pattern: {s}\ninput:   {s}\n\n", .{ pattern, input });
+
+    // ── isMatch / find ────────────────────────────────────────────────────────
+    std.debug.print("isMatch: {}\n", .{E.isMatch(&program, &scratch, input, .{})});
+    if (E.find(&program, &scratch, input, .{})) |m| {
+        std.debug.print("first:   \"{s}\" at [{d}..{d}]\n", .{ m.slice(input), m.start, m.end });
+    }
+
+    // ── capturesAll: every match with its submatches ──────────────────────────
+    std.debug.print("\nall matches (user / host / tld):\n", .{});
+    var slots: [8]?usize = undefined; // 2 * (capture_count + 1)
+    var it = E.capturesAll(&program, &scratch, input, &slots, meta, .{});
+    var i: usize = 0;
+    while (it.next()) |c| {
+        i += 1;
+        std.debug.print("  {d}. {s}  ->  {s} / {s} / {s}\n", .{
+            i,                 c.match().slice(input),
+            c.groupSlice(1).?, c.groupSlice(2).?,
+            c.groupSlice(3).?,
+        });
+    }
+    std.debug.print("\ncount:   {d}\n", .{E.count(&program, &scratch, input, .{})});
+
+    // ── replaceAll with capture references ($1, $2 …) ─────────────────────────
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try E.replaceAll(&program, &scratch, input, "$1 [at] $2 [dot] $3", &slots, meta, &w);
+    std.debug.print("redact:  {s}\n", .{w.buffered()});
+
+    // ── split on a separate pattern ───────────────────────────────────────────
+    var sdiag: ezi_gex.Diagnostic = .{};
+    const sep_ast = try ezi_gex.parse(gpa, "\\s*,\\s*", &sdiag);
+    var sep_prog = try PikeVM.buildAlloc(gpa, try ezi_gex.buildHir(gpa, sep_ast, .{}), .{});
+    var sep_scratch = try PikeVM.Scratch.init(gpa, &sep_prog);
+    std.debug.print("\nsplit \"a, b ,c,d\" on /\\s*,\\s*/:\n", .{});
+    var sit = E.split(&sep_prog, &sep_scratch, "a, b ,c,d", .{});
+    while (sit.next()) |piece| std.debug.print("  [{s}]\n", .{piece});
+
+    // ── a Unicode flex: \w is Unicode-aware ───────────────────────────────────
+    var udiag: ezi_gex.Diagnostic = .{};
+    const u_ast = try ezi_gex.parse(gpa, "\\w+", &udiag);
+    var u_prog = try PikeVM.buildAlloc(gpa, try ezi_gex.buildHir(gpa, u_ast, .{}), .{});
+    var u_scratch = try PikeVM.Scratch.init(gpa, &u_prog);
+    if (E.find(&u_prog, &u_scratch, "héllo, wörld", .{})) |m| {
+        std.debug.print("\nunicode \\w+ on \"héllo, wörld\": \"{s}\"\n", .{m.slice("héllo, wörld")});
+    }
+
+    // ── invalid pattern: report a diagnostic, don't crash ─────────────────────
+    // The runtime `parse` returns `error.InvalidPattern` and fills `diag` with a
+    // code + byte span. Catch it, print, and carry on — no panic, no abort.
+    const bad_pattern = "a(b|c[d-";
+    var bad_diag: ezi_gex.Diagnostic = .{};
+    if (ezi_gex.parse(gpa, bad_pattern, &bad_diag)) |bad_ast| {
+        bad_ast.deinit(gpa); // unreachable for this pattern, but shown for symmetry
+    } else |err| {
+        std.debug.print("\n", .{});
+        printDiagnostic(bad_pattern, bad_diag);
+        std.debug.print("handled {s} gracefully — program continues.\n", .{@errorName(err)});
+    }
+
+    // ══ Front door: the simple way (compileRuntime / compileComptime) ══════════
+    // No manual pipeline — `compile*` returns a ready regex. The caller only
+    // touches isMatch / find / captures, and owns the Scratch.
+    std.debug.print("\n── front door ──\n", .{});
+
+    // Runtime: compile from a (possibly user-supplied) pattern. On a bad pattern
+    // this returns error.InvalidPattern + a filled diagnostic — never crashes.
+    var rdiag: ezi_gex.Diagnostic = .{};
+    var re = ezi_gex.compileRuntime(gpa, "(?<word>\\p{L}+)", &rdiag, .{}) catch |err| {
+        printDiagnostic("(?<word>\\p{L}+)", rdiag);
+        return err;
+    };
+    defer re.deinit(); // frees the heap program
+
+    // The Scratch is the per-search working state — create it at the call site,
+    // reuse it across searches, one per thread.
+    var sc = try re.newScratch(gpa);
+    defer sc.deinit(gpa);
+
+    const text = "Þú ert hér 2026";
+    std.debug.print("isMatch: {}\n", .{re.isMatch(&sc, text)});
+    if (re.find(&sc, text)) |m| std.debug.print("find:    \"{s}\"\n", .{m.slice(text)});
+
+    // ── slots: the capture-output buffer ──────────────────────────────────────
+    // `captures`/`capturesAll`/`replaceAll` write match boundaries into a `[]?usize`
+    // you provide: two entries (start, end) per group, plus the whole match at
+    // index 0. So you need exactly `re.slotCount()` == 2*(captureCount+1) slots.
+    // At runtime, capture_count is dynamic → heap-allocate that many:
+    const cap_slots = try gpa.alloc(?usize, re.slotCount());
+    std.debug.print("slotCount: {d} (= 2*({d} groups + 1))\n", .{ re.slotCount(), re.captureCount() });
+    if (re.captures(&sc, cap_slots, text)) |c| {
+        std.debug.print("named:   word = \"{s}\"\n", .{c.namedSlice("word").?});
+    }
+
+    // Comptime: the program is baked into the binary (no allocator to compile —
+    // only to make a Scratch). Because capture_count is comptime here, the slot
+    // buffer can be a stack array sized by `slotCount()`.
+    const Re = comptime ezi_gex.compileComptime("(\\d{4})-(\\d{2})", .{});
+    var csc = try Re.newScratch(gpa);
+    defer csc.deinit(gpa);
+    var cslots: [Re.slotCount()]?usize = undefined; // comptime-sized; no allocation
+    if (Re.captures(&csc, &cslots, "y2026-06")) |c| {
+        std.debug.print("comptime captures: {s} / {s}\n", .{ c.groupSlice(1).?, c.groupSlice(2).? });
+    }
+}
+
+/// Pretty-print a parse diagnostic with a caret under the offending span. Pure
+/// formatting over the public `Diagnostic` API — nothing here can fail or crash.
+fn printDiagnostic(pattern: []const u8, diag: ezi_gex.Diagnostic) void {
+    std.debug.print("invalid regex: {s}\n  {s}\n  ", .{ diag.message(), pattern });
+    var col: usize = 0;
+    while (col < diag.span.start) : (col += 1) std.debug.print(" ", .{});
+    const width = @max(diag.span.end - diag.span.start, 1); // point spans still get one caret
+    var k: usize = 0;
+    while (k < width) : (k += 1) std.debug.print("^", .{});
+    std.debug.print("  [{s}] at bytes {d}..{d} (\"{s}\")\n", .{
+        @tagName(diag.code), diag.span.start, diag.span.end, diag.faultySlice(pattern),
+    });
 }
 
 // ── Usage examples (also serve as consumer-side API tests) ────────────────────

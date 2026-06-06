@@ -58,4 +58,44 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // ── Benchmarks ────────────────────────────────────────────────────────────
+    // Built (and linked against an ezi_gex module) in ReleaseFast by default so
+    // the engine is measured optimized, not in Debug. Override with
+    // `-Dbench-optimize=...`.
+    const bench_optimize = b.option(
+        std.builtin.OptimizeMode,
+        "bench-optimize",
+        "Optimization level for the bench executable (default ReleaseFast)",
+    ) orelse .ReleaseFast;
+
+    const ezi_code_bench = b.dependency("ezi_code", .{
+        .target = target,
+        .optimize = bench_optimize,
+    });
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .imports = &.{
+            .{ .name = "ezi_code", .module = ezi_code_bench.module("ezi_code") },
+        },
+    });
+
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/main.zig"),
+            .target = target,
+            .optimize = bench_optimize,
+            .imports = &.{
+                .{ .name = "ezi_gex", .module = bench_mod },
+            },
+        }),
+    });
+
+    const run_bench = b.addRunArtifact(bench_exe);
+    run_bench.addPassthruArgs();
+    const bench_step = b.step("bench", "Run benchmarks");
+    bench_step.dependOn(&run_bench.step);
 }
