@@ -141,18 +141,78 @@ pub const Node = struct {
     };
 };
 
-/// Cheap, precomputed facts a dispatcher/backend can consult without rewalking.
+/// A 256-bit set of byte values — backing storage for the `required_bytes`
+/// prefilter hint. Tiny and `comptime`-constructible, so it lives directly inside
+/// the HIR (ro_data at comptime, heap at runtime) with no separate allocation.
+pub const ByteSet = struct {
+    bits: [4]u64 = .{ 0, 0, 0, 0 },
+
+    pub fn set(self: *ByteSet, b: u8) void {
+        self.bits[b >> 6] |= @as(u64, 1) << @truncate(b);
+    }
+    pub fn has(self: ByteSet, b: u8) bool {
+        return (self.bits[b >> 6] >> @truncate(b)) & 1 != 0;
+    }
+    pub fn isEmpty(self: ByteSet) bool {
+        return (self.bits[0] | self.bits[1] | self.bits[2] | self.bits[3]) == 0;
+    }
+    /// Number of distinct bytes in the set (a prefilter picks the rarest member).
+    pub fn count(self: ByteSet) u32 {
+        var c: u64 = 0;
+        for (self.bits) |w| c += @popCount(w);
+        return @intCast(c);
+    }
+};
+
+/// Cheap, precomputed facts a dispatcher/backend can consult without rewalking the
+/// tree. Everything here is a *sound* property of the HIR: bounds are true bounds
+/// and the "required"/"anchored" facts hold for *every* match, so a prefilter or
+/// length gate built on them never yields a false negative.
 pub const Analysis = struct {
-    /// The pattern can only match starting at the very beginning of the input.
+    /// Match can only start at the very beginning of input (`\A`, or `^` without
+    /// multiline).
     anchored_start: bool,
+    /// Match can only end at the very end of input (`\z`/`\Z`, or `$` without
+    /// multiline). Mirror of `anchored_start`.
+    anchored_end: bool,
     /// Minimum match length, in code points.
     min_len: u32,
     /// Maximum match length in code points, or null if unbounded.
     max_len: ?u32,
+    /// Minimum match length, in UTF-8 bytes (≥ `min_len`; strictly larger when a
+    /// required atom is multi-byte). For "remaining input too short" gating.
+    min_utf8_len: u32,
+    /// Maximum match length, in UTF-8 bytes, or null if unbounded.
+    max_utf8_len: ?u32,
     /// Contains a `\X` grapheme node (routes to a grapheme-capable backend).
     has_grapheme: bool,
-    /// The whole pattern is a single literal run (no anchors, classes, etc.).
+    /// Contains a `\b`/`\B` word-boundary assertion — relevant to byte-DFA
+    /// feasibility (a boundary needs the previous code point, not just a byte).
+    has_word_boundary: bool,
+    /// The whole pattern is a single literal run (no anchors, classes, …) — route
+    /// straight to a memmem/substring backend.
     is_whole_literal: bool,
+    /// Reserved one-pass hint (an unambiguous NFA → fast single-pass capture path).
+    /// Soundly deciding this needs first/follow overlap analysis on the *lowered*
+    /// NFA, not the HIR tree, so the HIR leaves it conservatively `false`; the
+    /// backend that builds the NFA flips it on when it proves the property. A
+    /// `false` is always safe — the dispatcher just falls through to the Pike VM.
+    is_one_pass: bool,
+    /// A literal run that *every* match must begin with, or null — indexes
+    /// `Hir.literals`. The needle for a start-anchored scan. Null when the leading
+    /// atom isn't a fixed literal (a class, `.`, an alternation, an optional, or a
+    /// `(?i)`-folded letter that became a class). Leading zero-width anchors
+    /// (`^`, `\b`) are skipped.
+    prefix_literal: ?Node.Run,
+    /// The longest literal run that *every* match must contain somewhere — the best
+    /// general memmem prefilter needle — or null. May coincide with
+    /// `prefix_literal` when the leading run is also the longest.
+    required_literal: ?Node.Run,
+    /// Bytes that must appear in *every* match: the UTF-8 bytes of every required
+    /// literal code point. A `memchr` for any member is a sound prefilter (pick the
+    /// rarest). Empty when nothing is unconditionally required (e.g. a top-level
+    /// alternation, or a leading optional).
+    required_bytes: ByteSet,
 };
 
 /// The resolved program shape. All slices are sub-slices of caller storage
@@ -781,14 +841,32 @@ fn mergeRanges(s: []Range) usize {
 
 // ── Analysis ────────────────────────────────────────────────────────────────────
 
-fn analyze(nodes: []const Node, children: []const u32, root: u32, has_grapheme: bool) Analysis {
-    const mm = lenBounds(nodes, children, root);
+fn analyze(
+    nodes: []const Node,
+    children: []const u32,
+    ranges: []const Range,
+    literals: []const CodePoint,
+    root: u32,
+    has_grapheme: bool,
+) Analysis {
+    const cp = lenBounds(nodes, children, root);
+    const by = byteBounds(nodes, children, ranges, literals, root);
+    var req = Required{};
+    collectRequired(nodes, children, literals, root, &req);
     return .{
         .anchored_start = startsAnchored(nodes, children, root),
-        .min_len = mm.min,
-        .max_len = mm.max,
+        .anchored_end = endsAnchored(nodes, children, root),
+        .min_len = cp.min,
+        .max_len = cp.max,
+        .min_utf8_len = by.min,
+        .max_utf8_len = by.max,
         .has_grapheme = has_grapheme,
+        .has_word_boundary = hasWordBoundary(nodes, children, root),
         .is_whole_literal = nodes[root].tag == .literal,
+        .is_one_pass = false, // decided by the backend's NFA compiler; see Analysis
+        .prefix_literal = prefixLiteral(nodes, children, root),
+        .required_literal = req.best,
+        .required_bytes = req.bytes,
     };
 }
 
@@ -859,6 +937,174 @@ fn startsAnchored(nodes: []const Node, children: []const u32, idx: u32) bool {
     };
 }
 
+/// Mirror of `startsAnchored`: the pattern is pinned to end-of-input (`text_end`).
+/// Looks at the *last* element of a concat / the capture body.
+fn endsAnchored(nodes: []const Node, children: []const u32, idx: u32) bool {
+    const node = nodes[idx];
+    return switch (node.tag) {
+        .anchor => node.data.anchor.kind == .text_end,
+        .concat => blk: {
+            const d = node.data.children;
+            if (d.len == 0) break :blk false;
+            break :blk endsAnchored(nodes, children, children[d.start + d.len - 1]);
+        },
+        .capture => endsAnchored(nodes, children, node.data.capture.child),
+        else => false,
+    };
+}
+
+/// Whether any `\b`/`\B` assertion appears anywhere in the tree.
+fn hasWordBoundary(nodes: []const Node, children: []const u32, idx: u32) bool {
+    const node = nodes[idx];
+    return switch (node.tag) {
+        .anchor => switch (node.data.anchor.kind) {
+            .word_boundary, .not_word_boundary => true,
+            else => false,
+        },
+        .concat, .alternation => blk: {
+            const d = node.data.children;
+            for (children[d.start .. d.start + d.len]) |ci| {
+                if (hasWordBoundary(nodes, children, ci)) break :blk true;
+            }
+            break :blk false;
+        },
+        .capture => hasWordBoundary(nodes, children, node.data.capture.child),
+        .repetition => hasWordBoundary(nodes, children, node.data.repetition.child),
+        else => false,
+    };
+}
+
+/// The literal run every match must begin with, or null. Follows the mandatory
+/// leading atom — skipping leading zero-width anchors (`^`, `\b`) in a concat, and
+/// descending through capture / `min≥1` repetition bodies — down to a literal node.
+/// A class, `.`, alternation, or optional (`min==0`) leading atom ends it with null.
+fn prefixLiteral(nodes: []const Node, children: []const u32, idx: u32) ?Node.Run {
+    const node = nodes[idx];
+    return switch (node.tag) {
+        .literal => node.data.run,
+        .concat => blk: {
+            const d = node.data.children;
+            var i = d.start;
+            while (i < d.start + d.len) : (i += 1) {
+                const ci = children[i];
+                switch (nodes[ci].tag) {
+                    .anchor, .empty => continue, // zero-width: the match begins after it
+                    else => break :blk prefixLiteral(nodes, children, ci),
+                }
+            }
+            break :blk null;
+        },
+        .capture => prefixLiteral(nodes, children, node.data.capture.child),
+        .repetition => if (node.data.repetition.min >= 1)
+            prefixLiteral(nodes, children, node.data.repetition.child)
+        else
+            null,
+        else => null,
+    };
+}
+
+/// Accumulator for `collectRequired`: the longest required literal run found
+/// (`best`, the prefilter needle) and the union of required literal bytes.
+const Required = struct { best: ?Node.Run = null, bytes: ByteSet = .{} };
+
+/// Gather literal facts that hold for *every* match. Walks only the **mandatory
+/// spine** — every concat child, capture / `min≥1` repetition bodies — recording
+/// the longest literal run seen and every literal code point's UTF-8 bytes.
+/// Alternations (no single branch is required) and `min==0` repetitions (optional)
+/// are skipped, so every recorded fact is sound (a true lower bound on "must
+/// appear").
+fn collectRequired(nodes: []const Node, children: []const u32, literals: []const CodePoint, idx: u32, acc: *Required) void {
+    const node = nodes[idx];
+    switch (node.tag) {
+        .literal => {
+            const r = node.data.run;
+            if (acc.best == null or r.len > acc.best.?.len) acc.best = r;
+            for (literals[r.start .. r.start + r.len]) |c| addCpBytes(&acc.bytes, c);
+        },
+        .concat => {
+            const d = node.data.children;
+            for (children[d.start .. d.start + d.len]) |ci| collectRequired(nodes, children, literals, ci, acc);
+        },
+        .capture => collectRequired(nodes, children, literals, node.data.capture.child, acc),
+        .repetition => if (node.data.repetition.min >= 1)
+            collectRequired(nodes, children, literals, node.data.repetition.child, acc),
+        // class/any/grapheme/anchor/empty contribute no fixed literal; alternation
+        // is skipped — no single branch is mandatory.
+        else => {},
+    }
+}
+
+/// Set the UTF-8 bytes of `cp` in `set`. A required code point's bytes appear
+/// verbatim and contiguously in every match (UTF-8 is self-synchronizing), so each
+/// is individually a "must appear" byte.
+fn addCpBytes(set: *ByteSet, cp: CodePoint) void {
+    var buf: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(@intCast(cp), &buf) catch return; // skip non-encodable
+    for (buf[0..n]) |b| set.set(b);
+}
+
+const ByteBounds = struct { min: u32, max: ?u32 };
+
+/// UTF-8 byte length of a code point (1–4). Resolved HIR code points are always
+/// encodable; the `catch 4` is a defensive upper bound.
+fn utf8Len(cp: CodePoint) u32 {
+    return std.unicode.utf8CodepointSequenceLength(@intCast(cp)) catch 4;
+}
+
+/// Match-length bounds in UTF-8 bytes (parallels `lenBounds`, which counts code
+/// points). A class spans `[utf8Len(lo) .. utf8Len(hi)]`: UTF-8 length is monotonic
+/// in code-point value and the class ranges are sorted, so the first range's `lo`
+/// is the shortest member and the last range's `hi` the longest.
+fn byteBounds(nodes: []const Node, children: []const u32, ranges: []const Range, literals: []const CodePoint, idx: u32) ByteBounds {
+    const node = nodes[idx];
+    return switch (node.tag) {
+        .empty, .anchor => .{ .min = 0, .max = 0 },
+        .literal => blk: {
+            const r = node.data.run;
+            var n: u32 = 0;
+            for (literals[r.start .. r.start + r.len]) |c| n += utf8Len(c);
+            break :blk .{ .min = n, .max = n };
+        },
+        .class => blk: {
+            const c = node.data.class;
+            if (c.len == 0) break :blk .{ .min = 1, .max = 1 }; // unmatchable; vacuous bound
+            break :blk .{ .min = utf8Len(ranges[c.start].lo), .max = utf8Len(ranges[c.start + c.len - 1].hi) };
+        },
+        .any => .{ .min = 1, .max = 4 }, // any code point is 1–4 UTF-8 bytes
+        .grapheme => .{ .min = 1, .max = null },
+        .capture => byteBounds(nodes, children, ranges, literals, node.data.capture.child),
+        .repetition => blk: {
+            const c = byteBounds(nodes, children, ranges, literals, node.data.repetition.child);
+            const rep = node.data.repetition;
+            const min = c.min * rep.min;
+            const max: ?u32 = if (rep.max) |mx| (if (c.max) |cm| cm * mx else null) else null;
+            break :blk .{ .min = min, .max = max };
+        },
+        .concat => blk: {
+            const d = node.data.children;
+            var min: u32 = 0;
+            var max: ?u32 = 0;
+            for (children[d.start .. d.start + d.len]) |ci| {
+                const c = byteBounds(nodes, children, ranges, literals, ci);
+                min += c.min;
+                max = addMax(max, c.max);
+            }
+            break :blk .{ .min = min, .max = max };
+        },
+        .alternation => blk: {
+            const d = node.data.children;
+            var min: u32 = std.math.maxInt(u32);
+            var max: ?u32 = 0;
+            for (children[d.start .. d.start + d.len]) |ci| {
+                const c = byteBounds(nodes, children, ranges, literals, ci);
+                if (c.min < min) min = c.min;
+                max = maxMax(max, c.max);
+            }
+            break :blk .{ .min = min, .max = max };
+        },
+    };
+}
+
 // ════════════════════════════════════════════════════════════════════════════════
 // Storage-agnostic entry points
 // ════════════════════════════════════════════════════════════════════════════════
@@ -907,15 +1153,18 @@ pub fn build(a: ast.Ast, opts: Options, scratch: Scratch, buffers: Buffers) Buil
 
     const nodes = b.nodes[0..b.node_len];
     const children = b.children[0..b.child_len];
+    const ranges = b.ranges[0..b.range_len];
+    const literals = b.literals[0..b.lit_len];
+
     return .{
         .nodes = nodes,
         .children = children,
-        .ranges = b.ranges[0..b.range_len],
-        .literals = b.literals[0..b.lit_len],
+        .ranges = ranges,
+        .literals = literals,
         .names = b.names[0..b.name_len],
         .root = root,
         .capture_count = a.capture_count,
-        .analysis = analyze(nodes, children, root, b.has_grapheme),
+        .analysis = analyze(nodes, children, ranges, literals, root, b.has_grapheme),
     };
 }
 
@@ -1240,9 +1489,12 @@ test "analysis: anchored, lengths, whole-literal" {
     const h = try buildAlloc(testing.allocator, a, .{});
     defer deinitHir(testing.allocator, h);
     try testing.expect(h.analysis.anchored_start);
+    try testing.expect(!h.analysis.anchored_end);
     try testing.expectEqual(@as(u32, 3), h.analysis.min_len);
     try testing.expectEqual(@as(?u32, 3), h.analysis.max_len);
     try testing.expect(!h.analysis.is_whole_literal); // wrapped in a concat with the anchor
+    // the leading `^` is zero-width — the prefix is still the run that follows it
+    try testing.expectEqual(@as(u32, 3), h.analysis.prefix_literal.?.len);
 
     const a2 = try compile.parse(testing.allocator, "abc", &diag);
     defer a2.deinit(testing.allocator);
@@ -1250,6 +1502,71 @@ test "analysis: anchored, lengths, whole-literal" {
     defer deinitHir(testing.allocator, h2);
     try testing.expect(h2.analysis.is_whole_literal);
     try testing.expect(!h2.analysis.anchored_start);
+    try testing.expectEqual(@as(u32, 3), h2.analysis.required_literal.?.len);
+    try testing.expectEqual(@as(u32, 3), h2.analysis.min_utf8_len);
+    try testing.expectEqual(@as(?u32, 3), h2.analysis.max_utf8_len.?);
+}
+
+test "analysis: prefilter + feasibility facts" {
+    var diag: compile.Diagnostic = .{};
+
+    // Leading literal "abc", an inner class, trailing literal "xy" then `$`.
+    {
+        const a = try compile.parse(testing.allocator, "abc[0-9]+xy$", &diag);
+        defer a.deinit(testing.allocator);
+        const h = try buildAlloc(testing.allocator, a, .{});
+        defer deinitHir(testing.allocator, h);
+        const an = h.analysis;
+        try testing.expect(!an.anchored_start);
+        try testing.expect(an.anchored_end); // trailing `$` (no multiline) → text_end
+        // prefix is the leading run "abc"
+        const pre = an.prefix_literal.?;
+        try testing.expectEqual(@as(u32, 3), pre.len);
+        try testing.expectEqual(@as(CodePoint, 'a'), h.literals[pre.start]);
+        // best needle is the longest required run ("abc" len 3 beats "xy" len 2)
+        try testing.expectEqual(@as(u32, 3), an.required_literal.?.len);
+        // every required literal byte is present; the class member '0' is not
+        for ("abcxy") |b| try testing.expect(an.required_bytes.has(b));
+        try testing.expect(!an.required_bytes.has('0'));
+        try testing.expectEqual(@as(u32, 6), an.min_len); // a b c <digit> x y
+    }
+
+    // Top-level alternation: nothing is unconditionally required.
+    {
+        const a = try compile.parse(testing.allocator, "cat|dog", &diag);
+        defer a.deinit(testing.allocator);
+        const h = try buildAlloc(testing.allocator, a, .{});
+        defer deinitHir(testing.allocator, h);
+        try testing.expect(h.analysis.prefix_literal == null);
+        try testing.expect(h.analysis.required_literal == null);
+        try testing.expect(h.analysis.required_bytes.isEmpty());
+        try testing.expect(!h.analysis.is_one_pass); // HIR leaves it conservatively false
+    }
+
+    // Word boundary + multi-byte UTF-8 byte bounds (é = U+00E9 → 2 bytes).
+    {
+        const a = try compile.parse(testing.allocator, "\\bné\\b", &diag);
+        defer a.deinit(testing.allocator);
+        const h = try buildAlloc(testing.allocator, a, .{});
+        defer deinitHir(testing.allocator, h);
+        const an = h.analysis;
+        try testing.expect(an.has_word_boundary);
+        try testing.expectEqual(@as(u32, 2), an.min_len); // 'n', 'é' — two code points
+        try testing.expectEqual(@as(?u32, 2), an.max_len);
+        try testing.expectEqual(@as(u32, 3), an.min_utf8_len); // 1 + 2 bytes
+        try testing.expectEqual(@as(?u32, 3), an.max_utf8_len.?);
+    }
+
+    // Dot is 1–4 bytes; `.*` is unbounded above.
+    {
+        const a = try compile.parse(testing.allocator, "a.*", &diag);
+        defer a.deinit(testing.allocator);
+        const h = try buildAlloc(testing.allocator, a, .{});
+        defer deinitHir(testing.allocator, h);
+        try testing.expectEqual(@as(?u32, null), h.analysis.max_len);
+        try testing.expectEqual(@as(?u32, null), h.analysis.max_utf8_len);
+        try testing.expectEqual(@as(u32, 1), h.analysis.min_utf8_len); // just the leading 'a'
+    }
 }
 
 test "comptime build matches runtime build (parity)" {
