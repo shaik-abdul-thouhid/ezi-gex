@@ -34,7 +34,7 @@ fn Pattern(comptime pat: []const u8, comptime tmpl: []const u8) type {
                 var re = try ezi_gex.compileRuntimeWith(PikeVM, a, pat, &diag, .{});
                 cached = .{
                     .re = re,
-                    .sc = try re.newScratch(a),
+                    .sc = try RX.Scratch.init(a, &re.program),
                     .slots = try a.alloc(?usize, re.slotCount()),
                     .out = try a.alloc(u8, ctx.corpus.bytes.len * 2 + 1024),
                 };

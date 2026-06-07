@@ -26,6 +26,7 @@ pub const PerlClassKind = token.PerlClassKind;
 
 // ── Anchor kind ───────────────────────────────────────────────────────────────
 
+/// @stable-since: v0.1.0
 pub const AnchorKind = enum {
     /// ^ — respects multiline flag (matches after \n when multiline = true)
     line_begin,
@@ -44,6 +45,8 @@ pub const AnchorKind = enum {
 // ── Character class members ───────────────────────────────────────────────────
 
 /// A single inclusive code_point range. A bare literal is encoded as lo == hi.
+///
+/// @stable-since: v0.1.0
 pub const ClassRange = struct {
     lo: CodePoint,
     hi: CodePoint,
@@ -51,6 +54,8 @@ pub const ClassRange = struct {
 
 /// A Perl shorthand (`\d` `\w` `\s`) appearing inside a class.
 /// `negated` is set for the uppercase forms (`\D` `\W` `\S`).
+///
+/// @stable-since: v0.1.0
 pub const PerlItem = struct {
     kind: PerlClassKind,
     negated: bool,
@@ -58,6 +63,8 @@ pub const PerlItem = struct {
 
 /// A Unicode property test (`\p{...}` / `\P{...}`) appearing inside a class.
 /// `negated` is set for the `\P{...}` form.
+///
+/// @stable-since: v0.1.0
 pub const PropItem = struct {
     property: PropertyId,
     negated: bool,
@@ -69,6 +76,8 @@ pub const PropItem = struct {
 ///
 /// This is also how standalone shorthands are represented: `\d` is a class with
 /// a single `.perl` member, so the matcher has exactly one set-membership path.
+///
+/// @stable-since: v0.1.0
 pub const ClassItem = union(enum) {
     /// `a` or `a-z`
     range: ClassRange,
@@ -80,6 +89,7 @@ pub const ClassItem = union(enum) {
 
 // ── Quantifier bounds ─────────────────────────────────────────────────────────
 
+/// @stable-since: v0.1.0
 pub const Quantifier = struct {
     min: u32,
     /// null = unbounded (*, +, {m,})
@@ -90,6 +100,7 @@ pub const Quantifier = struct {
 
 // ── Node tag ──────────────────────────────────────────────────────────────────
 
+/// @stable-since: v0.1.0
 pub const NodeTag = enum {
     // ── Composite — variable children via children[] ────────────────────────
     /// a|b|c  Two or more branches. children[] holds branch node indices.
@@ -191,6 +202,7 @@ pub const UnicodePropData = struct {
 
 // ── Node ──────────────────────────────────────────────────────────────────────
 
+/// @stable-since: v0.1.0
 pub const Node = struct {
     tag: NodeTag,
     data: Data,
@@ -227,6 +239,8 @@ pub const Node = struct {
 /// Runtime path: the slices are heap-allocated by the parser, sized exactly.
 /// Free them with `deinit` once they are no longer needed (after NFA
 /// compilation, when the NFA has copied out whatever it needs).
+///
+/// @stable-since: v0.1.0
 pub const Ast = struct {
     /// Every node. `nodes[root]` is the tree root.
     nodes: []const Node,
@@ -249,6 +263,8 @@ pub const Ast = struct {
     /// Free the heap arrays of a runtime-parsed AST. The `names` entries point
     /// into the original pattern and are NOT freed — only the `names` array is.
     /// Never call this on a comptime-built AST (its slices are const data).
+    ///
+    /// @stable-since: v0.1.0
     pub fn deinit(self: Ast, allocator: std.mem.Allocator) void {
         if (self.nodes.len != 0) allocator.free(self.nodes);
         if (self.children.len != 0) allocator.free(self.children);

@@ -1,6 +1,6 @@
 .{
     .name = .ezi_gex,
-    .version = "0.0.0",
+    .version = "0.1.0-dev",
     .fingerprint = 0xe2db231a3c00347d,
     .minimum_zig_version = "0.17.0-dev.702+18b3c78a9",
     .dependencies = .{
@@ -13,5 +13,9 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "docs",
+        "LICENSE",
+        "README.md",
+        "CHANGELOG.md",
     },
 }

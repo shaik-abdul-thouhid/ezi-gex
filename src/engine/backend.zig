@@ -25,16 +25,21 @@ const utf8 = ezi_code.encoding.utf8;
 // ── Shared value types ──────────────────────────────────────────────────────────
 
 /// A match span, as byte offsets into the input.
+///
+/// @stable-since: v0.1.0
 pub const Match = struct {
     start: usize,
     end: usize,
 
+    /// @stable-since: v0.1.0
     pub fn slice(self: Match, input: []const u8) []const u8 {
         return input[self.start..self.end];
     }
+    /// @stable-since: v0.1.0
     pub fn len(self: Match) usize {
         return self.end - self.start;
     }
+    /// @stable-since: v0.1.0
     pub fn isEmpty(self: Match) bool {
         return self.start == self.end;
     }
@@ -42,6 +47,8 @@ pub const Match = struct {
 
 /// Where/how a single search runs. `start` is a byte offset; `anchored` forces the
 /// match to begin exactly at `start` (no leftward scan).
+///
+/// @stable-since: v0.1.0
 pub const SearchOptions = struct {
     start: usize = 0,
     anchored: bool = false,
@@ -50,6 +57,8 @@ pub const SearchOptions = struct {
 /// Budget/behaviour hints a backend may accept when its `Scratch` is constructed.
 /// Backends with no growable part (e.g. the Pike VM) ignore these; only a lazy-DFA
 /// memo consults them. `grow` is impossible for a fixed-buffer `Scratch.initBuffer`.
+///
+/// @stable-since: v0.1.0
 pub const ScratchOptions = struct {
     max_bytes: usize = 1 << 20,
     on_full: enum { reset, give_up, grow } = .reset,
@@ -57,6 +66,8 @@ pub const ScratchOptions = struct {
 
 /// What a backend can do (comptime). The dispatcher/front door reads these to
 /// route and to gate capability-specific methods.
+///
+/// @stable-since: v0.1.0
 pub const Caps = struct {
     /// Can report submatches (`searchCaptures`)?
     captures: bool,
@@ -71,6 +82,8 @@ pub const Caps = struct {
 /// Capture metadata, derived once from the HIR by the front door and carried
 /// alongside a `Program`. The backend does not need this — only the agnostic
 /// capture view does (to size `slots` and resolve names).
+///
+/// @stable-since: v0.1.0
 pub const Meta = struct {
     /// Number of capturing groups, excluding the whole match (group 0).
     capture_count: u32 = 0,
@@ -81,13 +94,18 @@ pub const Meta = struct {
 
     /// Required `slots` length for `searchCaptures`: two offsets per group + the
     /// whole match.
+    ///
+    /// @stable-since: v0.1.0
     pub fn slotLen(self: Meta) usize {
         return 2 * (self.capture_count + 1);
     }
 };
 
 /// Suggested error sets (backends may use their own supersets).
+///
+/// @stable-since: v0.1.0
 pub const BuildError = error{ PatternTooComplex, Unsupported } || std.mem.Allocator.Error;
+/// @stable-since: v0.1.0
 pub const ScratchError = error{ BufferTooSmall, Unsupported } || std.mem.Allocator.Error;
 
 // ── OPTIONAL shared scratch helpers (NOT part of the contract) ────────────────────
@@ -115,14 +133,19 @@ pub const ScratchError = error{ BufferTooSmall, Unsupported } || std.mem.Allocat
 ///   * `pub const Buf = Cell;`            — the buffer element type
 ///   * `pub fn bufferLen(program) usize;` — words a buffer must hold
 ///   * `pub fn initBuffer(buf: []Buf, program) ScratchError!Scratch;`
+///
+/// @stable-since: v0.1.0
 pub const Cell = union { w: usize, slot: ?usize };
 
 /// A bump-carver that slices a `[]Cell` buffer into typed sub-arrays. Pure slicing,
 /// so it runs at comptime as well as runtime; a short buffer yields
 /// `error.BufferTooSmall` (the "with limits" failure mode), never UB.
+///
+/// @stable-since: v0.1.0
 pub const Carver = struct {
     buf: []Cell,
     off: usize = 0,
+    /// @stable-since: v0.1.0
     pub fn take(self: *Carver, n: usize) ScratchError![]Cell {
         const end = self.off + n;
         if (end > self.buf.len) return error.BufferTooSmall;
@@ -138,20 +161,28 @@ pub const Carver = struct {
 /// buffer, the `Meta`, and the `input` — so it is identical for every backend.
 /// Borrows `slots` and `input`; valid until the `slots` buffer is reused (e.g. the
 /// next `CaptureIterator.next`).
+///
+/// @stable-since: v0.1.0
 pub const Captures = struct {
     slots: []const ?usize,
     meta: Meta,
     input: []const u8,
 
     /// The whole match (group 0).
+    ///
+    /// @stable-since: v0.1.0
     pub fn match(self: Captures) Match {
         return self.group(0).?;
     }
     /// Number of slots' worth of groups (whole match + capture groups).
+    ///
+    /// @stable-since: v0.1.0
     pub fn count(self: Captures) usize {
         return self.meta.capture_count + 1;
     }
     /// Group `i` (0 = whole match), or null if it did not participate.
+    ///
+    /// @stable-since: v0.1.0
     pub fn group(self: Captures, i: usize) ?Match {
         const lo = i * 2;
         if (lo + 1 >= self.slots.len) return null;
@@ -160,10 +191,14 @@ pub const Captures = struct {
         return .{ .start = s, .end = e };
     }
     /// The text of group `i`, or null.
+    ///
+    /// @stable-since: v0.1.0
     pub fn groupSlice(self: Captures, i: usize) ?[]const u8 {
         return if (self.group(i)) |m| m.slice(self.input) else null;
     }
     /// The group with the given name, or null (no such name, or didn't participate).
+    ///
+    /// @stable-since: v0.1.0
     pub fn named(self: Captures, name: []const u8) ?Match {
         for (self.meta.group_names, 0..) |gn, g| {
             if (gn) |n| {
@@ -173,6 +208,8 @@ pub const Captures = struct {
         return null;
     }
     /// The text of the named group, or null.
+    ///
+    /// @stable-since: v0.1.0
     pub fn namedSlice(self: Captures, name: []const u8) ?[]const u8 {
         return if (self.named(name)) |m| m.slice(self.input) else null;
     }
@@ -183,6 +220,8 @@ pub const Captures = struct {
 /// Comptime-assert that `B` satisfies the **mandatory** (Lean) contract, with
 /// clear errors. Everything beyond this is optional and `@hasDecl`-gated at the
 /// call site — a missing optional decl errors only when actually used.
+///
+/// @stable-since: v0.1.0
 pub fn verifyBackend(comptime B: type) void {
     comptime {
         const who = @typeName(B);
@@ -207,6 +246,8 @@ pub fn verifyBackend(comptime B: type) void {
 /// `Program` + `Scratch` + `Meta` and forwards to these. All of it is generic over
 /// the two backend primitives (`search`/`searchCaptures`) — backends contribute no
 /// iteration/capture/replace code.
+///
+/// @stable-since: v0.1.0
 pub fn Engine(comptime Backend: type) type {
     comptime verifyBackend(Backend);
     return struct {

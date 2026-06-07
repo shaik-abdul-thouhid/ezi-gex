@@ -31,10 +31,13 @@ const CodePoint = ezi_code.encoding.CodePoint;
 
 // ── Contract surface ────────────────────────────────────────────────────────────
 
+/// @stable-since: v0.1.0
 pub const caps = Caps{ .captures = true, .stateless = false, .grapheme = false };
 
 /// Backend build options. The HIR has already applied flags/folding, so the Pike
 /// VM needs nothing here; the field exists to satisfy the contract shape.
+///
+/// @stable-since: v0.1.0
 pub const Options = struct {};
 
 /// The NFA instruction set and compiled program live in the shared `nfa` module
@@ -43,15 +46,20 @@ pub const Inst = nfa.Inst;
 pub const Program = nfa.Program;
 
 /// Compile a HIR into a heap-allocated `Program` (free with `freeProgram`).
+///
+/// @stable-since: v0.1.0
 pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Program {
     return nfa.buildAlloc(gpa, h);
 }
 
 /// Compile a HIR into a ro_data `Program` at comptime. `\X` becomes a `@compileError`.
+///
+/// @stable-since: v0.1.0
 pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
     return nfa.buildComptime(h);
 }
 
+/// @stable-since: v0.1.0
 pub fn freeProgram(gpa: std.mem.Allocator, program: *Program) void {
     nfa.freeProgram(gpa, program);
 }
@@ -122,6 +130,8 @@ fn popStep(stack: []Cell, top: *usize) Step {
 /// Per-search mutable state (caller-owned; see the contract). Two thread lists, a
 /// working slot array for the epsilon closure, the closure's iterative work stack,
 /// and the winning match's slots — all carved from one `[]Cell` buffer.
+///
+/// @stable-since: v0.1.0
 pub const Scratch = struct {
     clist: ThreadList,
     n_list: ThreadList,
@@ -142,6 +152,8 @@ pub const Scratch = struct {
 
     /// Number of `Cell`s a buffer must hold for this program. Use it to size a
     /// fixed buffer (`var buf: [Scratch.bufferLen(&prog)]Scratch.Cell = undefined;`).
+    ///
+    /// @stable-since: v0.1.0
     pub fn bufferLen(program: *const Program) usize {
         const cap = program.insts.len;
         const sc = program.slot_count;
@@ -154,6 +166,8 @@ pub const Scratch = struct {
     /// the buffer as `var buf: [N]Cell` and references it. No allocator, no
     /// teardown (the caller owns `buf`); on a short buffer returns
     /// `error.BufferTooSmall`. This is the "with limits" path of the design.
+    ///
+    /// @stable-since: v0.1.0
     pub fn initBuffer(buf: []Cell, program: *const Program) backend.ScratchError!Scratch {
         const cap = program.insts.len;
         const sc = program.slot_count;
@@ -179,6 +193,8 @@ pub const Scratch = struct {
 
     /// Allocator-backed init: grab one `[]Cell` and carve it. The buffer is owned
     /// and released by `deinit`.
+    ///
+    /// @stable-since: v0.1.0
     pub fn init(gpa: std.mem.Allocator, program: *const Program) std.mem.Allocator.Error!Scratch {
         const buf = try gpa.alloc(Cell, bufferLen(program));
         var s = initBuffer(buf, program) catch unreachable; // buffer sized exactly
@@ -186,6 +202,7 @@ pub const Scratch = struct {
         return s;
     }
 
+    /// @stable-since: v0.1.0
     pub fn deinit(self: *Scratch, gpa: std.mem.Allocator) void {
         if (self.owned) |buf| gpa.free(buf);
         self.owned = null;
@@ -193,6 +210,8 @@ pub const Scratch = struct {
 
     /// Optional fast reuse — `run` already re-initializes per call, so this is a
     /// no-op kept for contract symmetry / explicit intent.
+    ///
+    /// @stable-since: v0.1.0
     pub fn reset(self: *Scratch) void {
         self.clist.clear();
         self.n_list.clear();
@@ -338,15 +357,18 @@ fn run(program: *const Program, sc: *Scratch, input: []const u8, opts: SearchOpt
 
 // ── Contract: matching entry points ──────────────────────────────────────────────
 
+/// @stable-since: v0.1.0
 pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) bool {
     return run(program, scratch, input, opts) != null;
 }
 
+/// @stable-since: v0.1.0
 pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) ?Match {
     const slots = run(program, scratch, input, opts) orelse return null;
     return .{ .start = slots[0].slot.?, .end = slots[1].slot.? };
 }
 
+/// @stable-since: v0.1.0
 pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const u8, slots_out: []?usize, opts: SearchOptions) ?Match {
     const slots = run(program, scratch, input, opts) orelse return null;
     const k = @min(slots_out.len, slots.len);

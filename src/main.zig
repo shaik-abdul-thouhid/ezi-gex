@@ -99,9 +99,11 @@ pub fn main(init: std.process.Init) !void {
     };
     defer re.deinit(); // frees the heap program
 
-    // The Scratch is the per-search working state — create it at the call site,
-    // reuse it across searches, one per thread.
-    var sc = try re.newScratch(gpa);
+    // The Scratch is the per-search working state — you own it, reuse it across
+    // searches, one per thread. The front door hands you only the *type*
+    // (`@TypeOf(re).Scratch`); you construct an instance off it with the backend's
+    // own init — here heap-backed; `.initBuffer(buf, &re.program)` needs no allocator.
+    var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
     defer sc.deinit(gpa);
 
     const text = "Þú ert hér 2026";
@@ -123,7 +125,7 @@ pub fn main(init: std.process.Init) !void {
     // only to make a Scratch). Because capture_count is comptime here, the slot
     // buffer can be a stack array sized by `slotCount()`.
     const Re = comptime ezi_gex.compileComptime("(\\d{4})-(\\d{2})", .{});
-    var csc = try Re.newScratch(gpa);
+    var csc = try @TypeOf(Re).Scratch.init(gpa, &Re.program);
     defer csc.deinit(gpa);
     var cslots: [Re.slotCount()]?usize = undefined; // comptime-sized; no allocation
     if (Re.captures(&csc, &cslots, "y2026-06")) |c| {

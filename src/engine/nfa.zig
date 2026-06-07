@@ -32,6 +32,8 @@ const CodePoint = ezi_code.encoding.CodePoint;
 
 /// One NFA instruction. `char`/`range`/`any` consume exactly one code point and
 /// fall through to `pc + 1`; the rest are epsilon transitions or terminal.
+///
+/// @stable-since: v0.1.0
 pub const Inst = union(enum) {
     /// Match this exact code point.
     char: CodePoint,
@@ -53,6 +55,8 @@ pub const Inst = union(enum) {
 
 /// The compiled, immutable program. Self-contained: it copies every range it
 /// needs out of the HIR, so the HIR may be freed after building.
+///
+/// @stable-since: v0.1.0
 pub const Program = struct {
     insts: []const Inst,
     ranges: []const Range,
@@ -220,12 +224,16 @@ fn build(h: hir.Hir, insts: []Inst, ranges: []Range, patch: []u32) error{Unsuppo
 }
 
 /// Whether this HIR can be lowered to an NFA program (false ⇒ `\X` grapheme).
+///
+/// @stable-since: v0.1.0
 pub fn supports(h: hir.Hir) bool {
     _ = measure(h) catch return false;
     return true;
 }
 
 /// Compile a HIR into a heap-allocated `Program` (free with `freeProgram`).
+///
+/// @stable-since: v0.1.0
 pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir) BuildError!Program {
     const sizes = measure(h) catch return error.Unsupported;
     const insts = try gpa.alloc(Inst, sizes.insts);
@@ -238,6 +246,8 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir) BuildError!Program {
 }
 
 /// Compile a HIR into a ro_data `Program` at comptime. `\X` becomes a `@compileError`.
+///
+/// @stable-since: v0.1.0
 pub fn buildComptime(comptime h: hir.Hir) Program {
     const work: u64 = @as(u64, h.nodes.len) + h.literals.len + h.ranges.len;
     @setEvalBranchQuota(@intCast(@min(20_000 + work * 100, std.math.maxInt(u32))));
@@ -251,6 +261,7 @@ pub fn buildComptime(comptime h: hir.Hir) Program {
     return .{ .insts = &final_insts, .ranges = &final_ranges, .slot_count = prog.slot_count };
 }
 
+/// @stable-since: v0.1.0
 pub fn freeProgram(gpa: std.mem.Allocator, program: *Program) void {
     gpa.free(program.insts);
     gpa.free(program.ranges);
@@ -258,6 +269,7 @@ pub fn freeProgram(gpa: std.mem.Allocator, program: *Program) void {
 
 // ── Code-point match primitives (shared by both NFA backends) ────────────────────
 
+/// @stable-since: v0.1.0
 pub fn inRanges(ranges: []const Range, cp: CodePoint) bool {
     // Ranges are sorted+merged; a binary search is possible but linear is fine for
     // the modest range counts the HIR produces.
@@ -268,11 +280,14 @@ pub fn inRanges(ranges: []const Range, cp: CodePoint) bool {
     return false;
 }
 
+/// @stable-since: v0.1.0
 pub const Decoded = struct { cp: CodePoint, len: usize };
 
 /// Decode one code point at byte offset `sp`. Invalid UTF-8 yields U+FFFD with a
 /// 1-byte advance — the engine's `fail`-ish policy: it won't match across an
 /// invalid byte but still makes progress.
+///
+/// @stable-since: v0.1.0
 pub fn decodeAt(input: []const u8, sp: usize) Decoded {
     const d = utf8.validateAndDecodeCodePointBytes(input, sp) catch return .{ .cp = 0xFFFD, .len = 1 };
     return .{ .cp = d.code_point, .len = d.len };
@@ -294,6 +309,8 @@ fn wordAfter(input: []const u8, sp: usize) bool {
 }
 
 /// Whether a zero-width assertion holds at byte offset `sp` in `input`.
+///
+/// @stable-since: v0.1.0
 pub fn assertionHolds(kind: hir.AnchorKind, input: []const u8, sp: usize) bool {
     return switch (kind) {
         .text_start => sp == 0,

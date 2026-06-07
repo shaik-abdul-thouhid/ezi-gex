@@ -11,7 +11,8 @@
 //! The compiled value exposes the user-facing API — `isMatch`, `find`, `captures`,
 //! `findAll`, `capturesAll`, `count`, `split`, `replaceAll` — all delegating to the
 //! backend-agnostic `Engine`. Per the contract, the **caller owns the `Scratch`**
-//! and creates it at the call site (`var s = try re.newScratch(alloc);`); the regex
+//! and creates it at the call site off the `Scratch` type
+//! (`var s = try @TypeOf(re).Scratch.init(alloc, &re.program);`); the regex
 //! methods take `&s`. Default backend is the Pike VM (the `auto` dispatcher will
 //! slot in here later without changing this API).
 
@@ -31,9 +32,13 @@ pub const Captures = backend.Captures;
 /// dispatcher, which picks the literal / backtrack / Pike VM strategy from the
 /// pattern's analysis and the input. Power users pass a specific backend to the
 /// `*With` constructors instead.
+///
+/// @stable-since: v0.1.0
 pub const default_backend = auto;
 
 /// Errors from the full compile pipeline (parse → HIR → program).
+///
+/// @stable-since: v0.1.0
 pub const Error = error{
     /// The pattern is malformed; see the `Diagnostic` for code + span.
     InvalidPattern,
@@ -47,6 +52,8 @@ pub const Error = error{
 /// Pipeline settings, comptime-known on both paths (so the HIR shape and backend
 /// can specialize). Every field has a default; pass `.{}` for all defaults or set
 /// only what you need. These flow into the HIR builder (and, later, the backend).
+///
+/// @stable-since: v0.1.0
 pub const Options = struct {
     /// How `(?i)` case-insensitivity is realized (`.none` / `.simple` / `.full`).
     case_fold: hir.CaseFold = .simple,
@@ -60,12 +67,16 @@ pub const Options = struct {
 /// A compiled regex over backend `B`: an immutable `Program` + capture `Meta`.
 /// Returned by `compileRuntime`/`compileComptime`. Thread-safe to share; each
 /// thread uses its own `Scratch`.
+///
+/// @stable-since: v0.1.0
 pub fn Compiled(comptime B: type) type {
     const Eng = backend.Engine(B);
     return struct {
         const Self = @This();
 
         /// The per-search state type — initialize one at the call site.
+        ///
+        /// @stable-since: v0.1.0
         pub const Scratch = B.Scratch;
         pub const Backend = B;
 
@@ -75,6 +86,8 @@ pub fn Compiled(comptime B: type) type {
         allocator: ?std.mem.Allocator,
 
         /// Release heap memory (no-op for a comptime-compiled regex).
+        ///
+        /// @stable-since: v0.1.0
         pub fn deinit(self: *Self) void {
             const a = self.allocator orelse return;
             if (@hasDecl(B, "freeProgram")) B.freeProgram(a, &self.program);
@@ -84,77 +97,84 @@ pub fn Compiled(comptime B: type) type {
             if (self.meta.group_names.len != 0) a.free(self.meta.group_names);
         }
 
-        // ── scratch (caller-owned) ────────────────────────────────────────────────
-
-        /// Allocate a `Scratch` sized for this program. Caller owns it; reuse it
-        /// across searches and `deinit` it when done. For a stateless backend whose
-        /// `Scratch` needs no construction, returns a default-initialized value.
-        pub fn newScratch(self: *const Self, allocator: std.mem.Allocator) std.mem.Allocator.Error!Scratch {
-            if (comptime @hasDecl(B.Scratch, "init")) return B.Scratch.init(allocator, &self.program);
-            return Scratch{}; // stateless backend with no `init`
-        }
-
-        /// Construct a `Scratch` over a caller-provided fixed buffer — no allocator.
-        /// The buffer element type is the backend's (`Buf` below); a too-small
-        /// buffer yields `error.BufferTooSmall` (the "with limits" path). Available
-        /// only for backends that opt into the buffer convention (`initBuffer`).
-        pub fn newScratchBuffer(self: *const Self, buf: []Buf) backend.ScratchError!Scratch {
-            if (comptime !@hasDecl(B.Scratch, "initBuffer"))
-                @compileError("backend `" ++ @typeName(B) ++ "` does not support buffer-backed Scratch");
-            return B.Scratch.initBuffer(buf, &self.program);
-        }
-
-        /// Buffer element type for `newScratchBuffer` / comptime matching, or `void`
-        /// if the backend doesn't opt into the buffer convention.
-        pub const Buf = if (@hasDecl(B.Scratch, "Buf")) B.Scratch.Buf else void;
-
-        /// Number of `Buf` words a fixed buffer must hold for this program.
-        pub fn bufferLen(self: *const Self) usize {
-            if (comptime !@hasDecl(B.Scratch, "bufferLen"))
-                @compileError("backend `" ++ @typeName(B) ++ "` does not support buffer-backed Scratch");
-            return B.Scratch.bufferLen(&self.program);
-        }
+        // ── scratch (caller-owned; the front door does NOT construct it) ──────────
+        //
+        // `Compiled` exposes only the Scratch TYPE (`Scratch` above) and the
+        // `program` field — never a constructor. Build an instance off the type with
+        // the backend's own mechanism, passing `&re.program`, exactly the
+        // `std.ArrayList(T)` model (the library hands you the type; you construct it
+        // with the resource you choose):
+        //
+        //   const Sc = @TypeOf(re).Scratch;
+        //   var sc = try Sc.init(gpa, &re.program);            // heap-backed
+        //   defer sc.deinit(gpa);
+        //
+        //   // …or, no allocator, over a caller-owned fixed buffer:
+        //   var buf: [Sc.bufferLen(&re.program)]Sc.Buf = undefined;
+        //   var sc = try Sc.initBuffer(&buf, &re.program);
+        //
+        //   // …or, a stateless backend whose Scratch needs no init:
+        //   var sc: @TypeOf(re).Scratch = .{};
+        //
+        // Keeping construction (and sizing) off `Compiled` is what makes it agnostic
+        // to *how* a Scratch is built: a backend with a novel init contract — two
+        // allocators, a pool, a config struct — needs zero changes here.
 
         /// How many `?usize` capture slots `captures`/`capturesAll`/`replaceAll`
         /// need: `2 * (captureCount + 1)`. Pre-allocate exactly this many.
+        ///
+        /// @stable-since: v0.1.0
         pub fn slotCount(self: Self) usize {
             return self.meta.slotLen();
         }
         /// Number of capturing groups (excluding the whole match).
+        ///
+        /// @stable-since: v0.1.0
         pub fn captureCount(self: Self) usize {
             return self.meta.capture_count;
         }
 
         // ── the user-facing API ──────────────────────────────────────────────────
 
+        /// @stable-since: v0.1.0
         pub fn isMatch(self: *const Self, scratch: *Scratch, input: []const u8) bool {
             return Eng.isMatch(&self.program, scratch, input, .{});
         }
+        /// @stable-since: v0.1.0
         pub fn isMatchAt(self: *const Self, scratch: *Scratch, input: []const u8, opts: backend.SearchOptions) bool {
             return Eng.isMatch(&self.program, scratch, input, opts);
         }
+        /// @stable-since: v0.1.0
         pub fn find(self: *const Self, scratch: *Scratch, input: []const u8) ?Match {
             return Eng.find(&self.program, scratch, input, .{});
         }
+        /// @stable-since: v0.1.0
         pub fn findAt(self: *const Self, scratch: *Scratch, input: []const u8, opts: backend.SearchOptions) ?Match {
             return Eng.find(&self.program, scratch, input, opts);
         }
         /// Capture the first match into `slots` (length `slotCount()`).
+        ///
+        /// @stable-since: v0.1.0
         pub fn captures(self: *const Self, scratch: *Scratch, slots: []?usize, input: []const u8) ?Captures {
             return Eng.captures(&self.program, scratch, input, slots, self.meta, .{});
         }
+        /// @stable-since: v0.1.0
         pub fn findAll(self: *const Self, scratch: *Scratch, input: []const u8) Eng.MatchIterator {
             return Eng.findAll(&self.program, scratch, input, .{});
         }
+        /// @stable-since: v0.1.0
         pub fn capturesAll(self: *const Self, scratch: *Scratch, slots: []?usize, input: []const u8) Eng.CaptureIterator {
             return Eng.capturesAll(&self.program, scratch, input, slots, self.meta, .{});
         }
+        /// @stable-since: v0.1.0
         pub fn count(self: *const Self, scratch: *Scratch, input: []const u8) usize {
             return Eng.count(&self.program, scratch, input, .{});
         }
+        /// @stable-since: v0.1.0
         pub fn split(self: *const Self, scratch: *Scratch, input: []const u8) Eng.SplitIterator {
             return Eng.split(&self.program, scratch, input, .{});
         }
+        /// @stable-since: v0.1.0
         pub fn replaceAll(
             self: *const Self,
             scratch: *Scratch,
@@ -178,32 +198,36 @@ pub fn Compiled(comptime B: type) type {
                 @compileError("comptime matching requires the backend's Scratch to expose Buf/bufferLen/initBuffer");
         }
 
+        /// @stable-since: v0.1.0
         pub fn isMatchComptime(comptime self: Self, comptime input: []const u8) bool {
             return self.isMatchAtComptime(input, .{});
         }
+        /// @stable-since: v0.1.0
         pub fn isMatchAtComptime(comptime self: Self, comptime input: []const u8, comptime opts: backend.SearchOptions) bool {
             comptime {
                 requireBufferConvention();
                 @setEvalBranchQuota(comptimeQuota(input.len));
-                var buf: [B.Scratch.bufferLen(&self.program)]Buf = undefined;
+                var buf: [B.Scratch.bufferLen(&self.program)]B.Scratch.Buf = undefined;
                 var sc = B.Scratch.initBuffer(&buf, &self.program) catch unreachable;
                 return Eng.isMatch(&self.program, &sc, input, opts);
             }
         }
+        /// @stable-since: v0.1.0
         pub fn findComptime(comptime self: Self, comptime input: []const u8) ?Match {
             comptime {
                 requireBufferConvention();
                 @setEvalBranchQuota(comptimeQuota(input.len));
-                var buf: [B.Scratch.bufferLen(&self.program)]Buf = undefined;
+                var buf: [B.Scratch.bufferLen(&self.program)]B.Scratch.Buf = undefined;
                 var sc = B.Scratch.initBuffer(&buf, &self.program) catch unreachable;
                 return Eng.find(&self.program, &sc, input, .{});
             }
         }
+        /// @stable-since: v0.1.0
         pub fn countComptime(comptime self: Self, comptime input: []const u8) usize {
             comptime {
                 requireBufferConvention();
                 @setEvalBranchQuota(comptimeQuota(input.len));
-                var buf: [B.Scratch.bufferLen(&self.program)]Buf = undefined;
+                var buf: [B.Scratch.bufferLen(&self.program)]B.Scratch.Buf = undefined;
                 var sc = B.Scratch.initBuffer(&buf, &self.program) catch unreachable;
                 return Eng.count(&self.program, &sc, input, .{});
             }
@@ -222,17 +246,23 @@ fn comptimeQuota(input_len: usize) u32 {
 /// Runtime: compile `pattern` into a heap-backed regex (default backend). On a
 /// malformed pattern, returns `error.InvalidPattern` and writes `diag` — the
 /// caller decides how to surface it. Free the result with `re.deinit()`.
+///
+/// @stable-since: v0.1.0
 pub fn compileRuntime(allocator: std.mem.Allocator, pattern: []const u8, diag: *Diagnostic, comptime opts: Options) Error!Compiled(default_backend) {
     return compileRuntimeWith(default_backend, allocator, pattern, diag, opts);
 }
 
 /// Comptime: compile `pattern` into a ro_data regex (default backend). A bad
 /// pattern is a compile error. No allocator; `deinit` is a no-op.
+///
+/// @stable-since: v0.1.0
 pub fn compileComptime(comptime pattern: []const u8, comptime opts: Options) Compiled(default_backend) {
     return compileComptimeWith(default_backend, pattern, opts);
 }
 
 /// `compileRuntime` with an explicit backend.
+///
+/// @stable-since: v0.1.0
 pub fn compileRuntimeWith(comptime B: type, allocator: std.mem.Allocator, pattern: []const u8, diag: *Diagnostic, comptime opts: Options) Error!Compiled(B) {
     const ast = parser.parse(allocator, pattern, diag) catch |e| switch (e) {
         error.InvalidPattern => return error.InvalidPattern,
@@ -254,6 +284,8 @@ pub fn compileRuntimeWith(comptime B: type, allocator: std.mem.Allocator, patter
 }
 
 /// `compileComptime` with an explicit backend.
+///
+/// @stable-since: v0.1.0
 pub fn compileComptimeWith(comptime B: type, comptime pattern: []const u8, comptime opts: Options) Compiled(B) {
     const ast = comptime parser.compile(pattern); // @compileError on a bad pattern
     const h = comptime switch (hir.buildComptime(ast, opts.toHir())) {
@@ -316,7 +348,7 @@ test "compileRuntime: full API over a heap-backed regex" {
     var diag: Diagnostic = .{};
     var re = try compileRuntime(testing.allocator, "(\\w+)@(\\w+)", &diag, .{});
     defer re.deinit();
-    var sc = try re.newScratch(testing.allocator);
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
     defer sc.deinit(testing.allocator);
 
     try testing.expect(re.isMatch(&sc, "x a@b y"));
@@ -342,7 +374,7 @@ test "compileRuntime: invalid pattern returns error + diagnostic, no crash" {
 test "compileComptime: program in ro_data, used at runtime" {
     const Re = compileComptime("\\d{3}-\\d{4}", .{});
     var re = Re; // a value; methods take *const Self
-    var sc = try re.newScratch(testing.allocator);
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
     defer sc.deinit(testing.allocator);
     try testing.expect(re.isMatch(&sc, "call 555-1234 now"));
     try testing.expectEqualStrings("555-1234", re.find(&sc, "call 555-1234 now").?.slice("call 555-1234 now"));
@@ -353,7 +385,7 @@ test "compileComptime: program in ro_data, used at runtime" {
 test "compileComptime: named captures resolve" {
     const Re = compileComptime("(?<y>\\d+)-(?<m>\\d+)", .{});
     var re = Re;
-    var sc = try re.newScratch(testing.allocator);
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
     defer sc.deinit(testing.allocator);
     var slots: [6]?usize = undefined;
     const c = re.captures(&sc, &slots, "2026-06").?;
@@ -367,11 +399,11 @@ test "comptime and runtime compile agree" {
     var diag: Diagnostic = .{};
     var rt = try compileRuntime(testing.allocator, pat, &diag, .{});
     defer rt.deinit();
-    var rsc = try rt.newScratch(testing.allocator);
+    var rsc = try @TypeOf(rt).Scratch.init(testing.allocator, &rt.program);
     defer rsc.deinit(testing.allocator);
 
     var ct = compileComptime(pat, .{});
-    var csc = try ct.newScratch(testing.allocator);
+    var csc = try @TypeOf(ct).Scratch.init(testing.allocator, &ct.program);
     defer csc.deinit(testing.allocator);
 
     try testing.expectEqualStrings("abc123", rt.find(&rsc, input).?.slice(input));
@@ -398,8 +430,8 @@ test "front door: runtime buffer scratch needs no allocator for matching" {
     var diag: Diagnostic = .{};
     var re = try compileRuntime(testing.allocator, "[a-z]+\\d+", &diag, .{});
     defer re.deinit();
-    var buf: [4096]@TypeOf(re).Buf = undefined; // Buf == the backend's Cell
-    var sc = try re.newScratchBuffer(&buf);
+    var buf: [4096]@TypeOf(re).Scratch.Buf = undefined; // Buf == the backend's Cell
+    var sc = try @TypeOf(re).Scratch.initBuffer(&buf, &re.program);
     try testing.expectEqualStrings("abc12", re.find(&sc, "??abc12!!").?.slice("??abc12!!"));
     try testing.expect(!re.isMatch(&sc, "ABC"));
 }
@@ -408,13 +440,13 @@ test "front-door iterators and replace" {
     var diag: Diagnostic = .{};
     var re = try compileRuntime(testing.allocator, "\\d+", &diag, .{});
     defer re.deinit();
-    var sc = try re.newScratch(testing.allocator);
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
     defer sc.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 3), re.count(&sc, "a1b22c333"));
 
     var split_re = try compileRuntime(testing.allocator, "\\s+", &diag, .{});
     defer split_re.deinit();
-    var ssc = try split_re.newScratch(testing.allocator);
+    var ssc = try @TypeOf(split_re).Scratch.init(testing.allocator, &split_re.program);
     defer ssc.deinit(testing.allocator);
     var it = split_re.split(&ssc, "the  quick fox");
     try testing.expectEqualStrings("the", it.next().?);

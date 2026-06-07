@@ -21,6 +21,8 @@ const props = ezi_code.unicode.properties;
 /// the matcher. The scanner only records them; it never acts on them. Defined
 /// here (rather than in ast.zig) so both the token layer and the AST can share
 /// the type without an import cycle — ast.zig imports token.zig, not the reverse.
+///
+/// @stable-since: v0.1.0
 pub const Flags = packed struct {
     /// i — case-insensitive matching.
     case_insensitive: bool = false,
@@ -34,6 +36,8 @@ pub const Flags = packed struct {
 
     /// Field-wise OR. Used to fold an inline `(?flags)` delta into the set of
     /// flags currently in effect.
+    ///
+    /// @stable-since: v0.1.0
     pub fn merge(self: Flags, other: Flags) Flags {
         return .{
             .case_insensitive = self.case_insensitive or other.case_insensitive,
@@ -43,6 +47,8 @@ pub const Flags = packed struct {
     }
 
     /// True when no flag bit is set.
+    ///
+    /// @stable-since: v0.1.0
     pub fn isEmpty(self: Flags) bool {
         return !self.case_insensitive and !self.multiline and !self.dot_all;
     }
@@ -54,6 +60,8 @@ pub const Flags = packed struct {
 ///   - digit : General_Category = Nd (decimal number)
 ///   - word  : Alphabetic ∪ Mark ∪ Nd ∪ Connector_Punctuation ∪ Join_Control
 ///   - space : White_Space
+///
+/// @stable-since: v0.1.0
 pub const PerlClassKind = enum { digit, word, space };
 
 // ── Unicode property identifier ──────────────────────────────────────────────
@@ -61,6 +69,8 @@ pub const PerlClassKind = enum { digit, word, space };
 /// Aggregate General_Category groups (L, M, N, P, S, Z, C, LC).
 /// These do not map to a single GeneralCategory variant — they cover
 /// multiple variants and are handled separately in the matcher.
+///
+/// @stable-since: v0.1.0
 pub const GeneralCategoryGroup = enum {
     letter, // L  — Lu Ll Lt Lm Lo
     cased_letter, // LC — Lu Ll Lt
@@ -75,6 +85,8 @@ pub const GeneralCategoryGroup = enum {
 /// What a `\p{...}` or `\P{...}` resolves to.
 /// The scanner resolves the property name string into one of these variants.
 /// The matcher dispatches to ezi_code with no further string parsing.
+///
+/// @stable-since: v0.1.0
 pub const PropertyId = union(enum) {
     /// Single General_Category variant — e.g. \p{Lu}, \p{Uppercase_Letter}
     general_category: props.GeneralCategory,
@@ -486,6 +498,8 @@ pub const script_long_name_map = std.StaticStringMap([]const u8).initComptime(&s
 ///   2. Try gc_map (general categories and groups).
 ///   3. Try derived_map (DerivedCoreProperties).
 ///   Returns null → scanner emits error.InvalidUnicodeProperty.
+///
+/// @stable-since: v0.1.0
 pub fn resolveProperty(name: []const u8) ?PropertyId {
     // ── Script_Extensions prefix ─────────────────────────────────────────
     // Strip by the matched prefix's own length. (Both the long and short forms
@@ -527,6 +541,8 @@ fn stripEitherPrefix(name: []const u8, comptime long: []const u8, comptime short
 
 /// Resolve a script name (either 4-letter ISO 15924 code or long name)
 /// to a ScriptType. Returns null for unrecognised names.
+///
+/// @stable-since: v0.1.0
 pub fn resolveScriptType(name: []const u8) ?scripts.ScriptType {
     // 4-letter ISO 15924 code — direct lookup in ezi_code.
     if (name.len == 4) {
@@ -539,6 +555,7 @@ pub fn resolveScriptType(name: []const u8) ?scripts.ScriptType {
     return null;
 }
 
+/// @stable-since: v0.1.0
 pub const Token = union(enum) {
     /// Any single codepoint — whether written literally or via escape.
     /// `\n` → literal(0x0A), `\(` → literal('('), `a` → literal('a').

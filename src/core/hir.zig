@@ -63,6 +63,8 @@ const CLASS_SCRATCH_CAP: usize = 1 << 14;
 
 /// Options governing the AST→HIR lowering. Comptime-known on both paths so the
 /// HIR shape (and backends) can specialize.
+///
+/// @stable-since: v0.1.0
 pub const Options = struct {
     /// How `i` (case-insensitive) folding is realized in the HIR.
     ///   `none`   — no folding, even under `(?i)`.
@@ -72,13 +74,18 @@ pub const Options = struct {
     case_fold: CaseFold = .simple,
 };
 
+/// @stable-since: v0.1.0
 pub const CaseFold = enum { none, simple, full };
 
 /// An inclusive code-point range, the atom of a resolved class.
+///
+/// @stable-since: v0.1.0
 pub const Range = struct { lo: CodePoint, hi: CodePoint };
 
 /// Resolved anchor kind. Flags (`m`) are already applied: `line_*` only appear
 /// when multiline was in effect, otherwise `^`/`$` became `text_*`.
+///
+/// @stable-since: v0.1.0
 pub const AnchorKind = enum {
     /// `\A`, or `^` without multiline — start of the whole input.
     text_start,
@@ -94,6 +101,7 @@ pub const AnchorKind = enum {
     not_word_boundary,
 };
 
+/// @stable-since: v0.1.0
 pub const Tag = enum {
     /// Matches the empty string.
     empty,
@@ -119,6 +127,7 @@ pub const Tag = enum {
     capture,
 };
 
+/// @stable-since: v0.1.0
 pub const Node = struct {
     tag: Tag,
     data: Data,
@@ -146,19 +155,26 @@ pub const Node = struct {
 /// A 256-bit set of byte values — backing storage for the `required_bytes`
 /// prefilter hint. Tiny and `comptime`-constructible, so it lives directly inside
 /// the HIR (ro_data at comptime, heap at runtime) with no separate allocation.
+///
+/// @stable-since: v0.1.0
 pub const ByteSet = struct {
     bits: [4]u64 = .{ 0, 0, 0, 0 },
 
+    /// @stable-since: v0.1.0
     pub fn set(self: *ByteSet, b: u8) void {
         self.bits[b >> 6] |= @as(u64, 1) << @truncate(b);
     }
+    /// @stable-since: v0.1.0
     pub fn has(self: ByteSet, b: u8) bool {
         return (self.bits[b >> 6] >> @truncate(b)) & 1 != 0;
     }
+    /// @stable-since: v0.1.0
     pub fn isEmpty(self: ByteSet) bool {
         return (self.bits[0] | self.bits[1] | self.bits[2] | self.bits[3]) == 0;
     }
     /// Number of distinct bytes in the set (a prefilter picks the rarest member).
+    ///
+    /// @stable-since: v0.1.0
     pub fn count(self: ByteSet) u32 {
         var c: u64 = 0;
         for (self.bits) |w| c += @popCount(w);
@@ -170,6 +186,8 @@ pub const ByteSet = struct {
 /// tree. Everything here is a *sound* property of the HIR: bounds are true bounds
 /// and the "required"/"anchored" facts hold for *every* match, so a prefilter or
 /// length gate built on them never yields a false negative.
+///
+/// @stable-since: v0.1.0
 pub const Analysis = struct {
     /// Match can only start at the very beginning of input (`\A`, or `^` without
     /// multiline).
@@ -219,6 +237,8 @@ pub const Analysis = struct {
 
 /// The resolved program shape. All slices are sub-slices of caller storage
 /// (ro_data at comptime, heap at runtime). Immutable and shareable.
+///
+/// @stable-since: v0.1.0
 pub const Hir = struct {
     nodes: []const Node,
     children: []const u32,
@@ -233,6 +253,8 @@ pub const Hir = struct {
 /// The only failure the builder can raise: a class/pattern that overruns the
 /// caller's buffers (e.g. an enormous resolved class). Mirrors the scanner's
 /// "guard every write, never overrun" model.
+///
+/// @stable-since: v0.1.0
 pub const BuildError = error{PatternTooComplex};
 
 // ── Sizes / Buffers (storage-agnostic core) ─────────────────────────────────────
@@ -240,6 +262,8 @@ pub const BuildError = error{PatternTooComplex};
 /// Exact output sizes, computed by `measure`. Unlike the scanner's
 /// pattern-length bounds these are exact, because a resolved class's range count
 /// is data-dependent and can be large; over-provisioning would bloat comptime.
+///
+/// @stable-since: v0.1.0
 pub const Sizes = struct {
     nodes: usize,
     children: usize,
@@ -251,6 +275,8 @@ pub const Sizes = struct {
 /// Transient scratch the builder needs while lowering. `stack` gathers child
 /// node indices (depth-balanced, scanner-style); `main`/`member` hold a class's
 /// ranges mid-resolution. Caller-owned; location is the caller's choice.
+///
+/// @stable-since: v0.1.0
 pub const Scratch = struct {
     stack: []u32,
     main: []Range,
@@ -261,6 +287,8 @@ pub const Scratch = struct {
 
 /// Backing storage for the produced HIR. Each slice must be at least the length
 /// given by `measure` (`nodes`, `children`, `ranges`, `literals`, `names`).
+///
+/// @stable-since: v0.1.0
 pub const Buffers = struct {
     nodes: []Node,
     children: []u32,
@@ -271,6 +299,8 @@ pub const Buffers = struct {
 
 /// Upper bound on scratch sizes for an AST. The stack depth is bounded by the
 /// produced node count, itself O(ast nodes); the class scratch is a fixed cap.
+///
+/// @stable-since: v0.1.0
 pub fn scratchSizes(a: ast.Ast) struct { stack: usize, ranges: usize } {
     return .{ .stack = 8 * a.nodes.len + 16, .ranges = CLASS_SCRATCH_CAP };
 }
@@ -1121,6 +1151,8 @@ fn byteBounds(nodes: []const Node, children: []const u32, ranges: []const Range,
 
 /// Count-only pass: run the identical lowering and report exact output sizes.
 /// `scratch` must be at least `scratchSizes(a)`.
+///
+/// @stable-since: v0.1.0
 pub fn measure(a: ast.Ast, opts: Options, scratch: Scratch) BuildError!Sizes {
     var b = Builder(.count){
         .a = a,
@@ -1143,6 +1175,8 @@ pub fn measure(a: ast.Ast, opts: Options, scratch: Scratch) BuildError!Sizes {
 /// Emit pass: lower `a` into the caller's `buffers` (each at least the matching
 /// `measure` size) and return the `Hir` sub-slicing them. `scratch` is as for
 /// `measure`.
+///
+/// @stable-since: v0.1.0
 pub fn build(a: ast.Ast, opts: Options, scratch: Scratch, buffers: Buffers) BuildError!Hir {
     var b = Builder(.emit){
         .a = a,
@@ -1183,6 +1217,8 @@ pub fn build(a: ast.Ast, opts: Options, scratch: Scratch, buffers: Buffers) Buil
 // ════════════════════════════════════════════════════════════════════════════════
 
 /// Result of the comptime builder (comptime can't thread an out-parameter).
+///
+/// @stable-since: v0.1.0
 pub const Outcome = union(enum) {
     ok: Hir,
     fail: BuildError,
@@ -1190,6 +1226,8 @@ pub const Outcome = union(enum) {
 
 /// Build a HIR at runtime into heap memory. Provisions scratch + exactly-sized
 /// output buffers from `allocator`. Free with `hir.deinitHir(allocator, &hir)`.
+///
+/// @stable-since: v0.1.0
 pub fn buildAlloc(allocator: std.mem.Allocator, a: ast.Ast, opts: Options) (BuildError || std.mem.Allocator.Error)!Hir {
     const ss = scratchSizes(a);
     const stack = try allocator.alloc(u32, ss.stack);
@@ -1229,6 +1267,8 @@ pub fn buildAlloc(allocator: std.mem.Allocator, a: ast.Ast, opts: Options) (Buil
 /// Free the heap arrays of a runtime-built HIR. Never call on a comptime HIR
 /// (its slices are const data). `names` entries borrow the pattern and are not
 /// freed — only the `names` array is.
+///
+/// @stable-since: v0.1.0
 pub fn deinitHir(allocator: std.mem.Allocator, hir: Hir) void {
     allocator.free(hir.nodes);
     allocator.free(hir.children);
@@ -1260,6 +1300,8 @@ fn comptimeBranchBudget(a: ast.Ast) u64 {
 
 /// Build a HIR at comptime into ro_data. Returns `.ok` with a HIR whose slices
 /// point at const data, or `.fail`.
+///
+/// @stable-since: v0.1.0
 pub fn buildComptime(comptime a: ast.Ast, comptime opts: Options) Outcome {
     @setEvalBranchQuota(@intCast(@min(comptimeBranchBudget(a), std.math.maxInt(u32))));
     const ss = comptime scratchSizes(a);
@@ -1317,6 +1359,8 @@ pub fn buildComptime(comptime a: ast.Ast, comptime opts: Options) Outcome {
 ///   (cls R…) / R = c | lo-hi        resolved class (positive ranges)
 ///   (any) (any.) (graph) (eps)      dot / dot-all / grapheme / empty
 ///   (anc KIND)                      anchor
+///
+/// @stable-since: v0.1.0
 pub fn formatHir(h: Hir, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try writeNode(h, h.root, w);
 }

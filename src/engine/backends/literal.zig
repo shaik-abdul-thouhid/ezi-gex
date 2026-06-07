@@ -41,10 +41,13 @@ const CodePoint = ezi_code.encoding.CodePoint;
 
 // ── Contract surface ────────────────────────────────────────────────────────────
 
+/// @stable-since: v0.1.0
 pub const caps = Caps{ .captures = true, .stateless = true, .grapheme = false };
 
 /// Backend build options. The HIR has already applied flags/folding, so nothing is
 /// needed here; the field exists to satisfy the contract shape.
+///
+/// @stable-since: v0.1.0
 pub const Options = struct {};
 
 /// One needle's slice into `Program.needles`.
@@ -53,6 +56,8 @@ const Bound = struct { start: u32, len: u32 };
 /// Immutable program: every branch's UTF-8 bytes concatenated into `needles`, with
 /// `bounds` delimiting them **in alternation (priority) order**. Self-contained, so
 /// the HIR may be freed after `buildAlloc`.
+///
+/// @stable-since: v0.1.0
 pub const Program = struct {
     needles: []const u8,
     bounds: []const Bound,
@@ -60,20 +65,27 @@ pub const Program = struct {
 
 /// Stateless companion. Zero-size, with the standard lifecycle as no-ops so the
 /// front door / `auto` use the same calls as a stateful backend.
+///
+/// @stable-since: v0.1.0
 pub const Scratch = struct {
     /// Buffer element type for the `initBuffer`/comptime convention (see backend.zig).
     pub const Buf = backend.Cell;
 
+    /// @stable-since: v0.1.0
     pub fn bufferLen(_: *const Program) usize {
         return 0;
     }
+    /// @stable-since: v0.1.0
     pub fn init(_: std.mem.Allocator, _: *const Program) std.mem.Allocator.Error!Scratch {
         return .{};
     }
+    /// @stable-since: v0.1.0
     pub fn initBuffer(_: []backend.Cell, _: *const Program) backend.ScratchError!Scratch {
         return .{};
     }
+    /// @stable-since: v0.1.0
     pub fn deinit(_: *Scratch, _: std.mem.Allocator) void {}
+    /// @stable-since: v0.1.0
     pub fn reset(_: *Scratch) void {}
 };
 
@@ -159,6 +171,8 @@ fn emit(h: hir.Hir, needles: []u8, bounds: []Bound) error{Unsupported}!Program {
 
 /// Can the literal backend handle this HIR? True only for a pure literal / literal
 /// alternation with no capturing groups and no grapheme node. Used by `auto`.
+///
+/// @stable-since: v0.1.0
 pub fn supports(h: hir.Hir) bool {
     if (h.capture_count != 0 or h.analysis.has_grapheme) return false;
     _ = measure(h) catch return false;
@@ -166,6 +180,8 @@ pub fn supports(h: hir.Hir) bool {
 }
 
 /// Compile a HIR into a heap-allocated `Program` (free with `freeProgram`).
+///
+/// @stable-since: v0.1.0
 pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Program {
     const sizes = measure(h) catch return error.Unsupported;
     const needles = try gpa.alloc(u8, sizes.bytes);
@@ -177,6 +193,8 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
 
 /// Compile a HIR into a ro_data `Program` at comptime. An unsupported pattern is a
 /// `@compileError` (callers that might pass a non-literal must gate on `supports`).
+///
+/// @stable-since: v0.1.0
 pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
     const work: u64 = @as(u64, h.nodes.len) + h.literals.len;
     @setEvalBranchQuota(@intCast(@min(20_000 + work * 100, std.math.maxInt(u32))));
@@ -189,6 +207,7 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
     return .{ .needles = &final_needles, .bounds = &final_bounds };
 }
 
+/// @stable-since: v0.1.0
 pub fn freeProgram(gpa: std.mem.Allocator, program: *Program) void {
     gpa.free(program.needles);
     gpa.free(program.bounds);
@@ -196,6 +215,7 @@ pub fn freeProgram(gpa: std.mem.Allocator, program: *Program) void {
 
 // ── Contract: matching entry points ──────────────────────────────────────────────
 
+/// @stable-since: v0.1.0
 pub fn search(program: *const Program, _: *Scratch, input: []const u8, opts: SearchOptions) ?Match {
     var pos = opts.start;
     while (pos <= input.len) : (pos += 1) {
@@ -210,10 +230,12 @@ pub fn search(program: *const Program, _: *Scratch, input: []const u8, opts: Sea
     return null;
 }
 
+/// @stable-since: v0.1.0
 pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) bool {
     return search(program, scratch, input, opts) != null;
 }
 
+/// @stable-since: v0.1.0
 pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const u8, slots: []?usize, opts: SearchOptions) ?Match {
     const m = search(program, scratch, input, opts) orelse return null;
     if (slots.len >= 1) slots[0] = m.start;

@@ -105,7 +105,7 @@ fn checkRuntime(comptime B: type, case: Case) !void {
         return e;
     };
     defer re.deinit();
-    var sc = try re.newScratch(gpa);
+    var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
     defer sc.deinit(gpa);
     const m = re.find(&sc, case.input);
     if (case.expect) |exp| {
@@ -155,7 +155,7 @@ fn captureSlots(comptime B: type, gpa: std.mem.Allocator, pattern: []const u8, i
     var diag: regex.Diagnostic = .{};
     var re = try regex.compileRuntimeWith(B, gpa, pattern, &diag, .{});
     defer re.deinit();
-    var sc = try re.newScratch(gpa);
+    var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
     defer sc.deinit(gpa);
     @memset(out, null);
     return re.captures(&sc, out, input) != null;
@@ -189,7 +189,7 @@ test "auto agrees with itself across the small/large input switch" {
     var diag: regex.Diagnostic = .{};
     var re = try regex.compileRuntimeWith(auto, gpa, "a\\w+z", &diag, .{});
     defer re.deinit();
-    var sc = try re.newScratch(gpa);
+    var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
     defer sc.deinit(gpa);
 
     // Small input → backtrack arm.

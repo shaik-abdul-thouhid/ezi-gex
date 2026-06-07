@@ -23,6 +23,8 @@ const std = @import("std");
 /// reason is carried out-of-band in the `Diagnostic`. (Runtime entry points add
 /// `error.OutOfMemory` to this set; the comptime path returns the diagnostic in
 /// a result union instead of erroring.)
+///
+/// @stable-since: v0.1.0
 pub const SyntaxError = error{InvalidPattern};
 
 // ── Span ────────────────────────────────────────────────────────────────────
@@ -31,27 +33,37 @@ pub const SyntaxError = error{InvalidPattern};
 /// span (`start == end`) marks a single position — used for "expected X here"
 /// style errors such as an unterminated group, where the fault is a missing
 /// byte rather than a present one.
+///
+/// @stable-since: v0.1.0
 pub const Span = struct {
     start: u32,
     end: u32,
 
     /// A zero-width span at byte `at`.
+    ///
+    /// @stable-since: v0.1.0
     pub fn point(at: u32) Span {
         return .{ .start = at, .end = at };
     }
 
     /// A span covering `[start, end)`.
+    ///
+    /// @stable-since: v0.1.0
     pub fn range(start: u32, end: u32) Span {
         return .{ .start = start, .end = end };
     }
 
     /// Number of bytes the span covers.
+    ///
+    /// @stable-since: v0.1.0
     pub fn len(self: Span) u32 {
         return self.end - self.start;
     }
 
     /// The substring of `pattern` this span refers to. Bounds are clamped so a
     /// stale or out-of-range span can never cause an out-of-bounds slice.
+    ///
+    /// @stable-since: v0.1.0
     pub fn slice(self: Span, pattern: []const u8) []const u8 {
         const hi = @min(self.end, @as(u32, @intCast(pattern.len)));
         const lo = @min(self.start, hi);
@@ -69,6 +81,8 @@ pub const Span = struct {
 /// regex flavours but are unsupported here because a Thompson NFA cannot express
 /// them (backreferences, lookaround, atomic groups, conditionals, recursion).
 /// They are rejected with a precise code rather than mis-parsed.
+///
+/// @stable-since: v0.1.0
 pub const ErrorCode = enum {
     /// No error. Sentinel value for an unused diagnostic.
     none,
@@ -179,6 +193,8 @@ pub const ErrorCode = enum {
 /// A short, stable, English description of `code`. Safe to embed in a message,
 /// a log line, or a comptime `@compileError`. Does not include the location —
 /// pair it with `Diagnostic.faultySlice` for that.
+///
+/// @stable-since: v0.1.0
 pub fn messageFor(code: ErrorCode) []const u8 {
     return switch (code) {
         .none => "no error",
@@ -240,6 +256,8 @@ pub fn messageFor(code: ErrorCode) []const u8 {
 /// out-parameter on failure; it is left at `.none` on success. Carrying the
 /// reason out-of-band (rather than as a Zig error per code) keeps the error set
 /// tiny while still pinning the exact fault and location.
+///
+/// @stable-since: v0.1.0
 pub const Diagnostic = struct {
     /// Why the pattern was rejected. `.none` means "no error recorded".
     code: ErrorCode = .none,
@@ -247,17 +265,23 @@ pub const Diagnostic = struct {
     span: Span = .{ .start = 0, .end = 0 },
 
     /// True when no error has been recorded.
+    ///
+    /// @stable-since: v0.1.0
     pub fn isOk(self: Diagnostic) bool {
         return self.code == .none;
     }
 
     /// The exact offending substring of `pattern`. Empty for zero-width spans
     /// (a missing-byte fault, e.g. an unterminated group).
+    ///
+    /// @stable-since: v0.1.0
     pub fn faultySlice(self: Diagnostic, pattern: []const u8) []const u8 {
         return self.span.slice(pattern);
     }
 
     /// Short English description of the error code (no location).
+    ///
+    /// @stable-since: v0.1.0
     pub fn message(self: Diagnostic) []const u8 {
         return messageFor(self.code);
     }
@@ -270,6 +294,8 @@ pub const Diagnostic = struct {
     ///   regex: unknown or unsupported escape sequence
     ///       a\qb
     ///        ^^
+    ///
+    /// @stable-since: v0.1.0
     pub fn render(self: Diagnostic, pattern: []const u8, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("regex: {s}\n    ", .{self.message()});
         try w.writeAll(pattern);

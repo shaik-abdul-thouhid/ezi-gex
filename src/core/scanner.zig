@@ -86,6 +86,8 @@ const BraceQuant = struct {
 /// and a slice of the `alt` stack (the `|`-separated branches gathered so far).
 /// Public only because it is the element type of the caller-provided scratch in
 /// `Buffers`; callers never construct one.
+///
+/// @stable-since: v0.1.0
 pub const Frame = struct {
     const Kind = enum { root, capture, non_capture };
 
@@ -119,6 +121,8 @@ const Prev = enum { start, atom, quantifier, lazy };
 /// AST arrays and the `seq`/`alt`/`frames` scratch stacks) is supplied by the
 /// caller as pre-sized slices, so the same struct drives both the comptime and
 /// runtime paths; only the backing memory differs.
+///
+/// @stable-since: v0.1.0
 pub const Scanner = struct {
     // input
     pattern: []const u8,
@@ -1089,6 +1093,8 @@ fn applyDelta(base: token.Flags, add: token.Flags, remove: token.Flags) token.Fl
 // never become memory-unsafety.
 
 /// Minimum length of each buffer for a pattern of `pattern_len` bytes.
+///
+/// @stable-since: v0.1.0
 pub const Sizes = struct {
     nodes: usize,
     children: usize,
@@ -1099,6 +1105,7 @@ pub const Sizes = struct {
     frames: usize,
 };
 
+/// @stable-since: v0.1.0
 pub fn requiredSizes(pattern_len: usize) Sizes {
     const n = pattern_len;
     return .{
@@ -1127,6 +1134,8 @@ pub fn requiredSizes(pattern_len: usize) Sizes {
 /// comptime/runtime convenience layer that provisions these buffers (heap vs
 /// ro_data) lives in compile.zig (`parse`, `parseComptime`, `compile`); a caller
 /// with special needs (arena, stack buffer, …) calls `scan` directly.
+///
+/// @stable-since: v0.1.0
 pub const Buffers = struct {
     nodes: []ast.Node,
     children: []u32,
@@ -1143,6 +1152,8 @@ pub const Buffers = struct {
 /// nothing here is heap-bound, and the same code runs at comptime and runtime.
 /// On a malformed pattern, returns `error.InvalidPattern` and writes the detail
 /// into `diag`.
+///
+/// @stable-since: v0.1.0
 pub fn scan(pattern: []const u8, diag: *Diagnostic, buffers: Buffers) Fail!Ast {
     diag.* = .{};
     var sc = Scanner{
@@ -1193,6 +1204,8 @@ pub fn scan(pattern: []const u8, diag: *Diagnostic, buffers: Buffers) Fail!Ast {
 ///   (cls ITEM ...) / (cls^ ..) character class (^ = negated)
 ///   (uprop) / (unprop)         standalone \p{...} / \P{...}
 ///   (graph)                    \X
+///
+/// @stable-since: v0.1.0
 pub fn formatAst(a: Ast, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try writeNode(a, a.root, w);
 }

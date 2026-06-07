@@ -50,12 +50,16 @@ const BACKTRACK_MAX_INPUT: usize = 4096;
 
 // ── Contract surface ────────────────────────────────────────────────────────────
 
+/// @stable-since: v0.1.0
 pub const caps = Caps{ .captures = true, .stateless = false, .grapheme = false };
+/// @stable-since: v0.1.0
 pub const Options = struct {};
 
 /// A compiled program: either a literal program or the shared NFA program. The
 /// active arm is the analysis-time choice; the per-search engine choice (pikevm vs
 /// backtrack) does not change the program, only how it is executed.
+///
+/// @stable-since: v0.1.0
 pub const Program = struct {
     inner: union(enum) {
         literal: literal.Program,
@@ -63,6 +67,7 @@ pub const Program = struct {
     },
 };
 
+/// @stable-since: v0.1.0
 pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Program {
     if (literal.supports(h)) {
         return .{ .inner = .{ .literal = try literal.buildAlloc(gpa, h, .{}) } };
@@ -71,6 +76,7 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     return .{ .inner = .{ .nfa = try nfa.buildAlloc(gpa, h) } };
 }
 
+/// @stable-since: v0.1.0
 pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
     if (comptime literal.supports(h)) {
         return .{ .inner = .{ .literal = literal.buildComptime(h, .{}) } };
@@ -78,6 +84,7 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
     return .{ .inner = .{ .nfa = nfa.buildComptime(h) } }; // `\X` ⇒ @compileError inside
 }
 
+/// @stable-since: v0.1.0
 pub fn freeProgram(gpa: std.mem.Allocator, program: *Program) void {
     switch (program.inner) {
         .literal => |*p| literal.freeProgram(gpa, p),
@@ -92,6 +99,8 @@ pub fn freeProgram(gpa: std.mem.Allocator, program: *Program) void {
 /// backtracker scratch, since the engine is chosen per search. Carved from one
 /// `[]Cell` buffer (Pike VM region, then backtracker region), so it works at
 /// comptime and runtime alike.
+///
+/// @stable-since: v0.1.0
 pub const Scratch = struct {
     /// Buffer element type for the `initBuffer`/comptime convention (see backend.zig).
     pub const Buf = Cell;
@@ -103,6 +112,7 @@ pub const Scratch = struct {
         nfa: NfaScratch,
     },
 
+    /// @stable-since: v0.1.0
     pub fn bufferLen(program: *const Program) usize {
         return switch (program.inner) {
             .literal => 0,
@@ -110,6 +120,7 @@ pub const Scratch = struct {
         };
     }
 
+    /// @stable-since: v0.1.0
     pub fn initBuffer(buf: []Cell, program: *const Program) backend.ScratchError!Scratch {
         switch (program.inner) {
             .literal => return .{ .inner = .{ .literal = .{} } },
@@ -123,6 +134,7 @@ pub const Scratch = struct {
         }
     }
 
+    /// @stable-since: v0.1.0
     pub fn init(gpa: std.mem.Allocator, program: *const Program) std.mem.Allocator.Error!Scratch {
         switch (program.inner) {
             .literal => return .{ .inner = .{ .literal = .{} } },
@@ -135,6 +147,7 @@ pub const Scratch = struct {
         }
     }
 
+    /// @stable-since: v0.1.0
     pub fn deinit(self: *Scratch, gpa: std.mem.Allocator) void {
         switch (self.inner) {
             .literal => |*s| s.deinit(gpa),
@@ -145,6 +158,7 @@ pub const Scratch = struct {
         }
     }
 
+    /// @stable-since: v0.1.0
     pub fn reset(self: *Scratch) void {
         switch (self.inner) {
             .literal => |*s| s.reset(),
@@ -164,6 +178,7 @@ fn preferBacktrack(p: *const nfa.Program, back: *const backtrack.Scratch, input:
 
 // ── Contract: matching entry points ──────────────────────────────────────────────
 
+/// @stable-since: v0.1.0
 pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) bool {
     switch (program.inner) {
         .literal => |*p| return literal.isMatch(p, &scratch.inner.literal, input, opts),
@@ -175,6 +190,7 @@ pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, op
     }
 }
 
+/// @stable-since: v0.1.0
 pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) ?Match {
     switch (program.inner) {
         .literal => |*p| return literal.search(p, &scratch.inner.literal, input, opts),
@@ -186,6 +202,7 @@ pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opt
     }
 }
 
+/// @stable-since: v0.1.0
 pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const u8, slots: []?usize, opts: SearchOptions) ?Match {
     switch (program.inner) {
         .literal => |*p| return literal.searchCaptures(p, &scratch.inner.literal, input, slots, opts),
@@ -198,6 +215,8 @@ pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const
 }
 
 /// Which way a built program routes (for diagnostics/tests): `.literal` or `.nfa`.
+///
+/// @stable-since: v0.1.0
 pub fn route(program: *const Program) []const u8 {
     return switch (program.inner) {
         .literal => "literal",

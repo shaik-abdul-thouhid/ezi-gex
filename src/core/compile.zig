@@ -31,10 +31,14 @@ pub const Span = errors.Span;
 
 /// Error returned by the runtime entry points. `InvalidPattern` carries its
 /// detail in the `Diagnostic`; `OutOfMemory` comes from the allocator.
+///
+/// @stable-since: v0.1.0
 pub const Error = errors.SyntaxError || std.mem.Allocator.Error;
 
 /// Result of the comptime entry point. Comptime code cannot thread an
 /// out-parameter the way runtime code does, so the diagnostic rides along here.
+///
+/// @stable-since: v0.1.0
 pub const Outcome = union(enum) {
     ok: Ast,
     fail: Diagnostic,
@@ -48,6 +52,8 @@ pub const Outcome = union(enum) {
 /// the returned AST owns its arrays; free them with `Ast.deinit(allocator)`. On a
 /// malformed pattern, returns `error.InvalidPattern` and fills `diag` with the
 /// precise code and byte span (see error.zig).
+///
+/// @stable-since: v0.1.0
 pub fn parse(allocator: std.mem.Allocator, pattern: []const u8, diag: *Diagnostic) Error!Ast {
     const sizes = scanner.requiredSizes(pattern.len);
 
@@ -102,6 +108,8 @@ pub fn parse(allocator: std.mem.Allocator, pattern: []const u8, diag: *Diagnosti
 ///   `pub fn report(self, Diagnostic, pattern: []const u8) void`
 /// method — that is where the caller does its own formatting/printing. The
 /// allocation error path does not call `report` (there is no diagnostic for it).
+///
+/// @stable-since: v0.1.0
 pub fn parseReporting(allocator: std.mem.Allocator, pattern: []const u8, ctx: anytype) Error!Ast {
     var diag: Diagnostic = .{};
     return parse(allocator, pattern, &diag) catch |e| {
@@ -117,6 +125,8 @@ pub fn parseReporting(allocator: std.mem.Allocator, pattern: []const u8, ctx: an
 /// in `ro_data`. Returns `.ok` with an AST whose slices point at that const data,
 /// or `.fail` with the diagnostic. Callers that want a hard compile error should
 /// use `compile`.
+///
+/// @stable-since: v0.1.0
 pub fn parseComptime(comptime pattern: []const u8) Outcome {
     // The quota is a CEILING on comptime backward-branches (a runaway-loop
     // guard), not a cost — raising it is free unless the work reaches it, and
@@ -170,6 +180,8 @@ pub fn parseComptime(comptime pattern: []const u8) Outcome {
 /// Build an AST at comptime, failing compilation with a located message if the
 /// pattern is invalid. The comptime analogue of "pretty-print the error": the
 /// build stops and the developer sees exactly what and where.
+///
+/// @stable-since: v0.1.0
 pub fn compile(comptime pattern: []const u8) Ast {
     comptime {
         return switch (parseComptime(pattern)) {

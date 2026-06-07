@@ -43,19 +43,24 @@ const DEFAULT_MAX_INPUT: usize = 64;
 
 // ── Contract surface ────────────────────────────────────────────────────────────
 
+/// @stable-since: v0.1.0
 pub const caps = Caps{ .captures = true, .stateless = false, .grapheme = false };
+/// @stable-since: v0.1.0
 pub const Options = struct {};
 
 /// Same compiled NFA the Pike VM uses (from the shared `nfa` module).
 pub const Inst = nfa.Inst;
 pub const Program = nfa.Program;
 
+/// @stable-since: v0.1.0
 pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Program {
     return nfa.buildAlloc(gpa, h);
 }
+/// @stable-since: v0.1.0
 pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
     return nfa.buildComptime(h);
 }
+/// @stable-since: v0.1.0
 pub fn freeProgram(gpa: std.mem.Allocator, program: *Program) void {
     nfa.freeProgram(gpa, program);
 }
@@ -72,6 +77,8 @@ fn visitedWords(nprog: usize, n: usize) usize {
 /// bitset. Carved from one `[]Cell` buffer. A heap `Scratch` (via `init`) grows the
 /// visited set as inputs demand; a buffer `Scratch` (via `initBuffer`) has a fixed
 /// ceiling — `fits()` tells you (and `auto`) whether an input is within it.
+///
+/// @stable-since: v0.1.0
 pub const Scratch = struct {
     /// Buffer element type for the `initBuffer`/comptime convention (see backend.zig).
     pub const Buf = Cell;
@@ -87,6 +94,8 @@ pub const Scratch = struct {
 
     /// Default fixed-buffer size: slots + a visited budget for inputs up to
     /// `DEFAULT_MAX_INPUT`. A larger buffer raises the input ceiling automatically.
+    ///
+    /// @stable-since: v0.1.0
     pub fn bufferLen(program: *const Program) usize {
         const sc = program.slot_count;
         return 2 * sc + visitedWords(program.insts.len, DEFAULT_MAX_INPUT);
@@ -95,6 +104,8 @@ pub const Scratch = struct {
     /// Carve a caller `[]Cell` buffer: slots, match slots, and the remainder as the
     /// visited budget. Works at comptime and runtime. The visited ceiling is
     /// `(buffer - 2*slot_count) words` — `fits()` checks an input against it.
+    ///
+    /// @stable-since: v0.1.0
     pub fn initBuffer(buf: []Cell, program: *const Program) backend.ScratchError!Scratch {
         const sc = program.slot_count;
         var cur = backend.Carver{ .buf = buf };
@@ -112,6 +123,8 @@ pub const Scratch = struct {
 
     /// Allocator-backed: slots up front; the visited set is grown lazily per search
     /// so any input length works (memory ∝ program × input).
+    ///
+    /// @stable-since: v0.1.0
     pub fn init(gpa: std.mem.Allocator, program: *const Program) std.mem.Allocator.Error!Scratch {
         const sc = program.slot_count;
         const buf = try gpa.alloc(Cell, 2 * sc);
@@ -126,6 +139,7 @@ pub const Scratch = struct {
         };
     }
 
+    /// @stable-since: v0.1.0
     pub fn deinit(self: *Scratch, gpa: std.mem.Allocator) void {
         if (self.owned) |b| gpa.free(b);
         if (self.owned_visited) |b| gpa.free(b);
@@ -134,6 +148,7 @@ pub const Scratch = struct {
         self.visited = &.{};
     }
 
+    /// @stable-since: v0.1.0
     pub fn reset(self: *Scratch) void {
         _ = self; // `run` clears the visited prefix per search
     }
@@ -153,6 +168,8 @@ pub const Scratch = struct {
 /// Whether `input` is within this scratch's visited ceiling. A heap scratch always
 /// fits (it grows); a buffer scratch fits iff the input's bitset fits the slack.
 /// `auto` consults this before routing to the backtracker.
+///
+/// @stable-since: v0.1.0
 pub fn fits(program: *const Program, scratch: *const Scratch, input: []const u8) bool {
     if (scratch.gpa != null) return true;
     return visitedWords(program.insts.len, input.len) <= scratch.visited.len;
@@ -269,15 +286,18 @@ fn run(program: *const Program, scratch: *Scratch, input: []const u8, opts: Sear
 
 // ── Contract: matching entry points ──────────────────────────────────────────────
 
+/// @stable-since: v0.1.0
 pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) bool {
     return run(program, scratch, input, opts);
 }
 
+/// @stable-since: v0.1.0
 pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) ?Match {
     if (!run(program, scratch, input, opts)) return null;
     return .{ .start = scratch.match_slots[0].slot.?, .end = scratch.match_slots[1].slot.? };
 }
 
+/// @stable-since: v0.1.0
 pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const u8, slots_out: []?usize, opts: SearchOptions) ?Match {
     if (!run(program, scratch, input, opts)) return null;
     const k = @min(slots_out.len, scratch.match_slots.len);

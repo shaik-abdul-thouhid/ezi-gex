@@ -33,7 +33,7 @@ fn Pattern(comptime pat: []const u8) type {
                 const a = std.heap.page_allocator;
                 var diag: ezi_gex.Diagnostic = .{};
                 var re = try ezi_gex.compileRuntimeWith(PikeVM, a, pat, &diag, .{});
-                const sc = try re.newScratch(a);
+                const sc = try RX.Scratch.init(a, &re.program);
                 cached = .{ .re = re, .sc = sc };
                 // print-once: show the work this bench will measure.
                 const n = cached.?.re.count(&cached.?.sc, ctx.corpus.bytes);
