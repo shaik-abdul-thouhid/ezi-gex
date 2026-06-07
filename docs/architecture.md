@@ -9,10 +9,6 @@ This is the document for two readers:
 If you only want to *use* the library, the [README](../README.md) is enough. This
 goes a layer down.
 
-> There is also a historical design-rationale map in
-> [`regex-engine-design.md`](regex-engine-design.md). This file is the authoritative,
-> current description; where they disagree, trust this one.
-
 ---
 
 ## 1. The shape: fixed frontend, pluggable backends
