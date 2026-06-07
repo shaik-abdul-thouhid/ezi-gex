@@ -107,6 +107,14 @@ its output arrays live in `ro_data` (comptime) or on the heap (runtime). This is
 
 `measure` and `emit` share one `Builder(comptime mode)` body, so they can't drift.
 
+> **⚠️ Comptime is bounded — prefer `compileRuntime` for big patterns.** `compileComptime`
+> lowers the whole pipeline in the compiler's const-evaluator and bakes the program into
+> `ro_data`. It only works until the eval-branch quota / compiler memory runs out, so a
+> large or pathological pattern can fail to build or make the build slow and heavy — use
+> `compileRuntime` there (no ceiling). And every embedded comptime program adds its tables
+> to the binary: Unicode classes are large (a single `\w{3,32}` ≈ 200 KB of ranges), so
+> embedding many can add megabytes of `ro_data`. **This trade-off is the user's to make.**
+
 ---
 
 ## 4. The backend contract
@@ -474,3 +482,46 @@ A lazy DFA mutates/caches state at match time, so it would be **runtime-only**
 inputs to the Pike VM (comptime-capable) and runtime/large inputs to the DFA. That is
 the whole point of the backend abstraction: a runtime speed demon and a comptime-pure
 matcher in one library, no fork.
+
+---
+
+## 11. Thread-safety
+
+The model is **share-nothing-mutable**, encoded directly in the primitive signatures —
+`search(program: *const Program, scratch: *Scratch, …)`: the `Program` is `*const`
+(compiler-enforced immutable during a search), and the `Scratch` is the only mutable state.
+
+**Safe pattern:** compile once, share the immutable `Compiled` / `Program` across threads,
+give **each thread its own `Scratch`**. No locks, no atomics, no global mutable state (the
+`\p{}` lookup tables are comptime `const`), so the engine is fully reentrant.
+
+```zig
+// shared, read-only, across N threads:
+const re = try gex.compileRuntime(gpa, pattern, &diag, .{});
+// per thread:
+var sc = try @TypeOf(re).Scratch.init(thread_gpa, &re.program);
+_ = re.find(&sc, input);
+```
+
+### Caveats (the fine print)
+
+- **A `Scratch` is single-threaded by definition.** It is mutated on every search; sharing
+  one across threads concurrently is a data race. One per thread — never pool one across them.
+- **The `backtrack` backend allocates *during* a search.** Its heap `Scratch` grows the
+  `(pc, sp)` visited bitset on demand through the allocator it was created with, and `auto`
+  routes inputs ≤ 4096 bytes to backtrack. So a per-thread `Scratch` is **necessary but not
+  sufficient** — if every thread's Scratch shares one *non-thread-safe* allocator, two threads
+  growing their visited sets at once race **inside the allocator**. Pick one:
+  - give each thread its own allocator / arena (cleanest), **or**
+  - use a thread-safe allocator (std `GeneralPurposeAllocator` defaults to thread-safe;
+    `page_allocator` is), **or**
+  - use a **buffer-backed `Scratch`** (`initBuffer`) — it never allocates during a search, **or**
+  - use the `pikevm` backend directly — it never allocates during a search either.
+- **Corollary:** the default `auto` + heap `Scratch` is therefore **not** strictly
+  zero-allocation during matching. A buffer-backed `Scratch` (or `pikevm`) is, if you need that.
+- **Compilation allocates.** `compileRuntime` (parse → HIR → program) uses its allocator;
+  concurrent compiles on a single shared allocator need it to be thread-safe (standard).
+- **The contract documents immutability but `verifyBackend` does not enforce it.** The
+  `*const Program` signature blocks honest mutation, but a third-party backend that
+  `@constCast`s or hides interior-mutable state inside its `Program` would break cross-thread
+  sharing. The four built-ins don't.

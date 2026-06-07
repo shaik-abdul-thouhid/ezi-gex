@@ -79,6 +79,23 @@ const Re = comptime gex.compileComptime("(\\d{4})-(\\d{2})", .{});
 const yes = comptime Re.isMatchComptime("y2026-06"); // true, computed at build
 ```
 
+> ### ⚠️ Comptime has limits — and the trade-off is yours
+>
+> `compileComptime` runs the **entire** parse → HIR → program lowering inside the Zig
+> compiler's const-evaluator and bakes the result into `ro_data`. Two consequences you own
+> as a deliberate choice — the library will not decide them for you:
+>
+> 1. **It only works until the compiler runs out of room.** Const-eval is bounded by the
+>    eval-branch quota and compiler memory; a large, deeply-nested, or pathological pattern
+>    can blow the quota or make builds slow and memory-heavy. **Prefer `compileRuntime` for
+>    big or user-supplied patterns** — runtime compilation has no such ceiling.
+> 2. **Embedding many comptime programs bloats the binary.** Each `compileComptime` adds its
+>    program tables to `ro_data`, and Unicode classes are large: one `\w` ≈ 800 ranges ≈ 6 KB
+>    *per occurrence*, and counted repetition multiplies it — a single `\w{3,32}` is ~200 KB.
+>    *Measured:* 30 realistic patterns added **~625 KB**; ~100 can be **2 MB+** (tens of MB if
+>    they use counted Unicode-class repeats). The matching *code* is shared across all of
+>    them, so the cost is almost entirely data.
+
 ## Supported syntax
 
 | Category | Supported |
@@ -107,6 +124,16 @@ treated as `\z`. See [`docs/architecture.md`](docs/architecture.md) §Caveats.
 
 `compileRuntime`/`compileComptime` use `auto`. Force one with the `*With` variants:
 `gex.compileRuntimeWith(gex.backends.pikevm, gpa, pat, &diag, .{})`.
+
+## Thread-safety
+
+Compile once, share the immutable `Compiled`/`Program` across threads, and give **each
+thread its own `Scratch`** — no locks, no atomics, no global state. **One caveat:** the
+`backtrack` backend (which `auto` uses for small inputs) **allocates during a search** to
+grow its visited set, so a per-thread `Scratch` also needs a per-thread or thread-safe
+allocator — or use a buffer-backed `Scratch` (`initBuffer`) or the `pikevm` backend, which
+never allocate while matching. Full details in
+[`docs/architecture.md`](docs/architecture.md) §11.
 
 ## Performance
 
