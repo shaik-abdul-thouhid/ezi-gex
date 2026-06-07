@@ -16,23 +16,39 @@ a **pluggable backend** architecture.
 - **Pluggable.** Matching lives behind a small, vtable-free **backend contract**.
   The library ships four backends and a dispatcher; you can write your own and
   drop it into the same front door. See [`docs/architecture.md`](docs/architecture.md).
+- **Target-agnostic.** Pure computation over caller-provided memory — no syscalls,
+  no global allocator, no platform assumptions in the library code. Imports and
+  compiles anywhere Zig (plus `ezi_code`) does: native, `wasm32-freestanding` /
+  `wasm32-wasi`, and bare-metal `*-freestanding` (verified to compile for all four).
 
 ## Status
 
-Version `0.1.0-dev`. Pre-1.0: the API may still change, though everything in the
-public surface is annotated `@stable-since: v0.1.0`. Tracks a recent Zig dev build
-(`0.17.0-dev`); it will not compile on stable 0.16.
+Version `0.1.0` — the first tagged release. Pre-1.0, so the API may still change,
+but everything in the public surface is annotated `@stable-since: v0.1.0` and is
+covered by SemVer from this tag on. Tracks a recent Zig dev build (`0.17.0-dev`); it
+will not compile on stable 0.16.
 
-**What works is tested** (≈200 tests: per-module behaviour, cross-backend
-conformance, runtime + comptime parity). **What is not done yet is performance:**
-the prefilter analysis is computed but not yet wired into the engines, and there is
-no lazy-DFA backend, so throughput today is well below RE2/Rust. The architecture is
-built to absorb those without API changes — see the *Performance* section.
+**What works is tested** (≈210 tests: per-module behaviour, cross-backend
+conformance, runtime + comptime parity). The **first prefilter tier is now wired**:
+the `literal` backend scans with `std.mem.indexOf` (SIMD `memchr` + Boyer–Moore–
+Horspool) and `auto` reads the HIR `Analysis` to skip work on NFA patterns — a
+leading-literal `memchr` prefilter, a `^`/`\A` start short-circuit, and a min-length
+gate. There is still **no lazy-DFA backend**, so on general (non-prefixable) patterns
+throughput is below RE2/Rust; the architecture absorbs a DFA without API changes —
+see the *Performance* section.
 
 ## Installing
 
+Via git ref (resolves the tag at fetch time):
+
 ```sh
 zig fetch --save git+https://github.com/shaik-abdul-thouhid/ezi-gex.git#v0.1.0
+```
+
+Or via plain HTTP tarball (pins the content hash in `build.zig.zon`):
+
+```sh
+zig fetch --save https://github.com/shaik-abdul-thouhid/ezi-gex/archive/refs/tags/v0.1.0.tar.gz
 ```
 
 Then in `build.zig` (the `ezi_code` dependency is resolved transitively — you only
@@ -137,17 +153,24 @@ never allocate while matching. Full details in
 
 ## Performance
 
-Honest: today it's NFA-simulation only and **unoptimized**. The fast pieces are
-designed-in but not yet wired:
+Honest about where it stands. **Tier 1 — the literal / prefilter fast path — is now
+wired:**
 
-1. The HIR computes a sound prefilter (`required_bytes`, `prefix_literal`) — not
-   yet consumed by any backend (no `memchr` skip yet).
-2. The `literal` backend scans naively (no `memchr`).
-3. There is no lazy-DFA backend (the RE2/Rust fast path).
+1. The `literal` backend scans with `std.mem.indexOf`: SIMD `memchr` to locate a
+   one-byte needle, Boyer–Moore–Horspool with a skip table for longer ones — instead
+   of an `eql` at every byte position. On memchr-friendly needles that is **~20×** the
+   old position-by-position scan; it is never slower.
+2. `auto` consumes the HIR `Analysis` on NFA patterns: when every match must begin
+   with a fixed literal, its first byte drives a `memchr` that skips straight to each
+   candidate start (each confirmed with an *anchored* NFA run); a `^`/`\A` pattern
+   skips the leftward scan entirely; and a min-length gate rejects inputs too short to
+   hold any match. Every `Analysis` fact is a sound one-sided bound, so the prefilter
+   never drops a real match — it only avoids running the NFA where one cannot start.
 
-These are additive — the backend contract is exactly the seam to add a DFA backend
-(runtime-only) without disturbing the comptime path or the API. See
-[`docs/architecture.md`](docs/architecture.md) for the planned tiers.
+**Still open (additive, no API change):** a one-pass NFA capture path, and a lazy-DFA
+backend (the RE2/Rust core — runtime-only, since it mutates state at match time). The
+backend contract is exactly the seam to drop a DFA in without disturbing the comptime
+path or the API. See [`docs/architecture.md`](docs/architecture.md) for the planned tiers.
 
 ## Documentation
 

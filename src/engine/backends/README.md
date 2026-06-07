@@ -22,11 +22,20 @@ is the one independent matcher (and only for pure literals).
 
 ```
 build time  (by analysis):  literal.supports(hir) ? → literal   :  → shared nfa.Program
-search time (by input):     nfa pattern, input ≤ 4096 B and fits scratch ? → backtrack : → pikevm
+                            distil a POD prefilter Filter from hir.Analysis (NFA arm)
+
+search time (NFA, prefilter): input shorter than min_utf8_len ?            → no match
+                              anchored_start ?                              → only offset 0
+                              every match starts with a fixed literal ?     → memchr its
+                                first byte, confirm each hit with an anchored NFA run
+search time (NFA, by input):  no usable filter → input ≤ 4096 B and fits ? → backtrack : → pikevm
 ```
 
-Both NFA arms run the identical program, so the per-input switch is invisible — same
-match, same captures. `auto.route(&program)` reports `"literal"` or `"nfa"` for tests.
+The prefilter facts are **sound one-sided bounds** (true for every match), so the
+skip never drops a real match. Both NFA arms run the identical program, so the
+per-input switch is invisible — same match, same captures. The `literal` backend
+itself scans with `std.mem.indexOf` (SIMD memchr / Boyer–Moore–Horspool), not an
+`eql` per position. `auto.route(&program)` reports `"literal"` or `"nfa"` for tests.
 
 ## Notes
 

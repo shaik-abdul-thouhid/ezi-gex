@@ -14,6 +14,15 @@
 //!     that fit the scratch and falls back to `pikevm` for large ones. Because both
 //!     execute the identical program with identical (leftmost-first) semantics, the
 //!     choice is invisible: same match, same captures, every time.
+//!   * **By analysis, at search time (the prefilter).** Before touching the NFA on an
+//!     unanchored search `auto` consults the HIR `Analysis` baked into the program
+//!     (a tiny POD `Filter`): a `min_utf8_len` length gate rejects inputs too short
+//!     to hold any match; an `anchored_start` pattern (`^…`/`\A…`) only ever matches
+//!     at offset 0, so the leftward scan is skipped entirely; and when every match
+//!     must begin with a fixed literal, its first byte drives a `memchr` that skips
+//!     straight to each candidate start, confirming there with an anchored NFA run.
+//!     Every `Analysis` fact is a sound one-sided bound, so the prefilter never drops
+//!     a real match — it only avoids running the NFA where one provably cannot start.
 //!
 //! This is the backend a casual user gets by default (`compileRuntime` /
 //! `compileComptime`); power users opt into a specific backend explicitly. It works
@@ -35,6 +44,10 @@ const literal = @import("literal.zig");
 const pikevm = @import("pikevm.zig");
 const backtrack = @import("backtrack.zig");
 
+const ezi_code = @import("ezi_code");
+const encoding = ezi_code.encoding;
+const utf8 = ezi_code.encoding.utf8;
+
 const Match = backend.Match;
 const SearchOptions = backend.SearchOptions;
 const Caps = backend.Caps;
@@ -55,9 +68,51 @@ pub const caps = Caps{ .captures = true, .stateless = false, .grapheme = false }
 /// @stable-since: v0.1.0
 pub const Options = struct {};
 
-/// A compiled program: either a literal program or the shared NFA program. The
-/// active arm is the analysis-time choice; the per-search engine choice (pikevm vs
-/// backtrack) does not change the program, only how it is executed.
+/// Search-time prefilter facts, distilled from the HIR `Analysis` at build into a
+/// tiny POD (so it bakes into `ro_data` at comptime and needs no allocation). Every
+/// field is a **sound one-sided bound** — true for *every* match — so acting on it
+/// never drops a real match. Only consulted on the NFA arm; the literal arm does its
+/// own scanning.
+///
+/// @stable-since: v0.1.0
+pub const Filter = struct {
+    /// `analysis.min_utf8_len`: a match needs at least this many bytes, so an input
+    /// (slice from the search start) shorter than this cannot match.
+    min_bytes: u32 = 0,
+    /// `analysis.anchored_start`: every match begins at offset 0 (`^`/`\A`, no
+    /// multiline) — an unanchored scan need only try position 0.
+    anchored_start: bool = false,
+    /// First UTF-8 byte of `analysis.prefix_literal` (the literal run every match
+    /// must begin with), or null when no fixed leading literal exists. Drives a
+    /// `memchr` start-skip: a match can only begin where this byte appears.
+    prefix_byte: ?u8 = null,
+};
+
+/// Distil the sound prefilter facts from the HIR analysis.
+fn filterFromAnalysis(h: hir.Hir) Filter {
+    const an = h.analysis;
+    var f = Filter{ .min_bytes = an.min_utf8_len, .anchored_start = an.anchored_start };
+    // A leading-byte memchr only helps an unanchored scan; for `anchored_start` the
+    // start short-circuit already pins the search to offset 0.
+    if (!an.anchored_start) {
+        if (an.prefix_literal) |run| {
+            if (run.len > 0) {
+                const cp = h.literals[run.start];
+                if (encoding.isValidCodePoint(cp)) {
+                    var buf: [4]u8 = undefined;
+                    const n = utf8.encodeCodePointUnchecked(cp, &buf);
+                    if (n > 0) f.prefix_byte = buf[0];
+                }
+            }
+        }
+    }
+    return f;
+}
+
+/// A compiled program: either a literal program or the shared NFA program, plus the
+/// search-time `Filter` distilled from analysis (meaningful only on the NFA arm).
+/// The active arm is the analysis-time choice; the per-search engine choice (pikevm
+/// vs backtrack) does not change the program, only how it is executed.
 ///
 /// @stable-since: v0.1.0
 pub const Program = struct {
@@ -65,6 +120,8 @@ pub const Program = struct {
         literal: literal.Program,
         nfa: nfa.Program,
     },
+    /// Sound prefilter facts for the NFA arm; default (all-permissive) for literal.
+    filter: Filter = .{},
 };
 
 /// @stable-since: v0.1.0
@@ -73,7 +130,7 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
         return .{ .inner = .{ .literal = try literal.buildAlloc(gpa, h, .{}) } };
     }
     if (!nfa.supports(h)) return error.Unsupported; // e.g. `\X` grapheme
-    return .{ .inner = .{ .nfa = try nfa.buildAlloc(gpa, h) } };
+    return .{ .inner = .{ .nfa = try nfa.buildAlloc(gpa, h) }, .filter = filterFromAnalysis(h) };
 }
 
 /// @stable-since: v0.1.0
@@ -81,7 +138,7 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
     if (comptime literal.supports(h)) {
         return .{ .inner = .{ .literal = literal.buildComptime(h, .{}) } };
     }
-    return .{ .inner = .{ .nfa = nfa.buildComptime(h) } }; // `\X` ⇒ @compileError inside
+    return .{ .inner = .{ .nfa = nfa.buildComptime(h) }, .filter = filterFromAnalysis(h) }; // `\X` ⇒ @compileError inside
 }
 
 /// @stable-since: v0.1.0
@@ -176,17 +233,88 @@ fn preferBacktrack(p: *const nfa.Program, back: *const backtrack.Scratch, input:
     return input.len <= BACKTRACK_MAX_INPUT and backtrack.fits(p, back, input);
 }
 
+/// First byte offset `≥ start` at which `byte` appears in `input`, or null. Runtime
+/// uses `std.mem.indexOfScalarPos` (SIMD memchr); comptime uses a plain scan (the
+/// project keeps `@Vector` out of const-eval). The prefilter's start-skip primitive.
+fn memchrFrom(input: []const u8, start: usize, byte: u8) ?usize {
+    if (@inComptime()) {
+        var i = start;
+        while (i < input.len) : (i += 1) if (input[i] == byte) return i;
+        return null;
+    }
+    return std.mem.indexOfScalarPos(u8, input, start, byte);
+}
+
+// ── NFA-arm execution: dispatch + analysis-driven prefilter ───────────────────────
+
+/// Confirm a match starting exactly at `at` (anchored). Uses the **Pike VM**: its
+/// per-search reset is O(program), so it stays cheap when the prefilter probes many
+/// candidate positions (the backtracker resets an O(program × input) visited set).
+/// Fills `slots` when provided; an anchored run that finds nothing leaves `slots`
+/// untouched, so repeated failed confirms never dirty a caller's buffer.
+fn confirmAt(p: *const nfa.Program, s: *Scratch.NfaScratch, input: []const u8, at: usize, slots: ?[]?usize) ?Match {
+    const o = SearchOptions{ .start = at, .anchored = true };
+    if (slots) |sl| return pikevm.searchCaptures(p, &s.pike, input, sl, o);
+    return pikevm.search(p, &s.pike, input, o);
+}
+
+/// Ordinary per-input dispatch over the whole (unfiltered) range: backtrack for a
+/// small input that fits, else the Pike VM. Both execute the same program with
+/// identical leftmost-first semantics, so the choice is invisible.
+fn dispatch(p: *const nfa.Program, s: *Scratch.NfaScratch, input: []const u8, opts: SearchOptions, slots: ?[]?usize) ?Match {
+    if (preferBacktrack(p, &s.back, input)) {
+        if (slots) |sl| return backtrack.searchCaptures(p, &s.back, input, sl, opts);
+        return backtrack.search(p, &s.back, input, opts);
+    }
+    if (slots) |sl| return pikevm.searchCaptures(p, &s.pike, input, sl, opts);
+    return pikevm.search(p, &s.pike, input, opts);
+}
+
+/// The NFA arm's single search core, shared by `isMatch`/`search`/`searchCaptures`
+/// (`slots` non-null ⇒ capture). Applies the sound analysis prefilter, then either
+/// confirms at filtered positions or falls back to the plain dispatch. Returns the
+/// leftmost match (filling `slots` on success).
+fn runNfa(p: *const nfa.Program, filter: Filter, s: *Scratch.NfaScratch, input: []const u8, opts: SearchOptions, slots: ?[]?usize) ?Match {
+    if (opts.start > input.len) return null;
+    // Length gate: too few bytes left from here for even the shortest match.
+    if (input.len - opts.start < filter.min_bytes) return null;
+
+    // Caller pinned the start: one anchored attempt, no scan, no prefilter.
+    if (opts.anchored) return dispatch(p, s, input, opts, slots);
+
+    // `^…`/`\A…`: a match can only begin at offset 0. Past it, none can; at 0, an
+    // anchored run avoids scanning the whole input leftward.
+    if (filter.anchored_start) {
+        if (opts.start != 0) return null;
+        return confirmAt(p, s, input, 0, slots);
+    }
+
+    // Leading-literal memchr prefilter: every match begins with `prefix_byte`, so
+    // jump to each occurrence and confirm anchored there. Leftmost by construction —
+    // positions are visited left→right and the first confirmed match wins. A
+    // false-positive byte (prefix's first byte without the full match) just fails the
+    // confirm; a real match's start is always one of these positions, so none is missed.
+    if (filter.prefix_byte) |fb| {
+        var pos = opts.start;
+        while (memchrFrom(input, pos, fb)) |hit| {
+            if (input.len - hit < filter.min_bytes) return null; // no later hit can fit either
+            if (confirmAt(p, s, input, hit, slots)) |m| return m;
+            pos = hit + 1;
+        }
+        return null;
+    }
+
+    // No usable filter: scan the whole range with the per-input engine choice.
+    return dispatch(p, s, input, opts, slots);
+}
+
 // ── Contract: matching entry points ──────────────────────────────────────────────
 
 /// @stable-since: v0.1.0
 pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) bool {
     switch (program.inner) {
         .literal => |*p| return literal.isMatch(p, &scratch.inner.literal, input, opts),
-        .nfa => |*p| {
-            const s = &scratch.inner.nfa;
-            if (preferBacktrack(p, &s.back, input)) return backtrack.isMatch(p, &s.back, input, opts);
-            return pikevm.isMatch(p, &s.pike, input, opts);
-        },
+        .nfa => |*p| return runNfa(p, program.filter, &scratch.inner.nfa, input, opts, null) != null,
     }
 }
 
@@ -194,11 +322,7 @@ pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, op
 pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) ?Match {
     switch (program.inner) {
         .literal => |*p| return literal.search(p, &scratch.inner.literal, input, opts),
-        .nfa => |*p| {
-            const s = &scratch.inner.nfa;
-            if (preferBacktrack(p, &s.back, input)) return backtrack.search(p, &s.back, input, opts);
-            return pikevm.search(p, &s.pike, input, opts);
-        },
+        .nfa => |*p| return runNfa(p, program.filter, &scratch.inner.nfa, input, opts, null),
     }
 }
 
@@ -206,11 +330,7 @@ pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opt
 pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const u8, slots: []?usize, opts: SearchOptions) ?Match {
     switch (program.inner) {
         .literal => |*p| return literal.searchCaptures(p, &scratch.inner.literal, input, slots, opts),
-        .nfa => |*p| {
-            const s = &scratch.inner.nfa;
-            if (preferBacktrack(p, &s.back, input)) return backtrack.searchCaptures(p, &s.back, input, slots, opts);
-            return pikevm.searchCaptures(p, &s.pike, input, slots, opts);
-        },
+        .nfa => |*p| return runNfa(p, program.filter, &scratch.inner.nfa, input, opts, slots),
     }
 }
 
@@ -268,6 +388,12 @@ fn expectFind(pattern: []const u8, input: []const u8, expected: []const u8) !voi
     try testing.expectEqualStrings(expected, m.slice(input));
 }
 
+fn expectNoMatch(pattern: []const u8, input: []const u8) !void {
+    var re = try Compiled.init(pattern);
+    defer re.deinit();
+    try testing.expect(re.find(input) == null);
+}
+
 test "auto satisfies the backend contract" {
     comptime backend.verifyBackend(@This());
 }
@@ -311,20 +437,88 @@ test "auto captures (nfa route)" {
 }
 
 test "auto: backtrack and pikevm routes agree on a large input (crosses the switch)" {
-    // An input longer than BACKTRACK_MAX_INPUT forces the Pike VM; a short slice of
-    // the same pattern uses the backtracker. Both must find the same thing.
-    var re = try Compiled.init("a\\w+z");
+    // A pattern with a leading *class* (no fixed leading literal) bypasses the memchr
+    // prefilter and exercises the per-input dispatch directly: an input longer than
+    // BACKTRACK_MAX_INPUT forces the Pike VM; a short one uses the backtracker. Both
+    // must find the same thing. Dot filler is not in `[a-z]`, so the leftmost match
+    // starts cleanly at the embedded run rather than absorbing the filler.
+    var re = try Compiled.init("[a-z]+!");
     defer re.deinit();
     const gpa = testing.allocator;
     const big = try gpa.alloc(u8, BACKTRACK_MAX_INPUT + 100);
     defer gpa.free(big);
-    @memset(big, 'x');
-    @memcpy(big[50 .. 50 + 6], "aBCDEz");
+    @memset(big, '.');
+    @memcpy(big[50 .. 50 + 4], "abc!");
     const m_big = re.find(big).?; // pikevm route (len > threshold)
-    try testing.expectEqualStrings("aBCDEz", m_big.slice(big));
+    try testing.expectEqualStrings("abc!", m_big.slice(big));
 
-    const m_small = re.find("..aBCDEz..").?; // backtrack route (len < threshold)
-    try testing.expectEqualStrings("aBCDEz", m_small.slice("..aBCDEz.."));
+    const m_small = re.find("..abc!..").?; // backtrack route (len < threshold)
+    try testing.expectEqualStrings("abc!", m_small.slice("..abc!.."));
+}
+
+test "auto: prefix-literal memchr prefilter finds the leftmost match" {
+    // Every match of `foo\d` begins with the literal "foo" → analysis yields a
+    // prefix byte 'f' that drives the memchr skip. A false-positive 'f' ("food",
+    // no trailing digit) fails the anchored confirm and the scan moves on.
+    try expectFind("foo\\d", "food foo5", "foo5");
+    try expectFind("foo\\d+", "xx foo123 yy", "foo123");
+    try expectNoMatch("foo\\d", "no digits here foo!");
+    // unicode prefix: 'é' is multi-byte; its first byte still seeds the memchr.
+    try expectFind("été\\d", "l'été9", "été9");
+}
+
+test "auto: prefilter is correct under findAll / count (multiple matches)" {
+    var re = try Compiled.init("a\\d"); // prefix 'a'
+    defer re.deinit();
+    const input = "a1 xa2 yy a3!";
+    try testing.expectEqual(@as(usize, 3), E.count(&re.program, &re.scratch, input, .{}));
+    var it = E.findAll(&re.program, &re.scratch, input, .{});
+    try testing.expectEqualStrings("a1", it.next().?.slice(input));
+    try testing.expectEqualStrings("a2", it.next().?.slice(input));
+    try testing.expectEqualStrings("a3", it.next().?.slice(input));
+    try testing.expect(it.next() == null);
+}
+
+test "auto: anchored_start short-circuit only matches at offset 0" {
+    try expectFind("^\\d+", "12 ab", "12");
+    try expectNoMatch("^\\d+", "ab 12"); // a match must begin at 0
+    // findAll over a start-anchored pattern yields exactly one match.
+    var re = try Compiled.init("^\\w+");
+    defer re.deinit();
+    try testing.expectEqual(@as(usize, 1), E.count(&re.program, &re.scratch, "hello world", .{}));
+}
+
+test "auto: length gate rejects too-short input" {
+    try expectNoMatch("\\d{5}", "123"); // needs ≥ 5 bytes
+    try expectFind("\\d{5}", "x 67890", "67890");
+}
+
+test "auto: prefilter preserves captures" {
+    var re = try Compiled.init("(foo)(\\d+)"); // prefix 'f', with groups
+    defer re.deinit();
+    var slots: [6]?usize = undefined;
+    const c = E.captures(&re.program, &re.scratch, "a food foo42 b", &slots, re.meta, .{}).?;
+    try testing.expectEqualStrings("foo42", c.match().slice("a food foo42 b"));
+    try testing.expectEqualStrings("foo", c.groupSlice(1).?);
+    try testing.expectEqualStrings("42", c.groupSlice(2).?);
+}
+
+test "auto: prefilter path runs at COMPTIME (memchr + anchored confirm)" {
+    const got = comptime blk: {
+        @setEvalBranchQuota(3_000_000);
+        const a = compile.compile("foo\\d+");
+        const h = switch (hir.buildComptime(a, .{})) {
+            .ok => |x| x,
+            .fail => @compileError("hir"),
+        };
+        const program = buildComptime(h, .{});
+        var buf: [Scratch.bufferLen(&program)]Cell = undefined;
+        var sc = Scratch.initBuffer(&buf, &program) catch unreachable;
+        const input = "skip food then foo777 end";
+        const m = E.find(&program, &sc, input, .{}) orelse @compileError("no match");
+        break :blk m.slice(input);
+    };
+    try testing.expectEqualStrings("foo777", got);
 }
 
 test "auto: grapheme pattern is unsupported" {

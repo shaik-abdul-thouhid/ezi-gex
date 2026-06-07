@@ -215,19 +215,66 @@ pub fn freeProgram(gpa: std.mem.Allocator, program: *Program) void {
 
 // ── Contract: matching entry points ──────────────────────────────────────────────
 
+/// First byte offset `≥ start` at which `needle` occurs in `input`, or null. An
+/// empty needle occurs at `start` (the empty string matches everywhere).
+///
+/// At **runtime** this is `std.mem.indexOfPos` — a memchr (`indexOfScalarPos`) for a
+/// one-byte needle and Boyer–Moore–Horspool with a skip table for longer ones, both
+/// SIMD-accelerated. That is the "absurd fast" path: it skips whole runs of input
+/// instead of re-comparing at every byte (the old `O(input × needle)` scan). At
+/// **comptime** it falls back to a plain `eql` scan — `std.mem.indexOfPos` would pull
+/// `@Vector` code into const-eval, which the project keeps out of comptime paths.
+///
+/// Byte scanning is sound for UTF-8: a needle is a whole-code-point sequence, and its
+/// bytes can only occur at a code-point boundary of valid UTF-8 input.
+fn firstMatchPos(input: []const u8, start: usize, needle: []const u8) ?usize {
+    if (needle.len == 0) return if (start <= input.len) start else null;
+    if (start + needle.len > input.len) return null;
+    if (@inComptime()) {
+        var i = start;
+        while (i + needle.len <= input.len) : (i += 1) {
+            if (std.mem.eql(u8, input[i .. i + needle.len], needle)) return i;
+        }
+        return null;
+    }
+    return std.mem.indexOfPos(u8, input, start, needle);
+}
+
 /// @stable-since: v0.1.0
 pub fn search(program: *const Program, _: *Scratch, input: []const u8, opts: SearchOptions) ?Match {
-    var pos = opts.start;
-    while (pos <= input.len) : (pos += 1) {
-        // Leftmost position first; at this position, alternation priority order.
+    if (opts.start > input.len) return null;
+
+    // Anchored: the match must begin exactly at `opts.start`. No scan — test each
+    // branch once, in alternation (priority) order, and take the first that fits.
+    if (opts.anchored) {
         for (program.bounds) |b| {
             const needle = program.needles[b.start .. b.start + b.len];
-            if (pos + needle.len <= input.len and std.mem.eql(u8, input[pos .. pos + needle.len], needle))
-                return .{ .start = pos, .end = pos + needle.len };
+            if (opts.start + needle.len <= input.len and std.mem.eql(u8, input[opts.start .. opts.start + needle.len], needle))
+                return .{ .start = opts.start, .end = opts.start + needle.len };
         }
-        if (opts.anchored) break; // anchored: only the start position
+        return null;
     }
-    return null;
+
+    // Unanchored, leftmost-first. The leftmost byte position where *any* branch
+    // matches wins; ties at that position go to the earliest-listed (highest
+    // priority) branch. For each branch take its first occurrence `≥ start` with the
+    // fast substring search, then keep the strictly-earliest — iterating branches in
+    // priority order means an equal-position later branch never displaces an earlier
+    // one. As soon as a branch matches at `opts.start` itself (the minimum possible
+    // position) nothing can beat it, so stop. A single needle reduces to one
+    // `indexOfPos` call.
+    var best: ?usize = null;
+    var best_len: usize = 0;
+    for (program.bounds) |b| {
+        const needle = program.needles[b.start .. b.start + b.len];
+        const at = firstMatchPos(input, opts.start, needle) orelse continue;
+        if (best == null or at < best.?) {
+            best = at;
+            best_len = needle.len;
+            if (at == opts.start) break;
+        }
+    }
+    return if (best) |at| .{ .start = at, .end = at + best_len } else null;
 }
 
 /// @stable-since: v0.1.0
@@ -310,6 +357,28 @@ test "literal alternation is leftmost-first" {
     try expectFind("foo|foobar", "foobar", "foo");
     try expectFind("cat|dog|fish", "redfish", "fish");
     try expectNoMatch("cat|dog", "fish");
+}
+
+test "alternation: leftmost beats priority; ties go to priority" {
+    // A lower-priority branch occurring earlier wins on position (leftmost).
+    try expectFind("ab|c", "xxcab", "c"); // 'c' at 2 beats "ab" at 3
+    try expectFind("dog|cat", "the cat sat", "cat"); // only the later branch occurs
+    // At the *same* leftmost position, the earlier-listed branch wins (priority).
+    try expectFind("abc|ab", "abc", "abc");
+    try expectFind("ab|abc", "abc", "ab");
+    // Empty branch participates: matches at `start` unless a higher-priority branch
+    // also matches there.
+    try expectFind("x|", "zzz", ""); // no 'x'; empty matches at start (pos 0)
+    try expectSpan("x|", "zzz", 0, 0);
+    try expectFind("x|", "xzz", "x"); // 'x' (higher priority) matches at start
+}
+
+fn expectSpan(pattern: []const u8, input: []const u8, start: usize, end: usize) !void {
+    var re = try Compiled.init(pattern);
+    defer re.deinit();
+    const m = re.find(input) orelse return error.NoMatch;
+    try testing.expectEqual(start, m.start);
+    try testing.expectEqual(end, m.end);
 }
 
 test "anchored / start-offset search" {

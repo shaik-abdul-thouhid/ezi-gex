@@ -401,8 +401,13 @@ match, so a prefilter or length gate built on them never yields a false negative
   contain (pick the rarest for a `memchr` prefilter).
 - `has_grapheme`, `has_word_boundary`, `is_whole_literal`, `is_one_pass`.
 
-> **As of 0.1.0 these are computed but only `has_grapheme` is consumed.** They are the
-> scaffolding for the prefilter/DFA work; a backend is free to read them today.
+> **As of 0.1.0 the `auto` dispatcher consumes the prefilter facts on its NFA arm:**
+> `min_utf8_len` (a length gate — reject inputs too short to match), `anchored_start`
+> (a `^`/`\A` start short-circuit — only try offset 0), and `prefix_literal` (its first
+> UTF-8 byte seeds a `memchr` start-skip, each hit confirmed by an *anchored* NFA run).
+> The `literal` backend likewise scans with `std.mem.indexOf` (memchr / Boyer–Moore–
+> Horspool). `required_bytes` / `required_literal` / `is_one_pass` remain unconsumed —
+> scaffolding for a future one-pass / DFA path; any backend is free to read them.
 
 ---
 
@@ -468,7 +473,7 @@ The contract is the seam that makes these drop-in:
 
 | Tier | Work | Effort | Lands at |
 |---|---|---|---|
-| 1 | wire `required_bytes` → `memchr` start-skip; literal `eql` → `indexOf` | days | 5–20× on unanchored search |
+| 1 ✅ *(0.1.0)* | literal `eql` → `std.mem.indexOf`; `prefix_literal` first byte → `memchr` start-skip in `auto` (+ length/anchor gates) | done | ~20× on memchr-friendly literals and prefixed NFA patterns |
 | 2 | one-pass NFA fast capture path | weeks | kills the captures penalty on common patterns |
 | 3 | lazy DFA on a UTF-8 **byte** automaton (the RE2/Rust core) | ~1–3 months | RE2 order of magnitude on general search |
 
