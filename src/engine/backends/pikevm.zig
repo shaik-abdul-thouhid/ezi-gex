@@ -1,35 +1,32 @@
 //! Pike VM backend — a Thompson-NFA simulation with capture slots.
 //!
-//! This is the captures-capable backstop (and v1's only backend): linear-time
-//! `O(input × program)`, no catastrophic backtracking, leftmost-first (Perl/JS)
-//! semantics. It is **code_point-based** — it decodes one UTF-8 code_point per step
-//! and tests it against the HIR's resolved ranges directly, so Unicode classes
-//! (`\w`, `\p{…}`, scripts) work with zero match-time Unicode-table lookups. (A
-//! future `hybrid` backend will lower to a UTF-8 byte DFA; that is a separate
-//! module — this one keeps the simple, correct code_point model.)
+//! The captures-capable, general backstop: linear-time `O(input × program)`, no
+//! catastrophic backtracking, leftmost-first (Perl/JS) semantics. It executes the
+//! shared `engine/nfa.zig` program breadth-first (a set of threads advanced one
+//! code point at a time), so Unicode classes work with zero match-time
+//! Unicode-table lookups. The HIR/NFA compiler and the code-point primitives live
+//! in `nfa.zig`; this file is just the breadth-first execution + its `Scratch`.
 //!
-//! Contract: it satisfies `engine/backend.zig`. The HIR is compiled once into a
-//! flat instruction `Program` (immutable, shareable); all per-search mutable state
-//! lives in `Scratch` (caller-owned, reset per search via generation stamping).
+//! Contract: it satisfies `engine/backend.zig`. The `Program` is immutable and
+//! shareable; all per-search mutable state lives in a caller-owned `Scratch`,
+//! reset per search via generation stamping. `Scratch` carves a single `[]Cell`
+//! buffer, so the exact same `initBuffer` path runs at comptime and runtime.
 //!
-//! v1 scope: `buildAlloc` (heap) only — `buildComptime` (ro_data) is a follow-up
-//! (needs the storage-agnostic two-pass like core/hir.zig). `\X` graphemes are not
-//! supported (`caps.grapheme = false`); a pattern containing one is rejected at
-//! build with `error.Unsupported`.
+//! `\X` graphemes are not supported (`caps.grapheme = false`); a pattern with one
+//! is rejected at build with `error.Unsupported` (by the shared compiler).
 
 const std = @import("std");
 
 const backend = @import("../backend.zig");
 const hir = @import("../../core/hir.zig");
+const nfa = @import("../nfa.zig");
 
 const ezi_code = @import("ezi_code");
-const properties = ezi_code.unicode.properties;
 
 const Match = backend.Match;
 const SearchOptions = backend.SearchOptions;
 const Caps = backend.Caps;
 const BuildError = backend.BuildError;
-const Range = hir.Range;
 const CodePoint = ezi_code.encoding.CodePoint;
 
 // ── Contract surface ────────────────────────────────────────────────────────────
@@ -40,262 +37,53 @@ pub const caps = Caps{ .captures = true, .stateless = false, .grapheme = false }
 /// VM needs nothing here; the field exists to satisfy the contract shape.
 pub const Options = struct {};
 
-// ── Instruction set ─────────────────────────────────────────────────────────────
-
-/// One NFA instruction. `char`/`range`/`any` consume exactly one code_point and
-/// fall through to `pc + 1`; the rest are epsilon transitions or terminal.
-pub const Inst = union(enum) {
-    /// Match this exact code_point.
-    char: CodePoint,
-    /// Match a code_point inside `ranges[start..start+len]` (already positive).
-    range: struct { start: u32, len: u32 },
-    /// Match any code_point (`dot_all`) or any-except-`\n`.
-    any: struct { dot_all: bool },
-    /// Record the current byte offset into capture slot `n`.
-    save: u32,
-    /// Two-way epsilon branch; `a` has higher priority than `b`.
-    split: struct { a: u32, b: u32 },
-    /// Unconditional epsilon jump.
-    jmp: u32,
-    /// Zero-width assertion; the thread dies unless it holds.
-    assertion: hir.AnchorKind,
-    /// Accept.
-    match,
-};
-
-/// The compiled, immutable program. Self-contained: it copies every range it
-/// needs out of the HIR, so the HIR may be freed after `buildAlloc`.
-pub const Program = struct {
-    insts: []const Inst,
-    ranges: []const Range,
-    /// `2 * (capture_count + 1)` — slots needed by `searchCaptures`.
-    slot_count: u32,
-};
-
-// ── Compiler: HIR → Program ──────────────────────────────────────────────────────
-
-/// Exact output sizes, from the `.count` pass.
-const Sizes = struct { insts: u32, ranges: u32 };
-
-const Mode = enum { count, emit };
-
-/// One compiler body, two modes — `.count` measures exact sizes, `.emit` fills
-/// caller buffers (with backpatching). Identical control flow ⇒ identical sizes,
-/// so the same code serves `buildAlloc` (heap) and `buildComptime` (ro_data),
-/// exactly like core/hir.zig. `error.Unsupported` is raised for `\X`.
-fn Builder(comptime mode: Mode) type {
-    return struct {
-        const Self = @This();
-        const is_emit = mode == .emit;
-
-        h: hir.Hir,
-        // Buffers + a backpatch stack exist only when emitting.
-        insts: if (is_emit) []Inst else void = if (is_emit) undefined else {},
-        ranges: if (is_emit) []Range else void = if (is_emit) undefined else {},
-        // A real (empty in count mode) slice so the backpatch loops type-check in
-        // both modes; count mode never pushes, so the loops run zero iterations.
-        patch: []u32 = &.{},
-        inst_len: u32 = 0,
-        range_len: u32 = 0,
-        patch_len: u32 = 0,
-
-        fn emit(self: *Self, inst: Inst) u32 {
-            const i = self.inst_len;
-            if (is_emit) self.insts[i] = inst;
-            self.inst_len += 1;
-            return i;
-        }
-        fn set(self: *Self, idx: u32, inst: Inst) void {
-            if (is_emit) self.insts[idx] = inst;
-        }
-        fn pc(self: *const Self) u32 {
-            return self.inst_len;
-        }
-        fn pushPatch(self: *Self, idx: u32) void {
-            if (is_emit) {
-                self.patch[self.patch_len] = idx;
-                self.patch_len += 1;
-            }
-        }
-        fn addRanges(self: *Self, src: []const Range) u32 {
-            const start = self.range_len;
-            if (is_emit) @memcpy(self.ranges[start .. start + src.len], src);
-            self.range_len += @intCast(src.len);
-            return start;
-        }
-
-        fn compileNode(self: *Self, idx: u32) error{Unsupported}!void {
-            const node = self.h.nodes[idx];
-            switch (node.tag) {
-                .empty => {},
-                .literal => {
-                    const r = node.data.run;
-                    for (self.h.literals[r.start .. r.start + r.len]) |cp| _ = self.emit(.{ .char = cp });
-                },
-                .class => {
-                    const c = node.data.class;
-                    const start = self.addRanges(self.h.ranges[c.start .. c.start + c.len]);
-                    _ = self.emit(.{ .range = .{ .start = start, .len = c.len } });
-                },
-                .any => _ = self.emit(.{ .any = .{ .dot_all = node.data.any.dot_all } }),
-                .anchor => _ = self.emit(.{ .assertion = node.data.anchor.kind }),
-                .grapheme => return error.Unsupported,
-                .concat => {
-                    const d = node.data.children;
-                    for (self.h.children[d.start .. d.start + d.len]) |child| try self.compileNode(child);
-                },
-                .alternation => try self.compileAlternation(node.data.children),
-                .repetition => try self.compileRepetition(node.data.repetition),
-                .capture => {
-                    const c = node.data.capture;
-                    _ = self.emit(.{ .save = 2 * c.index });
-                    try self.compileNode(c.child);
-                    _ = self.emit(.{ .save = 2 * c.index + 1 });
-                },
-            }
-        }
-
-        /// `a|b|c`: a chain of splits, each non-final branch jumping to a common end.
-        fn compileAlternation(self: *Self, d: hir.Node.Children) error{Unsupported}!void {
-            const kids = self.h.children[d.start .. d.start + d.len];
-            const base = self.patch_len;
-            for (kids, 0..) |child, i| {
-                if (i + 1 < kids.len) {
-                    const split_at = self.emit(.{ .split = .{ .a = 0, .b = 0 } });
-                    const branch = self.pc();
-                    try self.compileNode(child);
-                    self.pushPatch(self.emit(.{ .jmp = 0 }));
-                    self.set(split_at, .{ .split = .{ .a = branch, .b = self.pc() } });
-                } else {
-                    try self.compileNode(child); // last branch: no split, no jmp
-                }
-            }
-            const end = self.pc();
-            while (self.patch_len > base) {
-                self.patch_len -= 1;
-                self.set(self.patch[self.patch_len], .{ .jmp = end });
-            }
-        }
-
-        fn compileRepetition(self: *Self, rep: hir.Node.Repetition) error{Unsupported}!void {
-            var n: u32 = 0;
-            while (n < rep.min) : (n += 1) try self.compileNode(rep.child); // mandatory copies
-
-            if (rep.max) |max| {
-                // (max - min) optional copies; each split skips to the common end.
-                const base = self.patch_len;
-                var k: u32 = rep.min;
-                while (k < max) : (k += 1) {
-                    self.pushPatch(self.emit(.{ .split = .{ .a = 0, .b = 0 } }));
-                    try self.compileNode(rep.child);
-                }
-                const end = self.pc();
-                while (self.patch_len > base) {
-                    self.patch_len -= 1;
-                    const si = self.patch[self.patch_len];
-                    const body = si + 1;
-                    self.set(si, if (rep.greedy) .{ .split = .{ .a = body, .b = end } } else .{ .split = .{ .a = end, .b = body } });
-                }
-            } else {
-                // Unbounded tail: a star of the child (x{min,} = x{min} x*).
-                const split_at = self.emit(.{ .split = .{ .a = 0, .b = 0 } });
-                const body = self.pc();
-                try self.compileNode(rep.child);
-                _ = self.emit(.{ .jmp = split_at });
-                const after = self.pc();
-                self.set(split_at, if (rep.greedy) .{ .split = .{ .a = body, .b = after } } else .{ .split = .{ .a = after, .b = body } });
-            }
-        }
-    };
-}
-
-/// Count-only pass: the program is `save 0 · <root> · save 1 · match`.
-fn measure(h: hir.Hir) error{Unsupported}!Sizes {
-    var b = Builder(.count){ .h = h };
-    _ = b.emit(.{ .save = 0 });
-    try b.compileNode(h.root);
-    _ = b.emit(.{ .save = 1 });
-    _ = b.emit(.match);
-    return .{ .insts = b.inst_len, .ranges = b.range_len };
-}
-
-/// Emit pass: fill caller buffers (each ≥ the matching `measure` size; `patch` ≥
-/// `insts.len`) and return the `Program` sub-slicing them.
-fn build(h: hir.Hir, insts: []Inst, ranges: []Range, patch: []u32) error{Unsupported}!Program {
-    var b = Builder(.emit){ .h = h, .insts = insts, .ranges = ranges, .patch = patch };
-    _ = b.emit(.{ .save = 0 });
-    try b.compileNode(h.root);
-    _ = b.emit(.{ .save = 1 });
-    _ = b.emit(.match);
-    return .{
-        .insts = insts[0..b.inst_len],
-        .ranges = ranges[0..b.range_len],
-        .slot_count = 2 * (h.capture_count + 1),
-    };
-}
+/// The NFA instruction set and compiled program live in the shared `nfa` module
+/// (the backtracking backend executes the *same* program differently).
+pub const Inst = nfa.Inst;
+pub const Program = nfa.Program;
 
 /// Compile a HIR into a heap-allocated `Program` (free with `freeProgram`).
 pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Program {
-    const sizes = measure(h) catch return error.Unsupported;
-    const insts = try gpa.alloc(Inst, sizes.insts);
-    errdefer gpa.free(insts);
-    const ranges = try gpa.alloc(Range, sizes.ranges);
-    errdefer gpa.free(ranges);
-    const patch = try gpa.alloc(u32, sizes.insts); // backpatch stack ≤ #insts
-    defer gpa.free(patch);
-    return build(h, insts, ranges, patch) catch error.Unsupported;
+    return nfa.buildAlloc(gpa, h);
 }
 
-/// Compile a HIR into a ro_data `Program` at comptime — the basis for
-/// `compileComptime`. `\X` becomes a `@compileError`.
+/// Compile a HIR into a ro_data `Program` at comptime. `\X` becomes a `@compileError`.
 pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
-    // Compilation here is just two linear walks of the (already-resolved) HIR —
-    // no Unicode-table scans. Cost is ~O(nodes + literals + ranges), so the quota
-    // ceiling scales with those. Generous (~100×) but nowhere near the old
-    // 20k/node blanket.
-    const work: u64 = @as(u64, h.nodes.len) + h.literals.len + h.ranges.len;
-    @setEvalBranchQuota(@intCast(@min(20_000 + work * 100, std.math.maxInt(u32))));
-    const sizes = comptime (measure(h) catch @compileError("pikevm: unsupported HIR node (\\X grapheme is not supported by this backend)"));
-    comptime var insts: [sizes.insts]Inst = undefined;
-    comptime var ranges: [sizes.ranges]Range = undefined;
-    comptime var patch: [sizes.insts]u32 = undefined;
-    const prog = build(h, &insts, &ranges, &patch) catch unreachable; // measure already validated
-    const final_insts = insts[0..prog.insts.len].*;
-    const final_ranges = ranges[0..prog.ranges.len].*;
-    return .{ .insts = &final_insts, .ranges = &final_ranges, .slot_count = prog.slot_count };
+    return nfa.buildComptime(h);
 }
 
 pub fn freeProgram(gpa: std.mem.Allocator, program: *Program) void {
-    gpa.free(program.insts);
-    gpa.free(program.ranges);
+    nfa.freeProgram(gpa, program);
 }
 
-// ── Scratch: thread lists ────────────────────────────────────────────────────────
+
+// ── Scratch: one typed word buffer (comptime- and runtime-usable) ────────────────
+
+/// Scratch storage word — the shared contract type, so one `[]Cell` buffer backs
+/// every internal array and `auto` can forward the same buffer here. `.w` holds
+/// thread `pc`s and generation stamps, `.slot` holds capture offsets (a natural
+/// `?usize`). Carving by plain slicing is what lets `initBuffer` run at comptime.
+pub const Cell = backend.Cell;
+
+/// Top-bit tag distinguishing the two `Step` kinds packed into the work stack.
+/// A `pc`/`slot` index never reaches the top bit of a `usize`, so it is free.
+const STACK_TAG: usize = @as(usize, 1) << (@bitSizeOf(usize) - 1);
 
 /// A priority-ordered set of NFA threads, deduplicated by `pc` via generation
 /// stamping (clearing is O(1): bump `gen`).
 const ThreadList = struct {
-    pcs: []u32,
-    slots: []?usize, // capacity * slot_count
-    seen: []u32,
-    gen: u32 = 0,
+    pcs: []Cell, // .w   — instruction pointer per live thread (len = capacity)
+    slots: []Cell, // .slot — capture offsets (len = capacity * sc)
+    seen: []Cell, // .w   — generation stamp per pc (len = capacity)
+    gen: usize = 0,
     n: usize = 0,
     sc: usize,
 
-    fn init(gpa: std.mem.Allocator, capacity: usize, sc: usize) std.mem.Allocator.Error!ThreadList {
-        const seen = try gpa.alloc(u32, capacity);
-        @memset(seen, 0);
-        return .{
-            .pcs = try gpa.alloc(u32, capacity),
-            .slots = try gpa.alloc(?usize, capacity * sc),
-            .seen = seen,
-            .sc = sc,
-        };
-    }
-    fn deinit(self: *ThreadList, gpa: std.mem.Allocator) void {
-        gpa.free(self.pcs);
-        gpa.free(self.slots);
-        gpa.free(self.seen);
+    /// Build from caller-provided backing arrays (carved out of the one buffer).
+    /// `seen` is zeroed so the generation stamp starts clean.
+    fn fromParts(pcs: []Cell, slots: []Cell, seen: []Cell, sc: usize) ThreadList {
+        @memset(seen, .{ .w = 0 });
+        return .{ .pcs = pcs, .slots = slots, .seen = seen, .sc = sc };
     }
     fn clear(self: *ThreadList) void {
         self.n = 0;
@@ -303,95 +91,196 @@ const ThreadList = struct {
     }
 };
 
+/// One unit of deferred work for the iterative epsilon closure (`addThread`).
+/// `visit` follows the instruction at `pc`; `restore` writes `old` back into a
+/// capture slot once a `save`'s subtree has been fully explored, so sibling
+/// branches never observe the write. This is the explicit-stack form of the
+/// recursive closure's save/restore — see `addThread`. It is packed into the
+/// `[]Cell` stack two cells at a time (payload word + optional `old`).
+const Step = union(enum) {
+    visit: u32,
+    restore: struct { slot: u32, old: ?usize },
+};
+
+fn pushVisit(stack: []Cell, top: *usize, pc: u32) void {
+    stack[top.*] = .{ .w = pc };
+    top.* += 2;
+}
+fn pushRestore(stack: []Cell, top: *usize, slot: u32, old: ?usize) void {
+    stack[top.*] = .{ .w = @as(usize, slot) | STACK_TAG };
+    stack[top.* + 1] = .{ .slot = old };
+    top.* += 2;
+}
+fn popStep(stack: []Cell, top: *usize) Step {
+    top.* -= 2;
+    const w0 = stack[top.*].w;
+    if (w0 & STACK_TAG != 0)
+        return .{ .restore = .{ .slot = @intCast(w0 & ~STACK_TAG), .old = stack[top.* + 1].slot } };
+    return .{ .visit = @intCast(w0) };
+}
+
 /// Per-search mutable state (caller-owned; see the contract). Two thread lists, a
-/// working slot array for the epsilon closure, and the winning match's slots.
+/// working slot array for the epsilon closure, the closure's iterative work stack,
+/// and the winning match's slots — all carved from one `[]Cell` buffer.
 pub const Scratch = struct {
     clist: ThreadList,
-    nlist: ThreadList,
-    entry_slots: []?usize,
-    match_slots: []?usize,
+    n_list: ThreadList,
+    entry_slots: []Cell, // .slot — working captures for the seed closure
+    match_slots: []Cell, // .slot — the winning thread's captures
+    /// Work stack for `addThread` (the epsilon closure runs iteratively, not by
+    /// recursion). Each `Step` is two cells; the closure expands each `pc` at most
+    /// once (the `seen` guard) and only `split`/`save` push, so the live depth
+    /// never exceeds the instruction count — hence `2 * #insts` cells.
+    stack: []Cell,
     slot_count: usize,
+    /// The buffer `init` allocated, freed by `deinit`. `null` for a buffer-backed
+    /// Scratch (the caller owns that storage; `deinit` is then a no-op).
+    owned: ?[]Cell = null,
 
-    /// Allocator-backed init. Sized from the program (thread capacity = #insts).
-    pub fn init(gpa: std.mem.Allocator, program: *const Program) std.mem.Allocator.Error!Scratch {
+    /// Buffer element type for the `initBuffer`/comptime convention (see backend.zig).
+    pub const Buf = backend.Cell;
+
+    /// Number of `Cell`s a buffer must hold for this program. Use it to size a
+    /// fixed buffer (`var buf: [Scratch.bufferLen(&prog)]Scratch.Cell = undefined;`).
+    pub fn bufferLen(program: *const Program) usize {
         const cap = program.insts.len;
         const sc = program.slot_count;
+        // c{pcs,slots,seen} + n{pcs,slots,seen} + entry + match + stack
+        return 6 * cap + 2 * cap * sc + 2 * sc;
+    }
+
+    /// Carve a caller-provided `[]Cell` buffer (≥ `bufferLen`) into the scratch
+    /// arrays. **Works at comptime and runtime** — at comptime the caller declares
+    /// the buffer as `var buf: [N]Cell` and references it. No allocator, no
+    /// teardown (the caller owns `buf`); on a short buffer returns
+    /// `error.BufferTooSmall`. This is the "with limits" path of the design.
+    pub fn initBuffer(buf: []Cell, program: *const Program) backend.ScratchError!Scratch {
+        const cap = program.insts.len;
+        const sc = program.slot_count;
+        var cur = backend.Carver{ .buf = buf };
+        const c_pcs = try cur.take(cap);
+        const c_slots = try cur.take(cap * sc);
+        const c_seen = try cur.take(cap);
+        const n_pcs = try cur.take(cap);
+        const n_slots = try cur.take(cap * sc);
+        const n_seen = try cur.take(cap);
+        const e_slots = try cur.take(sc);
+        const m_slots = try cur.take(sc);
+        const stk = try cur.take(2 * cap);
         return .{
-            .clist = try ThreadList.init(gpa, cap, sc),
-            .nlist = try ThreadList.init(gpa, cap, sc),
-            .entry_slots = try gpa.alloc(?usize, sc),
-            .match_slots = try gpa.alloc(?usize, sc),
+            .clist = ThreadList.fromParts(c_pcs, c_slots, c_seen, sc),
+            .n_list = ThreadList.fromParts(n_pcs, n_slots, n_seen, sc),
+            .entry_slots = e_slots,
+            .match_slots = m_slots,
+            .stack = stk,
             .slot_count = sc,
         };
     }
 
+    /// Allocator-backed init: grab one `[]Cell` and carve it. The buffer is owned
+    /// and released by `deinit`.
+    pub fn init(gpa: std.mem.Allocator, program: *const Program) std.mem.Allocator.Error!Scratch {
+        const buf = try gpa.alloc(Cell, bufferLen(program));
+        var s = initBuffer(buf, program) catch unreachable; // buffer sized exactly
+        s.owned = buf;
+        return s;
+    }
+
     pub fn deinit(self: *Scratch, gpa: std.mem.Allocator) void {
-        self.clist.deinit(gpa);
-        self.nlist.deinit(gpa);
-        gpa.free(self.entry_slots);
-        gpa.free(self.match_slots);
+        if (self.owned) |buf| gpa.free(buf);
+        self.owned = null;
     }
 
     /// Optional fast reuse — `run` already re-initializes per call, so this is a
     /// no-op kept for contract symmetry / explicit intent.
     pub fn reset(self: *Scratch) void {
         self.clist.clear();
-        self.nlist.clear();
+        self.n_list.clear();
     }
 };
 
 // ── Epsilon closure ──────────────────────────────────────────────────────────────
 
-/// Add a thread at `pc` to `list`, following epsilon transitions
+/// Add a thread at `pc0` to `list`, following epsilon transitions
 /// (split/jmp/save/assertion) and appending consuming/match instructions. `slots`
-/// is the working capture array; `save` mutates then restores it so sibling
-/// branches are unaffected, and the value at a consuming/match inst is snapshotted
-/// into the list entry. Dedup by `pc` keeps it linear.
-fn addThread(program: *const Program, list: *ThreadList, pc: u32, slots: []?usize, sp: usize, input: []const u8) void {
-    if (list.seen[pc] == list.gen) return;
-    list.seen[pc] = list.gen;
-    switch (program.insts[pc]) {
-        .jmp => |t| addThread(program, list, t, slots, sp, input),
-        .split => |s| {
-            addThread(program, list, s.a, slots, sp, input);
-            addThread(program, list, s.b, slots, sp, input);
-        },
-        .save => |slot| {
-            if (slot < slots.len) {
-                const old = slots[slot];
-                slots[slot] = sp;
-                addThread(program, list, pc + 1, slots, sp, input);
-                slots[slot] = old;
-            } else {
-                addThread(program, list, pc + 1, slots, sp, input);
-            }
-        },
-        .assertion => |kind| {
-            if (assertionHolds(kind, input, sp)) addThread(program, list, pc + 1, slots, sp, input);
-        },
-        else => {
-            const i = list.n;
-            list.pcs[i] = pc;
-            @memcpy(list.slots[i * list.sc .. i * list.sc + list.sc], slots[0..list.sc]);
-            list.n += 1;
-        },
+/// is the working capture array; a `save` mutates it and queues a `restore` so
+/// sibling branches are unaffected, and the value at a consuming/match inst is
+/// snapshotted into the list entry. Dedup by `pc` (via `seen`/`gen`) keeps it
+/// linear and breaks epsilon cycles.
+///
+/// Done **iteratively** over the caller-owned `stack`, not by recursion: a deeply
+/// nested pattern produces a long epsilon chain, and recursing it once per `pc`
+/// would overflow the call stack. Each non-branching step (jmp/save/assertion and
+/// the higher-priority `split` arm) is followed in place; only the lower-priority
+/// `split` arm and a `save`'s deferred `restore` are pushed. A pushed entry pops
+/// only after everything above it drains — exactly the dynamic extent of the
+/// recursive call it replaces — so leftmost-first priority and capture save/restore
+/// nesting are preserved bit-for-bit.
+fn addThread(program: *const Program, list: *ThreadList, pc0: u32, slots: []Cell, sp: usize, input: []const u8, stack: []Cell) void {
+    var top: usize = 0;
+    pushVisit(stack, &top, pc0);
+    while (top > 0) {
+        switch (popStep(stack, &top)) {
+            // A `save`'s subtree (everything pushed above this) is now drained —
+            // undo the slot write so it stays local to that subtree.
+            .restore => |r| if (r.slot < slots.len) {
+                slots[r.slot] = .{ .slot = r.old };
+            },
+            .visit => |start_pc| {
+                var pc = start_pc;
+                follow: while (true) {
+                    if (list.seen[pc].w == list.gen) break :follow; // already queued / cycle
+                    list.seen[pc] = .{ .w = list.gen };
+                    switch (program.insts[pc]) {
+                        .jmp => |t| pc = t,
+                        .split => |s| {
+                            // Pursue the higher-priority branch now; defer `b` so it
+                            // pops only after everything `a` reaches — leftmost-first.
+                            pushVisit(stack, &top, s.b);
+                            pc = s.a;
+                        },
+                        .save => |slot| {
+                            if (slot < slots.len) {
+                                pushRestore(stack, &top, slot, slots[slot].slot);
+                                slots[slot] = .{ .slot = sp };
+                            }
+                            pc += 1;
+                        },
+                        .assertion => |kind| {
+                            if (!nfa.assertionHolds(kind, input, sp)) break :follow; // thread dies
+                            pc += 1;
+                        },
+                        else => {
+                            // Consuming (char/range/any) or match: snapshot slots into
+                            // a list entry; this epsilon chain ends here.
+                            const i = list.n;
+                            list.pcs[i] = .{ .w = pc };
+                            @memcpy(list.slots[i * list.sc .. i * list.sc + list.sc], slots[0..list.sc]);
+                            list.n += 1;
+                            break :follow;
+                        },
+                    }
+                }
+            },
+        }
     }
 }
 
 // ── The VM ───────────────────────────────────────────────────────────────────────
 
-fn run(program: *const Program, sc: *Scratch, input: []const u8, opts: SearchOptions) ?[]const ?usize {
-    var clist = &sc.clist;
-    var nlist = &sc.nlist;
-    clist.clear();
-    nlist.clear();
-    @memset(sc.entry_slots, null);
+fn run(program: *const Program, sc: *Scratch, input: []const u8, opts: SearchOptions) ?[]const Cell {
+    var c_list = &sc.clist;
+    var n_list = &sc.n_list;
+    c_list.clear();
+    n_list.clear();
+    @memset(sc.entry_slots, .{ .slot = null });
 
     var matched = false;
     var sp = opts.start;
+
     while (true) {
         if (!matched and (!opts.anchored or sp == opts.start)) {
-            addThread(program, clist, 0, sc.entry_slots, sp, input);
+            addThread(program, c_list, 0, sc.entry_slots, sp, input, sc.stack);
         }
         const at_end = sp >= input.len;
         // Stop only when there are no live threads AND no way to spawn a new
@@ -399,30 +288,38 @@ fn run(program: *const Program, sc: *Scratch, input: []const u8, opts: SearchOpt
         // we've run out of input. For an unanchored search mid-input we keep
         // going even with an empty list — the next position seeds a fresh start
         // thread (crucial when a leading assertion like `^`/`\b` fails here).
-        if (clist.n == 0 and (matched or opts.anchored or at_end)) break;
+        if (c_list.n == 0 and (matched or opts.anchored or at_end)) break;
 
         var cp: CodePoint = 0;
-        var cplen: usize = 1;
+        var cp_len: usize = 1;
         if (!at_end) {
-            const d = decodeAt(input, sp);
-            cp = d.cp;
-            cplen = d.len;
+            const b = input[sp];
+            if (b <= 0x7F) {
+                // ASCII fast path: one byte, one scalar (the overwhelmingly common
+                // case for the scan's hot loop). `cp_len` already defaults to 1.
+                @branchHint(.likely);
+                cp = b;
+            } else {
+                const d = nfa.decodeAt(input, sp);
+                cp = d.cp;
+                cp_len = d.len;
+            }
         }
 
-        nlist.clear();
+        n_list.clear();
         var i: usize = 0;
-        while (i < clist.n) : (i += 1) {
-            const t_pc = clist.pcs[i];
-            const tslots = clist.slots[i * clist.sc .. i * clist.sc + clist.sc];
+        while (i < c_list.n) : (i += 1) {
+            const t_pc: u32 = @intCast(c_list.pcs[i].w);
+            const t_slots = c_list.slots[i * c_list.sc .. i * c_list.sc + c_list.sc];
             switch (program.insts[t_pc]) {
                 .char => |ch| if (!at_end and cp == ch)
-                    addThread(program, nlist, t_pc + 1, tslots, sp + cplen, input),
-                .range => |r| if (!at_end and inRanges(program.ranges[r.start .. r.start + r.len], cp))
-                    addThread(program, nlist, t_pc + 1, tslots, sp + cplen, input),
+                    addThread(program, n_list, t_pc + 1, t_slots, sp + cp_len, input, sc.stack),
+                .range => |r| if (!at_end and nfa.inRanges(program.ranges[r.start .. r.start + r.len], cp))
+                    addThread(program, n_list, t_pc + 1, t_slots, sp + cp_len, input, sc.stack),
                 .any => |a| if (!at_end and (a.dot_all or cp != '\n'))
-                    addThread(program, nlist, t_pc + 1, tslots, sp + cplen, input),
+                    addThread(program, n_list, t_pc + 1, t_slots, sp + cp_len, input, sc.stack),
                 .match => {
-                    @memcpy(sc.match_slots, tslots);
+                    @memcpy(sc.match_slots, t_slots);
                     matched = true;
                     break; // cut lower-priority threads
                 },
@@ -430,11 +327,11 @@ fn run(program: *const Program, sc: *Scratch, input: []const u8, opts: SearchOpt
             }
         }
 
-        const tmp = clist;
-        clist = nlist;
-        nlist = tmp;
+        const tmp = c_list;
+        c_list = n_list;
+        n_list = tmp;
         if (at_end) break;
-        sp += cplen;
+        sp += cp_len;
     }
     return if (matched) sc.match_slots[0..sc.slot_count] else null;
 }
@@ -447,73 +344,19 @@ pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, op
 
 pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) ?Match {
     const slots = run(program, scratch, input, opts) orelse return null;
-    return .{ .start = slots[0].?, .end = slots[1].? };
+    return .{ .start = slots[0].slot.?, .end = slots[1].slot.? };
 }
 
 pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const u8, slots_out: []?usize, opts: SearchOptions) ?Match {
     const slots = run(program, scratch, input, opts) orelse return null;
     const k = @min(slots_out.len, slots.len);
-    @memcpy(slots_out[0..k], slots[0..k]);
-    return .{ .start = slots[0].?, .end = slots[1].? };
+    var i: usize = 0;
+    while (i < k) : (i += 1) slots_out[i] = slots[i].slot;
+    return .{ .start = slots[0].slot.?, .end = slots[1].slot.? };
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────────
-
-fn inRanges(ranges: []const Range, cp: CodePoint) bool {
-    // Ranges are sorted+merged; a binary search is possible but linear is fine for
-    // the modest range counts the HIR produces.
-    for (ranges) |r| {
-        if (cp < r.lo) return false; // sorted: no later range can contain cp
-        if (cp <= r.hi) return true;
-    }
-    return false;
-}
-
-const Decoded = struct { cp: CodePoint, len: usize };
-
-/// Decode one code_point at byte offset `sp`. Invalid UTF-8 yields U+FFFD with a
-/// 1-byte advance — the engine's `fail`-ish policy: it won't match across an
-/// invalid byte but still makes progress.
-fn decodeAt(input: []const u8, sp: usize) Decoded {
-    const len = std.unicode.utf8ByteSequenceLength(input[sp]) catch return .{ .cp = 0xFFFD, .len = 1 };
-    if (sp + len > input.len) return .{ .cp = 0xFFFD, .len = 1 };
-    const cp = std.unicode.utf8Decode(input[sp .. sp + len]) catch return .{ .cp = 0xFFFD, .len = 1 };
-    return .{ .cp = cp, .len = len };
-}
-
-fn isCont(b: u8) bool {
-    return (b & 0xC0) == 0x80;
-}
-
-/// Decode the code_point ending just before byte offset `sp`, or null at the start.
-fn cpBefore(input: []const u8, sp: usize) ?CodePoint {
-    if (sp == 0) return null;
-    var i = sp - 1;
-    var back: usize = 0;
-    while (i > 0 and isCont(input[i]) and back < 3) : (back += 1) i -= 1;
-    const len = std.unicode.utf8ByteSequenceLength(input[i]) catch return input[sp - 1];
-    if (i + len != sp) return input[sp - 1]; // misaligned/invalid → last byte as scalar
-    return std.unicode.utf8Decode(input[i .. i + len]) catch input[sp - 1];
-}
-
-fn wordBefore(input: []const u8, sp: usize) bool {
-    return if (cpBefore(input, sp)) |c| properties.isWord(c) else false;
-}
-fn wordAfter(input: []const u8, sp: usize) bool {
-    if (sp >= input.len) return false;
-    return properties.isWord(decodeAt(input, sp).cp);
-}
-
-fn assertionHolds(kind: hir.AnchorKind, input: []const u8, sp: usize) bool {
-    return switch (kind) {
-        .text_start => sp == 0,
-        .text_end => sp == input.len,
-        .line_start => sp == 0 or input[sp - 1] == '\n',
-        .line_end => sp == input.len or input[sp] == '\n',
-        .word_boundary => wordBefore(input, sp) != wordAfter(input, sp),
-        .not_word_boundary => wordBefore(input, sp) == wordAfter(input, sp),
-    };
-}
+// Code-point match primitives (`inRanges`, `decodeAt`, `assertionHolds`) live in
+// the shared `nfa` module — see the `run` loop above.
 
 // ════════════════════════════════════════════════════════════════════════════════
 // Tests — extensive end-to-end coverage through Engine(PikeVM)
@@ -865,6 +708,30 @@ test "no catastrophic backtracking: (a*)*b on long non-matching input" {
     try testing.expect(re.isMatch("aaaab"));
 }
 
+test "deep nesting does not overflow the call stack (iterative epsilon closure)" {
+    // `a?a?a?…` (n times) lowers to a chain of n `split`s with no consuming inst
+    // between them. The seed closure has to walk every skip-branch in one go, so it
+    // descends n epsilon transitions deep — the old recursive `addThread` recursed
+    // once per `split` and overflowed the call stack well before this n. The
+    // iterative closure walks the same chain on `Scratch.stack` (capacity #insts),
+    // so it just works.
+    const gpa = testing.allocator;
+    const n = 100_000;
+    const pat = try gpa.alloc(u8, 2 * n);
+    defer gpa.free(pat);
+    for (0..n) |i| {
+        pat[2 * i] = 'a';
+        pat[2 * i + 1] = '?';
+    }
+    var re = try Compiled.init(pat);
+    defer re.deinit();
+    // All optionals may be skipped → matches empty at position 0; and greedily
+    // consumes as many 'a's as present.
+    try testing.expectEqual(@as(usize, 0), re.find("").?.start);
+    try testing.expectEqual(@as(usize, 0), re.find("").?.end);
+    try testing.expectEqualStrings("aaa", re.find("aaab").?.slice("aaab"));
+}
+
 test "nested quantifiers terminate" {
     try expectFind("(a+)+", "aaa", "aaa");
     try expectFind("(a?)*", "aaa", "aaa");
@@ -887,6 +754,98 @@ test "scratch is reusable across many searches without stale state" {
     const c3 = E.captures(&re.program, &re.scratch, "ab", &slots, re.meta, .{}).?;
     try testing.expectEqualStrings("a", c3.groupSlice(1).?);
     try testing.expectEqualStrings("b", c3.groupSlice(2).?);
+}
+
+// ── comptime matching + buffer scratch (the new capability) ───────────────────────
+
+test "pikevm: full match pipeline runs at COMPTIME via a buffer scratch" {
+    // Build program + scratch and run a search entirely at comptime: the buffer is
+    // a plain `[N]Cell` array, carved by slicing — no allocator, no reinterpret.
+    const got = comptime blk: {
+        @setEvalBranchQuota(2_000_000);
+        const a = compile.compile("(\\d{4})-(\\d{2})");
+        const h = switch (hir.buildComptime(a, .{})) {
+            .ok => |x| x,
+            .fail => @compileError("hir build failed"),
+        };
+        const program = buildComptime(h, .{});
+        var buf: [Scratch.bufferLen(&program)]Cell = undefined;
+        var sc = Scratch.initBuffer(&buf, &program) catch unreachable;
+        const input = "date 2026-06 end";
+        const m = E.find(&program, &sc, input, .{}) orelse @compileError("no match at comptime");
+        break :blk m.slice(input);
+    };
+    try testing.expectEqualStrings("2026-06", got);
+}
+
+test "pikevm: comptime captures via a buffer scratch" {
+    const ok = comptime blk: {
+        @setEvalBranchQuota(2_000_000);
+        const a = compile.compile("(\\w+)@(\\w+)");
+        const h = switch (hir.buildComptime(a, .{})) {
+            .ok => |x| x,
+            .fail => @compileError("hir"),
+        };
+        const program = buildComptime(h, .{});
+        var buf: [Scratch.bufferLen(&program)]Cell = undefined;
+        var sc = Scratch.initBuffer(&buf, &program) catch unreachable;
+        var slots: [6]?usize = undefined;
+        const input = "user@host";
+        const c = E.captures(&program, &sc, input, &slots, .{ .capture_count = 2 }, .{}) orelse
+            @compileError("no captures");
+        break :blk std.mem.eql(u8, c.groupSlice(1).?, "user") and std.mem.eql(u8, c.groupSlice(2).?, "host");
+    };
+    try testing.expect(ok);
+}
+
+test "pikevm: runtime buffer scratch (no allocator) + BufferTooSmall" {
+    const gpa = testing.allocator;
+    var diag: compile.Diagnostic = .{};
+    const ast = try compile.parse(gpa, "[a-z]+\\d+", &diag);
+    defer ast.deinit(gpa);
+    const h = try hir.buildAlloc(gpa, ast, .{});
+    defer hir.deinitHir(gpa, h);
+    var program = try buildAlloc(gpa, h, .{});
+    defer freeProgram(gpa, &program);
+
+    // A generous fixed stack buffer — no heap at all. At runtime the program size
+    // is dynamic, so the caller picks a capacity and checks the result; a
+    // too-small buffer is reported, never a crash.
+    var stack_buf: [1024]Cell = undefined;
+    var sc = try Scratch.initBuffer(&stack_buf, &program);
+    try testing.expectEqualStrings("abc123", E.find(&program, &sc, "??abc123!!", .{}).?.slice("??abc123!!"));
+    // reusable across searches, same as the heap scratch
+    try testing.expect(!E.isMatch(&program, &sc, "ABC", .{}));
+
+    // A buffer too small is rejected cleanly (no crash, no UB).
+    var tiny: [4]Cell = undefined;
+    try testing.expectError(error.BufferTooSmall, Scratch.initBuffer(&tiny, &program));
+}
+
+test "pikevm: comptime and buffer scratch agree with the heap scratch" {
+    const pat = "a(b|c)+d";
+    const input = "xxabcbcd!";
+    // heap
+    const gpa = testing.allocator;
+    var diag: compile.Diagnostic = .{};
+    const ast = try compile.parse(gpa, pat, &diag);
+    defer ast.deinit(gpa);
+    const h = try hir.buildAlloc(gpa, ast, .{});
+    defer hir.deinitHir(gpa, h);
+    var program = try buildAlloc(gpa, h, .{});
+    defer freeProgram(gpa, &program);
+    var heap_sc = try Scratch.init(gpa, &program);
+    defer heap_sc.deinit(gpa);
+    const heap_span = E.find(&program, &heap_sc, input, .{}).?;
+
+    // buffer (runtime, generous fixed capacity)
+    var buf: [1024]Cell = undefined;
+    var buf_sc = try Scratch.initBuffer(&buf, &program);
+    const buf_span = E.find(&program, &buf_sc, input, .{}).?;
+
+    try testing.expectEqual(heap_span.start, buf_span.start);
+    try testing.expectEqual(heap_span.end, buf_span.end);
+    try testing.expectEqualStrings("abcbcd", heap_span.slice(input));
 }
 
 test "grapheme node is rejected (caps.grapheme = false)" {

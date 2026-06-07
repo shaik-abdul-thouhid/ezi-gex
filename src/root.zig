@@ -46,14 +46,24 @@ pub const Backend = engine.backend;
 pub const Match = engine.Match;
 pub const Captures = engine.Captures;
 pub const SearchOptions = engine.SearchOptions;
+/// Built-in, pluggable backends: `auto` (default), `pikevm`, `backtrack`,
+/// `literal`. Pass any to `compileRuntimeWith`/`compileComptimeWith`.
+pub const backends = engine.backends;
+/// Front-door pipeline options (`case_fold`, …), comptime-known on both paths.
+pub const Options = engine.Options;
 
 // ── Front door: the simplest way to use the engine ────────────────────────────
 
 /// Runtime: compile a pattern into a heap-backed regex (free with `re.deinit()`).
 /// On a bad pattern, returns `error.InvalidPattern` and fills the `Diagnostic`.
+/// Uses the default `auto` backend.
 pub const compileRuntime = engine.compileRuntime;
 /// Comptime: compile a pattern into a ro_data regex (a bad pattern is a compile error).
 pub const compileComptime = engine.compileComptime;
+/// Runtime: compile with an explicit backend (`backends.pikevm`, `.literal`, …).
+pub const compileRuntimeWith = engine.compileRuntimeWith;
+/// Comptime: compile with an explicit backend.
+pub const compileComptimeWith = engine.compileComptimeWith;
 pub const Compiled = engine.Compiled;
 
 /// Runtime: build a heap-allocated AST (free with `Ast.deinit`).

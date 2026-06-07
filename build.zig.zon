@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.17.0-dev.702+18b3c78a9",
     .dependencies = .{
         .ezi_code = .{
-            .url = "git+https://github.com/shaik-abdul-thouhid/ezi-code.git?ref=main#85dbba89beaaf86b6179f1076a9987c05e7b7df4",
-            .hash = "ezi_code-0.3.0-dev-05Rjj3Kg0QDsS8IB3l6S7FZWeMGDkSfz1qLik3Qrdkle",
+            .url = "git+https://github.com/shaik-abdul-thouhid/ezi-code.git?ref=main#bb4e9f16155b70e5306c324c0f88cc12d189765a",
+            .hash = "ezi_code-0.3.0-dev-05RjjzTd0QAkvaPPttZSeM2oVp6u6WZKXlsFtS9AB7ZG",
         },
     },
     .paths = .{

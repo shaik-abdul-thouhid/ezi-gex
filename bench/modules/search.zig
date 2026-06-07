@@ -32,7 +32,7 @@ fn Pattern(comptime pat: []const u8) type {
             if (cached == null) {
                 const a = std.heap.page_allocator;
                 var diag: ezi_gex.Diagnostic = .{};
-                var re = try ezi_gex.compileRuntime(a, pat, &diag, .{});
+                var re = try ezi_gex.compileRuntimeWith(PikeVM, a, pat, &diag, .{});
                 const sc = try re.newScratch(a);
                 cached = .{ .re = re, .sc = sc };
                 // print-once: show the work this bench will measure.

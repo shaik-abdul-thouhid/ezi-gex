@@ -40,6 +40,8 @@ const ast = @import("ast.zig");
 const token = @import("token.zig");
 
 const ezi_code = @import("ezi_code");
+const encoding = ezi_code.encoding;
+const utf8 = ezi_code.encoding.utf8;
 const CodePoint = ezi_code.encoding.CodePoint;
 const props = ezi_code.unicode.properties;
 const u_scripts = ezi_code.unicode.scripts;
@@ -1038,8 +1040,13 @@ fn collectRequired(nodes: []const Node, children: []const u32, literals: []const
 /// verbatim and contiguously in every match (UTF-8 is self-synchronizing), so each
 /// is individually a "must appear" byte.
 fn addCpBytes(set: *ByteSet, cp: CodePoint) void {
+    // `encodeCodePointUnchecked` assumes a valid scalar (a surrogate or
+    // out-of-range value is illegal behaviour), so guard first — this also
+    // reproduces the old `utf8Encode … catch return`: non-encodable code points
+    // are skipped.
+    if (!encoding.isValidCodePoint(cp)) return;
     var buf: [4]u8 = undefined;
-    const n = std.unicode.utf8Encode(@intCast(cp), &buf) catch return; // skip non-encodable
+    const n = utf8.encodeCodePointUnchecked(cp, &buf);
     for (buf[0..n]) |b| set.set(b);
 }
 
@@ -1048,7 +1055,10 @@ const ByteBounds = struct { min: u32, max: ?u32 };
 /// UTF-8 byte length of a code point (1–4). Resolved HIR code points are always
 /// encodable; the `catch 4` is a defensive upper bound.
 fn utf8Len(cp: CodePoint) u32 {
-    return std.unicode.utf8CodepointSequenceLength(@intCast(cp)) catch 4;
+    // `utf8EncodeLen` is `unreachable` on an out-of-range scalar; guard so the
+    // defensive upper bound of 4 still applies to any non-encodable value.
+    if (!encoding.isValidCodePoint(cp)) return 4;
+    return utf8.utf8EncodeLen(cp);
 }
 
 /// Match-length bounds in UTF-8 bytes (parallels `lenBounds`, which counts code

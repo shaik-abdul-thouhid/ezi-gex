@@ -31,7 +31,7 @@ fn Pattern(comptime pat: []const u8, comptime tmpl: []const u8) type {
             if (cached == null) {
                 const a = std.heap.page_allocator;
                 var diag: ezi_gex.Diagnostic = .{};
-                var re = try ezi_gex.compileRuntime(a, pat, &diag, .{});
+                var re = try ezi_gex.compileRuntimeWith(PikeVM, a, pat, &diag, .{});
                 cached = .{
                     .re = re,
                     .sc = try re.newScratch(a),

@@ -10,6 +10,8 @@ const ezi_gex = @import("ezi_gex");
 const Context = framework.Context;
 const RunResult = framework.RunResult;
 
+const PikeVM = ezi_gex.engine.backends.pikevm;
+
 const patterns = [_][]const u8{
     "the",
     "\\w+",
@@ -32,7 +34,7 @@ fn run(ctx: *Context) anyerror!RunResult {
     while (n < inner) : (n += 1) {
         for (patterns) |p| {
             var diag: ezi_gex.Diagnostic = .{};
-            var re = ezi_gex.compileRuntime(ctx.allocator, p, &diag, .{}) catch continue;
+            var re = ezi_gex.compileRuntimeWith(PikeVM, ctx.allocator, p, &diag, .{}) catch continue;
             re.deinit();
             bytes += p.len;
             ops += 1;

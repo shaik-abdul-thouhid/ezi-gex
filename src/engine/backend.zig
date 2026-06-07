@@ -19,6 +19,9 @@
 
 const std = @import("std");
 
+const ezi_code = @import("ezi_code");
+const utf8 = ezi_code.encoding.utf8;
+
 // ── Shared value types ──────────────────────────────────────────────────────────
 
 /// A match span, as byte offsets into the input.
@@ -86,6 +89,48 @@ pub const Meta = struct {
 /// Suggested error sets (backends may use their own supersets).
 pub const BuildError = error{ PatternTooComplex, Unsupported } || std.mem.Allocator.Error;
 pub const ScratchError = error{ BufferTooSmall, Unsupported } || std.mem.Allocator.Error;
+
+// ── OPTIONAL shared scratch helpers (NOT part of the contract) ────────────────────
+//
+// `Cell`/`Carver` are a convenience the *built-in* backends (pikevm, literal,
+// backtrack, auto) opt into; they are **not** required by the contract and
+// `verifyBackend` never checks for them. A third-party backend is free to use ANY
+// `Scratch` representation it likes — an `ArrayList`, a fixed struct, nothing at
+// all — with whatever `init`/`initBuffer` signatures it chooses (or none). The
+// front door only ever reaches for these behind `@hasDecl`, so a backend that
+// omits them still works; it simply doesn't get the buffer/comptime convenience.
+
+/// One word of scratch storage used by the built-in backends, so a SINGLE typed
+/// `[]Cell` buffer can back all of a backend's working arrays — and so `auto` can
+/// hand the same buffer to whichever sub-backend it selects. A **bare union**:
+/// integer/pc/bitset words live in `.w`, capture offsets in `.slot` (a natural
+/// `?usize`, no sentinel). Each region only ever touches one field, keeping the
+/// untagged access well-defined.
+///
+/// Why a homogeneous typed buffer rather than a `[]u8` arena: carving it is plain
+/// slicing (`buf[a..b]`) with **no pointer reinterpretation**, so the same
+/// `initBuffer` code runs at **comptime** — a caller writes `var buf: [N]Cell` —
+/// as at runtime. A `[]u8` arena cannot: `@ptrCast`/`@intFromPtr` are runtime-only.
+/// The built-in backends therefore expose, **by convention** (gated, not enforced):
+///   * `pub const Buf = Cell;`            — the buffer element type
+///   * `pub fn bufferLen(program) usize;` — words a buffer must hold
+///   * `pub fn initBuffer(buf: []Buf, program) ScratchError!Scratch;`
+pub const Cell = union { w: usize, slot: ?usize };
+
+/// A bump-carver that slices a `[]Cell` buffer into typed sub-arrays. Pure slicing,
+/// so it runs at comptime as well as runtime; a short buffer yields
+/// `error.BufferTooSmall` (the "with limits" failure mode), never UB.
+pub const Carver = struct {
+    buf: []Cell,
+    off: usize = 0,
+    pub fn take(self: *Carver, n: usize) ScratchError![]Cell {
+        const end = self.off + n;
+        if (end > self.buf.len) return error.BufferTooSmall;
+        const out = self.buf[self.off..end];
+        self.off = end;
+        return out;
+    }
+};
 
 // ── A resolved set of captures (backend-agnostic view over `slots`) ──────────────
 
@@ -354,7 +399,10 @@ pub fn Engine(comptime Backend: type) type {
 /// loops terminate). Lone/invalid lead bytes advance by 1.
 fn advanceCodePoint(input: []const u8, i: usize) usize {
     if (i >= input.len) return i + 1;
-    return i + (std.unicode.utf8ByteSequenceLength(input[i]) catch 1);
+    // `codePointLenLossy` returns the lead byte's optimistic length (1–4), or 0
+    // for an invalid lead byte — map that to a 1-byte advance.
+    const len = utf8.codePointLenLossy(input[i]);
+    return i + (if (len == 0) 1 else @as(usize, len));
 }
 
 fn isDigit(c: u8) bool {
