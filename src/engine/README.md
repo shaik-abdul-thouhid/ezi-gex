@@ -15,10 +15,17 @@
 
 1. `regex.compile*` runs `core` (pattern → AST → HIR), then `Backend.build*`
    (HIR → `Program`), and stores the `Program` + capture `Meta`.
-2. The caller makes a `Scratch` off the exposed type —
-   `@TypeOf(re).Scratch.init(gpa, &re.program)` (or `.initBuffer(buf, &re.program)`
-   for a fixed buffer). They own it; one per thread. The front door never constructs
-   it — the backend's `Scratch` owns its own lifecycle.
+2. The caller makes a `Scratch` of the backend's `Scratch` type and hands it to the
+   search ops — that is all the engine requires; it dictates no representation. *How*
+   the `Scratch` is built is the backend's design, so the caller builds it **directly
+   off `@TypeOf(re).Scratch`**, not through any front-door method — `Compiled` holds the
+   `Scratch` type and forwards `&sc`, nothing more. The built-in backends offer two
+   conventions: `@TypeOf(re).Scratch.init(gpa, &re.program)` (heap) and
+   `@TypeOf(re).Scratch.initBuffer(buf, &re.program)` over a
+   `@TypeOf(re).Scratch.bufferLen(&re.program)`-sized `@TypeOf(re).Scratch.Buf` buffer
+   (no allocator). A backend with a different protocol is built however it specifies (a
+   stateless one is just `.{}`). The caller owns it; the built-ins' `Scratch` is one per
+   thread (a backend may instead implement a thread-safe one).
 3. `re.find(&sc, input)` forwards to `Engine(Backend).find`, which calls the
    backend's `search` primitive. The backend only locates a match and fills slots;
    `Engine` does all iteration/captures/replace.

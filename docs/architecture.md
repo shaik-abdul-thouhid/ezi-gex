@@ -506,13 +506,18 @@ _ = re.find(&sc, input);
 
 ### Caveats (the fine print)
 
-- **A `Scratch` is single-threaded by definition.** It is mutated on every search; sharing
-  one across threads concurrently is a data race. One per thread — never pool one across them.
-- **The `backtrack` backend allocates *during* a search.** Its heap `Scratch` grows the
-  `(pc, sp)` visited bitset on demand through the allocator it was created with, and `auto`
-  routes inputs ≤ 4096 bytes to backtrack. So a per-thread `Scratch` is **necessary but not
-  sufficient** — if every thread's Scratch shares one *non-thread-safe* allocator, two threads
-  growing their visited sets at once race **inside the allocator**. Pick one:
+- **A `Scratch`'s concurrency model is the backend's choice.** The contract only requires
+  that a search takes `*Scratch`; whether that type is thread-safe is up to the backend — one
+  is free to implement a `Scratch` safe to share. **The four built-ins do not:** their
+  `Scratch` is mutated on every search, so sharing one across threads concurrently is a data
+  race. For them: one per thread — never pool one across them.
+- **The built-in `backtrack` backend allocates *during* a search** — but through the
+  allocator *you* gave it, not a hidden internal one (the front door allocates nothing while
+  matching). Its heap `Scratch` grows the `(pc, sp)` visited bitset on demand through the
+  allocator passed to `Scratch.init`, and `auto` routes inputs ≤ 4096 bytes to backtrack. So a
+  per-thread `Scratch` is **necessary but not sufficient** — if every thread's Scratch shares
+  one *non-thread-safe* allocator, two threads growing their visited sets at once race **inside
+  the allocator**. Pick one:
   - give each thread its own allocator / arena (cleanest), **or**
   - use a thread-safe allocator (std `GeneralPurposeAllocator` defaults to thread-safe;
     `page_allocator` is), **or**

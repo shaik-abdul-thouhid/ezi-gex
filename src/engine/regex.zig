@@ -97,29 +97,6 @@ pub fn Compiled(comptime B: type) type {
             if (self.meta.group_names.len != 0) a.free(self.meta.group_names);
         }
 
-        // ── scratch (caller-owned; the front door does NOT construct it) ──────────
-        //
-        // `Compiled` exposes only the Scratch TYPE (`Scratch` above) and the
-        // `program` field — never a constructor. Build an instance off the type with
-        // the backend's own mechanism, passing `&re.program`, exactly the
-        // `std.ArrayList(T)` model (the library hands you the type; you construct it
-        // with the resource you choose):
-        //
-        //   const Sc = @TypeOf(re).Scratch;
-        //   var sc = try Sc.init(gpa, &re.program);            // heap-backed
-        //   defer sc.deinit(gpa);
-        //
-        //   // …or, no allocator, over a caller-owned fixed buffer:
-        //   var buf: [Sc.bufferLen(&re.program)]Sc.Buf = undefined;
-        //   var sc = try Sc.initBuffer(&buf, &re.program);
-        //
-        //   // …or, a stateless backend whose Scratch needs no init:
-        //   var sc: @TypeOf(re).Scratch = .{};
-        //
-        // Keeping construction (and sizing) off `Compiled` is what makes it agnostic
-        // to *how* a Scratch is built: a backend with a novel init contract — two
-        // allocators, a pool, a config struct — needs zero changes here.
-
         /// How many `?usize` capture slots `captures`/`capturesAll`/`replaceAll`
         /// need: `2 * (captureCount + 1)`. Pre-allocate exactly this many.
         ///
@@ -195,7 +172,7 @@ pub fn Compiled(comptime B: type) type {
 
         fn requireBufferConvention() void {
             if (!@hasDecl(B.Scratch, "initBuffer") or !@hasDecl(B.Scratch, "bufferLen") or !@hasDecl(B.Scratch, "Buf"))
-                @compileError("comptime matching requires the backend's Scratch to expose Buf/bufferLen/initBuffer");
+                @compileError("the buffer-scratch / comptime-matching path requires the backend's Scratch to expose Buf/bufferLen/initBuffer");
         }
 
         /// @stable-since: v0.1.0
@@ -230,6 +207,28 @@ pub fn Compiled(comptime B: type) type {
                 var buf: [B.Scratch.bufferLen(&self.program)]B.Scratch.Buf = undefined;
                 var sc = B.Scratch.initBuffer(&buf, &self.program) catch unreachable;
                 return Eng.count(&self.program, &sc, input, .{});
+            }
+        }
+        /// Comptime captures: resolve the first match's groups at compile time. The
+        /// returned `Captures` references `ro_data` (the slot offsets and the input
+        /// are frozen into the binary), so `groupSlice`/`namedSlice` work on it at
+        /// comptime *and* at runtime. This rounds out `findComptime` with submatch
+        /// access; the backend must support captures (`caps.captures`).
+        ///
+        /// @stable-since: v0.2.0
+        pub fn capturesComptime(comptime self: Self, comptime input: []const u8) ?Captures {
+            comptime {
+                requireBufferConvention();
+                @setEvalBranchQuota(comptimeQuota(input.len));
+                var buf: [B.Scratch.bufferLen(&self.program)]B.Scratch.Buf = undefined;
+                var sc = B.Scratch.initBuffer(&buf, &self.program) catch unreachable;
+                var slots: [self.meta.slotLen()]?usize = undefined;
+                _ = Eng.captures(&self.program, &sc, input, &slots, self.meta, .{}) orelse return null;
+                // Freeze the resolved slots into ro_data so the returned view does
+                // not dangle on this block's comptime-local array — the same const-
+                // promotion trick `comptimeGroupNames` uses below.
+                const frozen = slots;
+                return .{ .slots = &frozen, .meta = self.meta, .input = input };
             }
         }
     };

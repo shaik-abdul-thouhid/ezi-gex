@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **`re.capturesComptime(input)`** (`engine/regex.zig`, `@stable-since: v0.2.0`) —
+  resolve a match's submatches at compile time, rounding out
+  `isMatchComptime`/`findComptime`/`countComptime`. The returned `Captures` freezes
+  the slot offsets and input into `ro_data`, so `groupSlice`/`namedSlice` (numbered
+  **and named** groups) work on it at comptime and at runtime.
 
 ## [0.1.0] - 2026-06-07
 

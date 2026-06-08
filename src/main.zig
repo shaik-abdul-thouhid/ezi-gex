@@ -100,9 +100,10 @@ pub fn main(init: std.process.Init) !void {
     defer re.deinit(); // frees the heap program
 
     // The Scratch is the per-search working state — you own it, reuse it across
-    // searches, one per thread. The front door hands you only the *type*
-    // (`@TypeOf(re).Scratch`); you construct an instance off it with the backend's
-    // own init — here heap-backed; `.initBuffer(buf, &re.program)` needs no allocator.
+    // searches, one per thread. The front door never builds it for you: construct it
+    // directly off the backend's `Scratch` type (heap-backed here). For a no-allocator
+    // path use `@TypeOf(re).Scratch.initBuffer(buf, &re.program)` over a
+    // `@TypeOf(re).Scratch.bufferLen(&re.program)`-sized `@TypeOf(re).Scratch.Buf` buffer.
     var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
     defer sc.deinit(gpa);
 
@@ -121,16 +122,24 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("named:   word = \"{s}\"\n", .{c.namedSlice("word").?});
     }
 
-    // Comptime: the program is baked into the binary (no allocator to compile —
-    // only to make a Scratch). Because capture_count is comptime here, the slot
-    // buffer can be a stack array sized by `slotCount()`.
+    // Comptime: the program is baked into the binary and the match runs at compile
+    // time — no allocator, no Scratch to manage. `capturesComptime` resolves the
+    // groups during const-eval and freezes them into ro_data, so the returned view
+    // works here at runtime too (this rounds out isMatchComptime/findComptime).
     const Re = comptime ezi_gex.compileComptime("(\\d{4})-(\\d{2})", .{});
-    var csc = try @TypeOf(Re).Scratch.init(gpa, &Re.program);
-    defer csc.deinit(gpa);
-    var cslots: [Re.slotCount()]?usize = undefined; // comptime-sized; no allocation
-    if (Re.captures(&csc, &cslots, "y2026-06")) |c| {
+    if (comptime Re.capturesComptime("y2026-06")) |c| {
         std.debug.print("comptime captures: {s} / {s}\n", .{ c.groupSlice(1).?, c.groupSlice(2).? });
     }
+
+    // …and the same with *named* groups — `namedSlice` resolves at compile time too,
+    // so you can pull a group out by name entirely during const-eval.
+    const ReNamed = comptime ezi_gex.compileComptime("(?<year>\\d{4})-(?<month>\\d{2})", .{});
+    if (comptime ReNamed.capturesComptime("y2026-06")) |c| {
+        std.debug.print("comptime named:    year={s} month={s}\n", .{ c.namedSlice("year").?, c.namedSlice("month").? });
+    }
+    // Pulled out as plain comptime constants (the slices live in ro_data):
+    const year = comptime ReNamed.capturesComptime("y2026-06").?.namedSlice("year").?;
+    std.debug.print("comptime const:    year = \"{s}\"\n", .{year});
 }
 
 /// Pretty-print a parse diagnostic with a caret under the offending span. Pure
