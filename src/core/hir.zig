@@ -33,6 +33,133 @@
 //! sizing uses a `measure` pre-pass that runs the identical lowering in
 //! count-only mode to get exact output sizes — so comptime arrays stay exact
 //! and small rather than wildly over-provisioned.
+//!
+//! ══════════════════════════════════════════════════════════════════════════════
+//! USAGE GUIDE
+//! ══════════════════════════════════════════════════════════════════════════════
+//!
+//! ## What this module CONSUMES
+//!
+//! An `ast.Ast` (produced by `core/scanner.zig`, wrapped by `core/compile.zig`)
+//! plus a comptime-known `Options`. The AST is the faithful, flag-bearing syntax
+//! tree — three parallel arrays (`nodes`/`children`/`class_items`), capture
+//! `names`, a `root` index, a `capture_count`, and the global `flags`. The builder
+//! only READS the AST; it never mutates it, and the AST may be freed the instant
+//! `build`/`buildAlloc`/`buildComptime` returns (the HIR copies out everything it
+//! keeps, except `names`, which it borrows — see "Lifetimes" below).
+//!
+//! ## What this module PRODUCES / EMITS
+//!
+//! One immutable `Hir` value: a structure-of-arrays "program shape" whose slices
+//! point into caller storage (`ro_data` at comptime, heap at runtime). Its arrays:
+//!
+//!   * `nodes`         — every HIR `Node`, flat. `nodes[root]` is the tree root.
+//!   * `children`      — packed child-index lists. A `concat`/`alternation` node's
+//!                       children are `children[d.start .. d.start + d.len]`.
+//!   * `ranges`        — packed, sorted, merged, NON-overlapping, POSITIVE code-point
+//!                       `Range`s. A `class` node's set is
+//!                       `ranges[c.start .. c.start + c.len]`.
+//!   * `literals`      — packed post-fold `CodePoint`s. A `literal` run is
+//!                       `literals[r.start .. r.start + r.len]`.
+//!   * `names`         — capture-group names, borrowed from the pattern string.
+//!   * `root`          — index of the root node within `nodes`.
+//!   * `capture_count` — number of capturing groups (group 0, the whole match,
+//!                       is NOT counted).
+//!   * `analysis`      — precomputed, sound prefilter/feasibility facts (`Analysis`).
+//!
+//! Everything is desugared and resolved. NO flags survive; `\d`/`\w`/`\s`,
+//! `\p{…}`/`\P{…}`, scripts, and `[...]` are already sorted/merged ranges with
+//! negation applied; `(?i)a` is already `[Aa]`; `(?m)^` is already `line_start`.
+//! A backend does PLAIN range membership and never performs a Unicode-table lookup
+//! for a class at match time.
+//!
+//! ## How to TRAVERSE a `Hir`
+//!
+//! Start at `h.nodes[h.root]` and `switch` on `node.tag` (`Tag`). The tag selects
+//! the active field of `node.data` — a BARE union, so read only the field the tag
+//! names (any other field is undefined):
+//!
+//! ```zig
+//! const hir = @import("core/hir.zig");
+//!
+//! fn walk(h: hir.Hir, idx: u32) void {
+//!     const node = h.nodes[idx];
+//!     switch (node.tag) {
+//!         .empty => {}, //                          matches the empty string
+//!         .literal => { //                          a run of exact code points
+//!             const r = node.data.run; //           Node.Run{ start, len }
+//!             for (h.literals[r.start .. r.start + r.len]) |cp| { _ = cp; }
+//!         },
+//!         .class => { //                            a resolved class (positive ranges)
+//!             const c = node.data.class; //         Node.Class{ start, len }
+//!             // len == 0 ⇒ the class matches NOTHING (a fully-negated total set).
+//!             for (h.ranges[c.start .. c.start + c.len]) |rg| { _ = rg; } // [lo,hi]
+//!         },
+//!         .any => { _ = node.data.any.dot_all; }, // `.`  (dot_all ⇒ also matches \n)
+//!         .grapheme => {}, //                       `\X` — opaque; needs segmentation
+//!         .anchor => { _ = node.data.anchor.kind; }, // AnchorKind (m already applied)
+//!         .concat, .alternation => { //             composite: indexes children[]
+//!             const d = node.data.children; //      Node.Children{ start, len }
+//!             for (h.children[d.start .. d.start + d.len]) |ci| walk(h, ci);
+//!         },
+//!         .repetition => { //                       child repeated min..max times
+//!             const rep = node.data.repetition; //  Node.Repetition
+//!             walk(h, rep.child);
+//!         },
+//!         .capture => { //                          a capturing group
+//!             const cap = node.data.capture; //     Node.Capture{ child, index, name }
+//!             walk(h, cap.child);
+//!         },
+//!     }
+//! }
+//! ```
+//!
+//! ## How to BUILD a `Hir`
+//!
+//! Three entry points run the SAME lowering; they differ only in where storage
+//! lives. Prefer the wrappers (a, b); reach for the storage-agnostic core (c) only
+//! when you want to own the buffers (freestanding / no-heap / custom arena).
+//!
+//! ```zig
+//! // (a) Runtime, heap-backed. Free with `deinitHir`.
+//! const h = try hir.buildAlloc(allocator, ast, .{ .case_fold = .simple });
+//! defer hir.deinitHir(allocator, h);
+//!
+//! // (b) Comptime, baked into ro_data. No allocator, no deinit; returns an
+//! //     `Outcome` union you switch on.
+//! const h2 = comptime switch (hir.buildComptime(ast, .{})) {
+//!     .ok => |x| x,
+//!     .fail => @compileError("HIR build failed"),
+//! };
+//!
+//! // (c) Storage-agnostic core (no allocator): measure exact sizes, then emit
+//! //     into buffers YOU own. This is exactly what (a)/(b) wrap. `scratch` must
+//! //     be at least `scratchSizes(ast)`; each output buffer at least its `Sizes`.
+//! const ss = hir.scratchSizes(ast);
+//! var stack: [ss.stack]u32 = undefined;
+//! var main:   [ss.ranges]hir.Range = undefined;
+//! var member: [ss.ranges]hir.Range = undefined;
+//! var aux:    [ss.ranges]hir.Range = undefined;
+//! const scratch = hir.Scratch{ .stack = &stack, .main = &main, .member = &member, .aux = &aux };
+//! const sizes = try hir.measure(ast, .{}, scratch);
+//! // …declare/allocate nodes/children/ranges/literals/names of `sizes` lengths…
+//! const h3 = try hir.build(ast, .{}, scratch, buffers);
+//! ```
+//!
+//! ## FAILURE & limits
+//!
+//! The only failure is `error.PatternTooComplex` — a resolved class or node count
+//! that overruns the caller's buffers (e.g. an enormous class, capped at
+//! `CLASS_SCRATCH_CAP` ranges). At comptime the same overrun surfaces as
+//! `Outcome.fail`. The builder NEVER overruns: every write is bounds-guarded.
+//!
+//! ## LIFETIMES (read before retaining a `Hir`)
+//!
+//!   * `names` entries BORROW the original pattern string — keep the pattern alive
+//!     for as long as you read `names`, or dupe them (the front-door `Compiled`
+//!     dupes them so a compiled regex outlives the pattern).
+//!   * A comptime `Hir`'s slices are `const` ro_data — NEVER pass one to `deinitHir`.
+//!   * The produced `Hir` is immutable and freely shareable across threads.
 
 const std = @import("std");
 
@@ -74,13 +201,32 @@ pub const Options = struct {
     case_fold: CaseFold = .simple,
 };
 
-/// @stable-since: v0.1.0
-pub const CaseFold = enum { none, simple, full };
-
-/// An inclusive code-point range, the atom of a resolved class.
+/// How `i` (case-insensitive) folding is realized when lowering literals/classes.
 ///
 /// @stable-since: v0.1.0
-pub const Range = struct { lo: CodePoint, hi: CodePoint };
+pub const CaseFold = enum {
+    /// No folding at all, even under `(?i)` — `a` matches only `a`.
+    none,
+    /// Widen every literal/class range to its SIMPLE-fold closure (a 1:1 mapping):
+    /// `a` under `(?i)` becomes `[Aa]`, `σ` becomes `[Σςσ]`. The default.
+    simple,
+    /// Intended FULL folding (the 1→many rewrite, e.g. `ß` ↔ `ss`). NOT yet
+    /// implemented: currently behaves exactly like `simple` for single code points
+    /// (a documented v1 gap — see the module header).
+    full,
+};
+
+/// An inclusive code-point range `[lo, hi]`, the atom of a resolved class. A bare
+/// single code point is encoded as `lo == hi`. Inside a `class` node's slice these
+/// are sorted by `lo`, merged, and non-overlapping.
+///
+/// @stable-since: v0.1.0
+pub const Range = struct {
+    /// Inclusive lower bound — the smallest code point the range covers.
+    lo: CodePoint,
+    /// Inclusive upper bound — the largest code point the range covers (≥ `lo`).
+    hi: CodePoint,
+};
 
 /// Resolved anchor kind. Flags (`m`) are already applied: `line_*` only appear
 /// when multiline was in effect, otherwise `^`/`$` became `text_*`.
@@ -127,27 +273,96 @@ pub const Tag = enum {
     capture,
 };
 
+/// One node of the HIR tree. `tag` selects which member of `data` is active — read
+/// ONLY that member (`data` is a bare union, not tagged). Children, class ranges,
+/// and literal runs are referenced by `(start, len)` index pairs into the `Hir`'s
+/// `children` / `ranges` / `literals` arrays, never by pointer. See `Tag` for what
+/// each variant means and `Hir` for the backing arrays.
+///
 /// @stable-since: v0.1.0
 pub const Node = struct {
+    /// Discriminator: which kind of node this is, and which `data` field is live.
     tag: Tag,
+    /// The payload. Read the field named by `tag`; the others are undefined.
     data: Data,
 
-    pub const Run = struct { start: u32, len: u32 };
-    pub const Class = struct { start: u32, len: u32 };
-    pub const Any = struct { dot_all: bool };
-    pub const Anchor = struct { kind: AnchorKind };
-    pub const Children = struct { start: u32, len: u32 };
-    pub const Repetition = struct { child: u32, min: u32, max: ?u32, greedy: bool };
-    pub const Capture = struct { child: u32, index: u32, name: ?u32 };
+    /// `literal` payload: a run of `len` code points at `literals[start..start+len]`.
+    pub const Run = struct {
+        /// Offset of the first code point in `Hir.literals`.
+        start: u32,
+        /// Number of code points in the run (≥ 1).
+        len: u32,
+    };
+    /// `class` payload: `len` sorted/merged positive ranges at
+    /// `ranges[start..start+len]`. `len == 0` ⇒ matches nothing (fully-negated set).
+    pub const Class = struct {
+        /// Offset of the first range in `Hir.ranges`.
+        start: u32,
+        /// Number of ranges (`0` ⇒ an unmatchable class).
+        len: u32,
+    };
+    /// `any` payload: the resolved `.` wildcard.
+    pub const Any = struct {
+        /// True under `(?s)`: `.` matches EVERY code point including `\n`. False ⇒
+        /// `.` matches any code point except `\n`.
+        dot_all: bool,
+    };
+    /// `anchor` payload: a zero-width assertion.
+    pub const Anchor = struct {
+        /// Which assertion — already resolved for multiline (`^`→`line_start` or
+        /// `text_start`, `$`→`line_end`/`text_end`). See `AnchorKind`.
+        kind: AnchorKind,
+    };
+    /// `concat` / `alternation` payload: `len` child node indices at
+    /// `children[start..start+len]` — sequence members, or alternation branches in
+    /// priority (leftmost-first) order.
+    pub const Children = struct {
+        /// Offset of the first child index in `Hir.children`.
+        start: u32,
+        /// Number of children (always ≥ 2 — the builder collapses the 0/1-child cases).
+        len: u32,
+    };
+    /// `repetition` payload: `child` repeated `min..max` times.
+    pub const Repetition = struct {
+        /// Index of the repeated child node in `Hir.nodes`.
+        child: u32,
+        /// Minimum repeat count (`*`→0, `+`→1, `{m,n}`→m).
+        min: u32,
+        /// Maximum repeat count, or `null` for unbounded (`*`, `+`, `{m,}`).
+        max: ?u32,
+        /// Greedy (`a*`) when true, lazy (`a*?`) when false. Backends encode this as
+        /// split priority; it changes WHICH match wins, never WHETHER one exists.
+        greedy: bool,
+    };
+    /// `capture` payload: a capturing group wrapping `child`.
+    pub const Capture = struct {
+        /// Index of the group's body node in `Hir.nodes`.
+        child: u32,
+        /// 1-based capture-group number (group 0 is the whole match). Its capture
+        /// slots are at offsets `2*index` (start) and `2*index + 1` (end).
+        index: u32,
+        /// Index into `Hir.names` for a named group `(?<n>…)`, else `null`.
+        name: ?u32,
+    };
 
+    /// The per-tag payload. A BARE union (untagged): `Node.tag` is the discriminator,
+    /// so it is the caller's responsibility to read only the active field.
     pub const Data = union {
+        /// active when `tag == .literal`
         run: Run,
+        /// active when `tag == .class`
         class: Class,
+        /// active when `tag == .any`
         any: Any,
+        /// active when `tag == .anchor`
         anchor: Anchor,
+        /// active when `tag == .concat` or `.alternation`
         children: Children,
+        /// active when `tag == .repetition`
         repetition: Repetition,
+        /// active when `tag == .capture`
         capture: Capture,
+        /// active when `tag == .empty` or `.grapheme` (these carry no payload)
         none: void,
     };
 };
@@ -158,6 +373,9 @@ pub const Node = struct {
 ///
 /// @stable-since: v0.1.0
 pub const ByteSet = struct {
+    /// 256 bits packed into four 64-bit words; byte `b` is present when bit
+    /// `b & 63` of word `b >> 6` is set. Prefer `set`/`has`/`isEmpty`/`count` over
+    /// touching this directly.
     bits: [4]u64 = .{ 0, 0, 0, 0 },
 
     /// @stable-since: v0.1.0
@@ -240,13 +458,28 @@ pub const Analysis = struct {
 ///
 /// @stable-since: v0.1.0
 pub const Hir = struct {
+    /// Every HIR node, flat. The tree is reconstructed by index; `nodes[root]` is
+    /// the entry. Composite nodes point into `children`; leaves into `ranges`/`literals`.
     nodes: []const Node,
+    /// Packed child-index lists. A `concat`/`alternation` node's children are
+    /// `children[d.start .. d.start + d.len]` for its `Node.Children` payload `d`.
     children: []const u32,
+    /// Packed, sorted, merged, non-overlapping, POSITIVE code-point ranges. A
+    /// `class` node's set is `ranges[c.start .. c.start + c.len]`. Negation is
+    /// already applied — membership is just "cp ∈ some range".
     ranges: []const Range,
+    /// Packed post-fold code points. A `literal` run is
+    /// `literals[r.start .. r.start + r.len]`. Each is a valid scalar (encodable).
     literals: []const CodePoint,
+    /// Capture-group names, indexed by `Node.Capture.name`. Each slice BORROWS the
+    /// original pattern string (not copied) — keep the pattern alive while reading.
     names: []const []const u8,
+    /// Index of the root node within `nodes` (the entry point for traversal/compile).
     root: u32,
+    /// Number of capturing groups, excluding group 0 (the whole match). Capture-aware
+    /// search needs `2 * (capture_count + 1)` slots.
     capture_count: u32,
+    /// Precomputed, sound prefilter/feasibility facts about every match (see `Analysis`).
     analysis: Analysis,
 };
 
@@ -265,10 +498,15 @@ pub const BuildError = error{PatternTooComplex};
 ///
 /// @stable-since: v0.1.0
 pub const Sizes = struct {
+    /// Exact `Node` count the emit pass will write — minimum length of `Buffers.nodes`.
     nodes: usize,
+    /// Exact child-index count — minimum length of `Buffers.children`.
     children: usize,
+    /// Exact resolved-range count — minimum length of `Buffers.ranges`.
     ranges: usize,
+    /// Exact post-fold code-point count — minimum length of `Buffers.literals`.
     literals: usize,
+    /// Exact capture-name count (= `ast.names.len`) — minimum length of `Buffers.names`.
     names: usize,
 };
 
@@ -278,8 +516,14 @@ pub const Sizes = struct {
 ///
 /// @stable-since: v0.1.0
 pub const Scratch = struct {
+    /// Gathers child node indices during lowering (depth-balanced, scanner-style).
+    /// Size it to `scratchSizes(ast).stack`.
     stack: []u32,
+    /// Accumulates a class's ranges as members are unioned in. Size it to
+    /// `scratchSizes(ast).ranges`.
     main: []Range,
+    /// Holds the ranges of ONE class member mid-resolution before it is merged into
+    /// `main`. Same size as `main`.
     member: []Range,
     /// Aux buffer for the merge sort (same size as `main`/`member`).
     aux: []Range,
@@ -290,10 +534,15 @@ pub const Scratch = struct {
 ///
 /// @stable-since: v0.1.0
 pub const Buffers = struct {
+    /// Receives the emitted nodes; length ≥ `measure(...).nodes`.
     nodes: []Node,
+    /// Receives the packed child indices; length ≥ `measure(...).children`.
     children: []u32,
+    /// Receives the resolved class ranges; length ≥ `measure(...).ranges`.
     ranges: []Range,
+    /// Receives the post-fold literal code points; length ≥ `measure(...).literals`.
     literals: []CodePoint,
+    /// Receives the borrowed capture names; length ≥ `measure(...).names`.
     names: [][]const u8,
 };
 

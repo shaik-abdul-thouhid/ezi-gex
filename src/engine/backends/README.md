@@ -46,4 +46,6 @@ itself scans with `std.mem.indexOf` (SIMD memchr / Boyer–Moore–Horspool), no
 - **None support `\X`** (`caps.grapheme = false`); such a pattern fails at build.
 - To add a fifth backend (e.g. a lazy DFA), implement the contract and either route to
   it from a copy of `auto.zig` or use it directly via `compile*With`. See
-  [`../../../docs/architecture.md`](../../../docs/architecture.md) §5 and §10.
+  [`../../../docs/architecture.md`](../../../docs/architecture.md) §5 and §10, and the
+  step-by-step, runnable walkthrough in
+  [`../../../docs/usage-guide.md`](../../../docs/usage-guide.md) §8.

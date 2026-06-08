@@ -12,9 +12,55 @@
 //! `findAll`, `capturesAll`, `count`, `split`, `replaceAll` — all delegating to the
 //! backend-agnostic `Engine`. Per the contract, the **caller owns the `Scratch`**
 //! and creates it at the call site off the `Scratch` type
-//! (`var s = try @TypeOf(re).Scratch.init(alloc, &re.program);`); the regex
-//! methods take `&s`. Default backend is the Pike VM (the `auto` dispatcher will
-//! slot in here later without changing this API).
+//! (`var s = try @TypeOf(re).Scratch.init(alloc, &re.program);`); the regex methods
+//! take `&s`. The default backend is the `auto` dispatcher (`default_backend`), which
+//! picks literal / backtrack / Pike VM from the pattern + input; pass a specific
+//! backend to the `*With` constructors to override it.
+//!
+//! ══════════════════════════════════════════════════════════════════════════════
+//! USAGE GUIDE
+//! ══════════════════════════════════════════════════════════════════════════════
+//!
+//! ## Pick an entry point
+//!
+//!   * `compileRuntime(gpa, pattern, &diag, opts)` — heap-backed; a bad pattern is
+//!     `error.InvalidPattern` + a filled `Diagnostic` (never a crash). `re.deinit()`.
+//!   * `compileComptime(pattern, opts)` — baked into `ro_data`; a bad pattern is a
+//!     `@compileError`. No allocator, no `deinit`.
+//!   * `compileRuntimeWith(B, …)` / `compileComptimeWith(B, …)` — same, with an
+//!     explicit backend `B` (`backends.pikevm` / `.backtrack` / `.literal` / `.auto`).
+//!
+//! ## Use it (runtime)
+//!
+//! ```zig
+//! var diag: gex.Diagnostic = .{};
+//! var re = try gex.compileRuntime(gpa, "\\d+", &diag, .{}); // .{} = default Options
+//! defer re.deinit();
+//! var sc = try @TypeOf(re).Scratch.init(gpa, &re.program); // caller-owned, per thread
+//! defer sc.deinit(gpa);
+//!
+//! _ = re.isMatch(&sc, "abc123"); //          bool
+//! _ = re.find(&sc, "abc123"); //             ?Match → "123"
+//! var it = re.findAll(&sc, "a1 b22 c333"); // iterate non-overlapping matches
+//! while (it.next()) |m| _ = m;
+//! ```
+//!
+//! ## Use it (comptime — no allocator)
+//!
+//! ```zig
+//! const re = comptime gex.compileComptime("\\d{3}-\\d{4}", .{});
+//! const Scratch = @TypeOf(re).Scratch; // the backend's Scratch type, exposing the buffer convention
+//! // (a) match AT comptime — the result is a compile-time constant:
+//! const ok = comptime re.isMatchComptime("call 555-1234"); // true
+//! // (b) or match at RUNTIME with a buffer Scratch (still no allocator):
+//! var buf: [Scratch.bufferLen(&re.program)]Scratch.Buf = undefined;
+//! var sc = try Scratch.initBuffer(&buf, &re.program);
+//! _ = re.find(&sc, "call 555-1234");
+//! _ = ok;
+//! ```
+//!
+//! See `Compiled` for the full method set incl. captures/replace, and
+//! `docs/usage-guide.md` for a from-scratch tour (lexer → AST → HIR → backend).
 
 const std = @import("std");
 
@@ -24,8 +70,11 @@ const parser = core.compile;
 const backend = @import("backend.zig");
 const auto = @import("backends/auto.zig");
 
+/// Re-export: a parse-failure report — error code + byte span + message + caret renderer.
 pub const Diagnostic = parser.Diagnostic;
+/// Re-export: a match span as half-open byte offsets (`backend.Match`).
 pub const Match = backend.Match;
+/// Re-export: a read-only view of one match's captures (`backend.Captures`).
 pub const Captures = backend.Captures;
 
 /// The default backend used by `compileRuntime`/`compileComptime`: the `auto`
@@ -65,8 +114,42 @@ pub const Options = struct {
 };
 
 /// A compiled regex over backend `B`: an immutable `Program` + capture `Meta`.
-/// Returned by `compileRuntime`/`compileComptime`. Thread-safe to share; each
-/// thread uses its own `Scratch`.
+/// Returned by `compileRuntime`/`compileComptime` (and the `*With` variants). This is
+/// the front-door value type — `re.isMatch`/`find`/`captures`/`findAll`/`split`/
+/// `replaceAll` live here and forward to `Engine(B)`.
+///
+/// Thread-safe to SHARE (immutable, `*const`-borrowed by every method); each thread
+/// brings its OWN `Scratch`. Per the contract the caller owns the `Scratch` and builds
+/// it directly off `@TypeOf(re).Scratch` — `Compiled` only holds the type and forwards
+/// `&sc`.
+///
+/// Step by step (runtime):
+///
+/// ```zig
+/// // 1) compile (heap-backed; free with deinit). A bad pattern fills `diag`.
+/// var diag: gex.Diagnostic = .{};
+/// var re = try gex.compileRuntime(gpa, "(\\w+)@(\\w+)", &diag, .{});
+/// defer re.deinit();
+///
+/// // 2) make a Scratch off the regex's Scratch type — caller-owned, one per thread.
+/// var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+/// defer sc.deinit(gpa);
+///
+/// // 3) use the API; pass &sc to each call.
+/// _ = re.isMatch(&sc, "x a@b y"); //                       bool
+/// if (re.find(&sc, "x a@b y")) |m| _ = m.slice("x a@b y"); // ?Match
+/// _ = re.count(&sc, "a@b c@d"); //                         non-overlapping match count
+///
+/// // 4) captures: size the slot array with slotCount().
+/// const slots = try gpa.alloc(?usize, re.slotCount());
+/// defer gpa.free(slots);
+/// if (re.captures(&sc, slots, "user@host")) |c| _ = c.groupSlice(1); // "user"
+/// ```
+///
+/// Comptime (no allocator, no deinit): `const re = compileComptime("\\d+", .{});` then
+/// either use the runtime methods with a buffer `Scratch`
+/// (`@TypeOf(re).Scratch.initBuffer`), or the `*Comptime` methods that run the match
+/// itself at compile time (`isMatchComptime`, `findComptime`, `capturesComptime`, …).
 ///
 /// @stable-since: v0.1.0
 pub fn Compiled(comptime B: type) type {
@@ -74,13 +157,19 @@ pub fn Compiled(comptime B: type) type {
     return struct {
         const Self = @This();
 
-        /// The per-search state type — initialize one at the call site.
+        /// The per-search state type — initialize one at the call site
+        /// (`@TypeOf(re).Scratch.init(gpa, &re.program)`, or `.initBuffer(buf, …)` for
+        /// a no-allocator/comptime buffer).
         ///
         /// @stable-since: v0.1.0
         pub const Scratch = B.Scratch;
+        /// The backend type `B` this regex was compiled with (e.g. `backends.auto`).
         pub const Backend = B;
 
+        /// The backend's immutable executable form (NFA insts, literal set, …),
+        /// shareable across threads. Pass `&re.program` to `Scratch.init`.
         program: B.Program,
+        /// Capture metadata (group count + names): sizes `slots` and resolves names.
         meta: backend.Meta,
         /// Non-null for `compileRuntime` (used by `deinit`); null for comptime.
         allocator: ?std.mem.Allocator,
@@ -113,44 +202,71 @@ pub fn Compiled(comptime B: type) type {
 
         // ── the user-facing API ──────────────────────────────────────────────────
 
+        /// Does the pattern match anywhere in `input`? (Unanchored; cheapest op —
+        /// stops at the first match, fills no captures.)
+        ///
         /// @stable-since: v0.1.0
         pub fn isMatch(self: *const Self, scratch: *Scratch, input: []const u8) bool {
             return Eng.isMatch(&self.program, scratch, input, .{});
         }
+        /// `isMatch` with explicit `SearchOptions` (`.start` offset, `.anchored`).
+        ///
         /// @stable-since: v0.1.0
         pub fn isMatchAt(self: *const Self, scratch: *Scratch, input: []const u8, opts: backend.SearchOptions) bool {
             return Eng.isMatch(&self.program, scratch, input, opts);
         }
+        /// The leftmost match in `input`, or null. The returned `Match` is byte
+        /// offsets; use `m.slice(input)` for the text.
+        ///
         /// @stable-since: v0.1.0
         pub fn find(self: *const Self, scratch: *Scratch, input: []const u8) ?Match {
             return Eng.find(&self.program, scratch, input, .{});
         }
+        /// `find` with explicit `SearchOptions` (resume at `.start`, or `.anchored`).
+        ///
         /// @stable-since: v0.1.0
         pub fn findAt(self: *const Self, scratch: *Scratch, input: []const u8, opts: backend.SearchOptions) ?Match {
             return Eng.find(&self.program, scratch, input, opts);
         }
-        /// Capture the first match into `slots` (length `slotCount()`).
+        /// Resolve the first match's submatches into `slots` (length `slotCount()`),
+        /// returning a `Captures` view (or null on no match). Read groups via
+        /// `c.group(i)`/`c.groupSlice(i)`/`c.named(...)`.
         ///
         /// @stable-since: v0.1.0
         pub fn captures(self: *const Self, scratch: *Scratch, slots: []?usize, input: []const u8) ?Captures {
             return Eng.captures(&self.program, scratch, input, slots, self.meta, .{});
         }
+        /// Iterator over every non-overlapping match, left to right. Empty matches
+        /// advance one code point so iteration always terminates.
+        ///
         /// @stable-since: v0.1.0
         pub fn findAll(self: *const Self, scratch: *Scratch, input: []const u8) Eng.MatchIterator {
             return Eng.findAll(&self.program, scratch, input, .{});
         }
+        /// Iterator yielding a `Captures` per non-overlapping match into the SHARED
+        /// `slots` — each view is valid only until the next `next()` reuses `slots`.
+        ///
         /// @stable-since: v0.1.0
         pub fn capturesAll(self: *const Self, scratch: *Scratch, slots: []?usize, input: []const u8) Eng.CaptureIterator {
             return Eng.capturesAll(&self.program, scratch, input, slots, self.meta, .{});
         }
+        /// Count the non-overlapping matches in `input`.
+        ///
         /// @stable-since: v0.1.0
         pub fn count(self: *const Self, scratch: *Scratch, input: []const u8) usize {
             return Eng.count(&self.program, scratch, input, .{});
         }
+        /// Iterator over the substrings between successive matches (the pattern is the
+        /// separator). Empty matches are skipped; the final piece is always yielded.
+        ///
         /// @stable-since: v0.1.0
         pub fn split(self: *const Self, scratch: *Scratch, input: []const u8) Eng.SplitIterator {
             return Eng.split(&self.program, scratch, input, .{});
         }
+        /// Replace every match, writing the result to `writer`. `template` may
+        /// reference captures: `$0`/`$1`/… by number, `${name}` by name, `$$` for a
+        /// literal `$`. Needs a `slots` buffer of `slotCount()`.
+        ///
         /// @stable-since: v0.1.0
         pub fn replaceAll(
             self: *const Self,

@@ -55,6 +55,9 @@ var re = try gex.compileRuntimeWith(MyBackend, gpa, pattern, &diag, .{});
 
 A **complete, runnable ~40-line example** (with the build step, the search loop, and
 how to add comptime support) is in
-[`../../docs/architecture.md`](../../docs/architecture.md) §5. Read §9 there for the
-implicit assumptions a backend may rely on (HIR ranges are sorted/positive, the
-program is self-contained, the Program is immutable + the Scratch is caller-owned, etc.).
+[`../../docs/architecture.md`](../../docs/architecture.md) §5; a longer, built-up-in-
+four-steps version (validated, with comptime support and notes on reusing the shared
+NFA) is in [`../../docs/usage-guide.md`](../../docs/usage-guide.md) §8. Read §9 in
+architecture.md for the implicit assumptions a backend may rely on (HIR ranges are
+sorted/positive, the program is self-contained, the Program is immutable + the Scratch
+is caller-owned, etc.).

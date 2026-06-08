@@ -29,4 +29,6 @@ library you could use on its own (e.g. to build a different engine).
 
 The `Hir` handed to backends is fully desugared: no flags, no `\d`, no Unicode
 lookups left. `\w` is already sorted ranges; `(?i)a` is already `[Aa]`; `[^x]` is
-already complemented. See [`../../docs/architecture.md`](../../docs/architecture.md) §2.
+already complemented. See [`../../docs/architecture.md`](../../docs/architecture.md) §2,
+and [`../../docs/usage-guide.md`](../../docs/usage-guide.md) §5–§6 for a hands-on walk of
+the pipeline from lexing and the resolved IR (with concrete s-expression output).

@@ -73,6 +73,9 @@ exe.root_module.addImport("ezi_gex", ezi_gex.module("ezi_gex"));
 
 ## Quick look
 
+> For the full hands-on tour — every op, the pipeline from lexing, comptime paths,
+> and writing your own backend — see [`docs/usage-guide.md`](docs/usage-guide.md).
+
 ```zig
 const gex = @import("ezi_gex");
 
@@ -419,6 +422,10 @@ path or the API. See [`docs/architecture.md`](docs/architecture.md) for the plan
 
 ## Documentation
 
+- [`docs/usage-guide.md`](docs/usage-guide.md) — **the hands-on guide**: copy-paste
+  recipes for every front-door op, the full pipeline used **from lexing** (scan → AST
+  → HIR → backend), comptime/no-allocator paths, and a complete, runnable, step-by-step
+  **"write your own backend"** walkthrough. Start here if you want to *do* something.
 - [`docs/architecture.md`](docs/architecture.md) — architecture, data flow,
   **how to write your own backend** (with a complete tiny example), caveats, and
   the implicit assumptions backends rely on.

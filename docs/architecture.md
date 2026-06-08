@@ -6,8 +6,10 @@ This is the document for two readers:
 2. Someone who wants to **write their own backend** — a matcher tuned to their
    needs — and plug it into the same front door.
 
-If you only want to *use* the library, the [README](../README.md) is enough. This
-goes a layer down.
+If you only want to *use* the library, the [README](../README.md) is enough, and
+[`usage-guide.md`](usage-guide.md) is its hands-on companion — copy-paste recipes for
+every op, the pipeline driven from lexing, and a runnable, step-by-step "write your own
+backend" walkthrough. This document goes a layer down: the *why* behind that *how*.
 
 ---
 

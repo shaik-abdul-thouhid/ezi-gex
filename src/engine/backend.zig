@@ -11,11 +11,81 @@
 //!
 //! The contract is duck-typed at comptime (no vtable): `Engine(Backend)` is a
 //! comptime function returning a namespace of operations specialized to that
-//! backend, fully inlined. See `docs/regex-engine-design.md` §3.
+//! backend, fully inlined. See `docs/architecture.md` §4 (the backend contract).
 //!
 //! This file depends only on `std` — it is the stable seam between `core/` (which
 //! produces the HIR) and the backends (which consume it). The HIR itself appears
 //! only in a backend's `build*` signatures, not here.
+//!
+//! ══════════════════════════════════════════════════════════════════════════════
+//! USAGE GUIDE
+//! ══════════════════════════════════════════════════════════════════════════════
+//!
+//! ## The two roles
+//!
+//! 1. **Backend author** — implement a `type` satisfying the contract below. The job
+//!    is narrow: turn a `Hir` into a `Program`, and locate a match / fill a `slots`
+//!    array. You write NO iteration, capture-view, or replace code.
+//! 2. **Backend user** — pick a backend and drive it, either through the front door
+//!    (`engine/regex.zig` → `Compiled`) or directly via `Engine(Backend)`.
+//!
+//! ## The contract (what a backend `type` must expose)
+//!
+//! MANDATORY (checked by `verifyBackend`):
+//!
+//! ```zig
+//! pub const caps: Caps; //     comptime capabilities (captures? stateless? grapheme?)
+//! pub const Program: type; //  the executable form — slices/POD only (ro_data- or heap-able)
+//! pub const Scratch: type; //  per-search state TYPE (use `struct{}` if stateless)
+//! pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, o: SearchOptions) bool;
+//! // …and AT LEAST ONE build path:
+//! pub fn buildAlloc(allocator, hir: Hir, opts) BuildError!Program; //  → heap
+//! pub fn buildComptime(comptime hir: Hir, comptime opts) Program; //   → ro_data
+//! ```
+//!
+//! OPTIONAL (used only behind `@hasDecl` — a hard error only when actually called):
+//!
+//! ```zig
+//! pub fn search(program, scratch, input, o) ?Match; //                       find/findAll/split/replace
+//! pub fn searchCaptures(program, scratch, input, slots: []?usize, o) ?Match; // if caps.captures
+//! pub fn freeProgram(allocator, program) void; //                            if you buildAlloc
+//! // Scratch lifecycle (the caller constructs it, ArrayList-style):
+//! pub fn Scratch.init(allocator, program) ScratchError!Scratch;
+//! pub fn Scratch.initBuffer(buf: []Buf, program) ScratchError!Scratch; //    fixed buffer → comptime-able
+//! pub fn Scratch.reset(self) void;
+//! pub fn Scratch.deinit(self, allocator) void;
+//! ```
+//!
+//! `Engine(Backend)` then implements `find`/`findAll`/`captures`/`capturesAll`/
+//! `count`/`split`/`replaceAll` on top of `search`/`searchCaptures` — once, for any
+//! backend (see `Engine` and `Captures` below for step-by-step usage).
+//!
+//! ## Driving a backend (user side)
+//!
+//! ```zig
+//! comptime verifyBackend(B); //                assert the contract at compile time
+//! const E = Engine(B); //                       the agnostic op layer for B
+//! var program = try B.buildAlloc(gpa, h, .{}); // Hir → Program (self-contained; free the Hir now)
+//! defer B.freeProgram(gpa, &program);
+//! var sc = try B.Scratch.init(gpa, &program); // the caller OWNS the Scratch (one per thread)
+//! defer sc.deinit(gpa);
+//! _ = E.find(&program, &sc, input, .{}); //     …and every other op
+//! ```
+//!
+//! ## Invariants a backend MAY rely on (the contract's fine print)
+//!
+//!   * `CodePoint` is a contract: HIR literals / range bounds are valid scalars.
+//!   * HIR ranges are sorted, merged, non-overlapping, POSITIVE (negation already
+//!     applied); a `class` with `len == 0` is unmatchable, not a wildcard.
+//!   * The `Program` is self-contained after build — copy out what you need; the
+//!     caller frees the HIR immediately. Keep the `Program` immutable + shareable.
+//!   * ALL mutable per-search state lives in the caller-owned `Scratch`; reset it at
+//!     the top of each search (the built-ins do this in O(1) via generation stamps).
+//!   * `slots` length is `2 * (capture_count + 1)`; write only what fits and leave
+//!     the rest untouched (`Engine` pre-zeroes them to `null`).
+//!
+//! See `docs/architecture.md` §4–§5 and §9, and `docs/usage-guide.md`, for the full
+//! treatment and a complete, runnable example backend.
 
 const std = @import("std");
 
@@ -24,11 +94,23 @@ const utf8 = ezi_code.encoding.utf8;
 
 // ── Shared value types ──────────────────────────────────────────────────────────
 
-/// A match span, as byte offsets into the input.
+/// A match span, as half-open BYTE offsets `[start, end)` into the input. Returned
+/// by `find`/`search`, yielded by `MatchIterator`, and carried by `Captures.group`.
+/// Offsets are byte indices (not code points) and always land on UTF-8 boundaries.
+///
+/// ```zig
+/// const input = "x a@b y";
+/// const m = re.find(&sc, input).?; //  locate the first match
+/// _ = m.slice(input); //               "a@b" — the matched substring
+/// _ = m.len(); //                      3      — end - start, in bytes
+/// _ = m.isEmpty(); //                  false  — true only for a zero-width match
+/// ```
 ///
 /// @stable-since: v0.1.0
 pub const Match = struct {
+    /// Byte offset where the match begins (inclusive).
     start: usize,
+    /// Byte offset where the match ends (exclusive). `end == start` ⇒ an empty match.
     end: usize,
 
     /// @stable-since: v0.1.0
@@ -45,12 +127,23 @@ pub const Match = struct {
     }
 };
 
-/// Where/how a single search runs. `start` is a byte offset; `anchored` forces the
-/// match to begin exactly at `start` (no leftward scan).
+/// Where/how a single search runs. Passed to every `Engine` op and to a backend's
+/// `search`/`isMatch`/`searchCaptures` primitives.
+///
+/// ```zig
+/// _ = E.find(&prog, &sc, input, .{}); //                     default: scan from offset 0
+/// _ = E.find(&prog, &sc, input, .{ .start = 10 }); //        resume the scan from byte 10
+/// _ = E.find(&prog, &sc, input, .{ .anchored = true }); //   must match AT start; no scan
+/// _ = E.find(&prog, &sc, input, .{ .start = 10, .anchored = true }); // exactly at byte 10
+/// ```
 ///
 /// @stable-since: v0.1.0
 pub const SearchOptions = struct {
+    /// Byte offset at which to begin the search (and, when `anchored`, the ONLY
+    /// position tried). Must be ≤ `input.len`.
     start: usize = 0,
+    /// When true the match must begin EXACTLY at `start` — no leftward/rightward
+    /// scan. Used to confirm a prefilter hit or to walk anchored matches by hand.
     anchored: bool = false,
 };
 
@@ -60,12 +153,25 @@ pub const SearchOptions = struct {
 ///
 /// @stable-since: v0.1.0
 pub const ScratchOptions = struct {
+    /// Soft ceiling on a growable `Scratch`'s memory, in bytes. Consulted only by a
+    /// backend with a growable part (e.g. a lazy-DFA memo); fixed backends ignore it.
     max_bytes: usize = 1 << 20,
+    /// What to do when a growable `Scratch` reaches `max_bytes`: `reset` (clear and
+    /// continue, the default), `give_up` (fail the search), or `grow` (allocate
+    /// more — impossible for a fixed-buffer `Scratch.initBuffer`).
     on_full: enum { reset, give_up, grow } = .reset,
 };
 
-/// What a backend can do (comptime). The dispatcher/front door reads these to
-/// route and to gate capability-specific methods.
+/// What a backend can do (comptime). The dispatcher/front door reads these to route
+/// and to gate capability-specific methods (e.g. `captures` is a `@compileError` on
+/// a backend whose `caps.captures == false`). A backend declares it as a `const`:
+///
+/// ```zig
+/// // a captures-capable, stateful, non-grapheme backend:
+/// pub const caps = backend.Caps{ .captures = true };
+/// // a stateless substring matcher (whole-match captures only):
+/// pub const caps = backend.Caps{ .captures = true, .stateless = true };
+/// ```
 ///
 /// @stable-since: v0.1.0
 pub const Caps = struct {
@@ -80,8 +186,17 @@ pub const Caps = struct {
 };
 
 /// Capture metadata, derived once from the HIR by the front door and carried
-/// alongside a `Program`. The backend does not need this — only the agnostic
-/// capture view does (to size `slots` and resolve names).
+/// alongside a `Program`. The backend does not need this — only the agnostic capture
+/// view does (to size the `slots` array and resolve group names). You build one from
+/// a HIR and pass it to every capture op:
+///
+/// ```zig
+/// const meta = backend.Meta{ .capture_count = h.capture_count };   // names optional
+/// const slots = try gpa.alloc(?usize, meta.slotLen());             // 2*(groups+1)
+/// defer gpa.free(slots);
+/// const caps = E.captures(&prog, &sc, input, slots, meta, .{}).?;  // resolve group 0..N
+/// _ = caps.groupSlice(1);                                          // text of group 1
+/// ```
 ///
 /// @stable-since: v0.1.0
 pub const Meta = struct {
@@ -135,15 +250,38 @@ pub const ScratchError = error{ BufferTooSmall, Unsupported } || std.mem.Allocat
 ///   * `pub fn initBuffer(buf: []Buf, program) ScratchError!Scratch;`
 ///
 /// @stable-since: v0.1.0
-pub const Cell = union { w: usize, slot: ?usize };
+pub const Cell = union {
+    /// A plain machine word — a pc, counter, bitset word, or stack entry. The field
+    /// every region except capture slots reads/writes.
+    w: usize,
+    /// A capture offset: a natural `?usize`, so "not captured" is just `null` (no
+    /// sentinel). The field a capture-slot region reads/writes.
+    slot: ?usize,
+};
 
 /// A bump-carver that slices a `[]Cell` buffer into typed sub-arrays. Pure slicing,
 /// so it runs at comptime as well as runtime; a short buffer yields
-/// `error.BufferTooSmall` (the "with limits" failure mode), never UB.
+/// `error.BufferTooSmall` (the "with limits" failure mode), never UB. A backend's
+/// `initBuffer` uses it to lay several working arrays over one caller buffer:
+///
+/// ```zig
+/// // inside your backend, given `buf: []backend.Cell` sized by `bufferLen`:
+/// pub fn initBuffer(buf: []backend.Cell, p: *const Program) backend.ScratchError!Scratch {
+///     var c = backend.Carver{ .buf = buf };
+///     const visited = try c.take(p.insts.len); //  []Cell for a pc bitset (read as .w)
+///     const stack   = try c.take(p.insts.len); //  []Cell for a work stack  (read as .w)
+///     const slots   = try c.take(p.slot_count); // []Cell for captures      (read as .slot)
+///     return .{ .visited = visited, .stack = stack, .slots = slots };
+/// }
+/// ```
 ///
 /// @stable-since: v0.1.0
 pub const Carver = struct {
+    /// The caller-owned buffer being carved. The Carver only sub-slices it; it never
+    /// writes through it.
     buf: []Cell,
+    /// Bump cursor — index of the next free `Cell`. Starts at 0; each `take(n)`
+    /// advances it by `n`.
     off: usize = 0,
     /// @stable-since: v0.1.0
     pub fn take(self: *Carver, n: usize) ScratchError![]Cell {
@@ -157,15 +295,45 @@ pub const Carver = struct {
 
 // ── A resolved set of captures (backend-agnostic view over `slots`) ──────────────
 
-/// A read-only view of one match's captures. Holds only the caller's `slots`
-/// buffer, the `Meta`, and the `input` — so it is identical for every backend.
-/// Borrows `slots` and `input`; valid until the `slots` buffer is reused (e.g. the
-/// next `CaptureIterator.next`).
+/// A read-only view of ONE match's captures. Holds only the caller's `slots` buffer,
+/// the `Meta`, and the `input`, so it is identical for every backend. Borrows `slots`
+/// and `input`: it is valid only until the `slots` buffer is reused (e.g. the next
+/// `CaptureIterator.next()` overwrites it).
+///
+/// Step by step:
+///
+/// ```zig
+/// // 1) size + allocate the slot array from the regex's capture count:
+/// const slots = try gpa.alloc(?usize, re.slotCount()); // 2 * (capture_count + 1)
+/// defer gpa.free(slots);
+///
+/// // 2) resolve the first match's captures into `slots`:
+/// const caps = re.captures(&sc, slots, "2026-06-08") orelse return; // null ⇒ no match
+///
+/// // 3) read groups. Group 0 is the whole match; 1..N are the parens, left to right.
+/// const whole = caps.match(); //      Match for the entire match (group 0)
+/// _ = caps.count(); //                number of groups, incl. group 0
+/// if (caps.group(1)) |m| _ = m; //    Match for group 1, or null if it didn't participate
+/// _ = caps.groupSlice(1); //          the TEXT of group 1 (?[]const u8), or null
+///
+/// // 4) named groups (?<name>…), by name:
+/// _ = caps.named("year"); //          ?Match
+/// _ = caps.namedSlice("year"); //     ?[]const u8
+/// _ = whole;
+/// ```
+///
+/// A non-participating group (e.g. the unmatched side of `(a)|(b)`) reads back as
+/// `null`, never as stale data — `Engine` zeroes `slots` before each search.
 ///
 /// @stable-since: v0.1.0
 pub const Captures = struct {
+    /// The resolved capture offsets: `slots[2*g]` / `slots[2*g + 1]` are group `g`'s
+    /// start/end byte offsets, or `null` if the group did not participate. Borrowed.
     slots: []const ?usize,
+    /// Group count + name table for this regex (drives `count` and named lookups).
     meta: Meta,
+    /// The input the offsets index into; the backing for `groupSlice`/`namedSlice`.
+    /// Borrowed — keep it alive while you read slices from this view.
     input: []const u8,
 
     /// The whole match (group 0).
@@ -217,9 +385,17 @@ pub const Captures = struct {
 
 // ── Contract verification ────────────────────────────────────────────────────────
 
-/// Comptime-assert that `B` satisfies the **mandatory** (Lean) contract, with
-/// clear errors. Everything beyond this is optional and `@hasDecl`-gated at the
-/// call site — a missing optional decl errors only when actually used.
+/// Comptime-assert that `B` satisfies the **mandatory** (Lean) contract, with clear
+/// errors. Everything beyond this is optional and `@hasDecl`-gated at the call site —
+/// a missing optional decl errors only when actually used. Call it once (a `test`, or
+/// the top of `Engine`) so a contract mistake is a precise compile error, not a
+/// confusing failure deep in a generic op:
+///
+/// ```zig
+/// test "MyBackend satisfies the contract" {
+///     comptime backend.verifyBackend(MyBackend); // compiles ⇒ pass
+/// }
+/// ```
 ///
 /// @stable-since: v0.1.0
 pub fn verifyBackend(comptime B: type) void {
@@ -241,11 +417,38 @@ pub fn verifyBackend(comptime B: type) void {
 
 // ── The agnostic operation layer ─────────────────────────────────────────────────
 
-/// `Engine(Backend)` is the namespace of regex operations specialized to a
-/// backend. The front door (`Regex`/`Compiled`) is a thin wrapper that stores a
-/// `Program` + `Scratch` + `Meta` and forwards to these. All of it is generic over
-/// the two backend primitives (`search`/`searchCaptures`) — backends contribute no
-/// iteration/capture/replace code.
+/// `Engine(Backend)` is the namespace of regex operations specialized to a backend:
+/// `isMatch`, `find`, `findAll`, `captures`, `capturesAll`, `count`, `split`,
+/// `replaceAll`. It implements ALL of them ONCE, generically, on top of just the
+/// backend's two primitives (`search` / `searchCaptures`) — so a backend writes no
+/// iteration, capture-view, or template code. The front door (`Compiled`) is a thin
+/// wrapper over this; reach for `Engine` directly to drive a chosen backend WITHOUT
+/// the wrapper (e.g. in a backend's own tests).
+///
+/// ```zig
+/// const B = gex.engine.backends.pikevm; // any backend type
+/// const E = backend.Engine(B); //         specialize the op layer to it
+///
+/// // build a Program (HIR → program) and a caller-owned Scratch:
+/// var program = try B.buildAlloc(gpa, h, .{});
+/// defer B.freeProgram(gpa, &program);
+/// var sc = try B.Scratch.init(gpa, &program);
+/// defer sc.deinit(gpa);
+/// const meta = backend.Meta{ .capture_count = h.capture_count };
+///
+/// // every op takes (program, scratch, input, …):
+/// _ = E.isMatch(&program, &sc, input, .{});
+/// if (E.find(&program, &sc, input, .{})) |m| _ = m.slice(input);
+/// var it = E.findAll(&program, &sc, input, .{}); //   iterate non-overlapping matches
+/// while (it.next()) |m| _ = m;
+/// var slots: [8]?usize = undefined; //                2 * (capture_count + 1)
+/// var ci = E.capturesAll(&program, &sc, input, &slots, meta, .{});
+/// while (ci.next()) |c| _ = c.groupSlice(1);
+/// ```
+///
+/// `find`/`findAll`/`split`/`replaceAll` require the backend's `search`; the capture
+/// ops and `replaceAll` additionally require `caps.captures == true` — otherwise a
+/// compile error names the offending backend.
 ///
 /// @stable-since: v0.1.0
 pub fn Engine(comptime Backend: type) type {
