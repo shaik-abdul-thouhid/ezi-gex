@@ -82,6 +82,14 @@ const general_cases = [_]Case{
     .{ .pat = "\\p{Nd}+", .input = "x٤٥٦y", .expect = "٤٥٦" },
     .{ .pat = "(?i)abc", .input = "XYZABCxyz", .expect = "ABC" },
     .{ .pat = "é{2,3}", .input = "xééééy", .expect = "ééé" },
+    // case-fold ORBIT closure: every member of a simple-fold orbit must match,
+    // even when reached transitively (K, k, and U+212A KELVIN SIGN all fold to
+    // 'k'; A-ring U+00C5, å U+00E5, and U+212B ANGSTROM SIGN all fold to 'å').
+    .{ .pat = "(?i)k", .input = "\u{212A}", .expect = "\u{212A}" },
+    .{ .pat = "(?i)K", .input = "\u{212A}", .expect = "\u{212A}" },
+    .{ .pat = "(?i)\u{212A}", .input = "k", .expect = "k" },
+    .{ .pat = "(?i)\u{00C5}", .input = "\u{212B}", .expect = "\u{212B}" },
+    .{ .pat = "(?i)[k]", .input = "\u{212A}", .expect = "\u{212A}" },
     // pathological (linear-time guarantee for both engines)
     .{ .pat = "(a*)*b", .input = "aaaaaaaaaaaaX", .expect = null },
 };
@@ -240,6 +248,33 @@ test "comptime == runtime for the same backend" {
             try checkComptime(B, c); // comptime — same expectation
         }
     }
+}
+
+// ── program range interning ───────────────────────────────────────────────────────
+
+test "identical class blocks are interned into one range-block in the program" {
+    const gpa = testing.allocator;
+    var diag: regex.Diagnostic = .{};
+
+    // Baseline: a single \w resolves to N ranges.
+    var one = try regex.compileRuntimeWith(pikevm, gpa, "\\w", &diag, .{});
+    defer one.deinit();
+    const n = one.program.ranges.len;
+    try testing.expect(n > 1); // \w is a real Unicode class, many ranges
+
+    // Repeating the SAME class — across concatenation, capture groups, and a
+    // counted repetition — must NOT multiply the stored ranges: every \w block
+    // is interned to the first. The program holds exactly one \w worth of ranges.
+    for ([_][]const u8{ "\\w\\w\\w", "(\\w)(\\w)(\\w)", "\\w{4,9}" }) |pat| {
+        var re = try regex.compileRuntimeWith(pikevm, gpa, pat, &diag, .{});
+        defer re.deinit();
+        try testing.expectEqual(n, re.program.ranges.len);
+    }
+
+    // Distinct classes are NOT collapsed — \w and \d stay separate blocks.
+    var mixed = try regex.compileRuntimeWith(pikevm, gpa, "\\w\\d", &diag, .{});
+    defer mixed.deinit();
+    try testing.expect(mixed.program.ranges.len > n);
 }
 
 test {

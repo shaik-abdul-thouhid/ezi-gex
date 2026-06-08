@@ -620,7 +620,11 @@ pub const Scanner = struct {
         while (i < name.len) {
             const d = utf8.validateAndDecodeCodePointBytes(name, i) catch
                 return self.fail(.invalid_group_name, Span.range(name_start, name_start + @as(u32, @intCast(name.len))));
-            const ok = if (first) u_props.isIdentifierStart(d.code_point) else u_props.isIdentifierContinue(d.code_point);
+            // Range-table-backed identifier test: identical result to
+            // isIdentifierStart/Continue, but resolves from the enumerable
+            // `derived_runs` table instead of the per-code-point page tries, so
+            // the scanner never links the ~170 KB DerivedCoreProperties trie.
+            const ok = if (first) u_props.isIdentifierStartByRanges(d.code_point) else u_props.isIdentifierContinueByRanges(d.code_point);
             if (!ok) return self.fail(.invalid_group_name, Span.range(name_start + @as(u32, @intCast(i)), name_start + @as(u32, @intCast(i)) + d.len));
             i += d.len;
             first = false;

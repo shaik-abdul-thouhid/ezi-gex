@@ -659,21 +659,46 @@ fn Builder(comptime mode: Mode) type {
             self.main_len += 1;
         }
 
+        /// Whether `cp` is already present in the member scratch (the ranges
+        /// accumulated for the class member being resolved). Used by `addFolded`
+        /// to close a simple-fold orbit transitively.
+        fn memberHas(self: *Self, cp: CodePoint) bool {
+            for (self.member[0..self.member_len]) |r| {
+                if (cp >= r.lo and cp <= r.hi) return true;
+            }
+            return false;
+        }
+
         fn foldActive(self: *Self, flags: Flags) bool {
             return flags.case_insensitive and self.opts.case_fold != .none;
         }
 
-        /// Append `[lo,hi]` to the member scratch, plus its simple-fold closure
-        /// when case folding is active (both directions of the fold table).
+        /// Append `[lo,hi]` to the member scratch, plus the full simple-fold
+        /// ORBIT of every code point it covers when case folding is active.
+        ///
+        /// Two table passes give the transitive closure. A single pass (add a
+        /// member's fold target, and add the sources of any target that lands in
+        /// the original range) misses *siblings*: code points that fold to the
+        /// same target as a member but whose shared target is outside `[lo,hi]`.
+        /// e.g. `(?i)K` (U+004B) — both `k` (U+006B) and U+212A KELVIN SIGN fold
+        /// to `k`; the forward pass adds `k`, and the closure pass then adds every
+        /// source of `k`, including the KELVIN SIGN. Simple-fold orbits have depth
+        /// ≤ 2 (each code point folds in one step to a canonical form that folds
+        /// to itself), so forward-then-closure is complete.
         fn addFolded(self: *Self, lo: CodePoint, hi: CodePoint, flags: Flags) BuildError!void {
             try self.addMember(lo, hi);
             if (!self.foldActive(flags)) return;
-            for (casing.case_folding.common_simple_table) |entry| {
+            const table = casing.case_folding.common_simple_table;
+            // Forward: add the simple-fold target of every code point in [lo,hi].
+            for (table) |entry| {
                 if (entry.to.len != 1) continue;
-                const t = entry.to[0];
-                const f = entry.from;
-                if (f >= lo and f <= hi) try self.addMember(t, t);
-                if (t >= lo and t <= hi) try self.addMember(f, f);
+                if (entry.from >= lo and entry.from <= hi) try self.addMember(entry.to[0], entry.to[0]);
+            }
+            // Closure: add every source whose target is now a member (an original
+            // code point OR a target added above) — completing each fold orbit.
+            for (table) |entry| {
+                if (entry.to.len != 1) continue;
+                if (self.memberHas(entry.to[0])) try self.addMember(entry.from, entry.from);
             }
         }
 

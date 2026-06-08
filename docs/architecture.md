@@ -109,9 +109,35 @@ its output arrays live in `ro_data` (comptime) or on the heap (runtime). This is
 > lowers the whole pipeline in the compiler's const-evaluator and bakes the program into
 > `ro_data`. It only works until the eval-branch quota / compiler memory runs out, so a
 > large or pathological pattern can fail to build or make the build slow and heavy — use
-> `compileRuntime` there (no ceiling). And every embedded comptime program adds its tables
-> to the binary: Unicode classes are large (a single `\w{3,32}` ≈ 200 KB of ranges), so
-> embedding many can add megabytes of `ro_data`. **This trade-off is the user's to make.**
+> `compileRuntime` there (no ceiling). Each embedded comptime program adds *its own*
+> ranges to `ro_data` (~6.3 KB per distinct `\w`, ~5.3 KB per `\p{L}`, ≤0.5 KB for ASCII
+> classes), but identical classes within a program are **interned** (so `\w{3,32}` costs
+> one `\w`, not 35 — see §3.1), and `compileRuntime` adds nothing to the binary at all.
+> **This trade-off is the user's to make.**
+
+### 3.1 Binary footprint — the Unicode tables are a *fixed* cost
+
+A recurring worry is that resolving Unicode classes "pulls in huge tables." It does
+pull in tables, but the size is **bounded and constant**, not proportional to how many
+or how complex your patterns are:
+
+- **Range tables, linked once (~135 KB total).** All Unicode work is delegated to
+  `ezi_code`'s *enumerable range tables* — `category_runs`, `derived_runs`,
+  `script_runs`, and the simple case-fold table. The HIR resolves every class from
+  them, and `\b`/`isWord` and the scanner's group-name validation go through their
+  range-backed predicates too. These tables are a one-time link cost: **the same ~135 KB
+  whether the program compiles one regex or ten thousand.**
+- **No per-code-point page tries.** ezi_gex deliberately uses only the *range* tables,
+  never `ezi_code`'s two-level per-code-point page tries (General_Category + Derived­Core­Properties),
+  which alone are ~220 KB. They are not linked.
+- **Program interning.** When `nfa` compiles the HIR it **interns identical class
+  range-blocks** in the `Program` (`engine/nfa.zig`, `addRanges`): two class instructions
+  with the same resolved ranges share one block. So a class repeated within a pattern —
+  by concatenation, capture groups, or a counted repeat like `\w{3,32}` — is stored
+  **once**. This shrinks both the heap program and, for `compileComptime`, the `ro_data`.
+- **Where size *does* scale:** only the `ro_data` of the `compileComptime` programs you
+  choose to bake in, by one block per *distinct* class per pattern. Runtime-compiled
+  regexes live on the heap and add nothing to the binary beyond the shared tables.
 
 ---
 

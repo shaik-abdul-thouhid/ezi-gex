@@ -15,6 +15,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the slot offsets and input into `ro_data`, so `groupSlice`/`namedSlice` (numbered
   **and named** groups) work on it at comptime and at runtime.
 
+### Changed
+
+- **Binary size: ~525 KB smaller** for a representative build (`main.zig` demo:
+  3.29 MB → 2.76 MB on macOS arm64, Debug), with no change to match semantics or
+  match-time performance. Two independent causes of Unicode-table bloat were
+  removed:
+  - The scanner now validates group names with `ezi_code`'s range-table
+    identifier predicates (`isIdentifierStartByRanges`/`isIdentifierContinueByRanges`),
+    and `\b` word-boundary goes through the range-table `isWord`, so ezi_gex no
+    longer links `ezi_code`'s ~220 KB of per-code-point property page tries — the
+    HIR and the matcher now consult *only* the enumerable range tables.
+  - The bumped `ezi_code` pin de-duplicates those range tables (each had been
+    emitted 2–3× in consumer binaries).
+- **Program range interning** (`engine/nfa.zig`): the compiler interns identical
+  resolved class range-blocks in the `Program`, so a pattern that repeats a class
+  (e.g. `(\w+)@(\w+)\.(\w+)`) stores those ranges once instead of per occurrence.
+  Shrinks both the heap program and the comptime `ro_data` it bakes into. Sound —
+  blocks are immutable and read-only at match time — and the match result is
+  unchanged.
+
+### Fixed
+
+- **Case-fold orbit closure** (`core/hir.zig`): under `(?i)` /
+  `case_fold = .simple` a class/literal now admits the *entire* simple-fold
+  orbit, including members reached transitively. Previously `(?i)K` (U+004B)
+  matched `K`/`k` but not U+212A KELVIN SIGN even though all three fold to `k`;
+  likewise `(?i)Å` (U+00C5) now also matches U+212B ANGSTROM SIGN. (Full
+  `1→many` folding such as `ß`↔`ss` remains a documented v1 gap.)
+
 ## [0.1.0] - 2026-06-07
 
 First public surface and first tagged release. Everything here is annotated

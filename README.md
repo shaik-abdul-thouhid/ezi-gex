@@ -357,13 +357,17 @@ Use it when **all three** are true:
    `@compileError`, not a runtime error path you have to handle.
 3. The pattern is light on Unicode classes.
 
-That third one is the catch. This engine resolves Unicode classes to sorted code-point
-ranges at HIR time, and those ranges bake into `ro_data` *per occurrence*. One `\w` is
-already ~6 KB. A counted repeat like `\w{3,32}` is ~200 KB — the inline expansion
-multiplies the table. Thirty real-world patterns with `\w`/`\s`/`\p{...}` added ~625 KB
-to a test binary; a hundred can push 2 MB+. If your pattern is ASCII-heavy (`\d`, `[a-z]`,
-explicit ranges), the cost is negligible. If it leans on Unicode classes or counted
-repetitions of them, check the binary size delta before committing.
+That third one is the catch — though a much smaller one than it used to be. This engine
+resolves Unicode classes to sorted code-point ranges at HIR time, and a
+`compileComptime` program bakes its ranges into `ro_data`. One `\w` is ~6.3 KB
+(802 ranges × 8 B), `\p{L}` ~5.3 KB, `\d` ~0.5 KB, `\s` ~80 B. **Identical classes
+inside a pattern are interned to a single range-block**, so a counted repeat like
+`\w{3,32}` costs *one* `\w` (~6.3 KB), not one per copy — repetition no longer
+multiplies the table. The remaining cost is one block per *distinct* class per
+comptime pattern. If your pattern is ASCII-heavy (`\d`, `[a-z]`, explicit ranges) the
+cost is negligible; if it stacks many *different* Unicode classes, check the delta.
+See [§ Binary size](#binary-size) for the whole picture (the Unicode tables themselves
+are a fixed one-time cost, not a per-pattern one).
 
 ### When the `*Comptime` match methods make sense
 
@@ -419,6 +423,36 @@ wired:**
 backend (the RE2/Rust core — runtime-only, since it mutates state at match time). The
 backend contract is exactly the seam to drop a DFA in without disturbing the comptime
 path or the API. See [`docs/architecture.md`](docs/architecture.md) for the planned tiers.
+
+## Binary size
+
+All Unicode work is delegated to `ezi_code`'s **enumerable range tables** — the HIR
+resolves every class (`\d \w \s`, `\p{…}`, scripts, `[...]`) to sorted code-point
+ranges, and the matcher and `\b` consult those same tables. ezi_gex links **none** of
+`ezi_code`'s per-code-point page tries.
+
+This makes the Unicode contribution to your binary a **fixed constant, not a growing
+one**:
+
+| What | Cost | Grows with…? |
+|---|---|---|
+| `ezi_code` range tables (General_Category, DerivedCoreProperties, Script, simple case-fold) | **~135 KB, linked once** | **nothing** — same for 1 pattern or 10 000 |
+| per-code-point page tries | **0** — not linked | — |
+| a runtime-compiled regex (`compileRuntime`) | on the **heap**, not the binary | the pattern |
+| a comptime-compiled regex (`compileComptime`), per pattern | one program in `ro_data`; ~6.3 KB per *distinct* `\w`, ~5.3 KB per `\p{L}`, ≤0.5 KB for ASCII classes | the pattern's distinct classes |
+
+So once a program touches the regex engine at all, the Unicode tables are paid for
+**once** and never again — adding more patterns, longer patterns, or more Unicode
+classes cannot push that ~135 KB any higher. The only size that scales with your code
+is `ro_data` for the `compileComptime` programs you choose to bake in, and even there
+**identical classes are interned** (a class used N times in one pattern is stored once;
+`\w{3,32}` costs one `\w`, not 35). `compileRuntime` adds nothing to the binary beyond
+the shared tables.
+
+Reference point: the bundled `main.zig` demo (which exercises runtime *and* comptime
+compilation, classes, captures, replace, split, and `\p{L}`) is **~2.76 MB** in `Debug`
+on macOS arm64 — the rest is the Zig `Debug` runtime (DWARF self-unwind, UBSan, the
+allocator), not regex data. `ReleaseSmall` is far smaller.
 
 ## Documentation
 

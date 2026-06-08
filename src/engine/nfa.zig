@@ -66,8 +66,25 @@ pub const Program = struct {
 
 // ── Compiler: HIR → Program ──────────────────────────────────────────────────────
 
-/// Exact output sizes, from the `.count` pass.
+/// Output sizes from the `.count` pass. `insts` is exact; `ranges` is an UPPER
+/// BOUND — the emit pass interns identical class range-blocks (see `addRanges`),
+/// so the program's final `ranges` length can be smaller. Buffers are sized to
+/// this bound; the comptime path trims to the exact length and the heap path
+/// right-sizes its allocation.
 const Sizes = struct { insts: u32, ranges: u32 };
+
+/// Bookkeeping for range-block interning: the `(start, len)` of one already-
+/// emitted block in the program's `ranges`, so a later identical block can point
+/// at it instead of being copied again.
+const Mark = struct { start: u32, len: u32 };
+
+fn rangesEqual(a: []const Range, b: []const Range) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (x.lo != y.lo or x.hi != y.hi) return false;
+    }
+    return true;
+}
 
 const Mode = enum { count, emit };
 
@@ -84,9 +101,11 @@ fn Builder(comptime mode: Mode) type {
         insts: if (is_emit) []Inst else void = if (is_emit) undefined else {},
         ranges: if (is_emit) []Range else void = if (is_emit) undefined else {},
         patch: []u32 = &.{},
+        marks: if (is_emit) []Mark else void = if (is_emit) undefined else {},
         inst_len: u32 = 0,
         range_len: u32 = 0,
         patch_len: u32 = 0,
+        mark_len: u32 = 0,
 
         fn emit(self: *Self, inst: Inst) u32 {
             const i = self.inst_len;
@@ -107,8 +126,25 @@ fn Builder(comptime mode: Mode) type {
             }
         }
         fn addRanges(self: *Self, src: []const Range) u32 {
+            if (!is_emit) {
+                // Count pass: an upper bound (interning only ever shrinks).
+                const start = self.range_len;
+                self.range_len += @intCast(src.len);
+                return start;
+            }
+            // Emit pass: intern. If an identical block was already emitted, point
+            // the new class instruction at it rather than copying the ranges
+            // again — sound because the program's `ranges` are immutable and only
+            // read (never indexed by class identity) at match time. This dedups,
+            // for example, the three `\w` blocks in `(\w+)@(\w+)\.(\w+)` down to
+            // one, shrinking the heap program and the comptime ro_data alike.
+            for (self.marks[0..self.mark_len]) |mk| {
+                if (rangesEqual(self.ranges[mk.start .. mk.start + mk.len], src)) return mk.start;
+            }
             const start = self.range_len;
-            if (is_emit) @memcpy(self.ranges[start .. start + src.len], src);
+            @memcpy(self.ranges[start .. start + src.len], src);
+            self.marks[self.mark_len] = .{ .start = start, .len = @intCast(src.len) };
+            self.mark_len += 1;
             self.range_len += @intCast(src.len);
             return start;
         }
@@ -208,10 +244,12 @@ fn measure(h: hir.Hir) error{Unsupported}!Sizes {
     return .{ .insts = b.inst_len, .ranges = b.range_len };
 }
 
-/// Emit pass: fill caller buffers (each ≥ the matching `measure` size; `patch` ≥
-/// `insts.len`) and return the `Program` sub-slicing them.
-fn build(h: hir.Hir, insts: []Inst, ranges: []Range, patch: []u32) error{Unsupported}!Program {
-    var b = Builder(.emit){ .h = h, .insts = insts, .ranges = ranges, .patch = patch };
+/// Emit pass: fill caller buffers (each ≥ the matching `measure` size; `patch`
+/// and `marks` ≥ `insts.len`) and return the `Program` sub-slicing them. Because
+/// `addRanges` interns identical class blocks, the returned `ranges` slice may be
+/// SHORTER than the `ranges` buffer; the callers right-size accordingly.
+fn build(h: hir.Hir, insts: []Inst, ranges: []Range, patch: []u32, marks: []Mark) error{Unsupported}!Program {
+    var b = Builder(.emit){ .h = h, .insts = insts, .ranges = ranges, .patch = patch, .marks = marks };
     _ = b.emit(.{ .save = 0 });
     try b.compileNode(h.root);
     _ = b.emit(.{ .save = 1 });
@@ -242,7 +280,13 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir) BuildError!Program {
     errdefer gpa.free(ranges);
     const patch = try gpa.alloc(u32, sizes.insts); // backpatch stack ≤ #insts
     defer gpa.free(patch);
-    return build(h, insts, ranges, patch) catch error.Unsupported;
+    const marks = try gpa.alloc(Mark, sizes.insts); // one per class inst ≤ #insts
+    defer gpa.free(marks);
+    var prog = build(h, insts, ranges, patch, marks) catch return error.Unsupported;
+    // Interning may leave `ranges` shorter than the measured upper bound. Return
+    // the slack to the allocator so `freeProgram` frees exactly what is held.
+    if (prog.ranges.len != ranges.len) prog.ranges = try gpa.realloc(ranges, prog.ranges.len);
+    return prog;
 }
 
 /// Compile a HIR into a ro_data `Program` at comptime. `\X` becomes a `@compileError`.
@@ -255,7 +299,8 @@ pub fn buildComptime(comptime h: hir.Hir) Program {
     comptime var insts: [sizes.insts]Inst = undefined;
     comptime var ranges: [sizes.ranges]Range = undefined;
     comptime var patch: [sizes.insts]u32 = undefined;
-    const prog = build(h, &insts, &ranges, &patch) catch unreachable; // measure already validated
+    comptime var marks: [sizes.insts]Mark = undefined;
+    const prog = build(h, &insts, &ranges, &patch, &marks) catch unreachable; // measure already validated
     const final_insts = insts[0..prog.insts.len].*;
     const final_ranges = ranges[0..prog.ranges.len].*;
     return .{ .insts = &final_insts, .ranges = &final_ranges, .slot_count = prog.slot_count };
