@@ -248,10 +248,12 @@ This also works for a **runtime**-compiled regex when you want zero allocation d
 matching — `initBuffer` over a fixed `[N]Buf` never allocates (unlike `init`).
 
 > **⚠️ Comptime is bounded.** `compileComptime` lowers the whole pipeline in const-eval
-> and bakes the program (incl. any Unicode class tables — a single `\w{3,32}` is ~200 KB
-> of ranges) into the binary. Large/pathological patterns can blow the eval-branch quota
-> or bloat `ro_data`. For those, prefer `compileRuntime` (no ceiling). The trade-off is
-> yours to make — see [`architecture.md`](architecture.md) §3.
+> and bakes the program into the binary, including its class ranges (~6.3 KB per *distinct*
+> `\w`; identical classes within a pattern are interned, so `\w{3,32}` costs one `\w`, not
+> 35). Large/pathological patterns can blow the eval-branch quota or grow `ro_data`. For
+> those, prefer `compileRuntime` (no ceiling). The shared Unicode *tables* are a fixed
+> one-time cost, not per-pattern. The trade-off is yours to make — see
+> [`architecture.md`](architecture.md) §3 and §3.1.
 
 ---
 

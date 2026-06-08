@@ -123,12 +123,15 @@ const year = comptime cap.groupSlice(1).?;              // "2026", a ro_data sli
 >    eval-branch quota and compiler memory; a large, deeply-nested, or pathological pattern
 >    can blow the quota or make builds slow and memory-heavy. **Prefer `compileRuntime` for
 >    big or user-supplied patterns** — runtime compilation has no such ceiling.
-> 2. **Embedding many comptime programs bloats the binary.** Each `compileComptime` adds its
->    program tables to `ro_data`, and Unicode classes are large: one `\w` ≈ 800 ranges ≈ 6 KB
->    *per occurrence*, and counted repetition multiplies it — a single `\w{3,32}` is ~200 KB.
->    *Measured:* 30 realistic patterns added **~625 KB**; ~100 can be **2 MB+** (tens of MB if
->    they use counted Unicode-class repeats). The matching *code* is shared across all of
->    them, so the cost is almost entirely data.
+> 2. **Each comptime program adds *its* ranges to `ro_data`.** A `compileComptime` regex
+>    bakes its class ranges in: ~6.3 KB per *distinct* `\w` (~800 ranges), ~5.3 KB per
+>    `\p{L}`, ≤0.5 KB for ASCII classes. **Identical classes within a pattern are interned
+>    to one range-block**, so a counted repeat like `\w{3,32}` costs *one* `\w`, not one
+>    per copy — repetition no longer multiplies the table. The cost is one block per
+>    *distinct* class per comptime pattern; `compileRuntime` adds nothing to the binary.
+>    The Unicode *tables* themselves are a fixed one-time cost, **not** per-pattern — see
+>    [§ Binary size](#binary-size). Stacking many *different* Unicode classes across many
+>    comptime programs is the only thing that grows `ro_data`; check the delta then.
 
 ## Matching & captures
 
