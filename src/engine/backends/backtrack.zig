@@ -215,21 +215,21 @@ fn backtrack(ctx: *Ctx, pc0: u32, sp0: usize) bool {
             .char => |ch| {
                 if (sp >= ctx.input.len) return false;
                 const d = nfa.decodeAt(ctx.input, sp);
-                if (d.cp != ch) return false;
+                if (!d.valid or d.cp != ch) return false; // dead-on-invalid
                 pc += 1;
                 sp += d.len;
             },
             .range => |r| {
                 if (sp >= ctx.input.len) return false;
                 const d = nfa.decodeAt(ctx.input, sp);
-                if (!nfa.inRanges(ctx.program.ranges[r.start .. r.start + r.len], d.cp)) return false;
+                if (!d.valid or !nfa.inRanges(ctx.program.ranges[r.start .. r.start + r.len], d.cp)) return false;
                 pc += 1;
                 sp += d.len;
             },
             .any => |a| {
                 if (sp >= ctx.input.len) return false;
                 const d = nfa.decodeAt(ctx.input, sp);
-                if (!(a.dot_all or d.cp != '\n')) return false;
+                if (!d.valid or !(a.dot_all or d.cp != '\n')) return false; // `.` never matches an invalid byte
                 pc += 1;
                 sp += d.len;
             },

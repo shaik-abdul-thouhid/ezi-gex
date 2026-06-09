@@ -316,6 +316,7 @@ fn run(program: *const Program, sc: *Scratch, input: []const u8, opts: SearchOpt
 
         var cp: CodePoint = 0;
         var cp_len: usize = 1;
+        var valid = true; // dead-on-invalid: an invalid UTF-8 byte matches nothing
         if (!at_end) {
             const b = input[sp];
             if (b <= 0x7F) {
@@ -327,6 +328,7 @@ fn run(program: *const Program, sc: *Scratch, input: []const u8, opts: SearchOpt
                 const d = nfa.decodeAt(input, sp);
                 cp = d.cp;
                 cp_len = d.len;
+                valid = d.valid;
             }
         }
 
@@ -336,11 +338,11 @@ fn run(program: *const Program, sc: *Scratch, input: []const u8, opts: SearchOpt
             const t_pc: u32 = @intCast(c_list.pcs[i].w);
             const t_slots = c_list.slots[i * c_list.sc .. i * c_list.sc + c_list.sc];
             switch (program.insts[t_pc]) {
-                .char => |ch| if (!at_end and cp == ch)
+                .char => |ch| if (!at_end and valid and cp == ch)
                     addThread(program, n_list, t_pc + 1, t_slots, sp + cp_len, input, sc.stack),
-                .range => |r| if (!at_end and nfa.inRanges(program.ranges[r.start .. r.start + r.len], cp))
+                .range => |r| if (!at_end and valid and nfa.inRanges(program.ranges[r.start .. r.start + r.len], cp))
                     addThread(program, n_list, t_pc + 1, t_slots, sp + cp_len, input, sc.stack),
-                .any => |a| if (!at_end and (a.dot_all or cp != '\n'))
+                .any => |a| if (!at_end and valid and (a.dot_all or cp != '\n'))
                     addThread(program, n_list, t_pc + 1, t_slots, sp + cp_len, input, sc.stack),
                 .match => {
                     @memcpy(sc.match_slots, t_slots);

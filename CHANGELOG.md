@@ -80,6 +80,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Invalid UTF-8 in input is now dead-on-invalid** (`engine/nfa.zig` + both NFA
+  backends). A malformed byte matches nothing (`.` no longer matches it) and the
+  unanchored scan resyncs one byte past it, so a match never spans a bad byte.
+  **Behaviour change:** previously an invalid byte decoded to `U+FFFD` and could match
+  `.` or a class containing `U+FFFD`. `decodeAt` now reports a `valid` bit;
+  `char`/`range`/`any` fail on an invalid byte in both the Pike VM and the
+  backtracker. The PATTERN is still strictly validated (invalid pattern bytes remain a
+  compile error, not a substitution).
+
 - **Binary size: ~525 KB smaller** for a representative build (`main.zig` demo:
   3.29 MB → 2.76 MB on macOS arm64, Debug), with no change to match semantics or
   match-time performance. Two independent causes of Unicode-table bloat were

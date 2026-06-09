@@ -340,15 +340,26 @@ pub fn inRanges(ranges: []const Range, cp: CodePoint) bool {
 }
 
 /// @stable-since: v0.1.0
-pub const Decoded = struct { cp: CodePoint, len: usize };
+pub const Decoded = struct {
+    cp: CodePoint,
+    len: usize,
+    /// False when the bytes at `sp` are not well-formed UTF-8. Under the engine's
+    /// **dead-on-invalid** policy a consuming instruction (`char`/`range`/`any`)
+    /// fails on an invalid byte — a match never spans one — while `len` still
+    /// reports a 1-byte advance so the unanchored scan resyncs to the next byte.
+    valid: bool = true,
+};
 
-/// Decode one code point at byte offset `sp`. Invalid UTF-8 yields U+FFFD with a
-/// 1-byte advance — the engine's `fail`-ish policy: it won't match across an
-/// invalid byte but still makes progress.
+/// Decode one code point at byte offset `sp`. Well-formed UTF-8 returns the scalar
+/// and its byte length with `valid = true`. **Invalid UTF-8 is dead-on-invalid:** it
+/// returns `{ U+FFFD, 1, valid = false }` — `valid = false` makes consuming
+/// instructions fail (so no match spans the bad byte), and the 1-byte `len` lets the
+/// search advance past it. (The PATTERN, by contrast, is always strictly validated
+/// at parse time — invalid pattern bytes are a compile error, not a substitution.)
 ///
 /// @stable-since: v0.1.0
 pub fn decodeAt(input: []const u8, sp: usize) Decoded {
-    const d = utf8.validateAndDecodeCodePointBytes(input, sp) catch return .{ .cp = 0xFFFD, .len = 1 };
+    const d = utf8.validateAndDecodeCodePointBytes(input, sp) catch return .{ .cp = 0xFFFD, .len = 1, .valid = false };
     return .{ .cp = d.code_point, .len = d.len };
 }
 

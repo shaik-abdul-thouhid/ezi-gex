@@ -899,6 +899,29 @@ test "(?x) verbose: an escaped space is still a literal space" {
     try testing.expect(!re.isMatch(&sc, "ab"));
 }
 
+// ── dead-on-invalid UTF-8 (input is matched, never substituted) ───────────────
+
+test "dead-on-invalid: a match never spans an invalid UTF-8 byte" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "a.c", &diag, .{ .dot_matches_newline = true });
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    // 0xFF is an invalid UTF-8 byte — `.` must NOT match it (no U+FFFD substitution):
+    try testing.expect(!re.isMatch(&sc, "a\xFFc"));
+    try testing.expect(re.isMatch(&sc, "axc")); // a valid scalar still matches
+}
+
+test "dead-on-invalid: the scan resyncs and matches the valid region after a bad byte" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "\\d+", &diag, .{});
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    // The leading 0xFF is skipped; the digits after it still match.
+    try testing.expectEqualStrings("42", re.find(&sc, "\xFF42").?.slice("\xFF42"));
+}
+
 test {
     testing.refAllDecls(@This());
 }
