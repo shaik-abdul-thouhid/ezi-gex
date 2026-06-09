@@ -125,6 +125,30 @@ pub const Options = struct {
     /// stay code-point / Unicode-aware. See `hir.Options.unicode`.
     unicode: bool = true,
 
+    /// Execution-strategy knobs. **Results-invariant by contract:** changing any
+    /// field here may affect only speed/memory, never which text matches. Reserved
+    /// for the byte-engine work (DESIGN.md §3) — the current engine does not consult
+    /// them yet; they lock the option shape so wiring them later is non-breaking.
+    strategy: Strategy = .{},
+
+    /// The reserved strategy tier (see `strategy`). Kept physically separate from
+    /// the semantic flags above so "these never change a match result" is a
+    /// type-level boundary the conformance suite can fuzz over.
+    ///
+    /// @stable-since: v0.2.0
+    pub const Strategy = struct {
+        /// Whether to use the (future) byte DFA: `.auto` lets analysis decide;
+        /// `.enabled`/`.disabled` force it. Currently inert.
+        byte_engine: enum { auto, enabled, disabled } = .auto,
+        /// Bake full Unicode `\b` into the (future) byte-DFA state, vs. the default
+        /// quit-to-NFA fallback. Currently inert.
+        unicode_word_boundary_in_dfa: bool = false,
+        /// Enable literal prefiltering. Currently inert (the engine's analysis
+        /// prefilter is always on); reserved so it can be made configurable later
+        /// without a breaking change.
+        prefilter: bool = true,
+    };
+
     /// Project these front-door options onto the HIR builder's options.
     fn toHir(self: Options) hir.Options {
         return .{ .case_fold = self.case_fold, .unicode = self.unicode };
@@ -797,6 +821,25 @@ test "grapheme \\X composes (a\\Xc over a combining-mark cluster)" {
     // a, then one cluster (e+U+0301), then c:
     try testing.expect(re.isMatch(&sc, "ae\u{0301}c"));
     try testing.expect(!re.isMatch(&sc, "ac")); // \X requires one cluster between
+}
+
+test "Options.strategy is results-invariant (reserved tier)" {
+    var diag: Diagnostic = .{};
+    var a = try compileRuntime(testing.allocator, "\\w+", &diag, .{});
+    defer a.deinit();
+    var b = try compileRuntime(testing.allocator, "\\w+", &diag, .{ .strategy = .{
+        .byte_engine = .disabled,
+        .prefilter = false,
+        .unicode_word_boundary_in_dfa = true,
+    } });
+    defer b.deinit();
+    var sa = try @TypeOf(a).Scratch.init(testing.allocator, &a.program);
+    defer sa.deinit(testing.allocator);
+    var sb = try @TypeOf(b).Scratch.init(testing.allocator, &b.program);
+    defer sb.deinit(testing.allocator);
+    const input = "  héllo_42  ";
+    // Flipping every strategy knob must not change which text matches.
+    try testing.expectEqualStrings(a.find(&sa, input).?.slice(input), b.find(&sb, input).?.slice(input));
 }
 
 test {

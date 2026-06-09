@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Options.strategy` reserved tier** (`engine/regex.zig`). A `Strategy` sub-struct
+  (`byte_engine`, `unicode_word_boundary_in_dfa`, `prefilter`) separates
+  results-invariant execution knobs from the semantic flags. Currently inert
+  (reserved for the byte-engine work); locks the option shape so wiring them later is
+  non-breaking. Flipping any field never changes which text matches.
+
 - **Grapheme `\X`** (UAX #29 extended grapheme clusters) is now supported. `\X`
   matches one whole cluster (combining marks, emoji ZWJ/modifier sequences,
   regional-indicator pairs, …). It compiles to a variable-width `grapheme` NFA
