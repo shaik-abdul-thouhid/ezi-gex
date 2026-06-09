@@ -842,6 +842,26 @@ test "Options.strategy is results-invariant (reserved tier)" {
     try testing.expectEqualStrings(a.find(&sa, input).?.slice(input), b.find(&sb, input).?.slice(input));
 }
 
+test "SearchOptions.span_end limits the search to a sub-range" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "\\d+", &diag, .{});
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    const input = "ab123cd456"; // digits "123" at [2,5), "456" at [7,10)
+
+    try testing.expectEqualStrings("123", re.find(&sc, input).?.slice(input)); // full search
+
+    // span_end = 4 ⇒ haystack "ab12" ⇒ matches "12":
+    try testing.expectEqualStrings("12", re.findAt(&sc, input, .{ .span_end = 4 }).?.slice(input));
+    // span_end before any digit ⇒ no match:
+    try testing.expect(re.findAt(&sc, input, .{ .span_end = 2 }) == null);
+    // start + span_end window [5,9) over "cd45" ⇒ "45":
+    try testing.expectEqualStrings("45", re.findAt(&sc, input, .{ .start = 5, .span_end = 9 }).?.slice(input));
+    // span_end past the end clamps to input.len (no panic):
+    try testing.expectEqualStrings("123", re.findAt(&sc, input, .{ .span_end = 999 }).?.slice(input));
+}
+
 test {
     testing.refAllDecls(@This());
 }

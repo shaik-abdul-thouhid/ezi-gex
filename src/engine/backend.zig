@@ -153,6 +153,19 @@ pub const SearchOptions = struct {
     /// When true the match must begin EXACTLY at `start` — no leftward/rightward
     /// scan. Used to confirm a prefilter hit or to walk anchored matches by hand.
     anchored: bool = false,
+    /// Upper bound for the search: no match may end past this byte offset, and the
+    /// engine never looks past it. `null` ⇒ end of input. Must be ≥ `start`
+    /// (a `span_end < start` simply yields no match). Lets you search a sub-range
+    /// without copying. The agnostic `Engine` ops enforce it by clamping the
+    /// haystack, so backends never see it; returned offsets still index the full
+    /// `input`.
+    span_end: ?usize = null,
+    /// Return as soon as ANY match is found rather than pursuing a longer/leftmost
+    /// one. The built-in leftmost-first engines already return the leftmost match
+    /// (and `isMatch` already short-circuits), so this is currently a no-op for
+    /// them; it is reserved for an engine with a distinct earliest-match mode (e.g.
+    /// a future byte DFA).
+    earliest: bool = false,
 };
 
 /// Budget/behaviour hints a backend may accept when its `Scratch` is constructed.
@@ -467,16 +480,25 @@ pub fn Engine(comptime Backend: type) type {
         pub const Scratch = Backend.Scratch;
         pub const supports_captures = Backend.caps.captures;
 
+        /// Clamp the haystack to `opts.span_end` (the upper search bound). Backends
+        /// never see `span_end`; the agnostic layer enforces it by shortening the
+        /// input here. Offsets stay 0-based, so a returned `Match` indexes the
+        /// original `input` too. `span_end < start` ⇒ an empty range ⇒ no match.
+        fn clampHaystack(input: []const u8, opts: SearchOptions) []const u8 {
+            const end = if (opts.span_end) |e| @min(e, input.len) else input.len;
+            return input[0..end];
+        }
+
         // ── single-shot ─────────────────────────────────────────────────────────
 
         pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) bool {
-            return Backend.isMatch(program, scratch, input, opts);
+            return Backend.isMatch(program, scratch, clampHaystack(input, opts), opts);
         }
 
         pub fn find(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) ?Match {
             if (comptime !@hasDecl(Backend, "search"))
                 @compileError("backend `" ++ @typeName(Backend) ++ "` has no `search` (find/findAll/split/replaceAll need it)");
-            return Backend.search(program, scratch, input, opts);
+            return Backend.search(program, scratch, clampHaystack(input, opts), opts);
         }
 
         /// Resolve the first match's captures into the caller-owned `slots` (length
@@ -492,9 +514,10 @@ pub fn Engine(comptime Backend: type) type {
         ) ?Captures {
             if (comptime !Backend.caps.captures)
                 @compileError("backend `" ++ @typeName(Backend) ++ "` does not support captures");
+            const hay = clampHaystack(input, opts);
             @memset(slots, null);
-            _ = Backend.searchCaptures(program, scratch, input, slots, opts) orelse return null;
-            return .{ .slots = slots, .meta = meta, .input = input };
+            _ = Backend.searchCaptures(program, scratch, hay, slots, opts) orelse return null;
+            return .{ .slots = slots, .meta = meta, .input = hay };
         }
 
         /// Count non-overlapping matches.
@@ -533,7 +556,7 @@ pub fn Engine(comptime Backend: type) type {
         pub fn findAll(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) MatchIterator {
             if (comptime !@hasDecl(Backend, "search"))
                 @compileError("backend `" ++ @typeName(Backend) ++ "` has no `search`");
-            return .{ .program = program, .scratch = scratch, .input = input, .pos = opts.start, .anchored = opts.anchored };
+            return .{ .program = program, .scratch = scratch, .input = clampHaystack(input, opts), .pos = opts.start, .anchored = opts.anchored };
         }
 
         // ── iterate captures ────────────────────────────────────────────────────────
@@ -577,7 +600,7 @@ pub fn Engine(comptime Backend: type) type {
             return .{
                 .program = program,
                 .scratch = scratch,
-                .input = input,
+                .input = clampHaystack(input, opts),
                 .slots = slots,
                 .meta = meta,
                 .pos = opts.start,

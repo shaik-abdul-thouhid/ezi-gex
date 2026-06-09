@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`SearchOptions.span_end` and `earliest`** (`engine/backend.zig`). `span_end`
+  bounds a search to the sub-range `[start, span_end)` without copying — the agnostic
+  `Engine` ops clamp the haystack, so backends are unchanged and returned offsets
+  still index the full input (reachable via `findAt`/`isMatchAt`/`capturesAt`).
+  `earliest` is reserved (a no-op for the leftmost-first engines, which already
+  return the leftmost match and short-circuit `isMatch`).
+
 - **`Options.strategy` reserved tier** (`engine/regex.zig`). A `Strategy` sub-struct
   (`byte_engine`, `unicode_word_boundary_in_dfa`, `prefilter`) separates
   results-invariant execution knobs from the semantic flags. Currently inert
