@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+`0.3.0-dev` — focus: the **lazy DFA** over the byte-NFA substrate landed in `0.2.0`
+(determinized over its `ByteMap` alphabet). A near-term follow-up is interning
+repeated classes in the byte compiler (the code-point compiler already does).
+
 ## [0.2.0] - 2026-06-09
 
 ### Added
