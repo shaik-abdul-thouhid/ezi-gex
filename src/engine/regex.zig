@@ -119,9 +119,15 @@ pub const Options = struct {
     /// with `(?s)`. Default off.
     dot_matches_newline: bool = false,
 
+    /// Unicode mode for `\d`/`\w`/`\s` (default `true`). Set `false` for the classic
+    /// ASCII shorthand sets (`\d`=`[0-9]`, `\w`=`[0-9A-Za-z_]`, `\s`=`[ \t\n\v\f\r]`),
+    /// which keeps automata small. Affects only the shorthand classes — `.` and `\b`
+    /// stay code-point / Unicode-aware. See `hir.Options.unicode`.
+    unicode: bool = true,
+
     /// Project these front-door options onto the HIR builder's options.
     fn toHir(self: Options) hir.Options {
-        return .{ .case_fold = self.case_fold };
+        return .{ .case_fold = self.case_fold, .unicode = self.unicode };
     }
 
     /// The initial inline-flag state to seed the pattern with. OR-merged with any
@@ -730,6 +736,42 @@ test "Options flags seed the comptime path too" {
     try testing.expect(comptime Re.isMatchComptime("ABC"));
     const Re2 = comptime compileComptime("abc", .{});
     try testing.expect(!comptime Re2.isMatchComptime("ABC"));
+}
+
+// ── ASCII mode for shorthand classes (Options.unicode = false) ────────────────
+
+test "unicode=false: \\w is ASCII [0-9A-Za-z_] only" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "\\w+", &diag, .{ .unicode = false });
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    // \w stops before é (not an ASCII word char):
+    try testing.expectEqualStrings("abc", re.find(&sc, "abc-é").?.slice("abc-é"));
+
+    // Unicode mode (the default): \w is Unicode-aware, so é is a word char.
+    var ure = try compileRuntime(testing.allocator, "\\w+", &diag, .{});
+    defer ure.deinit();
+    var usc = try @TypeOf(ure).Scratch.init(testing.allocator, &ure.program);
+    defer usc.deinit(testing.allocator);
+    try testing.expectEqualStrings("abcé", ure.find(&usc, "abcé-").?.slice("abcé-"));
+}
+
+test "unicode=false: \\d is ASCII [0-9] (no other Unicode digits)" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "\\d+", &diag, .{ .unicode = false });
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    try testing.expect(re.isMatch(&sc, "123"));
+    try testing.expect(!re.isMatch(&sc, "٣")); // U+0663 is a Unicode digit, not ASCII
+
+    // Unicode mode matches it:
+    var ure = try compileRuntime(testing.allocator, "\\d+", &diag, .{});
+    defer ure.deinit();
+    var usc = try @TypeOf(ure).Scratch.init(testing.allocator, &ure.program);
+    defer usc.deinit(testing.allocator);
+    try testing.expect(ure.isMatch(&usc, "٣"));
 }
 
 test {

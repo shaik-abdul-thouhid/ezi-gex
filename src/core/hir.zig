@@ -201,6 +201,14 @@ pub const Options = struct {
     ///              `ss`, `(?i)ﬀ` also matches `ff` (literals only; classes use
     ///              simple folding). See `CaseFold.full`.
     case_fold: CaseFold = .simple,
+
+    /// Unicode mode for the shorthand classes. When `true` (the default),
+    /// `\d`/`\w`/`\s` resolve to their full Unicode definitions (any Unicode digit,
+    /// word, or whitespace code point). When `false` (ASCII mode) they use the
+    /// classic ASCII sets — `\d`=`[0-9]`, `\w`=`[0-9A-Za-z_]`, `\s`=`[ \t\n\v\f\r]` —
+    /// which keeps automata small. NOTE: this affects only the shorthand classes;
+    /// `.` and `\b` remain code-point / Unicode-aware.
+    unicode: bool = true,
 };
 
 /// How `i` (case-insensitive) folding is realized when lowering literals/classes.
@@ -739,8 +747,12 @@ fn Builder(comptime mode: Mode) type {
             for (ranges) |r| try self.addMember(r.start, r.end);
         }
 
-        /// Resolve a Perl shorthand into the member scratch (positive form).
+        /// Resolve a Perl shorthand (`\d`/`\w`/`\s`) into the member scratch
+        /// (positive form). Unicode mode (the default) uses the full Unicode
+        /// definitions; ASCII mode (`Options.unicode == false`) uses the classic
+        /// ASCII sets — see `addPerlAscii`.
         fn addPerl(self: *Self, kind: PerlClassKind) BuildError!void {
+            if (!self.opts.unicode) return self.addPerlAscii(kind);
             switch (kind) {
                 .digit => try self.addCategory(.decimal_number),
                 .space => try self.addPropList(props.white_space_ranges),
@@ -750,6 +762,25 @@ fn Builder(comptime mode: Mode) type {
                     try self.addCategory(.decimal_number);
                     try self.addCategory(.connector_punctuation);
                     try self.addPropList(props.join_control_ranges);
+                },
+            }
+        }
+
+        /// ASCII-mode (`Options.unicode == false`) shorthand classes:
+        /// `\d`=`[0-9]`, `\w`=`[0-9A-Za-z_]`, `\s`=`[ \t\n\v\f\r]` (U+0009–U+000D and
+        /// U+0020). Negation (`\D`/`\W`/`\S`) is applied by the caller afterwards.
+        fn addPerlAscii(self: *Self, kind: PerlClassKind) BuildError!void {
+            switch (kind) {
+                .digit => try self.addMember('0', '9'),
+                .space => {
+                    try self.addMember(0x09, 0x0D); // \t \n \v \f \r
+                    try self.addMember(0x20, 0x20); // space
+                },
+                .word => {
+                    try self.addMember('0', '9');
+                    try self.addMember('A', 'Z');
+                    try self.addMember('a', 'z');
+                    try self.addMember('_', '_');
                 },
             }
         }

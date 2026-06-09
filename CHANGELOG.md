@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ASCII mode for shorthand classes** (`Options.unicode = false`). `\d`/`\w`/`\s`
+  resolve to the classic ASCII sets (`[0-9]`, `[0-9A-Za-z_]`, `[ \t\n\v\f\r]`)
+  instead of their Unicode definitions, keeping automata small. Affects only the
+  shorthands — `.` and `\b` stay Unicode-aware. Default `true` (today's behaviour).
+
 - **`Options` initial-flag seeding** (`engine/regex.zig`). `compileRuntime` /
   `compileComptime` now accept `case_insensitive`, `multiline`, and
   `dot_matches_newline` — seeding `(?i)` / `(?m)` / `(?s)` for the whole pattern
