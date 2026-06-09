@@ -105,11 +105,36 @@ pub const Error = error{
 /// @stable-since: v0.1.0
 pub const Options = struct {
     /// How `(?i)` case-insensitivity is realized (`.none` / `.simple` / `.full`).
+    /// See `hir.CaseFold` — `.full` adds the 1→many expansions (`ß`→`ss`).
     case_fold: hir.CaseFold = .simple,
+
+    /// Seed the `i` flag (case-insensitive) for the WHOLE pattern, as if it began
+    /// with `(?i)`. Inline flags still compose on top — a scoped `(?-i:…)` turns it
+    /// back off within that group. Default off.
+    case_insensitive: bool = false,
+    /// Seed the `m` flag (multiline): `^`/`$` also match at line boundaries, as if
+    /// the pattern began with `(?m)`. Default off.
+    multiline: bool = false,
+    /// Seed the `s` flag (dot-all): `.` also matches `\n`, as if the pattern began
+    /// with `(?s)`. Default off.
+    dot_matches_newline: bool = false,
 
     /// Project these front-door options onto the HIR builder's options.
     fn toHir(self: Options) hir.Options {
         return .{ .case_fold = self.case_fold };
+    }
+
+    /// The initial inline-flag state to seed the pattern with. OR-merged with any
+    /// bare `(?…)` flags the pattern sets, so `Options` provides the defaults and
+    /// inline flags add to them. (A bare `(?-i)` cannot remove an `Options` seed —
+    /// set the option to `false` instead; scoped `(?-i:…)` groups still scope
+    /// normally because they are applied during lowering, not to the global state.)
+    fn initialFlags(self: Options) hir.Flags {
+        return .{
+            .case_insensitive = self.case_insensitive,
+            .multiline = self.multiline,
+            .dot_all = self.dot_matches_newline,
+        };
     }
 };
 
@@ -385,7 +410,13 @@ pub fn compileRuntimeWith(comptime B: type, allocator: std.mem.Allocator, patter
     };
     defer ast.deinit(allocator);
 
-    const h = hir.buildAlloc(allocator, ast, opts.toHir()) catch |e| switch (e) {
+    // Seed the front-door flag options onto the AST's flags (OR-merged with any
+    // bare inline flags the pattern set) before lowering. `seeded` shares `ast`'s
+    // arrays — only the flag bits change — so `ast.deinit` above still owns them.
+    var seeded = ast;
+    seeded.flags = opts.initialFlags().merge(ast.flags);
+
+    const h = hir.buildAlloc(allocator, seeded, opts.toHir()) catch |e| switch (e) {
         error.PatternTooComplex => return error.PatternTooComplex,
         error.OutOfMemory => return error.OutOfMemory,
     };
@@ -403,7 +434,17 @@ pub fn compileRuntimeWith(comptime B: type, allocator: std.mem.Allocator, patter
 /// @stable-since: v0.1.0
 pub fn compileComptimeWith(comptime B: type, comptime pattern: []const u8, comptime opts: Options) Compiled(B) {
     const ast = comptime parser.compile(pattern); // @compileError on a bad pattern
-    const h = comptime switch (hir.buildComptime(ast, opts.toHir())) {
+    // Seed the front-door flag options (OR-merged with any bare inline flags).
+    const seeded = comptime blk: {
+        var a = ast;
+        a.flags = opts.initialFlags().merge(ast.flags);
+        break :blk a;
+    };
+    // HIR lowering with case folding scans ezi_code's fold tables per literal,
+    // which at comptime can exceed the default branch budget; raise it (a ceiling,
+    // not a cost — spent only on work actually done).
+    @setEvalBranchQuota(@intCast(@min(@as(u64, pattern.len) * 20_000 + 200_000, std.math.maxInt(u32))));
+    const h = comptime switch (hir.buildComptime(seeded, opts.toHir())) {
         .ok => |x| x,
         .fail => @compileError("ezi_gex: HIR build failed for pattern \"" ++ pattern ++ "\""),
     };
@@ -633,6 +674,62 @@ test "full folding: plain ASCII literals are unaffected (run coalescing intact)"
     try testing.expect(re.isMatch(&sc, "ABC"));
     try testing.expect(re.isMatch(&sc, "aBc"));
     try testing.expect(!re.isMatch(&sc, "abd"));
+}
+
+// ── Options-seeded inline flags (case_insensitive / multiline / dot_matches_newline)
+
+test "Options.case_insensitive seeds (?i) for the whole pattern" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "abc", &diag, .{ .case_insensitive = true });
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    try testing.expect(re.isMatch(&sc, "ABC"));
+    try testing.expect(re.isMatch(&sc, "aBc"));
+
+    // The default (no option) stays case-sensitive.
+    var re2 = try compileRuntime(testing.allocator, "abc", &diag, .{});
+    defer re2.deinit();
+    var sc2 = try @TypeOf(re2).Scratch.init(testing.allocator, &re2.program);
+    defer sc2.deinit(testing.allocator);
+    try testing.expect(!re2.isMatch(&sc2, "ABC"));
+}
+
+test "Options.multiline seeds (?m): ^ matches at line starts" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "^b", &diag, .{ .multiline = true });
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    try testing.expect(re.isMatch(&sc, "a\nb")); // ^ matches just after the \n
+
+    var re2 = try compileRuntime(testing.allocator, "^b", &diag, .{});
+    defer re2.deinit();
+    var sc2 = try @TypeOf(re2).Scratch.init(testing.allocator, &re2.program);
+    defer sc2.deinit(testing.allocator);
+    try testing.expect(!re2.isMatch(&sc2, "a\nb")); // without (?m), ^ is input start only
+}
+
+test "Options.dot_matches_newline seeds (?s): . matches newline" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "a.b", &diag, .{ .dot_matches_newline = true });
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    try testing.expect(re.isMatch(&sc, "a\nb"));
+
+    var re2 = try compileRuntime(testing.allocator, "a.b", &diag, .{});
+    defer re2.deinit();
+    var sc2 = try @TypeOf(re2).Scratch.init(testing.allocator, &re2.program);
+    defer sc2.deinit(testing.allocator);
+    try testing.expect(!re2.isMatch(&sc2, "a\nb"));
+}
+
+test "Options flags seed the comptime path too" {
+    const Re = comptime compileComptime("abc", .{ .case_insensitive = true });
+    try testing.expect(comptime Re.isMatchComptime("ABC"));
+    const Re2 = comptime compileComptime("abc", .{});
+    try testing.expect(!comptime Re2.isMatchComptime("ABC"));
 }
 
 test {

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Options` initial-flag seeding** (`engine/regex.zig`). `compileRuntime` /
+  `compileComptime` now accept `case_insensitive`, `multiline`, and
+  `dot_matches_newline` — seeding `(?i)` / `(?m)` / `(?s)` for the whole pattern
+  without writing the inline flag. Inline flags still compose (OR-merged onto the
+  seed; scoped `(?-i:…)` groups are unaffected). The comptime compile path now
+  raises its eval-branch quota so `(?i)`/folded patterns build at compile time.
+
 - **Full case folding** (`Options.case_fold = .full`). Under `(?i)`, a literal whose
   Unicode full fold expands now matches its expansion too: `ß` matches `ss`/`SS`,
   `ﬀ` matches `ff`, `ﬃ` matches `ffi`, … It lowers (`core/hir.zig` →
