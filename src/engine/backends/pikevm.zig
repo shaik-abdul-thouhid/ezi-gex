@@ -49,6 +49,9 @@ pub const Program = nfa.Program;
 ///
 /// @stable-since: v0.1.0
 pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Program {
+    // The breadth-first Pike VM cannot consume a variable-width `\X` cluster; refuse
+    // grapheme programs at build (the backtracker / `auto` handle them instead).
+    if (h.analysis.has_grapheme) return error.Unsupported;
     return nfa.buildAlloc(gpa, h);
 }
 
@@ -56,6 +59,8 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
 ///
 /// @stable-since: v0.1.0
 pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
+    if (comptime h.analysis.has_grapheme)
+        @compileError("ezi_gex: the Pike VM cannot match `\\X` (grapheme); use the backtrack or auto backend");
     return nfa.buildComptime(h);
 }
 

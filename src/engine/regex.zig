@@ -774,6 +774,31 @@ test "unicode=false: \\d is ASCII [0-9] (no other Unicode digits)" {
     try testing.expect(ure.isMatch(&usc, "٣"));
 }
 
+// ── Grapheme \X (front door, routed through auto → backtrack) ──────────────────
+
+test "grapheme \\X matches whole extended clusters" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "\\X", &diag, .{});
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    // "e" + combining acute U+0301 is ONE grapheme cluster (3 bytes):
+    try testing.expectEqualStrings("e\u{0301}", re.find(&sc, "e\u{0301}z").?.slice("e\u{0301}z"));
+    // a · 😀 (one cluster) · b → three clusters:
+    try testing.expectEqual(@as(usize, 3), re.count(&sc, "a😀b"));
+}
+
+test "grapheme \\X composes (a\\Xc over a combining-mark cluster)" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "a\\Xc", &diag, .{});
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    // a, then one cluster (e+U+0301), then c:
+    try testing.expect(re.isMatch(&sc, "ae\u{0301}c"));
+    try testing.expect(!re.isMatch(&sc, "ac")); // \X requires one cluster between
+}
+
 test {
     testing.refAllDecls(@This());
 }

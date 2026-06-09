@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Grapheme `\X`** (UAX #29 extended grapheme clusters) is now supported. `\X`
+  matches one whole cluster (combining marks, emoji ZWJ/modifier sequences,
+  regional-indicator pairs, …). It compiles to a variable-width `grapheme` NFA
+  instruction executed by the **backtracker**; `auto` routes any `\X` pattern there,
+  while the breadth-first Pike VM refuses grapheme programs at build (it cannot
+  consume a variable number of code points per step). Segmentation lives behind the
+  `utils.unicode.grapheme` facade helper. Previously `\X` was `error.Unsupported`.
+  Limitation: `\X` over very large inputs is bounded by the backtracker's memo.
+
 - **`Match.pattern` reserved field** (`engine/backend.zig`). A defaulted `u32`
   (always `0` today) is threaded through `Match` so a future multi-pattern / set
   API can report which pattern matched without breaking `Match`'s shape.

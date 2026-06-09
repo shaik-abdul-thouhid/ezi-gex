@@ -64,7 +64,7 @@ const BACKTRACK_MAX_INPUT: usize = 4096;
 // ── Contract surface ────────────────────────────────────────────────────────────
 
 /// @stable-since: v0.1.0
-pub const caps = Caps{ .captures = true, .stateless = false, .grapheme = false };
+pub const caps = Caps{ .captures = true, .stateless = false, .grapheme = true };
 /// @stable-since: v0.1.0
 pub const Options = struct {};
 
@@ -122,6 +122,9 @@ pub const Program = struct {
     },
     /// Sound prefilter facts for the NFA arm; default (all-permissive) for literal.
     filter: Filter = .{},
+    /// True when the program contains `\X` (grapheme). Such a program is matched
+    /// only by the backtracker (variable-width consume) — `runNfa` routes it there.
+    has_grapheme: bool = false,
 };
 
 /// @stable-since: v0.1.0
@@ -129,8 +132,12 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     if (literal.supports(h)) {
         return .{ .inner = .{ .literal = try literal.buildAlloc(gpa, h, .{}) } };
     }
-    if (!nfa.supports(h)) return error.Unsupported; // e.g. `\X` grapheme
-    return .{ .inner = .{ .nfa = try nfa.buildAlloc(gpa, h) }, .filter = filterFromAnalysis(h) };
+    if (!nfa.supports(h)) return error.Unsupported;
+    return .{
+        .inner = .{ .nfa = try nfa.buildAlloc(gpa, h) },
+        .filter = filterFromAnalysis(h),
+        .has_grapheme = h.analysis.has_grapheme,
+    };
 }
 
 /// @stable-since: v0.1.0
@@ -138,7 +145,11 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
     if (comptime literal.supports(h)) {
         return .{ .inner = .{ .literal = literal.buildComptime(h, .{}) } };
     }
-    return .{ .inner = .{ .nfa = nfa.buildComptime(h) }, .filter = filterFromAnalysis(h) }; // `\X` ⇒ @compileError inside
+    return .{
+        .inner = .{ .nfa = nfa.buildComptime(h) },
+        .filter = filterFromAnalysis(h),
+        .has_grapheme = h.analysis.has_grapheme,
+    };
 }
 
 /// @stable-since: v0.1.0
@@ -274,10 +285,20 @@ fn dispatch(p: *const nfa.Program, s: *Scratch.NfaScratch, input: []const u8, op
 /// (`slots` non-null ⇒ capture). Applies the sound analysis prefilter, then either
 /// confirms at filtered positions or falls back to the plain dispatch. Returns the
 /// leftmost match (filling `slots` on success).
-fn runNfa(p: *const nfa.Program, filter: Filter, s: *Scratch.NfaScratch, input: []const u8, opts: SearchOptions, slots: ?[]?usize) ?Match {
+fn runNfa(p: *const nfa.Program, filter: Filter, s: *Scratch.NfaScratch, input: []const u8, opts: SearchOptions, slots: ?[]?usize, has_grapheme: bool) ?Match {
     if (opts.start > input.len) return null;
     // Length gate: too few bytes left from here for even the shortest match.
     if (input.len - opts.start < filter.min_bytes) return null;
+
+    // `\X` (grapheme) consumes a variable number of code points per step, which the
+    // Pike VM (one code point per step) cannot do. Route the whole search to the
+    // backtracker — it scans unanchored itself, honouring `opts`. This deliberately
+    // skips the Pike-VM-based anchored-confirm prefilter, which also assumes one
+    // code point per step.
+    if (has_grapheme) {
+        if (slots) |sl| return backtrack.searchCaptures(p, &s.back, input, sl, opts);
+        return backtrack.search(p, &s.back, input, opts);
+    }
 
     // Caller pinned the start: one anchored attempt, no scan, no prefilter.
     if (opts.anchored) return dispatch(p, s, input, opts, slots);
@@ -314,7 +335,7 @@ fn runNfa(p: *const nfa.Program, filter: Filter, s: *Scratch.NfaScratch, input: 
 pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) bool {
     switch (program.inner) {
         .literal => |*p| return literal.isMatch(p, &scratch.inner.literal, input, opts),
-        .nfa => |*p| return runNfa(p, program.filter, &scratch.inner.nfa, input, opts, null) != null,
+        .nfa => |*p| return runNfa(p, program.filter, &scratch.inner.nfa, input, opts, null, program.has_grapheme) != null,
     }
 }
 
@@ -322,7 +343,7 @@ pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, op
 pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) ?Match {
     switch (program.inner) {
         .literal => |*p| return literal.search(p, &scratch.inner.literal, input, opts),
-        .nfa => |*p| return runNfa(p, program.filter, &scratch.inner.nfa, input, opts, null),
+        .nfa => |*p| return runNfa(p, program.filter, &scratch.inner.nfa, input, opts, null, program.has_grapheme),
     }
 }
 
@@ -330,7 +351,7 @@ pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opt
 pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const u8, slots: []?usize, opts: SearchOptions) ?Match {
     switch (program.inner) {
         .literal => |*p| return literal.searchCaptures(p, &scratch.inner.literal, input, slots, opts),
-        .nfa => |*p| return runNfa(p, program.filter, &scratch.inner.nfa, input, opts, slots),
+        .nfa => |*p| return runNfa(p, program.filter, &scratch.inner.nfa, input, opts, slots, program.has_grapheme),
     }
 }
 
@@ -521,14 +542,22 @@ test "auto: prefilter path runs at COMPTIME (memchr + anchored confirm)" {
     try testing.expectEqualStrings("foo777", got);
 }
 
-test "auto: grapheme pattern is unsupported" {
+test "auto: grapheme pattern (\\X) builds and matches whole clusters" {
     const gpa = testing.allocator;
     var diag: compile.Diagnostic = .{};
     const ast = try compile.parse(gpa, "\\X", &diag);
     defer ast.deinit(gpa);
     const h = try hir.buildAlloc(gpa, ast, .{});
     defer hir.deinitHir(gpa, h);
-    try testing.expectError(error.Unsupported, buildAlloc(gpa, h, .{}));
+    var program = try buildAlloc(gpa, h, .{});
+    defer freeProgram(gpa, &program);
+    try testing.expect(program.has_grapheme); // routed to the backtracker
+    var sc = try Scratch.init(gpa, &program);
+    defer sc.deinit(gpa);
+    // "e" + combining acute U+0301 is ONE extended grapheme cluster (3 bytes).
+    const m = search(&program, &sc, "e\u{0301}z", .{}).?;
+    try testing.expectEqual(@as(usize, 0), m.start);
+    try testing.expectEqual(@as(usize, 3), m.end);
 }
 
 test "auto runs at comptime (both routes) via a buffer scratch" {

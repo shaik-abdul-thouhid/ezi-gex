@@ -44,7 +44,7 @@ const DEFAULT_MAX_INPUT: usize = 64;
 // ── Contract surface ────────────────────────────────────────────────────────────
 
 /// @stable-since: v0.1.0
-pub const caps = Caps{ .captures = true, .stateless = false, .grapheme = false };
+pub const caps = Caps{ .captures = true, .stateless = false, .grapheme = true };
 /// @stable-since: v0.1.0
 pub const Options = struct {};
 
@@ -232,6 +232,14 @@ fn backtrack(ctx: *Ctx, pc0: u32, sp0: usize) bool {
                 if (!(a.dot_all or d.cp != '\n')) return false;
                 pc += 1;
                 sp += d.len;
+            },
+            .grapheme => {
+                // `\X`: consume one whole extended grapheme cluster. Variable width —
+                // the depth-first backtracker advances `sp` by the cluster length,
+                // which the breadth-first Pike VM cannot do (hence backtrack-only).
+                if (sp >= ctx.input.len) return false; // no cluster to consume
+                pc += 1;
+                sp += nfa.graphemeLenAt(ctx.input, sp);
             },
             .jmp => |t| pc = t,
             .assertion => |k| {

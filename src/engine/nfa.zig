@@ -49,6 +49,11 @@ pub const Inst = union(enum) {
     jmp: u32,
     /// Zero-width assertion; the thread dies unless it holds.
     assertion: hir.AnchorKind,
+    /// Consume one extended grapheme cluster (UAX #29) — `\X`. Variable width:
+    /// advances by the whole cluster, so only a backend that can step a variable
+    /// number of code points executes it (`caps.grapheme`). `auto` routes grapheme
+    /// patterns to the backtracker; the breadth-first Pike VM refuses them.
+    grapheme,
     /// Accept.
     match,
 };
@@ -164,7 +169,7 @@ fn Builder(comptime mode: Mode) type {
                 },
                 .any => _ = self.emit(.{ .any = .{ .dot_all = node.data.any.dot_all } }),
                 .anchor => _ = self.emit(.{ .assertion = node.data.anchor.kind }),
-                .grapheme => return error.Unsupported,
+                .grapheme => _ = self.emit(.grapheme),
                 .concat => {
                     const d = node.data.children;
                     for (self.h.children[d.start .. d.start + d.len]) |child| try self.compileNode(child);
@@ -267,6 +272,15 @@ fn build(h: hir.Hir, insts: []Inst, ranges: []Range, patch: []u32, marks: []Mark
 pub fn supports(h: hir.Hir) bool {
     _ = measure(h) catch return false;
     return true;
+}
+
+/// Byte length of the grapheme cluster (UAX #29) beginning at `sp` in `input`;
+/// `0` at end-of-input, otherwise always ≥ 1. The shared match-time primitive for
+/// the `.grapheme` instruction (`\X`), executed by grapheme-capable backends.
+///
+/// @stable-since: v0.2.0
+pub fn graphemeLenAt(input: []const u8, sp: usize) usize {
+    return utils.unicode.grapheme.lengthAt(input, sp);
 }
 
 /// Compile a HIR into a heap-allocated `Program` (free with `freeProgram`).

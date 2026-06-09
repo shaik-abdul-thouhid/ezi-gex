@@ -87,6 +87,27 @@ pub const casing = ezi_code.unicode.casing;
 // every backend shares one definition. New helpers land in this section with the
 // same doc density as the re-exports above.
 
+/// UAX #29 segmentation (grapheme / word / sentence breaking) and its iterators.
+/// Backs `\X` (grapheme cluster) via the `grapheme` helper below.
+///
+/// @stable-since: v0.2.0
+pub const segmentation = ezi_code.unicode.segmentation;
+
+/// Grapheme-cluster (`\X`) helpers built on UAX #29 segmentation.
+pub const grapheme = struct {
+    /// Byte length of the extended grapheme cluster beginning at `bytes[offset..]`.
+    /// Returns 0 at/after end-of-input; otherwise always ≥ 1 (a degenerate cluster
+    /// still advances one byte, so a scanner using this always makes progress).
+    ///
+    /// @stable-since: v0.2.0
+    pub fn lengthAt(bytes: []const u8, offset: usize) usize {
+        if (offset >= bytes.len) return 0;
+        var it = segmentation.iterator(bytes[offset..]);
+        const g = it.next() orelse return 1;
+        return if (g.len == 0) 1 else g.len;
+    }
+};
+
 test {
     // Touch the re-exports so a backend symbol that vanishes upstream is caught
     // here (at the seam) rather than deep in a call site.
