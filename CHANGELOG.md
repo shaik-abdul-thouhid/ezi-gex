@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Match.pattern` reserved field** (`engine/backend.zig`). A defaulted `u32`
+  (always `0` today) is threaded through `Match` so a future multi-pattern / set
+  API can report which pattern matched without breaking `Match`'s shape.
+
 - **ASCII mode for shorthand classes** (`Options.unicode = false`). `\d`/`\w`/`\s`
   resolve to the classic ASCII sets (`[0-9]`, `[0-9A-Za-z_]`, `[ \t\n\v\f\r]`)
   instead of their Unicode definitions, keeping automata small. Affects only the
