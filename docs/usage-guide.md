@@ -103,6 +103,10 @@ _ = re.find(&sc, "x abc123 y");          // ?Match → "abc123"
 // Start later, or require the match to begin exactly at the offset:
 _ = re.findAt(&sc, input, .{ .start = 4 });
 _ = re.isMatchAt(&sc, input, .{ .anchored = true }); // must match AT offset 0
+
+// Search a sub-range without copying: `span_end` caps where a match may end.
+// Returned offsets still index the full `input`.
+_ = re.findAt(&sc, input, .{ .start = 4, .span_end = 12 }); // search input[4..12]
 ```
 
 ### Captures (numbered and named)
@@ -196,12 +200,34 @@ defer re.deinit();
 
 ### Options
 
-`compile*` takes a comptime-known `Options`. Today it carries case-folding strategy:
+`compile*` takes a comptime-known `Options` with two tiers — **semantic** flags
+(change what matches) and a reserved results-invariant **`strategy`** tier:
 
 ```zig
+// case folding: .none / .simple (default) / .full (1→many, e.g. ß→ss)
 _ = try gex.compileRuntime(gpa, "(?i)te:t://", &diag, .{ .case_fold = .simple }); // (?i) → [Tt] etc.
-_ = try gex.compileRuntime(gpa, "(?i)abc",   &diag, .{ .case_fold = .none });     // (?i) ignored
+_ = try gex.compileRuntime(gpa, "(?i)abc",     &diag, .{ .case_fold = .none });   // (?i) ignored
+_ = try gex.compileRuntime(gpa, "(?i)stra\u{00DF}e", &diag, .{ .case_fold = .full }); // also matches "strasse"
+
+// Seed (?i)/(?m)/(?s) for the WHOLE pattern without writing the inline flag.
+// Inline flags still compose; a scoped (?-i:…) group turns it back off locally.
+_ = try gex.compileRuntime(gpa, "abc", &diag, .{ .case_insensitive = true });        // == "(?i)abc"
+_ = try gex.compileRuntime(gpa, "^a$", &diag, .{ .multiline = true });               // == "(?m)^a$"
+_ = try gex.compileRuntime(gpa, "a.b", &diag, .{ .dot_matches_newline = true });     // == "(?s)a.b"
+
+// ASCII mode: \d \w \s use the classic ASCII sets (smaller automata). `.` and `\b`
+// stay Unicode-aware. Default is unicode = true.
+_ = try gex.compileRuntime(gpa, "\\w+", &diag, .{ .unicode = false });               // \w = [0-9A-Za-z_]
+
+// strategy tier — results-invariant (reserved for the byte engine; inert today).
+// Flipping any field may change only speed/memory, never which text matches.
+_ = try gex.compileRuntime(gpa, "abc", &diag, .{ .strategy = .{ .prefilter = true } });
 ```
+
+> `(?x)` **verbose / extended mode** is a lex-time flag, so it has no `Options` field —
+> set it inline (`(?x)…` globally, `(?x:…)` scoped). In verbose mode unescaped
+> whitespace and `#`-to-end-of-line comments outside a class are insignificant; escape
+> a literal space as `\ `.
 
 ---
 
@@ -765,17 +791,21 @@ Read these before trusting edge cases (full list in [`architecture.md`](architec
   All built-in backends agree bit-for-bit (the NFA backends share one compiler).
 - **`$` is `\z`.** Without `(?m)`, `$` matches **only** end-of-input — *not* before a
   trailing `\n`. `abc$` does not match `"abc\n"` (JS/Go/RE2/Rust semantics). `\Z` == `\z`.
-- **`\X` parses but does not execute** — no backend sets `caps.grapheme`; a `\X` pattern
-  fails at build with `error.Unsupported`.
+- **`\X` (grapheme cluster) is `backtrack`-only** — it matches one whole UAX #29 cluster
+  and compiles to a variable-width instruction the breadth-first `pikevm`/`literal`
+  can't run, so `auto` routes any `\X` pattern to the backtracker (forcing `pikevm`
+  via `*With` on a `\X` pattern fails at build).
 - **No backreferences / lookaround / atomic / recursion / `\Q…\E`** — a Thompson NFA
   can't express them; each is rejected at parse with a precise diagnostic code.
 - **`{m,n}` expands, uncapped** — a huge counted repeat makes a large program (bounded by
   allocation failure or the comptime quota, never UB).
-- **Invalid UTF-8 input** decodes to `U+FFFD` with a 1-byte advance — the engine won't
-  match *across* a bad byte but still makes progress. (Pattern bytes must be valid UTF-8
-  or `scan` rejects them.)
-- **`case_fold = .full` behaves like `.simple`** for now (the `ß`→`ss` 1→many rewrite is
-  a v1 gap); `Script_Extensions` falls back to plain `Script` ranges.
+- **Invalid UTF-8 input** is *dead-on-invalid*: a malformed byte matches nothing (no
+  `U+FFFD` substitution — `.` won't match it), and the unanchored scan resyncs one byte
+  past it, so a match never spans a bad byte. (Pattern bytes must be valid UTF-8 or
+  `scan` rejects them at compile time.)
+- **`case_fold = .full`** expands 1→many foldings for literals (`(?i)ß` also matches
+  `ss`, `ﬀ` matches `ff`); character classes use simple folding (a class matches one
+  code point). `Script_Extensions` falls back to plain `Script` ranges.
 
 ---
 

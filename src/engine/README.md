@@ -6,7 +6,8 @@
 |---|---|
 | `backend.zig` | the **backend contract** + shared types (`Caps`, `Match`, `SearchOptions`, `Meta`, `Captures`, the `Cell`/`Carver` scratch helpers), `verifyBackend`, and **`Engine(Backend)`** — the agnostic op layer that implements `find`/`findAll`/`captures`/`split`/`replaceAll`/`count` once, for any backend |
 | `nfa.zig` | the **shared** Thompson-NFA: instruction set, the HIR→program compiler, and the code-point primitives (`inRanges`, `decodeAt`, `assertionHolds`). **Not a backend** — pikevm and backtrack both execute it |
-| `backends/` | the four built-in backends (see [`backends/README.md`](backends/README.md)) |
+| `byte.zig` | the **byte-NFA substrate** (also not a backend): UTF-8 `utf8-ranges` lowering, a `byte_range` Thompson NFA (zero-decode), and `ByteMap` byte equivalence classes. The substrate the future lazy DFA determinizes; `bytepike` executes it. Gated by `byteLowerable(hir)` (no `\X`/`\b`) |
+| `backends/` | the built-in backends (see [`backends/README.md`](backends/README.md)) |
 | `conformance.zig` | cross-backend tests: every backend agrees, runtime + comptime |
 | `regex.zig` | the **front door** — `compileRuntime`/`compileComptime`(`With`) → `Compiled(Backend)`, the user-facing API |
 | `root.zig` | re-exports; `default_backend = auto` |

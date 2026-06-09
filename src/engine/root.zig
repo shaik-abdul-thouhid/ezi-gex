@@ -8,6 +8,10 @@ pub const backend = @import("backend.zig");
 /// pikevm and backtrack backends both execute it, differently).
 pub const nfa = @import("nfa.zig");
 
+/// Byte-grained HIR lowering (UTF-8 automaton substrate; not a backend). The byte
+/// Pike VM executes it; the future lazy DFA will determinize it.
+pub const byte = @import("byte.zig");
+
 /// Built-in backends. Each is independently pluggable; `auto` is the default
 /// dispatcher that composes them. Third-party backends implementing the contract
 /// (see `backend.verifyBackend`) drop in the same way.
@@ -18,6 +22,10 @@ pub const backends = struct {
     pub const literal = @import("backends/literal.zig");
     /// Bounded backtracking — depth-first over the same NFA; fast on small inputs.
     pub const backtrack = @import("backends/backtrack.zig");
+    /// Byte Pike VM — executes the byte-grained `byte.Program` (zero-decode match).
+    /// The reference executor for the byte lowering / substrate for the future DFA;
+    /// not `auto`'s default. Refuses `\X` and `\b`/`\B` (not byte-lowerable).
+    pub const bytepike = @import("backends/bytepike.zig");
     /// The default dispatcher — composes the above, switching on analysis + input.
     pub const auto = @import("backends/auto.zig");
 };

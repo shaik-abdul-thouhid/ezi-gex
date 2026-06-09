@@ -127,7 +127,7 @@ pub const Options = struct {
 
     /// Execution-strategy knobs. **Results-invariant by contract:** changing any
     /// field here may affect only speed/memory, never which text matches. Reserved
-    /// for the byte-engine work (DESIGN.md §3) — the current engine does not consult
+    /// for the byte-engine work — the current engine does not consult
     /// them yet; they lock the option shape so wiring them later is non-breaking.
     strategy: Strategy = .{},
 

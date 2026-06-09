@@ -23,44 +23,50 @@ a **pluggable backend** architecture.
 
 ## Status
 
-Version `0.1.0` — the first tagged release. With `0.2.0-dev` under development. Pre-1.0, so the API may still change,
-but everything in the public surface is annotated `@stable-since: v0.1.0` and is
-covered by SemVer from this tag on. Tracks a recent Zig dev build (`0.17.0-dev`); it
-will not compile on stable 0.16.
+Version `0.2.0` — the current tagged release; **`0.3.0-dev` is now under
+development** on `main`. Pre-1.0, so the API may still change, but everything in the
+public surface is annotated `@stable-since: vX.Y.Z` and is covered by SemVer. Tracks a
+recent Zig dev build (`0.17.0-dev`); it will not compile on stable 0.16.
 
-**What works is tested** (≈210 tests: per-module behaviour, cross-backend
-conformance, runtime + comptime parity). The **first prefilter tier is now wired**:
-the `literal` backend scans with `std.mem.indexOf` (SIMD `memchr` + Boyer–Moore–
-Horspool) and `auto` reads the HIR `Analysis` to skip work on NFA patterns — a
-leading-literal `memchr` prefilter, a `^`/`\A` start short-circuit, and a min-length
-gate. There is still **no lazy-DFA backend**, so on general (non-prefixable) patterns
-throughput is below RE2/Rust; the architecture absorbs a DFA without API changes —
-see the *Performance* section.
+**What works is tested** (≈250 tests: per-module behaviour, cross-backend
+conformance, runtime + comptime parity). `0.2.0` added full case folding, grapheme
+`\X`, a two-tier `Options` (semantic + results-invariant strategy), `(?x)` verbose
+mode, ASCII mode, dead-on-invalid UTF-8, and — the headline — the **byte-NFA lowering
++ `ByteMap` equivalence classes** (`engine/byte.zig`): the zero-decode UTF-8 automaton
+substrate the lazy DFA will determinize, executed today by the new `bytepike` backend
+(the reference executor, conformance-proven against the code-point engines).
+
+The **first prefilter tier is wired** (`literal` scans with `std.mem.indexOf`; `auto`
+reads the HIR `Analysis` for a leading-literal `memchr` prefilter, a `^`/`\A` start
+short-circuit, and a min-length gate). There is still **no lazy-DFA backend** — the
+byte substrate it needs now exists, and the DFA is the focus of `0.3.0-dev`; until it
+lands, throughput on general (non-prefixable) patterns is below RE2/Rust. The
+architecture absorbs a DFA without API changes — see *Performance*.
 
 ## Installing
 
 Via git ref (resolves the tag at fetch time):
 
 ```sh
-zig fetch --save git+https://github.com/shaik-abdul-thouhid/ezi-gex.git#v0.1.0
+zig fetch --save git+https://github.com/shaik-abdul-thouhid/ezi-gex.git#v0.2.0
 ```
 
 Or via plain HTTP tarball (pins the content hash in `build.zig.zon`):
 
 ```sh
-zig fetch --save https://github.com/shaik-abdul-thouhid/ezi-gex/archive/refs/tags/v0.1.0.tar.gz
+zig fetch --save https://github.com/shaik-abdul-thouhid/ezi-gex/archive/refs/tags/v0.2.0.tar.gz
 ```
 
-**Tracking `main` (unreleased `0.2.0-dev`)** — if you want the latest, in-development
-surface before they're tagged, fetch the branch instead of a tag. This resolves
-`main`'s current commit and pins its hash in `build.zig.zon`; re-run it to move up:
+**Tracking `main` (unreleased `0.3.0-dev`)** — if you want the latest, in-development
+surface before it's tagged, fetch the branch instead of a tag. This resolves `main`'s
+current commit and pins its hash in `build.zig.zon`; re-run it to move up:
 
 ```sh
 zig fetch --save git+https://github.com/shaik-abdul-thouhid/ezi-gex.git#main
 ```
 
 `main` is the development branch: it builds and is tested, but APIs there are not yet
-covered by a tag, so they can still change before `0.2.0`. For reproducible builds,
+covered by a tag, so they can still change before `0.3.0`. For reproducible builds,
 prefer a tagged release; reach for `main` only when you specifically need unreleased work.
 
 Then in `build.zig` (the `ezi_code` dependency is resolved transitively — you only
@@ -305,10 +311,10 @@ const year = comptime Re.capturesComptime("y2026-06").?.namedSlice("year").?; //
 | Classes `[...]`, `[^...]`, ranges, `\d \w \s` (+ negations) | ✅ |
 | Unicode `\p{L}` `\P{…}` `\p{Script=…}`, `\pL` | ✅ |
 | Anchors `^ $ \A \z`, word boundary `\b \B`, multiline `(?m)` | ✅ |
-| Inline flags `(?i)` `(?m)` `(?s)`, scoped `(?i:…)` | ✅ |
-| Escapes `\n \t \xHH \x{…} \u{…} \cX`, comments `(?#…)` | ✅ |
+| Inline flags `(?i)` `(?m)` `(?s)` `(?x)`, scoped `(?i:…)` | ✅ |
+| Escapes `\n \t \xHH \x{…} \u{…} \cX`, comments `(?#…)`, verbose `(?x)` | ✅ |
+| `\X` grapheme cluster (UAX #29) | ✅ (matched by `backtrack`/`auto`) |
 | Backreferences, lookaround, atomic/conditional, recursion, `\Q…\E` | ❌ rejected with a precise error |
-| `\X` grapheme | ⚠️ parses, not yet executable |
 
 Anchors are JS/RE2-style: `$` without `(?m)` is end-of-input (`\z`), and `\Z` is
 treated as `\z`. See [`docs/architecture.md`](docs/architecture.md) §Caveats.
@@ -321,6 +327,7 @@ treated as `\z`. See [`docs/architecture.md`](docs/architecture.md) §Caveats.
 | `pikevm` | breadth-first NFA | ✅ | ✅ | general, large inputs |
 | `backtrack` | bounded depth-first NFA | ✅ | ✅ | small inputs |
 | `literal` | substring / literal-alternation | whole-match | ✅ | pure-literal patterns |
+| `bytepike` | byte-stepping Pike VM (zero-decode) | ✅ | ✅ | byte-automaton substrate (no `\X`/`\b`) |
 
 `compileRuntime`/`compileComptime` use `auto`. Force one with the `*With` variants:
 `gex.compileRuntimeWith(gex.backends.pikevm, gpa, pat, &diag, .{})`.

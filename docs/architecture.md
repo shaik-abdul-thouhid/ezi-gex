@@ -60,14 +60,25 @@ already `[Aa]`, `(?m)^` is already `line_start`.
 
 ### What the HIR builder does (driven by comptime-known `Options`)
 
+`Options` has two tiers. The **semantic** tier changes what matches: `case_fold`
+(`.none`/`.simple`/`.full`); `case_insensitive`/`multiline`/`dot_matches_newline`,
+which *seed* the `(?i)`/`(?m)`/`(?s)` flag state for the whole pattern (inline `(?…)`
+flags OR-merge on top of the seed); and `unicode`, which toggles ASCII vs. Unicode
+`\d\w\s`. The **strategy** tier (`Options.strategy`) is **results-invariant by
+contract** — reserved for the byte engine, it may change only
+speed/memory, never which text matches. (See `usage-guide.md` §Options for recipes.)
+
 - **Applies & drops flags.** `(?i)`/`(?m)`/`(?s)` and scoped `(?flags:…)` disappear:
   `m` picks the anchor kind, `s` sets dot-all on `.`, `i` folds literals/classes.
 - **Resolves all Unicode to ranges.** `\d \w \s`, `\p{…}`/`\P{…}`, scripts, and
   `[...]` collapse into **one normalized, sorted, merged, non-overlapping** code-point
   range set, **with negation already applied** (`[^…]`, `\D`, `\P`). Match-time
-  membership is then "is cp in some range" — nothing more.
-- **Simple case folding.** `simple` widens ranges to their fold closure (`a`↔`A`,
-  `σ`↔`Σ`). `full` (ß→ss) is a documented gap — it currently behaves like `simple`.
+  membership is then "is cp in some range" — nothing more. With `Options.unicode =
+  false` the shorthands `\d`/`\w`/`\s` resolve to their classic ASCII sets instead
+  (smaller automata); `.` and `\b` stay Unicode-aware.
+- **Case folding.** `simple` widens ranges to their fold closure (`a`↔`A`,
+  `σ`↔`Σ`). `full` adds the 1→many expansions for literals (`ß`→`ss`, `ﬀ`→`ff`),
+  lowering them to an alternation; character classes stay simple.
 - **Simplifies.** Merges adjacent literals into runs, flattens nested concat/alt,
   inlines non-capturing groups (keeping capture numbering), drops `{1}` wrappers.
 - **Keeps `{m,n}` compact** — each backend lowers it its own way.
@@ -446,18 +457,25 @@ match, so a prefilter or length gate built on them never yields a false negative
 - **`$` is `\z`.** Without `(?m)`, `$` matches **only** end-of-input — *not* before a
   trailing newline. `abc$` does **not** match `"abc\n"`. This is JS/Go/RE2/Rust
   semantics, not Perl/Python/PCRE. `\Z` is treated as `\z`.
-- **`\X` parses but does not execute.** No current backend sets `caps.grapheme = true`;
-  a pattern containing `\X` fails at build with `error.Unsupported`.
+- **`\X` (grapheme cluster) is `backtrack`-only.** `\X` matches one whole UAX #29
+  extended grapheme cluster; it compiles to a variable-width `grapheme` NFA
+  instruction. `backtrack` and `auto` set `caps.grapheme = true`; the breadth-first
+  `pikevm` and the `literal` backend cannot consume a variable number of code points
+  per step (`caps.grapheme = false`) and reject such a program at build, so `auto`
+  routes any `\X` pattern to the backtracker (whose memo bounds `\X` over very large
+  inputs).
 - **No backreferences / lookaround / atomic / conditional / recursion / `\Q…\E`.**
   A Thompson NFA can't express them; each is rejected at parse with a precise code.
 - **`{m,n}` expands, uncapped.** The NFA compiler emits `n` copies; a huge counted
   repeat makes a large program (bounded by allocation failure or the comptime branch
   quota — never UB, but there is no `size_limit` yet).
-- **Invalid UTF-8 in input** decodes to `U+FFFD` with a 1-byte advance — the engine
-  won't match *across* a bad byte but still makes progress. (Pattern bytes, by
-  contrast, must be valid UTF-8 or `scan` rejects them.)
-- **`case_fold = .full` == `.simple`** for now; `Script_Extensions` falls back to the
-  plain `Script` ranges.
+- **Invalid UTF-8 in input** is *dead-on-invalid* — a malformed byte matches nothing
+  (no `U+FFFD` substitution) and the unanchored scan resyncs one byte past it, so a
+  match never spans a bad byte. (Pattern bytes, by contrast, must be valid UTF-8 or
+  `scan` rejects them.)
+- **`case_fold = .full`** expands 1→many foldings for literals (`ß`→`ss`); character
+  classes use simple folding. `Script_Extensions` falls back to the plain `Script`
+  ranges.
 
 ---
 
@@ -492,6 +510,14 @@ Backends — including yours — may rely on all of these; the frontend guarante
    `@intFromPtr` are runtime-only and will fail in const-eval.
 10. **`Analysis` facts are sound one-sided bounds.** Treat them as "must hold for every
     match" (safe to prefilter on); never as "this exact thing matches".
+11. **`SearchOptions.span_end` is enforced by `Engine`, not the backend.** The agnostic
+    ops clamp the haystack to `[start, span_end)` before calling your `search`, so a
+    backend never sees `span_end`; returned offsets still index the full `input`.
+    `earliest` is advisory — a no-op for the leftmost-first built-ins (reserved for a
+    future earliest-match engine).
+12. **`Match.pattern` is reserved** — a defaulted `u32`, always `0` today (single
+    pattern), threaded through `Match` for a future multi-pattern / set API. Leave it
+    `0`; `Match{ .start, .end }` literals keep compiling unchanged.
 
 ---
 
@@ -502,8 +528,34 @@ The contract is the seam that makes these drop-in:
 | Tier | Work | Effort | Lands at |
 |---|---|---|---|
 | 1 ✅ *(0.1.0)* | literal `eql` → `std.mem.indexOf`; `prefix_literal` first byte → `memchr` start-skip in `auto` (+ length/anchor gates) | done | ~20× on memchr-friendly literals and prefixed NFA patterns |
+| 3a ✅ *(0.2.0)* | **byte-NFA lowering + `ByteMap`** (`engine/byte.zig`) — UTF-8 `utf8-ranges`, a `byte_range` Thompson NFA, byte equivalence classes; executed by the `bytepike` reference VM | done | the substrate for the lazy DFA below |
 | 2 | one-pass NFA fast capture path | weeks | kills the captures penalty on common patterns |
-| 3 | lazy DFA on a UTF-8 **byte** automaton (the RE2/Rust core) | ~1–3 months | RE2 order of magnitude on general search |
+| 3b | lazy DFA over the **byte** automaton (the RE2/Rust core) | ~1–3 months | RE2 order of magnitude on general search |
+
+### The byte substrate (tier 3a, landed)
+
+`engine/byte.zig` lowers the code-point HIR to a **byte-grained** Thompson NFA: each
+consuming instruction is a `byte_range [lo, hi]` test, and a Unicode class is lowered
+to UTF-8 byte-range sequences (`enumerate`, the Cox/RE2 `utf8-ranges` algorithm), so a
+class like `\p{Greek}` matches exactly the same code points **with zero decode**. This
+is the LLVM "one IR, multiple ISAs" pattern: the HIR stays the
+code-point source of truth; bytes are a second lowering target, gated by
+`byteLowerable(hir)` (false for `\X` and `\b`/`\B`). `byteClasses(program)` compresses
+the 256 input bytes into a handful of equivalence classes (sound + contiguous) — the
+alphabet a DFA keys transitions on.
+
+> **Size:** a byte program is *larger* than the code-point program for Unicode classes
+> (a single `\w+` expands ~21×, ~137 KB; ASCII patterns are unchanged) — inherent to a
+> byte NFA, which is exactly why matching throughput comes from determinizing it to a
+> DFA, not from running the NFA. The huge NFA still collapses to ~100 byte classes, so
+> the DFA's alphabet stays tiny. This memory is only paid when the byte path is used
+> (`bytepike` or a comptime byte program); the default code-point engines are
+> unaffected.
+
+The `bytepike` backend executes this byte program (byte-stepping Pike VM, captures,
+comptime + runtime) and is the **reference executor** that proves the lowering correct
+(`conformance.zig`). It is not `auto`'s default — per-byte stepping is not a throughput
+win over the code-point VM; the DFA (tier 3b) is what the substrate exists for.
 
 A lazy DFA mutates/caches state at match time, so it would be **runtime-only**
 (`buildAlloc` + `search`, no `buildComptime`) — which the contract already allows

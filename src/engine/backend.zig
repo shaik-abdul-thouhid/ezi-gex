@@ -114,8 +114,8 @@ pub const Match = struct {
     end: usize,
     /// Which pattern produced this match — for the (future) multi-pattern / set API.
     /// **Reserved:** always `0` today (single-pattern). It is threaded through the
-    /// public surface now so adding a set API later does not change `Match`'s shape
-    /// (see DESIGN.md §5). Defaulted, so every existing `Match{ .start, .end }`
+    /// public surface now so adding a set API later does not change `Match`'s shape.
+    /// Defaulted, so every existing `Match{ .start, .end }`
     /// literal keeps compiling unchanged.
     ///
     /// @stable-since: v0.2.0

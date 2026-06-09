@@ -1,6 +1,6 @@
 # backends/ — the built-in matchers
 
-Four backends. All satisfy the same contract (`../backend.zig`), all build and run at
+Five backends. All satisfy the same contract (`../backend.zig`), all build and run at
 **comptime and runtime**, all are leftmost-first (Perl/JS). `auto` is the default.
 
 | Backend | Strategy | Memory | Captures | When `auto` picks it |
@@ -8,7 +8,8 @@ Four backends. All satisfy the same contract (`../backend.zig`), all build and r
 | `literal` | substring / literal-alternation byte scan | none (stateless) | whole-match only | pure-literal pattern (`abc`, `cat\|dog`) |
 | `pikevm` | breadth-first NFA (thread set, one code point/step) | O(program), input-independent | ✅ | NFA pattern, large input |
 | `backtrack` | depth-first NFA + `(pc,sp)` memo | O(program × input) | ✅ | NFA pattern, small input that fits |
-| `auto` | dispatcher over the three | per sub-backend | ✅ | the default |
+| `bytepike` | breadth-first **byte** NFA (`../byte.zig`), one *byte*/step, zero-decode | O(program); program is larger for Unicode classes | ✅ | never (not a default arm) — the byte-lowering reference VM / DFA substrate; refuses `\X`/`\b` |
+| `auto` | dispatcher over the others | per sub-backend | ✅ | the default |
 
 ## The shared NFA
 
@@ -43,7 +44,10 @@ itself scans with `std.mem.indexOf` (SIMD memchr / Boyer–Moore–Horspool), no
   `Scratch` grows it; a fixed-buffer `Scratch` caps it — `fits()` reports the ceiling,
   which is why `auto` only routes small inputs to it.
 - **`pikevm` is the general backstop** — constant memory, linear time, no input ceiling.
-- **None support `\X`** (`caps.grapheme = false`); such a pattern fails at build.
+- **`\X` (grapheme) is `backtrack`-only** (`caps.grapheme = true` on `backtrack` and
+  `auto`). `\X` compiles to a variable-width `grapheme` NFA instruction; the
+  breadth-first `pikevm` and the `literal` backend set `caps.grapheme = false` and
+  reject such a program at build, so `auto` routes any `\X` pattern to the backtracker.
 - To add a fifth backend (e.g. a lazy DFA), implement the contract and either route to
   it from a copy of `auto.zig` or use it directly via `compile*With`. See
   [`../../../docs/architecture.md`](../../../docs/architecture.md) §5 and §10, and the

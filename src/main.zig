@@ -140,6 +140,33 @@ pub fn main(init: std.process.Init) !void {
     // Pulled out as plain comptime constants (the slices live in ro_data):
     const year = comptime ReNamed.capturesComptime("y2026-06").?.namedSlice("year").?;
     std.debug.print("comptime const:    year = \"{s}\"\n", .{year});
+
+    // ══ Byte engine: the zero-decode byte-NFA substrate (v0.2.0) ═══════════════
+    // `bytepike` executes a byte-grained lowering of the HIR: each step consumes one
+    // input BYTE against a byte range, so a Unicode class matches with NO decode. It
+    // is the substrate the future lazy DFA will determinize — not the default backend
+    // (per-byte stepping is not a throughput win yet), but selectable via `*With`.
+    std.debug.print("\n── byte engine ──\n", .{});
+    const BytePike = ezi_gex.backends.bytepike;
+    var bdiag: ezi_gex.Diagnostic = .{};
+    var bre = try ezi_gex.compileRuntimeWith(BytePike, gpa, "\\p{Script=Greek}+", &bdiag, .{});
+    defer bre.deinit();
+    var bsc = try @TypeOf(bre).Scratch.init(gpa, &bre.program);
+    defer bsc.deinit(gpa);
+    const greek = "αβγ rest";
+    if (bre.find(&bsc, greek)) |m|
+        std.debug.print("bytepike \\p{{Script=Greek}}+ on \"{s}\": \"{s}\" (no decode)\n", .{ greek, m.slice(greek) });
+
+    // Inspect the lowering itself: the byte automaton plus its `ByteMap` equivalence
+    // classes — the small alphabet a DFA keys on, even when the NFA is large. (A
+    // Unicode class lowers to many byte ranges, so the byte program is bigger than
+    // the code-point one; that cost is only paid on the byte path.)
+    const byte = ezi_gex.engine.byte;
+    const w_hir = try ezi_gex.buildHir(gpa, try ezi_gex.parse(gpa, "\\w+", &bdiag), .{});
+    var w_prog = try byte.buildAlloc(gpa, w_hir);
+    defer byte.freeProgram(gpa, &w_prog);
+    const classes = byte.byteClasses(&w_prog);
+    std.debug.print("\\w+ byte program: {d} insts → {d} byte classes (256 bytes compressed)\n", .{ w_prog.insts.len, classes.count });
 }
 
 /// Pretty-print a parse diagnostic with a caret under the offending span. Pure
@@ -183,6 +210,16 @@ test "usage: comptime compile bakes the AST into the binary (no allocator)" {
     // `phone_re`'s slices point into .rodata. No deinit, no parsing at runtime.
     // An invalid pattern would have been a compile error.
     try std.testing.expect(phone_re.nodes.len > 0);
+}
+
+test "usage: byte engine (bytepike) matches a Unicode class without decoding" {
+    const gpa = std.testing.allocator;
+    var diag: ezi_gex.Diagnostic = .{};
+    var re = try ezi_gex.compileRuntimeWith(ezi_gex.backends.bytepike, gpa, "[α-ω]+", &diag, .{});
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+    defer sc.deinit(gpa);
+    try std.testing.expectEqualStrings("αβγ", re.find(&sc, "ΑΒΓαβγ").?.slice("ΑΒΓαβγ"));
 }
 
 test "usage: bad pattern yields a precise diagnostic" {

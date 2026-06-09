@@ -5,9 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-06-09
 
 ### Added
+
+- **Byte-NFA lowering + `ByteMap` equivalence classes** (`engine/byte.zig`) — the
+  UTF-8 automaton substrate the future lazy DFA will determinize. A
+  scalar range lowers to UTF-8 **byte-range sequences** (the Cox/RE2 `utf8-ranges`
+  algorithm, exact across length + surrogate boundaries), so a Unicode class becomes
+  a byte sub-automaton that matches the same code points with **zero decode**. The
+  byte `Program` is a Thompson NFA whose only consuming instruction is a `byte_range`
+  test; it builds at comptime and runtime. `byteClasses(program)` computes sound,
+  contiguous byte equivalence classes (alphabet compression: even `\w+`'s automaton
+  collapses to ~112 classes). Gated by `byteLowerable(hir)` — `\X` (grapheme) and
+  `\b`/`\B` (word boundary needs the adjacent code point) are not byte-lowerable and
+  route to the code-point engines. **Memory note:** byte programs are *larger* than
+  the code-point program for Unicode classes (a single `\w+` is ~137 KB vs 6.5 KB;
+  ASCII patterns are unchanged) — expected for an NFA substrate, and only paid when
+  the byte path is used. The byte compiler does not yet intern repeated classes
+  (future work).
+- **`bytepike` backend** (`engine/backends/bytepike.zig`) — a byte-stepping Pike VM
+  that executes the byte `Program`: linear-time, leftmost-first, captures, comptime +
+  runtime, same caller-owned `Scratch` design. The reference executor proving the
+  byte lowering correct (`conformance.zig` shows it agrees with `pikevm`/`backtrack`/
+  `auto` across the whole case table, runtime and comptime) and the substrate for the
+  lazy DFA. It is **not** `auto`'s default — stepping per byte is not a throughput win
+  over the code-point VM; the DFA will be. **Invalid UTF-8** is dead-on-invalid by
+  construction (the lowering only accepts well-formed sequences).
 
 - **`(?x)` extended / verbose mode** (`core/scanner.zig`, `core/token.zig`). In
   normal (non-class) context, unescaped whitespace and `#`-to-end-of-line comments

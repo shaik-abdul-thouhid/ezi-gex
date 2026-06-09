@@ -3,3 +3,6 @@
 **/zig-out
 
 .DS_Store
+
+# Personal design notes — not part of the repo
+DESIGN.md

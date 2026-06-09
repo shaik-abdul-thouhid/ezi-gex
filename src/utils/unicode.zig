@@ -15,7 +15,7 @@
 //!         1→many full-fold rewrite like `ß` ↔ `ss`).
 //!       * `grapheme` — UAX #29 grapheme-cluster (`\X`) helpers.
 //!       * decode policy — a single definition of how invalid UTF-8 is treated
-//!         at match time (so every backend agrees — see DESIGN.md §2.3).
+//!         at match time (so every backend agrees).
 //!
 //! ## Contract / invariants
 //!
@@ -81,8 +81,8 @@ pub const casing = ezi_code.unicode.casing;
 
 // ── Layer 2: value-added helpers ──────────────────────────────────────────────
 //
-// Engine-specific Unicode policy wrapping the backend. Implemented incrementally
-// (see DESIGN.md): full case folding, grapheme (`\X`) segmentation, and the
+// Engine-specific Unicode policy wrapping the backend. Implemented incrementally:
+// full case folding, grapheme (`\X`) segmentation, and the
 // shared invalid-UTF-8 decode policy will be added here so every call site and
 // every backend shares one definition. New helpers land in this section with the
 // same doc density as the re-exports above.

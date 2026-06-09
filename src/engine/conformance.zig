@@ -24,7 +24,35 @@ const backend = @import("backend.zig");
 const pikevm = @import("backends/pikevm.zig");
 const backtrack = @import("backends/backtrack.zig");
 const literal = @import("backends/literal.zig");
+const bytepike = @import("backends/bytepike.zig");
 const auto = @import("backends/auto.zig");
+
+const byte = @import("byte.zig");
+const hir = @import("../core/hir.zig");
+const ccompile = @import("../core/compile.zig");
+
+/// Whether `pattern` can be lowered to a byte program (false for `\X`/`\b` — those
+/// route to the code-point engines, so the byte Pike VM is not expected to run them).
+fn byteLowerablePattern(pattern: []const u8) bool {
+    const gpa = testing.allocator;
+    var diag: regex.Diagnostic = .{};
+    const ast = ccompile.parse(gpa, pattern, &diag) catch return false;
+    defer ast.deinit(gpa);
+    const h = hir.buildAlloc(gpa, ast, .{}) catch return false;
+    defer hir.deinitHir(gpa, h);
+    return byte.byteLowerable(h);
+}
+
+/// Small ASCII-only cases for the byte engine's *comptime* parity. Kept separate
+/// from `comptime_cases` because the byte lowering of a Unicode class (`\d`/`\w`)
+/// expands to many `byte_range` insts, and building + running several of those in
+/// the const-evaluator is heavy; these stay small. (`bytepike.zig`'s own tests cover
+/// comptime byte matching of `\d`/`\w` directly.)
+const byte_comptime_cases = [_]Case{
+    .{ .pat = "cat|dog", .input = "a dog", .expect = "dog" },
+    .{ .pat = "a{2,4}", .input = "aaaaaa", .expect = "aaaa" },
+    .{ .pat = "ab*c", .input = "xabbbc", .expect = "abbbc" },
+};
 
 const Case = struct { pat: []const u8, input: []const u8, expect: ?[]const u8 };
 
@@ -148,6 +176,24 @@ test "literal cases agree across all four backends (incl. literal)" {
     }
 }
 
+test "byte Pike VM agrees on the byte-lowerable subset (the lowering is correct)" {
+    // The byte lowering's correctness proof: for every case the byte engine *can*
+    // run (i.e. no `\b`/`\X`), it must reach the SAME result the code-point engines
+    // are checked against above. Cases it can't lower are covered by those engines.
+    var ran: usize = 0;
+    for (general_cases) |c| {
+        if (!byteLowerablePattern(c.pat)) continue;
+        try checkRuntime(bytepike, c);
+        ran += 1;
+    }
+    for (literal_cases) |c| {
+        if (!byteLowerablePattern(c.pat)) continue;
+        try checkRuntime(bytepike, c);
+        ran += 1;
+    }
+    try testing.expect(ran > 0); // guard against the filter silently skipping everything
+}
+
 // ── capture-array conformance ─────────────────────────────────────────────────────
 
 const capture_cases = [_][]const u8{
@@ -185,6 +231,14 @@ test "capture slot arrays agree across pikevm / backtrack / auto" {
             if (ra) {
                 try testing.expectEqualSlices(?usize, &a, &b);
                 try testing.expectEqualSlices(?usize, &a, &c);
+            }
+            // The byte Pike VM must report the SAME capture slots for every
+            // byte-lowerable capture pattern (none here use `\b`).
+            if (byteLowerablePattern(pat)) {
+                var d: [16]?usize = undefined;
+                const rd = try captureSlots(bytepike, gpa, pat, in, &d);
+                try testing.expectEqual(ra, rd);
+                if (ra) try testing.expectEqualSlices(?usize, &a, &d);
             }
         }
     }
@@ -247,6 +301,13 @@ test "comptime == runtime for the same backend" {
             try checkRuntime(B, c); // runtime
             try checkComptime(B, c); // comptime — same expectation
         }
+    }
+}
+
+test "byte Pike VM matches at comptime too (small ASCII subset)" {
+    inline for (byte_comptime_cases) |c| {
+        try checkComptime(bytepike, c); // ro_data byte program, matched in const-eval
+        try checkRuntime(bytepike, c); // and the same answer at runtime
     }
 }
 

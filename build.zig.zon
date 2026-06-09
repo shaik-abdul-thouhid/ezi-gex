@@ -1,6 +1,6 @@
 .{
     .name = .ezi_gex,
-    .version = "0.2.0-dev",
+    .version = "0.2.0",
     .fingerprint = 0xe2db231a3c00347d,
     .minimum_zig_version = "0.17.0-dev.702+18b3c78a9",
     .dependencies = .{
