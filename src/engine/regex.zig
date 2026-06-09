@@ -862,6 +862,43 @@ test "SearchOptions.span_end limits the search to a sub-range" {
     try testing.expectEqualStrings("123", re.findAt(&sc, input, .{ .span_end = 999 }).?.slice(input));
 }
 
+test "(?x) verbose mode ignores unescaped whitespace and # comments" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "(?x) a b c  # a trailing comment", &diag, .{});
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    try testing.expect(re.isMatch(&sc, "abc")); //  whitespace + comment stripped → "abc"
+    try testing.expect(!re.isMatch(&sc, "a b c")); // literal spaces are NOT in the pattern
+}
+
+test "(?x:...) scoped verbose skips whitespace only inside the group" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "a(?x: b c )d", &diag, .{});
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    // Inside (?x:...) the spaces are ignored → the group matches "bc":
+    try testing.expect(re.isMatch(&sc, "abcd"));
+
+    // A literal space OUTSIDE the scoped group stays significant.
+    var re2 = try compileRuntime(testing.allocator, "a (?x:b)", &diag, .{});
+    defer re2.deinit();
+    var sc2 = try @TypeOf(re2).Scratch.init(testing.allocator, &re2.program);
+    defer sc2.deinit(testing.allocator);
+    try testing.expect(re2.isMatch(&sc2, "a b"));
+}
+
+test "(?x) verbose: an escaped space is still a literal space" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "(?x) a\\ b", &diag, .{});
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    try testing.expect(re.isMatch(&sc, "a b")); // `\ ` matches a literal space
+    try testing.expect(!re.isMatch(&sc, "ab"));
+}
+
 test {
     testing.refAllDecls(@This());
 }

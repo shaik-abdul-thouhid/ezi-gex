@@ -30,6 +30,11 @@ pub const Flags = packed struct {
     multiline: bool = false,
     /// s — `.` also matches `\n` (dot-all / single-line).
     dot_all: bool = false,
+    /// x — extended/verbose mode: in normal (non-class) context the scanner skips
+    /// unescaped whitespace and `#`-to-end-of-line comments while lexing. Unlike the
+    /// other flags this one is acted on at LEX time, so it takes effect only via an
+    /// inline `(?x)` (not the front-door `Options`, which is applied after lexing).
+    verbose: bool = false,
 
     /// The empty flag set (nothing toggled).
     pub const none: Flags = .{};
@@ -43,6 +48,7 @@ pub const Flags = packed struct {
             .case_insensitive = self.case_insensitive or other.case_insensitive,
             .multiline = self.multiline or other.multiline,
             .dot_all = self.dot_all or other.dot_all,
+            .verbose = self.verbose or other.verbose,
         };
     }
 
@@ -50,7 +56,7 @@ pub const Flags = packed struct {
     ///
     /// @stable-since: v0.1.0
     pub fn isEmpty(self: Flags) bool {
-        return !self.case_insensitive and !self.multiline and !self.dot_all;
+        return !self.case_insensitive and !self.multiline and !self.dot_all and !self.verbose;
     }
 };
 

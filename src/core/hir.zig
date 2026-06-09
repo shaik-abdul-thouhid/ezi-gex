@@ -1119,6 +1119,7 @@ fn applyDelta(base: Flags, add: Flags, remove: Flags) Flags {
         .case_insensitive = (base.case_insensitive or add.case_insensitive) and !remove.case_insensitive,
         .multiline = (base.multiline or add.multiline) and !remove.multiline,
         .dot_all = (base.dot_all or add.dot_all) and !remove.dot_all,
+        .verbose = (base.verbose or add.verbose) and !remove.verbose,
     };
 }
 

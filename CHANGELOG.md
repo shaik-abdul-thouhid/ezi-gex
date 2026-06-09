@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`(?x)` extended / verbose mode** (`core/scanner.zig`, `core/token.zig`). In
+  normal (non-class) context, unescaped whitespace and `#`-to-end-of-line comments
+  are insignificant, so patterns can be laid out readably. Works globally (`(?x)…`)
+  and scoped (`(?x:…)`, restored at the group's `)`); an escaped space (`\ `) stays
+  literal. It is a lex-time flag, so it is set via inline `(?x)` (not the front-door
+  `Options`, which is applied after lexing).
+
 - **`SearchOptions.span_end` and `earliest`** (`engine/backend.zig`). `span_end`
   bounds a search to the sub-range `[start, span_end)` without copying — the agnostic
   `Engine` ops clamp the haystack, so backends are unchanged and returned offsets

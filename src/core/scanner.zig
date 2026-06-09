@@ -105,6 +105,11 @@ pub const Frame = struct {
     flags_remove: token.Flags = .{},
     /// Byte offset of the opening `(` — used to point at an unclosed group.
     open_pos: u32 = 0,
+    /// The scanner's `flags` as they were just before this group opened, restored
+    /// on close. Only `verbose` (`x`) has a lex-time effect, so this is what makes a
+    /// scoped `(?x:…)` skip whitespace inside the group and stop at its `)`.
+    /// Empty/no-op for groups without a flag delta.
+    saved_flags: token.Flags = .{},
 };
 
 /// What the previous token contributed, for quantifier legality.
@@ -262,6 +267,21 @@ pub const Scanner = struct {
             if (self.commentAhead()) {
                 try self.skipComment();
                 continue;
+            }
+            // `(?x)` extended mode: outside a character class, unescaped ASCII
+            // whitespace and `#`-to-end-of-line comments are insignificant. (An
+            // escaped space `\ ` is a literal — it goes through `lexEscape`, since
+            // this skip only fires on the raw whitespace/`#` byte.)
+            if (self.flags.verbose) {
+                const wb = self.pattern[self.pos];
+                if (wb == ' ' or wb == '\t' or wb == '\n' or wb == '\r' or wb == 0x0B or wb == 0x0C) {
+                    self.pos += 1;
+                    continue;
+                }
+                if (wb == '#') {
+                    while (!self.atEnd() and self.pattern[self.pos] != '\n') self.pos += 1;
+                    continue;
+                }
             }
             const start = self.pos;
             const b = self.pattern[self.pos];
@@ -640,7 +660,7 @@ pub const Scanner = struct {
             if (self.atEnd()) return self.fail(.invalid_group_syntax, Span.range(start, self.pos));
             const c = self.pattern[self.pos];
             switch (c) {
-                'i', 'm', 's' => {
+                'i', 'm', 's', 'x' => {
                     const bit = flagBit(c);
                     if (neg) remove = remove.merge(bit) else add = add.merge(bit);
                     self.pos += 1;
@@ -790,12 +810,17 @@ pub const Scanner = struct {
             .flags_add = add,
             .flags_remove = remove,
             .open_pos = open_pos,
+            .saved_flags = self.flags,
         };
         if (kind == .capture) {
             self.capture_count += 1;
             fr.group_index = self.capture_count;
         }
         try self.pushFrame(fr);
+        // Apply the (scoped) flag delta for the duration of the group body so the
+        // lexer sees it — chiefly `(?x:…)` verbose. Restored in `onCloseGroup`.
+        // (i/m/s have no lex-time effect; HIR re-derives them from the AST node.)
+        self.flags = applyDelta(self.flags, add, remove);
         self.prev = .start;
     }
 
@@ -826,6 +851,7 @@ pub const Scanner = struct {
         const fr = self.topFrame().*;
         const body = try self.buildAlternation(fr.alt_base);
         self.frame_len -= 1;
+        self.flags = fr.saved_flags; // restore lex flags — ends a scoped `(?x:…)`
 
         const group_node = switch (fr.kind) {
             .capture => try self.emitNode(ast.makeCapture(body, fr.group_index, fr.name)),
@@ -1076,6 +1102,7 @@ fn flagBit(c: u8) token.Flags {
         'i' => .{ .case_insensitive = true },
         'm' => .{ .multiline = true },
         's' => .{ .dot_all = true },
+        'x' => .{ .verbose = true },
         else => .{},
     };
 }
@@ -1085,6 +1112,7 @@ fn applyDelta(base: token.Flags, add: token.Flags, remove: token.Flags) token.Fl
         .case_insensitive = (base.case_insensitive or add.case_insensitive) and !remove.case_insensitive,
         .multiline = (base.multiline or add.multiline) and !remove.multiline,
         .dot_all = (base.dot_all or add.dot_all) and !remove.dot_all,
+        .verbose = (base.verbose or add.verbose) and !remove.verbose,
     };
 }
 
@@ -1290,9 +1318,11 @@ fn writeFlagDelta(add: token.Flags, remove: token.Flags, w: *std.Io.Writer) std.
     if (add.case_insensitive) try w.writeAll("+i");
     if (add.multiline) try w.writeAll("+m");
     if (add.dot_all) try w.writeAll("+s");
+    if (add.verbose) try w.writeAll("+x");
     if (remove.case_insensitive) try w.writeAll("-i");
     if (remove.multiline) try w.writeAll("-m");
     if (remove.dot_all) try w.writeAll("-s");
+    if (remove.verbose) try w.writeAll("-x");
 }
 
 fn writeClassItem(it: ast.ClassItem, w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -1582,7 +1612,7 @@ test "global inline flags set the ast flags" {
 
 test "flag errors" {
     try expectError("(?q)", .unknown_flag);
-    try expectError("(?x:a)", .unknown_flag);
+    try expectError("(?z:a)", .unknown_flag); // `x` is now a valid flag; `z` is not
     try expectError("(?)", .empty_flag_group);
 }
 
