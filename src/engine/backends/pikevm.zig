@@ -21,13 +21,13 @@ const backend = @import("../backend.zig");
 const hir = @import("../../core/hir.zig");
 const nfa = @import("../nfa.zig");
 
-const ezi_code = @import("ezi_code");
+const utils = @import("utils");
 
 const Match = backend.Match;
 const SearchOptions = backend.SearchOptions;
 const Caps = backend.Caps;
 const BuildError = backend.BuildError;
-const CodePoint = ezi_code.encoding.CodePoint;
+const CodePoint = utils.unicode.CodePoint;
 
 // ── Contract surface ────────────────────────────────────────────────────────────
 

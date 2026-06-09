@@ -20,13 +20,13 @@ const std = @import("std");
 const backend = @import("backend.zig");
 const hir = @import("../core/hir.zig");
 
-const ezi_code = @import("ezi_code");
-const properties = ezi_code.unicode.properties;
-const utf8 = ezi_code.encoding.utf8;
+const utils = @import("utils");
+const properties = utils.unicode.properties;
+const utf8 = utils.unicode.utf8;
 
 const BuildError = backend.BuildError;
 const Range = hir.Range;
-const CodePoint = ezi_code.encoding.CodePoint;
+const CodePoint = utils.unicode.CodePoint;
 
 // ── Instruction set ──────────────────────────────────────────────────────────────
 

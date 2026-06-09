@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Full case folding** (`Options.case_fold = .full`). Under `(?i)`, a literal whose
+  Unicode full fold expands now matches its expansion too: `ß` matches `ss`/`SS`,
+  `ﬀ` matches `ff`, `ﬃ` matches `ffi`, … It lowers (`core/hir.zig` →
+  `lowerLiteralFull`) to an alternation of the code point's simple-fold orbit and
+  the spelled-out expansion (each letter case-folded). Literals only — character
+  classes keep simple folding (a class matches one code point), and the pattern is
+  folded, not the input (so `ss` does not match a lone `ß`). Previously `.full`
+  behaved like `.simple` (a v1 gap). Build-time only (O(1) full-fold table lookup,
+  ASCII short-circuited); match-time is unchanged.
+
+- **`utils` module — the single `ezi_code` seam** (`src/utils/{root,unicode}.zig`).
+  All Unicode/encoding access (`CodePoint`, `utf8`, `properties`, `scripts`,
+  `casing`) now flows through `utils.unicode.*`. Enforced by the build graph: the
+  engine module imports `utils`, not `ezi_code`, so a stray `@import("ezi_code")`
+  anywhere else fails to compile. Reserves one home for the value-added Unicode
+  helpers (full case folding, grapheme `\X`, invalid-UTF-8 decode policy) still to
+  land. No change to match semantics or performance.
+
 - **`re.capturesComptime(input)`** (`engine/regex.zig`, `@stable-since: v0.2.0`) —
   resolve a match's submatches at compile time, rounding out
   `isMatchComptime`/`findComptime`/`countComptime`. The returned `Captures` freezes

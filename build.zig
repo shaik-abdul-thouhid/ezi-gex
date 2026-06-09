@@ -10,12 +10,26 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ── The single Unicode/encoding seam ──────────────────────────────────────
+    // `utils` is the ONLY module that imports `ezi_code`. The engine module below
+    // imports `utils`, NOT `ezi_code`, so a stray `@import("ezi_code")` anywhere
+    // in the engine is a *compile error* — the no-direct-ezi_code rule is enforced
+    // by the build graph, not just by convention. See src/utils/root.zig.
+    const utils_mod = b.createModule(.{
+        .root_source_file = b.path("src/utils/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ezi_code", .module = ezi_code.module("ezi_code") },
+        },
+    });
+
     const mod = b.addModule("ezi_gex", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "ezi_code", .module = ezi_code.module("ezi_code") },
+            .{ .name = "utils", .module = utils_mod },
         },
     });
 
@@ -27,7 +41,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "ezi_gex", .module = mod },
-                .{ .name = "ezi_code", .module = ezi_code.module("ezi_code") },
             },
         }),
     });
@@ -43,6 +56,11 @@ pub fn build(b: *std.Build) void {
 
     run_cmd.addPassthruArgs();
 
+    const utils_tests = b.addTest(.{
+        .root_module = utils_mod,
+    });
+    const run_utils_tests = b.addRunArtifact(utils_tests);
+
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
@@ -56,6 +74,7 @@ pub fn build(b: *std.Build) void {
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&run_utils_tests.step);
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
@@ -73,12 +92,22 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = bench_optimize,
     });
+    // The seam again, at the bench optimize level (a distinct ezi_code instance,
+    // so a distinct `utils` instance must wrap it).
+    const utils_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/utils/root.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .imports = &.{
+            .{ .name = "ezi_code", .module = ezi_code_bench.module("ezi_code") },
+        },
+    });
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = bench_optimize,
         .imports = &.{
-            .{ .name = "ezi_code", .module = ezi_code_bench.module("ezi_code") },
+            .{ .name = "utils", .module = utils_bench_mod },
         },
     });
 

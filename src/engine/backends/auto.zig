@@ -44,9 +44,9 @@ const literal = @import("literal.zig");
 const pikevm = @import("pikevm.zig");
 const backtrack = @import("backtrack.zig");
 
-const ezi_code = @import("ezi_code");
-const encoding = ezi_code.encoding;
-const utf8 = ezi_code.encoding.utf8;
+const utils = @import("utils");
+const encoding = utils.unicode.encoding;
+const utf8 = utils.unicode.utf8;
 
 const Match = backend.Match;
 const SearchOptions = backend.SearchOptions;

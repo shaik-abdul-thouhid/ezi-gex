@@ -41,10 +41,10 @@ const ast = @import("ast.zig");
 const token = @import("token.zig");
 const errors = @import("error.zig");
 
-const ezi_code = @import("ezi_code");
-const utf8 = ezi_code.utf8;
-const u_props = ezi_code.unicode.properties;
-const CodePoint = ezi_code.encoding.CodePoint;
+const utils = @import("utils");
+const utf8 = utils.unicode.utf8;
+const u_props = utils.unicode.properties;
+const CodePoint = utils.unicode.CodePoint;
 
 // ── Public re-exports ─────────────────────────────────────────────────────────
 

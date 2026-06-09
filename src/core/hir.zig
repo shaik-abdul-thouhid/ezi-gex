@@ -18,8 +18,9 @@
 //!     consulted here, once; after HIR a backend does plain range membership —
 //!     no Unicode tables at match time for classes.
 //!   * Case folding. `simple` widens literal/class ranges to their simple-fold
-//!     closure via ezi_code's enumerable fold table. (`full`'s 1→many rewrite,
-//!     e.g. ß→ss, is a documented v1 gap — see `Options.case_fold`.)
+//!     closure via ezi_code's enumerable fold table; `full` additionally expands
+//!     the 1→many foldings (`ß`→`ss`, `ﬀ`→`ff`) for literals into an alternation —
+//!     see `Options.case_fold` and `lowerLiteralFull`.
 //!   * Simplify. Merge adjacent literals into runs, inline non-capturing groups
 //!     (keeping capture numbering), drop redundant single-repeat wrappers.
 //!   * Keep `{m,n}` compact (each backend lowers it its own way).
@@ -166,13 +167,13 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const token = @import("token.zig");
 
-const ezi_code = @import("ezi_code");
-const encoding = ezi_code.encoding;
-const utf8 = ezi_code.encoding.utf8;
-const CodePoint = ezi_code.encoding.CodePoint;
-const props = ezi_code.unicode.properties;
-const u_scripts = ezi_code.unicode.scripts;
-const casing = ezi_code.unicode.casing;
+const utils = @import("utils");
+const encoding = utils.unicode.encoding;
+const utf8 = utils.unicode.utf8;
+const CodePoint = utils.unicode.CodePoint;
+const props = utils.unicode.properties;
+const u_scripts = utils.unicode.scripts;
+const casing = utils.unicode.casing;
 
 pub const Flags = token.Flags;
 pub const PerlClassKind = token.PerlClassKind;
@@ -196,8 +197,9 @@ pub const Options = struct {
     /// How `i` (case-insensitive) folding is realized in the HIR.
     ///   `none`   — no folding, even under `(?i)`.
     ///   `simple` — widen literal/class ranges to the simple-fold closure (1:1).
-    ///   `full`   — currently behaves like `simple` for single code points; the
-    ///              1→many rewrite (ß ↔ ss) is not yet implemented (v1 gap).
+    ///   `full`   — `simple` PLUS the 1→many expansions: `(?i)ß` also matches
+    ///              `ss`, `(?i)ﬀ` also matches `ff` (literals only; classes use
+    ///              simple folding). See `CaseFold.full`.
     case_fold: CaseFold = .simple,
 };
 
@@ -210,9 +212,13 @@ pub const CaseFold = enum {
     /// Widen every literal/class range to its SIMPLE-fold closure (a 1:1 mapping):
     /// `a` under `(?i)` becomes `[Aa]`, `σ` becomes `[Σςσ]`. The default.
     simple,
-    /// Intended FULL folding (the 1→many rewrite, e.g. `ß` ↔ `ss`). NOT yet
-    /// implemented: currently behaves exactly like `simple` for single code points
-    /// (a documented v1 gap — see the module header).
+    /// FULL folding: everything `simple` does, plus the 1→many expansions a single
+    /// code point can fold to. A literal whose full fold expands (`ß`→`ss`,
+    /// `ﬀ`→`ff`, `ﬃ`→`ffi`) lowers to an alternation matching BOTH the single code
+    /// point (any case) AND its spelled-out expansion (each letter, any case) — so
+    /// `(?i)ß` matches `ß`, `ẞ`, and `ss`/`SS`/`ſs`. The pattern is folded, not the
+    /// input, so the converse (`ss` matching a lone `ß`) does not hold, and
+    /// character classes use simple folding only. See `lowerLiteralFull`.
     full,
 };
 
@@ -821,7 +827,21 @@ fn Builder(comptime mode: Mode) type {
             };
         }
 
+        /// Lower a single literal code point under the active case-fold mode.
+        /// `none`/`simple` produce one node (a literal, or a small fold-orbit class);
+        /// `full` additionally expands the 1→many foldings (`ß`→`ss`, `ﬀ`→`ff`) into
+        /// an alternation — see `lowerLiteralFull`.
         fn lowerLiteral(self: *Self, cp: CodePoint, flags: Flags) BuildError!u32 {
+            if (self.foldActive(flags) and self.opts.case_fold == .full and fullFoldExpands(cp))
+                return self.lowerLiteralFull(cp, flags);
+            return self.lowerLiteralSimple(cp, flags);
+        }
+
+        /// Lower a literal under no-fold or SIMPLE folding: a 1:1 fold orbit stays a
+        /// literal, a wider orbit becomes a (tiny) class. Also the per-element builder
+        /// `lowerLiteralFull` composes — each code point of a full expansion is lowered
+        /// through here, so its own simple orbit (e.g. `s`→`[sSſ]`) is honoured.
+        fn lowerLiteralSimple(self: *Self, cp: CodePoint, flags: Flags) BuildError!u32 {
             if (!self.foldActive(flags)) {
                 const start = self.lit_len;
                 try self.addLiteralCp(cp);
@@ -842,6 +862,54 @@ fn Builder(comptime mode: Mode) type {
             for (self.member[0..k]) |r| try self.addMain(r);
             const cls = try self.commitMain(false);
             return self.addNode(.{ .tag = .class, .data = .{ .class = cls } });
+        }
+
+        /// Lower a literal whose FULL case fold expands to multiple code points
+        /// (`ß`→`ss`, `ﬀ`→`ff`, `ﬃ`→`ffi`, …) under `(?i)` with `case_fold = .full`.
+        ///
+        /// Caseless matching of such a code point must accept BOTH its single-code-
+        /// point forms and its spelled-out expansion, so the literal becomes an
+        /// alternation of two branches:
+        ///
+        ///   * **A** — the SIMPLE fold orbit of `cp` itself (e.g. `[ßẞ]`): the input
+        ///     is one of the single code points that fold together.
+        ///   * **B** — a concat of the simple fold orbit of each code point in the
+        ///     expansion (e.g. `[sSſ][sSſ]`): the input spells the expansion out, in
+        ///     any case.
+        ///
+        /// So `(?i)ß` (full) lowers to `(?:[ßẞ]|[sSſ][sSſ])` — matching `ß`, `ẞ`, and
+        /// `ss`/`SS`/`ſs`/… . NOTE the converse is *not* covered: a pattern `ss` does
+        /// not match a lone `ß`, because the matcher folds the PATTERN, not the input
+        /// (the standard limitation). Character classes likewise use simple folding
+        /// only — a class matches exactly one code point.
+        ///
+        /// The expansion comes straight from `ezi_code`'s full-fold table (an O(1)
+        /// indexed lookup returning a slice into static data), at build time only;
+        /// the resolved HIR carries no folding state into match time.
+        fn lowerLiteralFull(self: *Self, cp: CodePoint, flags: Flags) BuildError!u32 {
+            // Branch A: the single-code-point forms (simple orbit of cp).
+            const alt_a = try self.lowerLiteralSimple(cp, flags);
+
+            // Branch B: the spelled-out expansion, each code point simple-folded.
+            const seq = casing.case_folding.lookup(.full, .default, cp) orelse return alt_a;
+            const base_b = self.stack_len;
+            for (seq) |c| try self.push(try self.lowerLiteralSimple(c, flags));
+            const alt_b = try self.finishChildren(base_b, .concat);
+
+            // Top-level alternation [A, B].
+            const base = self.stack_len;
+            try self.push(alt_a);
+            try self.push(alt_b);
+            return self.finishChildren(base, .alternation);
+        }
+
+        /// True when `cp`'s FULL case fold expands to more than one code point (so
+        /// `.full` must lower it specially). ASCII never expands, so it short-circuits
+        /// before the table lookup — keeping the hot path (plain ASCII literals) free.
+        fn fullFoldExpands(cp: CodePoint) bool {
+            if (cp <= encoding.MAX_ASCII) return false;
+            const mapped = casing.case_folding.lookup(.full, .default, cp) orelse return false;
+            return mapped.len > 1;
         }
 
         fn lowerClass(self: *Self, idx: u32, flags: Flags) BuildError!u32 {
@@ -999,6 +1067,10 @@ fn Builder(comptime mode: Mode) type {
             if (node.tag != .literal) return null;
             const cp = node.data.literal.code_point;
             if (!self.foldActive(flags)) return cp;
+            // A full-fold code point that expands (`ß`→`ss`, `ﬀ`→`ff`) cannot join a
+            // plain literal run — it must go through `lowerLiteral` to become an
+            // alternation. Force the non-run path.
+            if (self.opts.case_fold == .full and fullFoldExpands(cp)) return null;
             self.member_len = 0;
             try self.addFolded(cp, cp, flags);
             sortRanges(self.member[0..self.member_len], self.aux);

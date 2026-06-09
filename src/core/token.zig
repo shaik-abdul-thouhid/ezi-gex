@@ -9,11 +9,11 @@
 //!   - `(?:` → Token{ .group_non_capture }
 
 const std = @import("std");
-const ezi_code = @import("ezi_code");
-const CodePoint = ezi_code.encoding.CodePoint;
+const utils = @import("utils");
+const CodePoint = utils.unicode.CodePoint;
 
-const scripts = ezi_code.unicode.scripts;
-const props = ezi_code.unicode.properties;
+const scripts = utils.unicode.scripts;
+const props = utils.unicode.properties;
 
 // ── Inline flags ──────────────────────────────────────────────────────────────
 

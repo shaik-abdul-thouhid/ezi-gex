@@ -570,6 +570,71 @@ test "front-door iterators and replace" {
     try testing.expect(it.next() == null);
 }
 
+// ── Full case folding (case_fold = .full) ─────────────────────────────────────
+
+test "full folding: (?i)ß also matches its expansion ss" {
+    var diag: Diagnostic = .{};
+    // `.full` lowers ß to (?:[ßẞ] | [sSſ][sSſ]) — both the sharp-s code points
+    // AND the spelled-out "ss" in any case.
+    var re = try compileRuntime(testing.allocator, "(?i)ß", &diag, .{ .case_fold = .full });
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+
+    try testing.expect(re.isMatch(&sc, "ß")); //  the code point itself
+    try testing.expect(re.isMatch(&sc, "ẞ")); //  U+1E9E, simple-folds to ß
+    try testing.expect(re.isMatch(&sc, "ss")); // the expansion …
+    try testing.expect(re.isMatch(&sc, "SS")); // … in any case
+    try testing.expect(re.isMatch(&sc, "Ss"));
+    try testing.expect(!re.isMatch(&sc, "s")); // a lone s is not enough
+    try testing.expectEqualStrings("ss", re.find(&sc, "<<ss>>").?.slice("<<ss>>"));
+}
+
+test "full folding: ligature (?i)ﬀ also matches ff" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "(?i)ﬀ", &diag, .{ .case_fold = .full });
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    try testing.expect(re.isMatch(&sc, "ﬀ"));
+    try testing.expect(re.isMatch(&sc, "ff"));
+    try testing.expect(re.isMatch(&sc, "FF"));
+}
+
+test "simple folding leaves ß un-expanded (the .full / .simple contrast)" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "(?i)ß", &diag, .{ .case_fold = .simple });
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    try testing.expect(re.isMatch(&sc, "ß"));
+    try testing.expect(re.isMatch(&sc, "ẞ"));
+    try testing.expect(!re.isMatch(&sc, "ss")); // simple folding: no 1→many expansion
+}
+
+test "full folding in a class stays simple (a class matches one code point)" {
+    var diag: Diagnostic = .{};
+    // Inside [...] there is no multi-code-point expansion; [ß] under .full still
+    // matches only the single sharp-s code points, never the two-char "ss".
+    var re = try compileRuntime(testing.allocator, "(?i)[ß]", &diag, .{ .case_fold = .full });
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    try testing.expect(re.isMatch(&sc, "ß"));
+    try testing.expect(!re.isMatch(&sc, "ss"));
+}
+
+test "full folding: plain ASCII literals are unaffected (run coalescing intact)" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "(?i)abc", &diag, .{ .case_fold = .full });
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    try testing.expect(re.isMatch(&sc, "ABC"));
+    try testing.expect(re.isMatch(&sc, "aBc"));
+    try testing.expect(!re.isMatch(&sc, "abd"));
+}
+
 test {
     testing.refAllDecls(@This());
 }

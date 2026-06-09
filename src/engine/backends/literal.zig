@@ -29,15 +29,15 @@ const std = @import("std");
 const backend = @import("../backend.zig");
 const hir = @import("../../core/hir.zig");
 
-const ezi_code = @import("ezi_code");
-const utf8 = ezi_code.encoding.utf8;
-const encoding = ezi_code.encoding;
+const utils = @import("utils");
+const utf8 = utils.unicode.utf8;
+const encoding = utils.unicode.encoding;
 
 const Match = backend.Match;
 const SearchOptions = backend.SearchOptions;
 const Caps = backend.Caps;
 const BuildError = backend.BuildError;
-const CodePoint = ezi_code.encoding.CodePoint;
+const CodePoint = utils.unicode.CodePoint;
 
 // ── Contract surface ────────────────────────────────────────────────────────────
 

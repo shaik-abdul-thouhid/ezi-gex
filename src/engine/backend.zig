@@ -89,8 +89,8 @@
 
 const std = @import("std");
 
-const ezi_code = @import("ezi_code");
-const utf8 = ezi_code.encoding.utf8;
+const utils = @import("utils");
+const utf8 = utils.unicode.utf8;
 
 // ── Shared value types ──────────────────────────────────────────────────────────
 

@@ -14,8 +14,8 @@
 //! first. Always use `Ast.root` to find it — do not assume index 0.
 
 const std = @import("std");
-const ezi_code = @import("ezi_code");
-const CodePoint = ezi_code.encoding.CodePoint;
+const utils = @import("utils");
+const CodePoint = utils.unicode.CodePoint;
 
 const token = @import("token.zig");
 
