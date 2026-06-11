@@ -15,7 +15,10 @@ a **pluggable backend** architecture.
   trick, in Zig, with full Unicode.)
 - **Pluggable.** Matching lives behind a small, vtable-free **backend contract**.
   The library ships four backends and a dispatcher; you can write your own and
-  drop it into the same front door. See [`docs/architecture.md`](docs/architecture.md).
+  drop it into the same front door. See [`docs/architecture.md`](docs/architecture.md)
+  for the contract, and the step-by-step
+  [*write your own backend*](docs/usage-guide.md#8-writing-your-own-backend) walkthrough
+  in the usage guide.
 - **Target-agnostic.** Pure computation over caller-provided memory — no syscalls,
   no global allocator, no platform assumptions in the library code. Imports and
   compiles anywhere Zig (plus `ezi_code`) does: native, `wasm32-freestanding` /
@@ -145,6 +148,11 @@ Everything below uses the default `auto` engine — `compileRuntime` /
 `compileComptime`. The shape never changes: **compile once → make a `Scratch` →
 run searches**. The compiled regex is immutable and shareable; the `Scratch` is the
 single piece of mutable per-search state.
+
+> Prefer copy-paste? The usage guide has a runnable recipe for each op below in
+> [§3 Front-door recipes](docs/usage-guide.md#3-front-door-recipes), plus the
+> [`Options`](docs/usage-guide.md#options) reference and the
+> [comptime / no-allocator](docs/usage-guide.md#4-comptime--no-allocator-usage) paths.
 
 ### 1. The `Scratch` — the engine only needs *a* scratch
 
@@ -332,6 +340,10 @@ treated as `\z`. See [`docs/architecture.md`](docs/architecture.md) §Caveats.
 `compileRuntime`/`compileComptime` use `auto`. Force one with the `*With` variants:
 `gex.compileRuntimeWith(gex.backends.pikevm, gpa, pat, &diag, .{})`.
 
+The usage guide covers [choosing a backend](docs/usage-guide.md#choosing-a-specific-backend)
+and walks the whole [*write your own backend*](docs/usage-guide.md#8-writing-your-own-backend)
+process end to end.
+
 ## When to use comptime — honest advice
 
 The library has two things it calls "comptime" and they behave quite differently, so
@@ -411,7 +423,8 @@ rather than any hidden internal one — the front door allocates nothing during 
 - A **buffer-backed `Scratch`** (`initBuffer`) and the **`pikevm`** backend allocate
   nothing at all while matching, sidestepping that entirely.
 
-Full details in [`docs/architecture.md`](docs/architecture.md) §11.
+Full details in [`docs/architecture.md`](docs/architecture.md) §11 and the usage guide's
+[§9 Thread-safety](docs/usage-guide.md#9-thread-safety).
 
 ## Performance
 
@@ -422,7 +435,8 @@ wired:**
    one-byte needle, Boyer–Moore–Horspool with a skip table for longer ones — instead
    of an `eql` at every byte position. On memchr-friendly needles that is **~20×** the
    old position-by-position scan; it is never slower.
-2. `auto` consumes the HIR `Analysis` on NFA patterns: when every match must begin
+2. `auto` consumes the HIR [`Analysis`](docs/usage-guide.md#7-the-analysis-prefilter-facts)
+   on NFA patterns: when every match must begin
    with a fixed literal, its first byte drives a `memchr` that skips straight to each
    candidate start (each confirmed with an *anchored* NFA run); a `^`/`\A` pattern
    skips the leftward scan entirely; and a min-length gate rejects inputs too short to
