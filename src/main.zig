@@ -187,7 +187,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Through `auto`: opt in with `byte_engine = .enabled`. `auto` then runs the DFA
     // for the span scan and the Pike VM for captures — so you still get groups, just a
-    // faster span. `auto.route` reports which arm a compiled program took ("dfa" here).
+    // faster span. `auto.route` reports which arm a compiled program took ("nfa+dfa").
     var adiag: ezi_gex.Diagnostic = .{};
     var are = try ezi_gex.compileRuntimeWith(ezi_gex.backends.auto, gpa, "(\\w+)@(\\w+)", &adiag, .{ .strategy = .{ .byte_engine = .enabled } });
     defer are.deinit();
@@ -291,7 +291,7 @@ test "usage: auto opts into the DFA span arm (byte_engine=.enabled); captures st
     defer re.deinit();
     var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
     defer sc.deinit(gpa);
-    try std.testing.expectEqualStrings("dfa", ezi_gex.backends.auto.route(&re.program)); // DFA span arm built
+    try std.testing.expectEqualStrings("nfa+dfa", ezi_gex.backends.auto.route(&re.program)); // DFA span arm built
     const slots = try gpa.alloc(?usize, re.slotCount());
     defer gpa.free(slots);
     const c = re.captures(&sc, slots, "bob@example").?; // captures via the Pike VM

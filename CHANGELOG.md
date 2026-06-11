@@ -21,11 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into the DFA state, so it is **leftmost-first** — its span never disagrees with the
   Pike VM (proven by a differential corpus in the backend's own tests and by
   `conformance.zig`). Key properties:
-  - **Span-only** (`caps.captures = false`): the DFA finds `[start, end)`; the
-    code-point Pike VM fills captures and evaluates Unicode `\b` over that span.
+  - **Span-only** (`caps.captures = false`): the DFA finds `[start, end)`.
     `Engine(dfa)` offers `isMatch`/`find`/`findAll`/`count`/`split`; `captures` and
     `replaceAll` are a `@compileError` (route them through `auto`/`pikevm`). This is the
-    first contract-legal `captures = false` backend.
+    first contract-legal `captures = false` backend. When opted in via `auto`, the DFA
+    accelerates the span ops (`isMatch`/`find`); capture ops run the code-point Pike VM
+    as a **full, independent search** (no DFA-span → Pike-VM handoff yet), so captures
+    are correct but not DFA-accelerated.
   - **Runtime-only** (`buildAlloc` + `search`, no `buildComptime`): the cache mutates at
     match time, which const-eval cannot do. The transition cache lives in the
     caller-owned `Scratch` (never on the immutable `Program`), and is the first consumer

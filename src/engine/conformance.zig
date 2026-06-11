@@ -251,8 +251,8 @@ test "auto's byte_engine=.enabled is results-invariant (DFA span == NFA span) an
             defer sc1.deinit(gpa);
 
             const r = auto.route(&re1.program);
-            try testing.expect(!std.mem.eql(u8, r, "nfa")); // eligible+enabled ⇒ dfa or literal, never plain nfa
-            if (std.mem.eql(u8, r, "dfa")) dfa_routed += 1;
+            try testing.expect(!std.mem.eql(u8, r, "nfa")); // eligible+enabled ⇒ nfa+dfa or literal, never plain nfa
+            if (std.mem.eql(u8, r, "nfa+dfa")) dfa_routed += 1;
 
             const m0 = re0.find(&sc0, c.input);
             const m1 = re1.find(&sc1, c.input);
@@ -279,7 +279,7 @@ test "auto with byte_engine=.enabled still fills captures via the Pike VM" {
     var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
     defer sc.deinit(gpa);
 
-    try testing.expectEqualStrings("dfa", auto.route(&re.program));
+    try testing.expectEqualStrings("nfa+dfa", auto.route(&re.program));
     var slots: [6]?usize = undefined;
     const c = re.captures(&sc, &slots, "ping bob@example").?;
     try testing.expectEqualStrings("bob@example", c.match().slice("ping bob@example"));

@@ -69,7 +69,6 @@ pub fn freeProgram(gpa: std.mem.Allocator, program: *Program) void {
     nfa.freeProgram(gpa, program);
 }
 
-
 // ── Scratch: one typed word buffer (comptime- and runtime-usable) ────────────────
 
 /// Scratch storage word — the shared contract type, so one `[]Cell` buffer backs

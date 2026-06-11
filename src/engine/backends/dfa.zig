@@ -1,7 +1,10 @@
 //! Lazy DFA backend — a caching subset-construction over the **byte** automaton.
 //!
-//! This is the throughput backend the byte substrate (`engine/byte.zig`) was built
-//! for. Where `bytepike` *simulates* the byte Thompson NFA (every live thread stepped
+//! This is the byte substrate's (`engine/byte.zig`) throughput backend. It is **opt-in**
+//! and **off by default**: a plain `compileRuntime`/`auto` does NOT build or use it;
+//! you reach it via `compileRuntimeWith(backends.dfa, …)` or by setting
+//! `Options.strategy.byte_engine = .enabled` (then `auto` uses it for the span scan).
+//! Where `bytepike` *simulates* the byte Thompson NFA (every live thread stepped
 //! per input byte), this backend **determinizes** it on the fly: it groups the NFA
 //! states reachable so far into a single DFA state, and advances **one DFA state per
 //! input byte** via a cached transition table keyed on the program's `ByteClasses`
@@ -15,12 +18,13 @@
 //! ## What it is (and is not)
 //!
 //!   * **Span-only.** `caps.captures = false`: the DFA locates the match **span**
-//!     `[start, end)`; it does not fill capture slots. By the division of labour the
-//!     engine is designed around, the code-point Pike VM runs over the located span to
-//!     fill captures and evaluate Unicode `\b` (the `auto` dispatcher wires this up).
-//!     A standalone `Engine(dfa)` therefore offers `isMatch`/`find`/`findAll`/`count`/
-//!     `split`, but `captures`/`replaceAll` are a `@compileError` (use `auto` or
-//!     `pikevm` for those).
+//!     `[start, end)`; it does not fill capture slots. A standalone `Engine(dfa)` thus
+//!     offers `isMatch`/`find`/`findAll`/`count`/`split`, but `captures`/`replaceAll`
+//!     are a `@compileError` (use `auto` or `pikevm`). When you opt the DFA in through
+//!     `auto`, `auto` uses the DFA only for the span ops (`isMatch`/`search`); capture
+//!     ops (`searchCaptures`) run the code-point Pike VM as a **full, independent
+//!     search** — there is no DFA-span → Pike-VM handoff (a possible future
+//!     optimization), so captures are correct but not DFA-accelerated.
 //!   * **Runtime-only.** The transition cache grows during matching (it allocates),
 //!     which a const-evaluator cannot do, so this backend defines only `buildAlloc` —
 //!     no `buildComptime`, no buffer-`Scratch` convention. The contract allows this
@@ -34,36 +38,54 @@
 //!     never disagrees with `pikevm` (proven in `conformance.zig`). Greedy vs. lazy
 //!     quantifiers fall out of the priority order for free.
 //!
-//! ## Match start, without a reverse DFA
+//! ## `isMatch` vs `find` (start location)
 //!
-//! A forward DFA naturally finds a match *end*, not its leftmost *start*. Rather than
-//! build a reverse DFA (a separate, future piece), v1 finds the start by an
-//! **anchored restart**: it runs the DFA anchored at each candidate start position,
-//! left to right, and the first position that reaches an accepting state is the
-//! leftmost match — then the last accepting position reached from there is the
-//! leftmost-first end. The transition cache is shared across all start positions and
-//! all searches on one `Scratch`, so determinization is paid once and amortized. A
-//! non-matching start dies in a single `step` (its first byte has no edge → the dead
-//! state), so the scan is linear on typical input; the worst case (a pattern that can
-//! begin, but not complete, at very many positions) is quadratic — a known v1 limit,
-//! superseded later by a prefilter / reverse DFA.
+//!   * **`isMatch` is one-pass, O(input).** Detection needs neither endpoint, so it runs
+//!     the *unanchored* automaton (`ustep`/`utrans`): every byte re-seeds the start into
+//!     the live state — the implicit `(?s:.)*?` prefix — and it accepts the instant the
+//!     state is accepting. A single forward scan; no per-position restart.
+//!   * **`find` locates the leftmost *start* by an anchored restart** (no reverse DFA
+//!     yet): it runs the DFA anchored at each candidate position, left to right; the
+//!     first that accepts is the leftmost start, and the last accepting position from
+//!     there is the leftmost-first end. The transition cache is shared across positions
+//!     and searches, so determinization is amortized. A non-matching start usually dies
+//!     in one `step`; the worst case is a pattern that can *begin* but not *complete* at
+//!     many positions — e.g. `\w+@\w+` on a long word run with sparse `@` — which is
+//!     **quadratic**. This is NOT helped by `auto`'s prefilter (below): `\w+@\w+` starts
+//!     with a class, so it has no leading literal. The real fix is an *interior*
+//!     required-byte prefilter (`memchr` the rare `@`, scan outward) — which needs HIR
+//!     `analysis.required_bytes` surfaced separately from `prefix_literal` — or a reverse
+//!     DFA; both are future work. A leading `\A`/`^` (`anchored_start`) tries only
+//!     offset 0, which is where anchored restart has no weakness.
+//!
+//! ## Prefilter (only via `auto`, and only for *leading*-literal patterns)
+//!
+//! The DFA backend itself has no prefilter — its restart loop is a bare `s += 1`. When
+//! reached through `auto`, the same sound `Analysis` facts the NFA arm uses apply to the
+//! DFA arm too: a `min_utf8_len` length gate, an `anchored_start` short-circuit, and a
+//! **leading-literal** `memchr` start-skip (jump to each candidate byte, confirm with an
+//! anchored DFA run). So opting the DFA in is never *slower* than the default on patterns
+//! with a fixed leading literal. Patterns with **no** leading literal (a leading class,
+//! e.g. `\w+@\w+`) get *no* prefilter benefit and keep the quadratic `find` worst case
+//! above — the interior required-byte prefilter that would help them is not built yet.
 //!
 //! ## Invalid UTF-8 — dead-on-invalid, for free
 //!
 //! The byte lowering only ever emits `byte_range`s that cover well-formed UTF-8
 //! (continuation bytes are always `[0x80, 0xBF]`, leads are tight, surrogates are
 //! split out), so a malformed byte has **no transition out of any state** — it lands
-//! in the dead state. The anchored-restart wrapper then resyncs to the next start, so
-//! a match never spans a bad byte. No validity check in the hot loop, no decode.
+//! in the dead state. The search resyncs past it (`find`'s restart advances the start;
+//! `isMatch`'s unanchored scan re-seeds the start each byte), so a match never spans a
+//! bad byte. No validity check in the hot loop, no decode.
 //!
 //! ## Feature gate
 //!
 //! `supports(hir)` accepts a pattern iff it is byte-lowerable (`byte.byteLowerable`,
-//! i.e. no `\X`/`\b`) **and** carries no zero-width assertions (`^`, `$`, `\A`, `\z`,
-//! line anchors). Assertions are position-dependent, which would make a closed DFA
-//! state position-dependent (defeating the cache); v1 declines them so the closure is
-//! purely structural. `auto` keeps those patterns on the code-point engines, exactly
-//! as it does for `\b`/`\X` today.
+//! i.e. no `\X`/`\b`) **and** its only zero-width assertion (if any) is `text_start`
+//! (`\A`, non-multiline `^`). `text_start` depends only on the search position, so two
+//! start closures (true at offset 0, false past it) handle it with no position-dependent
+//! transition state. Other assertions — `$`/`\z` (`text_end`) and `(?m)` line anchors —
+//! are declined and stay on the code-point engines, exactly as `\b`/`\X` do.
 
 const std = @import("std");
 
@@ -129,25 +151,32 @@ pub const Program = struct {
     /// `[0 .. classes.count)` is meaningful). Because a `byte_range` is class-uniform,
     /// testing the representative decides the whole class.
     class_rep: [256]u8,
+    /// True when every match must begin at offset 0 (a leading `\A` / non-multiline
+    /// `^` — `analysis.anchored_start`). The search then tries only `s == 0`, where the
+    /// anchored restart has no overhead at all.
+    ///
+    /// @stable-since: v0.3.0
+    anchored_start: bool,
 };
 
 /// Whether this HIR can run on the lazy DFA: byte-lowerable (no `\X`/`\b`) **and**
-/// free of zero-width assertions (`^ $ \A \z` and line anchors), which v1 declines
-/// because they make a closed state position-dependent. `auto` consults this to route
-/// eligible patterns here and leave the rest on the code-point engines.
+/// carrying no zero-width assertions other than `text_start`. `\A` and non-multiline
+/// `^` both lower to a `text_start` assertion, which is evaluable purely from the
+/// search position (true only at offset 0) — handled by two start closures, no
+/// position-dependent transition state. The rest (`$` / `\z` `text_end`, `(?m)` line
+/// anchors) stay on the code-point engines. `auto` consults this to route.
 ///
 /// @stable-since: v0.3.0
 pub fn supports(h: hir.Hir) bool {
     if (!byte.byteLowerable(h)) return false; // excludes \X and \b/\B
-    for (h.nodes) |n| switch (n.tag) {
-        .anchor => return false, // ^ $ \A \z (?m) line — position-dependent
-        else => {},
-    };
+    for (h.nodes) |n| {
+        if (n.tag == .anchor and n.data.anchor.kind != .text_start) return false;
+    }
     return true;
 }
 
 /// Compile a HIR into a heap-allocated DFA `Program` (free with `freeProgram`).
-/// A pattern this backend cannot run (`\X`/`\b`/anchors) is rejected with
+/// A pattern this backend cannot run (`\X`/`\b`/`$`/line anchors) is rejected with
 /// `error.Unsupported`; `auto` then keeps it on the code-point engines.
 ///
 /// @stable-since: v0.3.0
@@ -155,17 +184,22 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     if (!supports(h)) return error.Unsupported;
     var bp = try byte.buildAlloc(gpa, h);
     errdefer byte.freeProgram(gpa, &bp);
-    // Defensive: the closure is position-independent, so it cannot evaluate an
-    // assertion. `supports` already excludes anchors; double-check the lowered program.
+    // Defensive: only `text_start` assertions are DFA-evaluable here (at offset 0);
+    // `supports` already excludes the rest, but double-check the lowered program.
     for (bp.insts) |inst| switch (inst) {
-        .assertion => return error.Unsupported,
+        .assertion => |k| if (k != .text_start) return error.Unsupported,
         else => {},
     };
     const classes = byte.byteClasses(&bp);
     var class_rep: [256]u8 = @splat(0);
     var b: u16 = 0;
     while (b < 256) : (b += 1) class_rep[classes.map[b]] = @intCast(b);
-    return .{ .byte_prog = bp, .classes = classes, .class_rep = class_rep };
+    return .{
+        .byte_prog = bp,
+        .classes = classes,
+        .class_rep = class_rep,
+        .anchored_start = h.analysis.anchored_start,
+    };
 }
 
 /// Release a `Program` built with `buildAlloc`.
@@ -191,6 +225,10 @@ const StateCtx = struct {
 
 const InternMap = std.HashMapUnmanaged([]const u32, u32, StateCtx, std.hash_map.default_max_load_percentage);
 
+/// How many mid-search cache flushes are tolerated before `on_full = .give_up` raises
+/// the `gave_up` flag (a routing hint for `auto`; results stay correct regardless).
+const MAX_FLUSHES: u32 = 4;
+
 // ── Scratch: the caller-owned lazy transition cache ──────────────────────────────
 
 /// Per-search companion holding the lazy DFA's growable state. The cache (interned
@@ -214,13 +252,27 @@ pub const Scratch = struct {
     states: std.ArrayListUnmanaged([]const u32) = .empty,
     /// `state_match.items[id]` — does state `id` contain the `match` pc (accepting)?
     state_match: std.ArrayListUnmanaged(bool) = .empty,
-    /// Flat `id * nclass + class` transition table; `UNKNOWN` until first computed.
+    /// Flat `id * nclass + class` **anchored** transition table; `UNKNOWN` until first
+    /// computed. Used by `search` (anchored restart from each start).
     trans: std.ArrayListUnmanaged(u32) = .empty,
-    /// The anchored start state (closure of `{0}`); determinized lazily on first use.
-    start_state: u32 = DEAD,
+    /// Flat `id * nclass + class` **unanchored** transition table — each edge re-seeds
+    /// the start (`startN`) into the successors, giving the implicit `.*?`-prefix
+    /// automaton that drives one-pass `isMatch`.
+    utrans: std.ArrayListUnmanaged(u32) = .empty,
+    /// Start closure with `text_start` TRUE (used at offset 0).
+    start0: u32 = DEAD,
+    /// Start closure with `text_start` FALSE (used at offset > 0, and as the
+    /// unanchored re-seed). Equals `start0` for patterns with no `\A`/`^`.
+    startN: u32 = DEAD,
     start_ready: bool = false,
     /// Approximate live cache footprint in bytes (drives `ScratchOptions` eviction).
     cache_bytes: usize = 0,
+    /// Raised when the cache was flushed `MAX_FLUSHES` times within one search and
+    /// `on_full == .give_up`: a hint that the DFA is thrashing on this program. A
+    /// wrapper (e.g. `auto`) may then stop routing to the DFA. Results stay correct.
+    ///
+    /// @stable-since: v0.3.0
+    gave_up: bool = false,
     opts: ScratchOptions,
 
     // ── reusable per-closure work buffers (no allocation during a closure) ──
@@ -241,11 +293,15 @@ pub const Scratch = struct {
     }
 
     /// Construct a cache-backed `Scratch` with an explicit cache budget. When the
-    /// memo's footprint exceeds `opts.max_bytes`, `opts.on_full` decides what happens
-    /// at the next search boundary: `.reset` clears and re-determinizes (default,
-    /// always results-invariant — the cache is pure optimization), `.give_up` also
-    /// clears (a standalone DFA has no other engine to defer to), `.grow` never
-    /// clears (the memo saturates at the program's natural state count anyway).
+    /// memo's footprint exceeds `opts.max_bytes` it is flushed **mid-search** (the live
+    /// state is preserved across the flush), so `max_bytes` actually bounds memory
+    /// within one search — not just between searches. `opts.on_full`:
+    ///   * `.reset` (default) — flush and keep matching with the DFA, indefinitely.
+    ///   * `.give_up` — flush, but after `MAX_FLUSHES` flushes in one search raise
+    ///     `gave_up`; a wrapper (`auto`) then stops routing to the DFA for this program.
+    ///     Standalone, `.give_up` matches `.reset` behaviour but sets the flag.
+    ///   * `.grow` — never flush; grow until the allocator is exhausted (then `@panic`).
+    /// Every choice is results-invariant — the cache is a pure optimization.
     ///
     /// @stable-since: v0.3.0
     pub fn initOptions(gpa: std.mem.Allocator, program: *const Program, opts: ScratchOptions) Err!Scratch {
@@ -257,7 +313,7 @@ pub const Scratch = struct {
         errdefer gpa.free(stack);
         const work = try gpa.alloc(u32, n + 1);
         errdefer gpa.free(work);
-        const seeds = try gpa.alloc(u32, n + 1);
+        const seeds = try gpa.alloc(u32, 2 * n + 2); // `ustep` unions two pc-lists
         errdefer gpa.free(seeds);
 
         var sc = Scratch{
@@ -276,6 +332,7 @@ pub const Scratch = struct {
         }
         errdefer sc.state_match.deinit(gpa);
         errdefer sc.trans.deinit(gpa);
+        errdefer sc.utrans.deinit(gpa);
 
         // Intern the empty set as the DEAD sink (state id 0).
         sc.work_len = 0;
@@ -289,6 +346,7 @@ pub const Scratch = struct {
         self.states.deinit(gpa);
         self.state_match.deinit(gpa);
         self.trans.deinit(gpa);
+        self.utrans.deinit(gpa);
         self.intern.deinit(gpa);
         gpa.free(self.seen);
         gpa.free(self.stack);
@@ -305,9 +363,11 @@ pub const Scratch = struct {
         _ = self;
     }
 
-    /// Drop the entire memo and re-seed the DEAD sink. Safe only at a search boundary
-    /// (the cache is a pure optimization; the next search re-determinizes from the
-    /// start). Triggered by the `ScratchOptions` budget.
+    /// Drop the entire memo and re-seed the DEAD sink. Invalidates every state id, so a
+    /// mid-search caller must preserve the live state across it (see `flushPreserving`);
+    /// at a search boundary nothing needs preserving. The cache is a pure optimization,
+    /// so this is always results-invariant. Does NOT touch the `work` buffer beyond
+    /// `work[0..0]`, so a caller may stage a pc-list in `work` across it.
     fn clearCache(self: *Scratch) void {
         for (self.states.items) |o| self.gpa.free(o);
         self.states.deinit(self.gpa);
@@ -316,6 +376,8 @@ pub const Scratch = struct {
         self.state_match = .empty;
         self.trans.deinit(self.gpa);
         self.trans = .empty;
+        self.utrans.deinit(self.gpa);
+        self.utrans = .empty;
         self.intern.deinit(self.gpa);
         self.intern = .empty;
         self.cache_bytes = 0;
@@ -324,12 +386,31 @@ pub const Scratch = struct {
         _ = self.internState(false) catch @panic(OOM_PANIC); // re-seed DEAD = state 0
     }
 
-    /// Evict the cache if it has outgrown its budget. Called at the top of each
-    /// search, where dropping the memo is always correct.
+    /// Evict the cache if it has outgrown its budget, at a search boundary (no live
+    /// state to preserve). Mid-search enforcement is `evictIfNeeded`/`flushPreserving`.
     fn maybeEvict(self: *Scratch) void {
         if (self.opts.on_full == .grow) return;
         if (self.cache_bytes <= self.opts.max_bytes) return;
         self.clearCache();
+    }
+
+    /// Flush the cache mid-search, preserving the live `state_id`: copy its pc list into
+    /// `work` (which `clearCache` leaves intact), clear, re-intern it (and the start
+    /// states), and return its new id. Bounds memory *within* a single search — the
+    /// scenario `ScratchOptions.max_bytes` exists for. After `MAX_FLUSHES` flushes in
+    /// one search, `.give_up` raises `gave_up`.
+    fn flushPreserving(self: *Scratch, program: *const Program, state_id: u32, flushes: *u32) Err!u32 {
+        const pcs = self.states.items[state_id];
+        const plen = pcs.len;
+        @memcpy(self.work[0..plen], pcs); // stage across the clear (clearCache spares `work`)
+        const is_match = self.state_match.items[state_id];
+        self.clearCache();
+        self.work_len = plen;
+        const new_id = try self.internState(is_match);
+        try self.ensureStart(program); // start0/startN are invalid after the clear
+        flushes.* += 1;
+        if (self.opts.on_full == .give_up and flushes.* >= MAX_FLUSHES) self.gave_up = true;
+        return new_id;
     }
 
     /// Intern the state currently in `work[0..work_len]` (with accepting flag
@@ -349,18 +430,20 @@ pub const Scratch = struct {
         gop.value_ptr.* = id;
         try self.states.append(self.gpa, owned);
         try self.state_match.append(self.gpa, is_match);
-        var i: u32 = 0;
-        while (i < self.nclass) : (i += 1) try self.trans.append(self.gpa, UNKNOWN);
+        try self.trans.appendNTimes(self.gpa, UNKNOWN, self.nclass);
+        try self.utrans.appendNTimes(self.gpa, UNKNOWN, self.nclass);
 
-        self.cache_bytes += owned.len * @sizeOf(u32) + @as(usize, self.nclass) * @sizeOf(u32) + 48;
+        self.cache_bytes += owned.len * @sizeOf(u32) + 2 * @as(usize, self.nclass) * @sizeOf(u32) + 48;
         return id;
     }
 
     /// Epsilon-closure of `seeds` into `work` (priority order, deduplicated, cut on
-    /// match). The byte analogue of the Pike VM's thread closure, minus capture slots
-    /// and minus assertions (none survive `supports`). Writes `work`/`work_len` and
-    /// sets `work_match`. Allocation-free (all buffers pre-sized to the program).
-    fn closure(self: *Scratch, program: *const Program, seeds: []const u32) void {
+    /// match). The byte analogue of the Pike VM's thread closure, minus capture slots.
+    /// `at_start` is whether the search position is offset 0 — the only thing a
+    /// `text_start` assertion (the sole assertion that survives `buildAlloc`) depends
+    /// on. Writes `work`/`work_len` and sets `work_match`. Allocation-free (all buffers
+    /// pre-sized to the program).
+    fn closure(self: *Scratch, program: *const Program, seeds: []const u32, at_start: bool) void {
         const insts = program.byte_prog.insts;
         self.seen_gen +%= 1;
         const gen = self.seen_gen;
@@ -386,7 +469,12 @@ pub const Scratch = struct {
                             pc = s.a;
                         },
                         .save => pc += 1, // captures are epsilons to the DFA
-                        .assertion => unreachable, // excluded by `supports`/`buildAlloc`
+                        .assertion => {
+                            // Only `text_start` reaches here (buildAlloc rejects the
+                            // rest); it holds iff we are at offset 0.
+                            if (!at_start) break :follow;
+                            pc += 1;
+                        },
                         .byte_range => {
                             self.work[self.work_len] = pc;
                             self.work_len += 1;
@@ -414,44 +502,68 @@ pub const Scratch = struct {
         const cached = self.trans.items[idx];
         if (cached != UNKNOWN) return cached;
 
-        // Successors: pc+1 of every `byte_range` in this state that contains the
-        // class representative, in the state's (priority) order. `pcs` is a stable
-        // owned slice, so it survives the `intern` reallocation below.
-        const pcs = self.states.items[state_id];
+        // Successors: pc+1 of every `byte_range` in this state that contains the class
+        // representative, in the state's (priority) order.
         const rep = program.class_rep[class];
         var ns: usize = 0;
-        for (pcs) |pc| switch (program.byte_prog.insts[pc]) {
-            .byte_range => |r| if (r.lo <= r.hi and r.contains(rep)) {
-                self.seeds[ns] = pc + 1;
-                ns += 1;
-            },
-            .match => {}, // terminal: no outgoing edge
-            else => unreachable, // a canonical state holds only byte_range / match
-        };
-
-        self.closure(program, self.seeds[0..ns]);
+        self.collectSeeds(program, state_id, rep, &ns);
+        self.closure(program, self.seeds[0..ns], false); // sp > 0 during a transition
         const next = try self.internState(self.work_match);
         // `internState` may have grown `trans` (realloc) — re-index to write the edge.
         self.trans.items[@as(usize, state_id) * self.nclass + class] = next;
         return next;
     }
 
+    /// Unanchored transition: the next state from `state_id` on `class`, where the
+    /// successors are unioned with the start's (`startN`) successors — the implicit
+    /// `(?s:.)*?` prefix that lets a match begin at any position. Drives one-pass
+    /// `isMatch`. Cached in `utrans`.
+    fn ustep(self: *Scratch, program: *const Program, state_id: u32, class: u32) Err!u32 {
+        const idx = @as(usize, state_id) * self.nclass + class;
+        const cached = self.utrans.items[idx];
+        if (cached != UNKNOWN) return cached;
+
+        const rep = program.class_rep[class];
+        var ns: usize = 0;
+        self.collectSeeds(program, state_id, rep, &ns); // successors of the live state
+        self.collectSeeds(program, self.startN, rep, &ns); // ∪ a fresh start at this byte
+        self.closure(program, self.seeds[0..ns], false);
+        const next = try self.internState(self.work_match);
+        self.utrans.items[@as(usize, state_id) * self.nclass + class] = next;
+        return next;
+    }
+
+    /// Append `pc+1` for every `byte_range` in `state_id` that contains `rep`, in the
+    /// state's priority order. Shared by `step`/`ustep`.
+    fn collectSeeds(self: *Scratch, program: *const Program, state_id: u32, rep: u8, ns: *usize) void {
+        for (self.states.items[state_id]) |pc| switch (program.byte_prog.insts[pc]) {
+            .byte_range => |r| if (r.lo <= r.hi and r.contains(rep)) {
+                self.seeds[ns.*] = pc + 1;
+                ns.* += 1;
+            },
+            .match => {}, // terminal: no outgoing edge
+            else => unreachable, // a canonical state holds only byte_range / match
+        };
+    }
+
     fn ensureStart(self: *Scratch, program: *const Program) Err!void {
         if (self.start_ready) return;
-        self.closure(program, &[_]u32{0});
-        self.start_state = try self.internState(self.work_match);
+        self.closure(program, &[_]u32{0}, true); // text_start holds at offset 0
+        self.start0 = try self.internState(self.work_match);
+        self.closure(program, &[_]u32{0}, false); // ...and not past it
+        self.startN = try self.internState(self.work_match);
         self.start_ready = true;
     }
 
     /// Run the DFA anchored at `s`: returns the leftmost-first match end reached from
     /// `s`, or null if no match begins exactly at `s`. With `earliest`, returns as soon
-    /// as any accepting state is entered (used by `isMatch`); otherwise it scans on,
-    /// keeping the last accepting position — which, thanks to the priority/cut closure,
-    /// is the leftmost-first end.
-    fn runAnchored(self: *Scratch, program: *const Program, input: []const u8, s: usize, earliest: bool) Err!?usize {
-        try self.ensureStart(program);
-        var state = self.start_state;
-        if (state == DEAD) return null;
+    /// as any accepting state is entered; otherwise it scans on, keeping the last
+    /// accepting position — which, thanks to the priority/cut closure, is the
+    /// leftmost-first end. The caller must have run `ensureStart`. (No dead check on the
+    /// start: the closure of pc 0 always interns at least one `byte_range`/`match` pc,
+    /// so the start is never the empty set.)
+    fn runAnchored(self: *Scratch, program: *const Program, input: []const u8, s: usize, earliest: bool, flushes: *u32) Err!?usize {
+        var state = if (s == 0) self.start0 else self.startN; // text_start holds only at 0
         var match_end: ?usize = if (self.state_match.items[state]) s else null;
         if (match_end != null and earliest) return match_end;
 
@@ -465,43 +577,97 @@ pub const Scratch = struct {
                 match_end = pos;
                 if (earliest) break;
             }
+            // Bound the cache mid-scan. Inlined (not a per-byte call): `cache_bytes` only
+            // grows on a cold transition, so this compare is branch-predicted false on
+            // every warm byte; the flush itself is rare.
+            if (self.opts.on_full != .grow and self.cache_bytes > self.opts.max_bytes)
+                state = try self.flushPreserving(program, state, flushes);
         }
         return match_end;
+    }
+
+    /// One-pass unanchored match detection (`isMatch`): scan once from `start`, each
+    /// byte re-seeding the start via `ustep`, accepting the instant the live state is
+    /// accepting. O(input), no per-position restart — the fix for the Θ(n²) `[ab]*c`
+    /// class of patterns. Caller must have run `ensureStart`.
+    fn runUnanchored(self: *Scratch, program: *const Program, input: []const u8, start: usize, flushes: *u32) Err!bool {
+        var state = if (start == 0) self.start0 else self.startN;
+        if (self.state_match.items[state]) return true;
+        var pos = start;
+        while (pos < input.len) {
+            const class = program.classes.get(input[pos]);
+            state = try self.ustep(program, state, class);
+            if (self.state_match.items[state]) return true;
+            pos += 1;
+            if (self.opts.on_full != .grow and self.cache_bytes > self.opts.max_bytes)
+                state = try self.flushPreserving(program, state, flushes);
+        }
+        return false;
     }
 };
 
 // ── Search core ───────────────────────────────────────────────────────────────────
 
 /// Leftmost match: scan start positions from `opts.start`, run the DFA anchored at
-/// each, and return the first that matches. Internal (returns the allocator error);
-/// the contract entry points turn OOM into a `@panic`.
+/// each, return the first that matches. A start-anchored pattern (`\A`/`^`) tries only
+/// `s == 0`. Internal (returns the allocator error); the entry points turn OOM into a
+/// `@panic`.
 fn searchImpl(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions, earliest: bool) Err!?Match {
     if (opts.start > input.len) return null;
+    scratch.gave_up = false;
     scratch.maybeEvict();
+    try scratch.ensureStart(program);
+    var flushes: u32 = 0;
+
+    if (program.anchored_start and !opts.anchored) {
+        // Every match begins at offset 0 — try only there.
+        if (opts.start != 0) return null;
+        if (try scratch.runAnchored(program, input, 0, earliest, &flushes)) |end|
+            return Match{ .start = 0, .end = end };
+        return null;
+    }
+
     var s = opts.start;
     while (s <= input.len) : (s += 1) {
-        if (try scratch.runAnchored(program, input, s, earliest)) |end| {
+        if (try scratch.runAnchored(program, input, s, earliest, &flushes)) |end|
             return Match{ .start = s, .end = end };
-        }
         if (opts.anchored) break; // anchored: only the start position
     }
     return null;
 }
 
+/// One-pass `isMatch`. An anchored or start-anchored pattern reduces to a single
+/// anchored run (no scan); otherwise the unanchored automaton detects a match anywhere
+/// in O(input).
+fn isMatchImpl(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) Err!bool {
+    if (opts.start > input.len) return false;
+    scratch.gave_up = false;
+    scratch.maybeEvict();
+    try scratch.ensureStart(program);
+    var flushes: u32 = 0;
+
+    if (opts.anchored)
+        return (try scratch.runAnchored(program, input, opts.start, true, &flushes)) != null;
+    if (program.anchored_start) {
+        if (opts.start != 0) return false;
+        return (try scratch.runAnchored(program, input, 0, true, &flushes)) != null;
+    }
+    return scratch.runUnanchored(program, input, opts.start, &flushes);
+}
+
 // ── Contract: matching entry points ──────────────────────────────────────────────
 
-/// Does the pattern match anywhere from `opts.start`? Uses earliest-exit (stops at the
-/// first accepting state), so it is the cheapest op.
+/// Does the pattern match anywhere from `opts.start`? One-pass (O(input)) for the
+/// common unanchored case; the cheapest op.
 ///
 /// @stable-since: v0.3.0
 pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) bool {
-    const m = searchImpl(program, scratch, input, opts, true) catch @panic(OOM_PANIC);
-    return m != null;
+    return isMatchImpl(program, scratch, input, opts) catch @panic(OOM_PANIC);
 }
 
 /// The leftmost match span `[start, end)`, or null. Leftmost-first, identical to the
 /// code-point engines. `SearchOptions.earliest` is advisory and ignored here (the span
-/// is always leftmost-first); it only short-circuits `isMatch`.
+/// is always leftmost-first); `isMatch` is the earliest-exit entry point.
 ///
 /// @stable-since: v0.3.0
 pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) ?Match {
@@ -646,10 +812,11 @@ test "invalid UTF-8 input is dead-on-invalid (a match never spans a bad byte)" {
     try expectNoMatch("\\w+", "\xFF\xFE");
 }
 
-test "supports(): accepts byte-class patterns, declines anchors / \\b / \\X" {
+test "supports(): accepts byte-class + \\A/^; declines $/(?m)/\\b/\\X" {
     const gpa = testing.allocator;
-    const accepts = [_][]const u8{ "[a-z]+", "\\w+\\d*", "cat|dog", "héllo", "a.*c", "\\p{L}+" };
-    const declines = [_][]const u8{ "^abc", "abc$", "\\bcat\\b", "\\Bx", "a\\Xb", "(?m)^line" };
+    // \A and non-multiline ^ lower to a text_start assertion the DFA can evaluate.
+    const accepts = [_][]const u8{ "[a-z]+", "\\w+\\d*", "cat|dog", "héllo", "a.*c", "\\p{L}+", "^abc", "\\Aword", "^\\d+" };
+    const declines = [_][]const u8{ "abc$", "\\bcat\\b", "\\Bx", "a\\Xb", "(?m)^line", "^abc$", "x\\z" };
     inline for (accepts) |pat| {
         var diag: compile.Diagnostic = .{};
         const ast = try compile.parse(gpa, pat, &diag);
@@ -669,6 +836,53 @@ test "supports(): accepts byte-class patterns, declines anchors / \\b / \\X" {
         try testing.expect(!supports(h));
         try testing.expectError(error.Unsupported, buildAlloc(gpa, h, .{}));
     }
+}
+
+test "text_start anchors (\\A / non-multiline ^) match only at offset 0" {
+    try expectFind("^abc", "abcdef", "abc");
+    try expectNoMatch("^abc", "xabc");
+    try expectFind("\\Aword", "word here", "word");
+    try expectNoMatch("\\Aword", "a word");
+    try expectFind("^\\d+", "123abc", "123");
+    try expectNoMatch("^\\d+", "x123");
+    try expectSpan("^a*", "aaab", 0, 3); // greedy from the anchored start
+    try expectFind("^a*", "baaa", ""); // empty match at 0 (no 'a' there)
+}
+
+test "one-pass isMatch is correct on the Θ(n²)-restart pattern class" {
+    // `[ab]*c` can BEGIN at every position of `aaaa…` but completes nowhere — the case
+    // anchored-restart handles in O(n²). The unanchored one-pass isMatch is O(n) and
+    // must still answer correctly.
+    var re = try Compiled.init("[ab]*c");
+    defer re.deinit();
+    var big: [4096]u8 = undefined;
+    @memset(&big, 'a');
+    try testing.expect(!re.isMatch(&big)); // no 'c' anywhere
+    @memcpy(big[2048..][0..2], "bc");
+    try testing.expect(re.isMatch(&big)); // now there is
+    // isMatch must agree with find != null on a spread of inputs.
+    const inputs = [_][]const u8{ "", "c", "aaac", "no c here", "  abc  ", "zzbbaac!" };
+    for (inputs) |in| try testing.expectEqual(re.find(in) != null, re.isMatch(in));
+}
+
+test "on_full = .give_up raises gave_up after thrashing; .reset does not; both stay correct" {
+    const gpa = testing.allocator;
+    var program = try buildFrom(gpa, "\\w+");
+    defer freeProgram(gpa, &program);
+    const input = "  hello world  ";
+
+    // A 1-byte budget forces a flush nearly every step (mid-search eviction). `.give_up`
+    // raises `gave_up` once it has thrashed past MAX_FLUSHES; the result stays correct.
+    var g = try Scratch.initOptions(gpa, &program, .{ .max_bytes = 1, .on_full = .give_up });
+    defer g.deinit(gpa);
+    try testing.expectEqualStrings("hello", E.find(&program, &g, input, .{}).?.slice(input));
+    try testing.expect(g.gave_up);
+
+    // `.reset` thrashes identically and is just as correct, but never raises `gave_up`.
+    var r = try Scratch.initOptions(gpa, &program, .{ .max_bytes = 1, .on_full = .reset });
+    defer r.deinit(gpa);
+    try testing.expectEqualStrings("hello", E.find(&program, &r, input, .{}).?.slice(input));
+    try testing.expect(!r.gave_up);
 }
 
 test "agnostic ops: findAll / count / split over the shared cache" {

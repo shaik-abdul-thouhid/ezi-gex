@@ -576,13 +576,21 @@ Three design choices follow from the contract:
   requires *one of* the two build paths). The cache lives in the caller-owned `Scratch`
   (never on the immutable `Program`), bounded by `ScratchOptions{ max_bytes, on_full }`
   (its first real consumer). The comptime path stays on the Pike VM.
-- It is **span-only** (`caps.captures = false`): the DFA finds `[start, end)`; the
-  code-point Pike VM fills captures and evaluates Unicode `\b` over that span. `auto`
-  wires the two together — DFA for the span scan, Pike VM for `searchCaptures`.
-- It finds the leftmost **start** by an **anchored restart** (no reverse DFA yet): it
-  runs anchored at each candidate position, sharing the cache, and the first position
-  that accepts is the leftmost match. It declines `\b`/`\X` and zero-width anchors for
-  now (those route to the code-point engines, as they already do).
+- It is **span-only** (`caps.captures = false`): the DFA finds `[start, end)`. Through
+  `auto`, the DFA serves the span ops (`isMatch`/`search`) and the Pike VM serves
+  `searchCaptures` as a **full, independent search** — there is no DFA-span → Pike-VM
+  handoff yet (a possible future optimization), so captures are correct but not
+  DFA-accelerated.
+- **`isMatch` is one-pass O(n)** (an unanchored automaton with an implicit `.*?`
+  prefix); **`find`** locates the leftmost **start** by an **anchored restart** (no
+  reverse DFA yet), sharing the cache across positions. Through `auto` the DFA arm
+  reuses the NFA arm's sound prefilter (length gate, `^`/`\A` short-circuit,
+  **leading-literal** `memchr`), so opting in is never slower than the default *on
+  leading-literal patterns*. A prefix-less pattern (a leading class, e.g. `\w+@\w+`)
+  gets no prefilter benefit and keeps the quadratic `find` worst case — the *interior*
+  required-byte prefilter (`memchr` the rare `@`) or a reverse DFA that would fix it is
+  future work. It supports `\A` / non-multiline `^`, and declines `\b`/`\X` and the
+  other zero-width anchors for now (those route to the code-point engines).
 
 It is **opt-in** via `Options.strategy.byte_engine = .enabled` (the default `.auto`
 leaves it off). That is the whole point of the backend abstraction: a runtime speed

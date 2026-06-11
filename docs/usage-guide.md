@@ -201,7 +201,8 @@ defer re.deinit();
 > **The `dfa` backend is span-only and runtime-only.** `gex.backends.dfa` is the byte
 > **lazy DFA** — it finds the match *span* fast (one cached DFA state per byte) but does
 > not fill captures (`re.captures`/`re.replaceAll` are a `@compileError` on it; use
-> `auto`/`pikevm`). It only runs patterns without `\b`/`\X`/anchors and only at runtime
+> `auto`/`pikevm`). It runs patterns without `\b`/`\X`/`$`/line anchors (`\A`/`^` are
+> fine) and only at runtime
 > (no `compileComptimeWith(dfa, …)`). The usual way to get its speed is not to pin it but
 > to **opt in through `auto`** with `byte_engine = .enabled` (below): `auto` then uses the
 > DFA for the span scan and the Pike VM for captures, transparently.
@@ -230,7 +231,7 @@ _ = try gex.compileRuntime(gpa, "\\w+", &diag, .{ .unicode = false });          
 // strategy tier — results-invariant: flipping any field changes only speed/memory,
 // never which text matches.
 //   byte_engine = .enabled  → `auto` uses the byte lazy DFA for the span scan on
-//                             eligible patterns (no \b/\X/anchors); captures still come
+//                             eligible patterns (no \b/\X/$/line anchors); captures come
 //                             from the Pike VM, so the result is identical, just faster
 //                             on a long scan. .auto (default) and .disabled keep the
 //                             code-point engines.

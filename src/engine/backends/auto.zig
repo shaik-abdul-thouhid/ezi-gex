@@ -222,6 +222,13 @@ pub const Scratch = struct {
     ///
     /// @stable-since: v0.3.0
     dfa_sc: ?dfa.Scratch = null,
+    /// Sticky: set once the DFA raised `gave_up` (its bounded cache thrashed on this
+    /// program under `on_full = .give_up`). Subsequent span ops then route to the NFA
+    /// arm instead. Not cleared by `reset` — the signal is about the program, not one
+    /// search.
+    ///
+    /// @stable-since: v0.3.0
+    dfa_disabled: bool = false,
 
     /// @stable-since: v0.1.0
     pub fn bufferLen(program: *const Program) usize {
@@ -377,6 +384,44 @@ fn runNfa(p: *const nfa.Program, filter: Filter, s: *Scratch.NfaScratch, input: 
     return dispatch(p, s, input, opts, slots);
 }
 
+// ── Byte-DFA arm: span ops with the same prefilter the NFA arm uses ────────────────
+
+/// Confirm/locate a match anchored at `at` via the DFA. `match_only` selects the op
+/// (a non-null `Match` with `[at, at)` is a true/false token for `isMatch`).
+fn dfaConfirmAt(dp: *const dfa.Program, d: *dfa.Scratch, input: []const u8, at: usize, match_only: bool) ?Match {
+    const o = SearchOptions{ .start = at, .anchored = true };
+    if (match_only) return if (dfa.isMatch(dp, d, input, o)) Match{ .start = at, .end = at } else null;
+    return dfa.search(dp, d, input, o);
+}
+
+/// The byte-DFA arm's span search. It applies the **same sound prefilter as `runNfa`**
+/// — the `min_bytes` length gate, the `anchored_start` short-circuit, and the
+/// leading-literal `memchr` start-skip — before running the DFA, so opting the DFA in
+/// is never slower than the default on prefix-literal / sparse-hit patterns. With no
+/// usable filter it runs one DFA pass (one-pass O(n) for `isMatch`, anchored-restart
+/// for `find`). Captures never come here — they always use the Pike VM (`runNfa`).
+fn runByteDfa(dp: *const dfa.Program, filter: Filter, d: *dfa.Scratch, input: []const u8, opts: SearchOptions, match_only: bool) ?Match {
+    if (opts.start > input.len) return null;
+    if (input.len - opts.start < filter.min_bytes) return null; // length gate
+    if (opts.anchored) return dfaConfirmAt(dp, d, input, opts.start, match_only);
+    if (filter.anchored_start) {
+        if (opts.start != 0) return null;
+        return dfaConfirmAt(dp, d, input, 0, match_only);
+    }
+    if (filter.prefix_byte) |fb| {
+        var pos = opts.start;
+        while (memchrFrom(input, pos, fb)) |hit| {
+            if (input.len - hit < filter.min_bytes) return null;
+            if (dfaConfirmAt(dp, d, input, hit, match_only)) |m| return m;
+            pos = hit + 1;
+        }
+        return null;
+    }
+    if (match_only)
+        return if (dfa.isMatch(dp, d, input, opts)) Match{ .start = opts.start, .end = opts.start } else null;
+    return dfa.search(dp, d, input, opts);
+}
+
 // ── Contract: matching entry points ──────────────────────────────────────────────
 
 /// @stable-since: v0.1.0
@@ -384,10 +429,14 @@ pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, op
     switch (program.inner) {
         .literal => |*p| return literal.isMatch(p, &scratch.inner.literal, input, opts),
         .nfa => |*p| {
-            // Byte lazy DFA span scan when built and its cache is present — same
-            // result the NFA arm would give, faster on a long scan.
-            if (scratch.dfa_sc) |*d| {
-                if (program.dfa_prog) |*dp| return dfa.isMatch(dp, d, input, opts);
+            // Byte lazy DFA span scan (prefiltered) when built and not disabled — same
+            // result the NFA arm gives, faster on a long scan.
+            if (!scratch.dfa_disabled) {
+                if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
+                    const r = runByteDfa(dp, program.filter, d, input, opts, true);
+                    if (d.gave_up) scratch.dfa_disabled = true; // cache thrashed → stop using it
+                    return r != null;
+                };
             }
             return runNfa(p, program.filter, &scratch.inner.nfa, input, opts, null, program.has_grapheme) != null;
         },
@@ -399,8 +448,12 @@ pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opt
     switch (program.inner) {
         .literal => |*p| return literal.search(p, &scratch.inner.literal, input, opts),
         .nfa => |*p| {
-            if (scratch.dfa_sc) |*d| {
-                if (program.dfa_prog) |*dp| return dfa.search(dp, d, input, opts);
+            if (!scratch.dfa_disabled) {
+                if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
+                    const r = runByteDfa(dp, program.filter, d, input, opts, false);
+                    if (d.gave_up) scratch.dfa_disabled = true;
+                    return r;
+                };
             }
             return runNfa(p, program.filter, &scratch.inner.nfa, input, opts, null, program.has_grapheme);
         },
@@ -416,12 +469,14 @@ pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const
 }
 
 /// Which way a built program routes (for diagnostics/tests): `"literal"`, `"nfa"`, or
-/// `"dfa"` when the byte lazy DFA span arm is built (it still carries an NFA program
-/// underneath for captures / `\b`).
+/// `"nfa+dfa"`. The last names what the program actually *is* — an NFA program (it backs
+/// captures, `\b`, and the buffer/comptime scratch path) **with** a byte-DFA span arm
+/// the heap-scratch span ops (`isMatch`/`find`) use. It is deliberately not `"dfa"`:
+/// captures never touch the DFA, and a buffer `Scratch` (no `dfa_sc`) runs the NFA arm.
 ///
 /// @stable-since: v0.1.0
 pub fn route(program: *const Program) []const u8 {
-    if (program.dfa_prog != null) return "dfa";
+    if (program.dfa_prog != null) return "nfa+dfa";
     return switch (program.inner) {
         .literal => "literal",
         .nfa => "nfa",
