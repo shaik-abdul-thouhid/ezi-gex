@@ -46,8 +46,9 @@ pub const Backend = engine.backend;
 pub const Match = engine.Match;
 pub const Captures = engine.Captures;
 pub const SearchOptions = engine.SearchOptions;
-/// Built-in, pluggable backends: `auto` (default), `pikevm`, `backtrack`,
-/// `literal`. Pass any to `compileRuntimeWith`/`compileComptimeWith`.
+/// Built-in, pluggable backends: `auto` (default), `pikevm`, `backtrack`, `literal`,
+/// `bytepike`, and `dfa` (the byte lazy DFA — span-only, runtime-only). Pass any to
+/// `compileRuntimeWith`/`compileComptimeWith`.
 pub const backends = engine.backends;
 /// Front-door pipeline options (`case_fold`, …), comptime-known on both paths.
 pub const Options = engine.Options;

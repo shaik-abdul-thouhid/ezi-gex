@@ -25,6 +25,7 @@ const pikevm = @import("backends/pikevm.zig");
 const backtrack = @import("backends/backtrack.zig");
 const literal = @import("backends/literal.zig");
 const bytepike = @import("backends/bytepike.zig");
+const dfa = @import("backends/dfa.zig");
 const auto = @import("backends/auto.zig");
 
 const byte = @import("byte.zig");
@@ -192,6 +193,98 @@ test "byte Pike VM agrees on the byte-lowerable subset (the lowering is correct)
         ran += 1;
     }
     try testing.expect(ran > 0); // guard against the filter silently skipping everything
+}
+
+// ── lazy DFA span conformance ─────────────────────────────────────────────────────
+
+/// Whether `pattern` can run on the lazy DFA (byte-lowerable AND no zero-width
+/// anchors — the v1 DFA declines `^ $ \b \X` and line anchors). A narrower gate than
+/// `byteLowerablePattern`, so it gets its own predicate.
+fn dfaRoutablePattern(pattern: []const u8) bool {
+    const gpa = testing.allocator;
+    var diag: regex.Diagnostic = .{};
+    const ast = ccompile.parse(gpa, pattern, &diag) catch return false;
+    defer ast.deinit(gpa);
+    const h = hir.buildAlloc(gpa, ast, .{}) catch return false;
+    defer hir.deinitHir(gpa, h);
+    return dfa.supports(h);
+}
+
+test "lazy DFA agrees with the code-point engines on its eligible subset (span-only)" {
+    // The DFA is span-only, so it is checked through `re.find` (the whole-match span)
+    // exactly like every other backend — its span must equal what pikevm/backtrack/auto
+    // are pinned to. Cases with `\b`/`\X`/anchors it cannot run are covered by those.
+    var ran: usize = 0;
+    for (general_cases) |c| {
+        if (!dfaRoutablePattern(c.pat)) continue;
+        try checkRuntime(dfa, c);
+        ran += 1;
+    }
+    for (literal_cases) |c| {
+        if (!dfaRoutablePattern(c.pat)) continue;
+        try checkRuntime(dfa, c);
+        ran += 1;
+    }
+    try testing.expect(ran > 0); // guard against the gate silently skipping everything
+}
+
+test "auto's byte_engine=.enabled is results-invariant (DFA span == NFA span) and routes to dfa" {
+    // Flipping the strategy knob must not change a single match (DESIGN §3). For every
+    // DFA-eligible case, the .enabled build and the default build must return
+    // byte-identical spans. With .enabled an eligible pattern routes to the DFA span
+    // arm ("dfa") unless it is a pure literal (then "literal", already optimal); it is
+    // never left on the plain "nfa" arm.
+    const gpa = testing.allocator;
+    var ran: usize = 0;
+    var dfa_routed: usize = 0;
+    inline for (general_cases ++ literal_cases) |c| {
+        if (dfaRoutablePattern(c.pat)) {
+            var diag: regex.Diagnostic = .{};
+            var re0 = try regex.compileRuntimeWith(auto, gpa, c.pat, &diag, .{});
+            defer re0.deinit();
+            var sc0 = try @TypeOf(re0).Scratch.init(gpa, &re0.program);
+            defer sc0.deinit(gpa);
+
+            var re1 = try regex.compileRuntimeWith(auto, gpa, c.pat, &diag, .{ .strategy = .{ .byte_engine = .enabled } });
+            defer re1.deinit();
+            var sc1 = try @TypeOf(re1).Scratch.init(gpa, &re1.program);
+            defer sc1.deinit(gpa);
+
+            const r = auto.route(&re1.program);
+            try testing.expect(!std.mem.eql(u8, r, "nfa")); // eligible+enabled ⇒ dfa or literal, never plain nfa
+            if (std.mem.eql(u8, r, "dfa")) dfa_routed += 1;
+
+            const m0 = re0.find(&sc0, c.input);
+            const m1 = re1.find(&sc1, c.input);
+            try testing.expectEqual(m0 == null, m1 == null);
+            if (m0) |a| {
+                try testing.expectEqual(a.start, m1.?.start);
+                try testing.expectEqual(a.end, m1.?.end);
+            }
+            ran += 1;
+        }
+    }
+    try testing.expect(ran > 0);
+    try testing.expect(dfa_routed > 0); // the DFA span arm is actually exercised
+}
+
+test "auto with byte_engine=.enabled still fills captures via the Pike VM" {
+    // The DFA finds the span; captures are span-only's job for the code-point engine.
+    // A capture pattern compiled with the DFA enabled must still report correct groups
+    // (auto routes searchCaptures to the Pike VM, span scan to the DFA).
+    const gpa = testing.allocator;
+    var diag: regex.Diagnostic = .{};
+    var re = try regex.compileRuntimeWith(auto, gpa, "(\\w+)@(\\w+)", &diag, .{ .strategy = .{ .byte_engine = .enabled } });
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+    defer sc.deinit(gpa);
+
+    try testing.expectEqualStrings("dfa", auto.route(&re.program));
+    var slots: [6]?usize = undefined;
+    const c = re.captures(&sc, &slots, "ping bob@example").?;
+    try testing.expectEqualStrings("bob@example", c.match().slice("ping bob@example"));
+    try testing.expectEqualStrings("bob", c.groupSlice(1).?);
+    try testing.expectEqualStrings("example", c.groupSlice(2).?);
 }
 
 // ── capture-array conformance ─────────────────────────────────────────────────────

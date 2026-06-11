@@ -7,9 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-`0.3.0-dev` — focus: the **lazy DFA** over the byte-NFA substrate landed in `0.2.0`
-(determinized over its `ByteMap` alphabet). A near-term follow-up is interning
-repeated classes in the byte compiler (the code-point compiler already does).
+`0.3.0-dev`.
+
+### Added
+
+- **Lazy DFA backend** (`engine/backends/dfa.zig`) — the throughput engine the byte
+  substrate (landed in `0.2.0`) was built for. It **determinizes the byte Thompson NFA
+  on the fly**, advancing **one DFA state per input byte** through a transition table
+  keyed on the program's `ByteClasses` (a handful of classes even for a large Unicode
+  program), caching each `(state, class)` edge the first time it is taken. The memo is
+  the "lazy" part. Determinization keeps the NFA states in **priority order** and
+  **cuts on match**, lifting the Pike VM's "cut lower-priority threads on match" rule
+  into the DFA state, so it is **leftmost-first** — its span never disagrees with the
+  Pike VM (proven by a differential corpus in the backend's own tests and by
+  `conformance.zig`). Key properties:
+  - **Span-only** (`caps.captures = false`): the DFA finds `[start, end)`; the
+    code-point Pike VM fills captures and evaluates Unicode `\b` over that span.
+    `Engine(dfa)` offers `isMatch`/`find`/`findAll`/`count`/`split`; `captures` and
+    `replaceAll` are a `@compileError` (route them through `auto`/`pikevm`). This is the
+    first contract-legal `captures = false` backend.
+  - **Runtime-only** (`buildAlloc` + `search`, no `buildComptime`): the cache mutates at
+    match time, which const-eval cannot do. The transition cache lives in the
+    caller-owned `Scratch` (never on the immutable `Program`), and is the first consumer
+    of `ScratchOptions{ max_bytes, on_full }` (via `Scratch.initOptions`) — a bounded
+    cache that evicts at a search boundary, always results-invariant.
+  - **Dead-on-invalid for free**: the byte lowering emits edges only for well-formed
+    UTF-8, so a malformed byte has no transition and lands in the dead state; the
+    anchored-restart wrapper resyncs to the next start. No validity check, no decode.
+  - **Match start without a reverse DFA**: an anchored restart locates the leftmost
+    start, with the cache shared across start positions and searches. Declines `\X`,
+    `\b`/`\B`, and zero-width anchors (`^ $ \A \z` and line anchors) — `dfa.supports(hir)`
+    — which keep routing to the code-point engines, exactly as `\b`/`\X` do today.
+- **`auto` byte-engine wiring** (`engine/backends/auto.zig`, `engine/regex.zig`) — the
+  `Options.strategy.byte_engine` knob is no longer inert. The front door projects it
+  onto the backend's build options (`backendOptions`); with
+  `.{ .strategy = .{ .byte_engine = .enabled } }`, `auto` builds the byte lazy DFA
+  alongside the NFA program and uses it for the span scan (`isMatch`/`find`), while
+  `searchCaptures` still runs the Pike VM — so captures and `\b` are unaffected.
+  Results-invariant by contract (`conformance.zig` pins the enabled span to the default
+  span and verifies captures still resolve). `auto.route` now also reports `"dfa"`. The
+  default (`.auto`) behaviour is unchanged — the DFA is strictly opt-in for now.
+
+### Changed
+
+- **Dependency:** pinned `ezi_code` to **0.4.1** (was a `0.3.0-dev` commit). The 0.4.x
+  releases hardened the decode contract the engine relies on — "lossy never errors,
+  unchecked never panics" now holds structurally across all three codecs, so the
+  engine's `\b` reverse-decode and dead-on-invalid paths inherit a stronger guarantee —
+  and unified the `BufferTooSmall` error name. **No `ezi_gex` source change was
+  required**: the breaking 0.4.x changes were confined to UTF-8 stream / UTF-16/32 paths
+  the engine does not use, and the facade (`src/utils/unicode.zig`) absorbed the rest.
+
+### Notes
+
+- A near-term follow-up remains: interning repeated classes in the byte compiler (the
+  code-point compiler already does), which shrinks the byte NFA and therefore the DFA's
+  state space on patterns that repeat a Unicode class.
 
 ## [0.2.0] - 2026-06-09
 

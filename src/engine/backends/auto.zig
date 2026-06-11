@@ -43,6 +43,7 @@ const nfa = @import("../nfa.zig");
 const literal = @import("literal.zig");
 const pikevm = @import("pikevm.zig");
 const backtrack = @import("backtrack.zig");
+const dfa = @import("dfa.zig");
 
 const utils = @import("utils");
 const encoding = utils.unicode.encoding;
@@ -65,8 +66,22 @@ const BACKTRACK_MAX_INPUT: usize = 4096;
 
 /// @stable-since: v0.1.0
 pub const caps = Caps{ .captures = true, .stateless = false, .grapheme = true };
+
+/// Build options. `byte_engine` is projected from the front-door
+/// `Options.strategy.byte_engine` (see `regex.zig`): `.enabled` builds the byte lazy
+/// DFA alongside the NFA program and uses it for the span scan (`isMatch`/`search`)
+/// on eligible patterns, with the Pike VM still filling captures and `\b`; `.auto`
+/// and `.disabled` keep the code-point engines only. Results-invariant — the DFA arm
+/// returns the same span the NFA arm would.
+///
 /// @stable-since: v0.1.0
-pub const Options = struct {};
+pub const Options = struct {
+    /// @stable-since: v0.3.0
+    byte_engine: ByteEngine = .auto,
+
+    /// @stable-since: v0.3.0
+    pub const ByteEngine = enum { auto, enabled, disabled };
+};
 
 /// Search-time prefilter facts, distilled from the HIR `Analysis` at build into a
 /// tiny POD (so it bakes into `ro_data` at comptime and needs no allocation). Every
@@ -125,19 +140,38 @@ pub const Program = struct {
     /// True when the program contains `\X` (grapheme). Such a program is matched
     /// only by the backtracker (variable-width consume) — `runNfa` routes it there.
     has_grapheme: bool = false,
+    /// The byte lazy DFA program, built **only at runtime** (`buildAlloc`) when
+    /// `byte_engine == .enabled` and the pattern is DFA-eligible (`dfa.supports`).
+    /// Non-null ⇒ `isMatch`/`search` use the DFA for the span scan; `searchCaptures`
+    /// always uses the Pike VM. Null on the comptime path and for `\b`/`\X`/anchored
+    /// patterns (which stay on the code-point engines, returning the same spans).
+    ///
+    /// @stable-since: v0.3.0
+    dfa_prog: ?dfa.Program = null,
 };
 
 /// @stable-since: v0.1.0
-pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Program {
+pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, opts: Options) BuildError!Program {
     if (literal.supports(h)) {
         return .{ .inner = .{ .literal = try literal.buildAlloc(gpa, h, .{}) } };
     }
     if (!nfa.supports(h)) return error.Unsupported;
-    return .{
+    var program = Program{
         .inner = .{ .nfa = try nfa.buildAlloc(gpa, h) },
         .filter = filterFromAnalysis(h),
         .has_grapheme = h.analysis.has_grapheme,
     };
+    errdefer nfa.freeProgram(gpa, &program.inner.nfa);
+    // Opt-in byte lazy DFA span arm (runtime-only). Best-effort: a pattern the DFA
+    // cannot run (`error.Unsupported`) just leaves `dfa_prog` null and the NFA arm
+    // handles it. OOM propagates.
+    if (opts.byte_engine == .enabled and dfa.supports(h)) {
+        program.dfa_prog = dfa.buildAlloc(gpa, h, .{}) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => null,
+        };
+    }
+    return program;
 }
 
 /// @stable-since: v0.1.0
@@ -145,6 +179,8 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
     if (comptime literal.supports(h)) {
         return .{ .inner = .{ .literal = literal.buildComptime(h, .{}) } };
     }
+    // No DFA at comptime (its cache mutates at match time): the comptime path stays
+    // on the NFA program. `dfa_prog` defaults to null.
     return .{
         .inner = .{ .nfa = nfa.buildComptime(h) },
         .filter = filterFromAnalysis(h),
@@ -154,6 +190,7 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
 
 /// @stable-since: v0.1.0
 pub fn freeProgram(gpa: std.mem.Allocator, program: *Program) void {
+    if (program.dfa_prog) |*d| dfa.freeProgram(gpa, d);
     switch (program.inner) {
         .literal => |*p| literal.freeProgram(gpa, p),
         .nfa => |*p| nfa.freeProgram(gpa, p),
@@ -179,6 +216,12 @@ pub const Scratch = struct {
         literal: literal.Scratch,
         nfa: NfaScratch,
     },
+    /// The byte lazy DFA's per-search cache, present only on a heap `Scratch` (`init`)
+    /// built for a program that has a `dfa_prog`. Null on a buffer/comptime `Scratch`
+    /// (`initBuffer`) — that path falls back to the NFA arm for the span scan.
+    ///
+    /// @stable-since: v0.3.0
+    dfa_sc: ?dfa.Scratch = null,
 
     /// @stable-since: v0.1.0
     pub fn bufferLen(program: *const Program) usize {
@@ -209,14 +252,18 @@ pub const Scratch = struct {
             .nfa => |*p| {
                 var pike = try pikevm.Scratch.init(gpa, p);
                 errdefer pike.deinit(gpa);
-                const back = try backtrack.Scratch.init(gpa, p);
-                return .{ .inner = .{ .nfa = .{ .pike = pike, .back = back } } };
+                var back = try backtrack.Scratch.init(gpa, p);
+                errdefer back.deinit(gpa);
+                var dfa_sc: ?dfa.Scratch = null;
+                if (program.dfa_prog) |*dp| dfa_sc = try dfa.Scratch.init(gpa, dp);
+                return .{ .inner = .{ .nfa = .{ .pike = pike, .back = back } }, .dfa_sc = dfa_sc };
             },
         }
     }
 
     /// @stable-since: v0.1.0
     pub fn deinit(self: *Scratch, gpa: std.mem.Allocator) void {
+        if (self.dfa_sc) |*d| d.deinit(gpa);
         switch (self.inner) {
             .literal => |*s| s.deinit(gpa),
             .nfa => |*s| {
@@ -228,6 +275,7 @@ pub const Scratch = struct {
 
     /// @stable-since: v0.1.0
     pub fn reset(self: *Scratch) void {
+        if (self.dfa_sc) |*d| d.reset();
         switch (self.inner) {
             .literal => |*s| s.reset(),
             .nfa => |*s| {
@@ -335,7 +383,14 @@ fn runNfa(p: *const nfa.Program, filter: Filter, s: *Scratch.NfaScratch, input: 
 pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) bool {
     switch (program.inner) {
         .literal => |*p| return literal.isMatch(p, &scratch.inner.literal, input, opts),
-        .nfa => |*p| return runNfa(p, program.filter, &scratch.inner.nfa, input, opts, null, program.has_grapheme) != null,
+        .nfa => |*p| {
+            // Byte lazy DFA span scan when built and its cache is present — same
+            // result the NFA arm would give, faster on a long scan.
+            if (scratch.dfa_sc) |*d| {
+                if (program.dfa_prog) |*dp| return dfa.isMatch(dp, d, input, opts);
+            }
+            return runNfa(p, program.filter, &scratch.inner.nfa, input, opts, null, program.has_grapheme) != null;
+        },
     }
 }
 
@@ -343,7 +398,12 @@ pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, op
 pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) ?Match {
     switch (program.inner) {
         .literal => |*p| return literal.search(p, &scratch.inner.literal, input, opts),
-        .nfa => |*p| return runNfa(p, program.filter, &scratch.inner.nfa, input, opts, null, program.has_grapheme),
+        .nfa => |*p| {
+            if (scratch.dfa_sc) |*d| {
+                if (program.dfa_prog) |*dp| return dfa.search(dp, d, input, opts);
+            }
+            return runNfa(p, program.filter, &scratch.inner.nfa, input, opts, null, program.has_grapheme);
+        },
     }
 }
 
@@ -355,10 +415,13 @@ pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const
     }
 }
 
-/// Which way a built program routes (for diagnostics/tests): `.literal` or `.nfa`.
+/// Which way a built program routes (for diagnostics/tests): `"literal"`, `"nfa"`, or
+/// `"dfa"` when the byte lazy DFA span arm is built (it still carries an NFA program
+/// underneath for captures / `\b`).
 ///
 /// @stable-since: v0.1.0
 pub fn route(program: *const Program) []const u8 {
+    if (program.dfa_prog != null) return "dfa";
     return switch (program.inner) {
         .literal => "literal",
         .nfa => "nfa",

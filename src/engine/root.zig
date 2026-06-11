@@ -9,7 +9,7 @@ pub const backend = @import("backend.zig");
 pub const nfa = @import("nfa.zig");
 
 /// Byte-grained HIR lowering (UTF-8 automaton substrate; not a backend). The byte
-/// Pike VM executes it; the future lazy DFA will determinize it.
+/// Pike VM executes it; the lazy DFA (`backends.dfa`) determinizes it.
 pub const byte = @import("byte.zig");
 
 /// Built-in backends. Each is independently pluggable; `auto` is the default
@@ -23,9 +23,15 @@ pub const backends = struct {
     /// Bounded backtracking — depth-first over the same NFA; fast on small inputs.
     pub const backtrack = @import("backends/backtrack.zig");
     /// Byte Pike VM — executes the byte-grained `byte.Program` (zero-decode match).
-    /// The reference executor for the byte lowering / substrate for the future DFA;
+    /// The reference executor for the byte lowering / substrate for the lazy DFA;
     /// not `auto`'s default. Refuses `\X` and `\b`/`\B` (not byte-lowerable).
     pub const bytepike = @import("backends/bytepike.zig");
+    /// Lazy DFA — determinizes the byte automaton on the fly (cached transitions),
+    /// one DFA state per input byte. The throughput backend: span-only
+    /// (`caps.captures = false`) and runtime-only (no comptime). `auto` uses it for
+    /// the span scan on eligible patterns; `pikevm` fills captures. Refuses `\X`,
+    /// `\b`/`\B`, and zero-width anchors (not yet byte-DFA-able).
+    pub const dfa = @import("backends/dfa.zig");
     /// The default dispatcher — composes the above, switching on analysis + input.
     pub const auto = @import("backends/auto.zig");
 };

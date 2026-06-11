@@ -193,10 +193,18 @@ input). To pin one, use the `*With` constructors — the returned `Compiled` has
 same API:
 
 ```zig
-const pikevm = gex.backends.pikevm; // or .backtrack / .literal / .auto
+const pikevm = gex.backends.pikevm; // or .backtrack / .literal / .auto / .bytepike / .dfa
 var re = try gex.compileRuntimeWith(pikevm, gpa, "\\w+", &diag, .{});
 defer re.deinit();
 ```
+
+> **The `dfa` backend is span-only and runtime-only.** `gex.backends.dfa` is the byte
+> **lazy DFA** — it finds the match *span* fast (one cached DFA state per byte) but does
+> not fill captures (`re.captures`/`re.replaceAll` are a `@compileError` on it; use
+> `auto`/`pikevm`). It only runs patterns without `\b`/`\X`/anchors and only at runtime
+> (no `compileComptimeWith(dfa, …)`). The usual way to get its speed is not to pin it but
+> to **opt in through `auto`** with `byte_engine = .enabled` (below): `auto` then uses the
+> DFA for the span scan and the Pike VM for captures, transparently.
 
 ### Options
 
@@ -219,8 +227,15 @@ _ = try gex.compileRuntime(gpa, "a.b", &diag, .{ .dot_matches_newline = true });
 // stay Unicode-aware. Default is unicode = true.
 _ = try gex.compileRuntime(gpa, "\\w+", &diag, .{ .unicode = false });               // \w = [0-9A-Za-z_]
 
-// strategy tier — results-invariant (reserved for the byte engine; inert today).
-// Flipping any field may change only speed/memory, never which text matches.
+// strategy tier — results-invariant: flipping any field changes only speed/memory,
+// never which text matches.
+//   byte_engine = .enabled  → `auto` uses the byte lazy DFA for the span scan on
+//                             eligible patterns (no \b/\X/anchors); captures still come
+//                             from the Pike VM, so the result is identical, just faster
+//                             on a long scan. .auto (default) and .disabled keep the
+//                             code-point engines.
+_ = try gex.compileRuntime(gpa, "\\w+", &diag, .{ .strategy = .{ .byte_engine = .enabled } });
+//   unicode_word_boundary_in_dfa / prefilter remain reserved (inert).
 _ = try gex.compileRuntime(gpa, "abc", &diag, .{ .strategy = .{ .prefilter = true } });
 ```
 

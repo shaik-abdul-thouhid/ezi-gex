@@ -144,8 +144,9 @@ pub fn main(init: std.process.Init) !void {
     // ══ Byte engine: the zero-decode byte-NFA substrate (v0.2.0) ═══════════════
     // `bytepike` executes a byte-grained lowering of the HIR: each step consumes one
     // input BYTE against a byte range, so a Unicode class matches with NO decode. It
-    // is the substrate the future lazy DFA will determinize — not the default backend
-    // (per-byte stepping is not a throughput win yet), but selectable via `*With`.
+    // is the substrate the lazy DFA (`backends.dfa`, below) determinizes — not the
+    // default backend (per-byte stepping is not a throughput win), but selectable via
+    // `*With`.
     std.debug.print("\n── byte engine ──\n", .{});
     const BytePike = ezi_gex.backends.bytepike;
     var bdiag: ezi_gex.Diagnostic = .{};
@@ -167,6 +168,50 @@ pub fn main(init: std.process.Init) !void {
     defer byte.freeProgram(gpa, &w_prog);
     const classes = byte.byteClasses(&w_prog);
     std.debug.print("\\w+ byte program: {d} insts → {d} byte classes (256 bytes compressed)\n", .{ w_prog.insts.len, classes.count });
+
+    // ══ Lazy DFA: the throughput span-finder (v0.3.0) ══════════════════════════
+    // `dfa` DETERMINIZES the byte automaton on the fly — one cached DFA state per
+    // input byte, keyed on those byte classes. It is SPAN-ONLY (finds [start, end);
+    // the Pike VM fills captures) and RUNTIME-ONLY. Determinization keeps the NFA
+    // states in priority order and cuts on match, so it is leftmost-first: its span
+    // always agrees with the Pike VM. Invalid UTF-8 is dead-on-invalid for free (a
+    // malformed byte has no transition, so a match never spans it).
+    std.debug.print("\n── lazy DFA (span-only, runtime-only) ──\n", .{});
+    try demoDfa(gpa, "\\w+", "  héllo, wörld 42  "); //   multi-byte, zero decode
+    try demoDfa(gpa, "[a-z]+[0-9]+", "  test42!  ");
+    try demoDfa(gpa, "a|ab", "ab"); //                   leftmost-first → "a"
+    try demoDfa(gpa, "ab|a", "ab"); //                   higher-priority longer → "ab"
+    try demoDfa(gpa, "a.*?c", "abXcYc"); //              lazy → "abXc"
+    try demoDfa(gpa, "\\p{Script=Greek}+", "abcαβγdef"); // unicode property → "αβγ"
+    try demoDfa(gpa, "a.c", "a\xFFc abc"); //            dead-on-invalid → "abc"
+
+    // Through `auto`: opt in with `byte_engine = .enabled`. `auto` then runs the DFA
+    // for the span scan and the Pike VM for captures — so you still get groups, just a
+    // faster span. `auto.route` reports which arm a compiled program took ("dfa" here).
+    var adiag: ezi_gex.Diagnostic = .{};
+    var are = try ezi_gex.compileRuntimeWith(ezi_gex.backends.auto, gpa, "(\\w+)@(\\w+)", &adiag, .{ .strategy = .{ .byte_engine = .enabled } });
+    defer are.deinit();
+    var asc = try @TypeOf(are).Scratch.init(gpa, &are.program);
+    defer asc.deinit(gpa);
+    const aslots = try gpa.alloc(?usize, are.slotCount());
+    std.debug.print("auto+dfa /(\\w+)@(\\w+)/  route=\"{s}\"  ", .{ezi_gex.backends.auto.route(&are.program)});
+    if (are.captures(&asc, aslots, "ping bob@example")) |c|
+        std.debug.print("→ \"{s}\"  (g1=\"{s}\", g2=\"{s}\")\n", .{ c.match().slice("ping bob@example"), c.groupSlice(1).?, c.groupSlice(2).? });
+}
+
+/// Compile `pat` on the byte lazy DFA, print the leftmost span it finds in `input`.
+/// The DFA is span-only, so we only read `m.slice` (no captures) — `find` is all it
+/// needs. A helper so each compile's `Scratch` is released at its own scope exit.
+fn demoDfa(gpa: std.mem.Allocator, pat: []const u8, input: []const u8) !void {
+    var diag: ezi_gex.Diagnostic = .{};
+    var re = try ezi_gex.compileRuntimeWith(ezi_gex.backends.dfa, gpa, pat, &diag, .{});
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+    defer sc.deinit(gpa);
+    if (re.find(&sc, input)) |m|
+        std.debug.print("  dfa /{s}/ on \"{s}\"  →  \"{s}\"\n", .{ pat, input, m.slice(input) })
+    else
+        std.debug.print("  dfa /{s}/ on \"{s}\"  →  (no match)\n", .{ pat, input });
 }
 
 /// Pretty-print a parse diagnostic with a caret under the offending span. Pure
@@ -220,6 +265,38 @@ test "usage: byte engine (bytepike) matches a Unicode class without decoding" {
     var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
     defer sc.deinit(gpa);
     try std.testing.expectEqualStrings("αβγ", re.find(&sc, "ΑΒΓαβγ").?.slice("ΑΒΓαβγ"));
+}
+
+test "usage: lazy DFA finds spans (span-only, runtime-only, leftmost-first)" {
+    const gpa = std.testing.allocator;
+    var diag: ezi_gex.Diagnostic = .{};
+    var re = try ezi_gex.compileRuntimeWith(ezi_gex.backends.dfa, gpa, "[a-z]+[0-9]+", &diag, .{});
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+    defer sc.deinit(gpa);
+    try std.testing.expectEqualStrings("abc123", re.find(&sc, "  abc123!  ").?.slice("  abc123!  "));
+
+    // leftmost-first, identical to the Pike VM (the first alternative wins on a tie).
+    var re2 = try ezi_gex.compileRuntimeWith(ezi_gex.backends.dfa, gpa, "a|ab", &diag, .{});
+    defer re2.deinit();
+    var sc2 = try @TypeOf(re2).Scratch.init(gpa, &re2.program);
+    defer sc2.deinit(gpa);
+    try std.testing.expectEqualStrings("a", re2.find(&sc2, "ab").?.slice("ab"));
+}
+
+test "usage: auto opts into the DFA span arm (byte_engine=.enabled); captures still work" {
+    const gpa = std.testing.allocator;
+    var diag: ezi_gex.Diagnostic = .{};
+    var re = try ezi_gex.compileRuntimeWith(ezi_gex.backends.auto, gpa, "(\\w+)@(\\w+)", &diag, .{ .strategy = .{ .byte_engine = .enabled } });
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+    defer sc.deinit(gpa);
+    try std.testing.expectEqualStrings("dfa", ezi_gex.backends.auto.route(&re.program)); // DFA span arm built
+    const slots = try gpa.alloc(?usize, re.slotCount());
+    defer gpa.free(slots);
+    const c = re.captures(&sc, slots, "bob@example").?; // captures via the Pike VM
+    try std.testing.expectEqualStrings("bob", c.groupSlice(1).?);
+    try std.testing.expectEqualStrings("example", c.groupSlice(2).?);
 }
 
 test "usage: bad pattern yields a precise diagnostic" {

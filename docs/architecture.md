@@ -529,8 +529,8 @@ The contract is the seam that makes these drop-in:
 |---|---|---|---|
 | 1 ✅ *(0.1.0)* | literal `eql` → `std.mem.indexOf`; `prefix_literal` first byte → `memchr` start-skip in `auto` (+ length/anchor gates) | done | ~20× on memchr-friendly literals and prefixed NFA patterns |
 | 3a ✅ *(0.2.0)* | **byte-NFA lowering + `ByteMap`** (`engine/byte.zig`) — UTF-8 `utf8-ranges`, a `byte_range` Thompson NFA, byte equivalence classes; executed by the `bytepike` reference VM | done | the substrate for the lazy DFA below |
+| 3b ✅ *(0.3.0)* | **lazy DFA** over the **byte** automaton (`engine/backends/dfa.zig`) — caches `(state, class)` transitions; span-only, runtime-only, leftmost-first via priority + cut-on-match determinization; opt-in with `byte_engine = .enabled` | done | one DFA state per byte (cached); the byte-class alphabet keeps the table tiny |
 | 2 | one-pass NFA fast capture path | weeks | kills the captures penalty on common patterns |
-| 3b | lazy DFA over the **byte** automaton (the RE2/Rust core) | ~1–3 months | RE2 order of magnitude on general search |
 
 ### The byte substrate (tier 3a, landed)
 
@@ -557,12 +557,36 @@ comptime + runtime) and is the **reference executor** that proves the lowering c
 (`conformance.zig`). It is not `auto`'s default — per-byte stepping is not a throughput
 win over the code-point VM; the DFA (tier 3b) is what the substrate exists for.
 
-A lazy DFA mutates/caches state at match time, so it would be **runtime-only**
-(`buildAlloc` + `search`, no `buildComptime`) — which the contract already allows
-(`verifyBackend` requires *one of* the two build paths). `auto` routes comptime/tiny
-inputs to the Pike VM (comptime-capable) and runtime/large inputs to the DFA. That is
-the whole point of the backend abstraction: a runtime speed demon and a comptime-pure
-matcher in one library, no fork.
+### The lazy DFA (tier 3b, landed — `backends/dfa.zig`)
+
+The lazy DFA **determinizes** the byte automaton at match time: a DFA state is the set
+of byte-NFA program counters reachable so far, and one input byte advances one DFA
+state through a cached `(state, class)` transition table (the alphabet is the program's
+`ByteClasses`, a handful of classes even for a large Unicode program). Each edge is
+computed once — an epsilon-closure of the successors — then memoized; every later visit
+is a single array lookup. Determinization keeps the NFA states in **priority order** and
+**cuts on match**, which is exactly the Pike VM's "cut lower-priority threads on match"
+rule lifted into the DFA state, so the result is **leftmost-first** and its span never
+disagrees with the Pike VM (`conformance.zig` and a differential corpus check it).
+
+Three design choices follow from the contract:
+
+- It mutates/caches state at match time, so it is **runtime-only** (`buildAlloc` +
+  `search`, no `buildComptime`) — which the contract already allows (`verifyBackend`
+  requires *one of* the two build paths). The cache lives in the caller-owned `Scratch`
+  (never on the immutable `Program`), bounded by `ScratchOptions{ max_bytes, on_full }`
+  (its first real consumer). The comptime path stays on the Pike VM.
+- It is **span-only** (`caps.captures = false`): the DFA finds `[start, end)`; the
+  code-point Pike VM fills captures and evaluates Unicode `\b` over that span. `auto`
+  wires the two together — DFA for the span scan, Pike VM for `searchCaptures`.
+- It finds the leftmost **start** by an **anchored restart** (no reverse DFA yet): it
+  runs anchored at each candidate position, sharing the cache, and the first position
+  that accepts is the leftmost match. It declines `\b`/`\X` and zero-width anchors for
+  now (those route to the code-point engines, as they already do).
+
+It is **opt-in** via `Options.strategy.byte_engine = .enabled` (the default `.auto`
+leaves it off). That is the whole point of the backend abstraction: a runtime speed
+demon and a comptime-pure matcher in one library, no fork.
 
 ---
 

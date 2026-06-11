@@ -1,7 +1,8 @@
 # backends/ — the built-in matchers
 
-Five backends. All satisfy the same contract (`../backend.zig`), all build and run at
-**comptime and runtime**, all are leftmost-first (Perl/JS). `auto` is the default.
+Six backends. All satisfy the same contract (`../backend.zig`) and are leftmost-first
+(Perl/JS). All build and run at **comptime and runtime** *except* `dfa`, which is
+runtime-only (its cache mutates at match time). `auto` is the default.
 
 | Backend | Strategy | Memory | Captures | When `auto` picks it |
 |---|---|---|---|---|
@@ -9,6 +10,7 @@ Five backends. All satisfy the same contract (`../backend.zig`), all build and r
 | `pikevm` | breadth-first NFA (thread set, one code point/step) | O(program), input-independent | ✅ | NFA pattern, large input |
 | `backtrack` | depth-first NFA + `(pc,sp)` memo | O(program × input) | ✅ | NFA pattern, small input that fits |
 | `bytepike` | breadth-first **byte** NFA (`../byte.zig`), one *byte*/step, zero-decode | O(program); program is larger for Unicode classes | ✅ | never (not a default arm) — the byte-lowering reference VM / DFA substrate; refuses `\X`/`\b` |
+| `dfa` | **lazy DFA**: determinizes the byte NFA on the fly, one DFA *state*/byte via a cached `(state, class)` table | the transition cache in `Scratch` (heap; runtime-only) | **span-only** (`caps.captures = false`) | the span scan (`isMatch`/`find`) when `byte_engine = .enabled` and the pattern is eligible (no `\b`/`\X`/anchors); captures still come from the Pike VM |
 | `auto` | dispatcher over the others | per sub-backend | ✅ | the default |
 
 ## The shared NFA
@@ -36,7 +38,19 @@ The prefilter facts are **sound one-sided bounds** (true for every match), so th
 skip never drops a real match. Both NFA arms run the identical program, so the
 per-input switch is invisible — same match, same captures. The `literal` backend
 itself scans with `std.mem.indexOf` (SIMD memchr / Boyer–Moore–Horspool), not an
-`eql` per position. `auto.route(&program)` reports `"literal"` or `"nfa"` for tests.
+`eql` per position. `auto.route(&program)` reports `"literal"`, `"nfa"`, or `"dfa"`.
+
+### The byte lazy DFA arm (opt-in)
+
+With `Options.strategy.byte_engine = .enabled` (projected onto the backend by the
+front door), `auto` also builds a byte lazy DFA (`dfa.zig`) for any NFA-arm pattern the
+DFA can run (`dfa.supports`: byte-lowerable, no zero-width anchors). It then uses the
+DFA for the **span scan** — `isMatch`/`search` — and the Pike VM for `searchCaptures`,
+since the DFA is span-only. The two agree on the span by construction (priority +
+cut-on-match determinization is the Pike VM's leftmost-first rule), so the switch is
+results-invariant; `conformance.zig` pins it. The default (`.auto`) leaves the DFA off.
+The DFA is **runtime-only**, so the comptime path (`buildComptime`/`initBuffer`) never
+builds it and stays on the NFA program.
 
 ## Notes
 
@@ -48,8 +62,11 @@ itself scans with `std.mem.indexOf` (SIMD memchr / Boyer–Moore–Horspool), no
   `auto`). `\X` compiles to a variable-width `grapheme` NFA instruction; the
   breadth-first `pikevm` and the `literal` backend set `caps.grapheme = false` and
   reject such a program at build, so `auto` routes any `\X` pattern to the backtracker.
-- To add a fifth backend (e.g. a lazy DFA), implement the contract and either route to
-  it from a copy of `auto.zig` or use it directly via `compile*With`. See
+- The `dfa` backend is the worked example of adding a non-trivial engine: a span-only
+  (`caps.captures = false`), runtime-only (`buildAlloc` only) matcher that reuses the
+  shared `byte.Program` substrate and consumes `ByteClasses` — see `dfa.zig`. To add
+  another, implement the contract and either route to it from a copy of `auto.zig` or
+  use it directly via `compile*With`. See
   [`../../../docs/architecture.md`](../../../docs/architecture.md) §5 and §10, and the
   step-by-step, runnable walkthrough in
   [`../../../docs/usage-guide.md`](../../../docs/usage-guide.md) §8.

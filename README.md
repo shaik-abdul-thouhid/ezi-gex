@@ -31,20 +31,23 @@ development** on `main`. Pre-1.0, so the API may still change, but everything in
 public surface is annotated `@stable-since: vX.Y.Z` and is covered by SemVer. Tracks a
 recent Zig dev build (`0.17.0-dev`); it will not compile on stable 0.16.
 
-**What works is tested** (≈250 tests: per-module behaviour, cross-backend
+**What works is tested** (≈270 tests: per-module behaviour, cross-backend
 conformance, runtime + comptime parity). `0.2.0` added full case folding, grapheme
 `\X`, a two-tier `Options` (semantic + results-invariant strategy), `(?x)` verbose
-mode, ASCII mode, dead-on-invalid UTF-8, and — the headline — the **byte-NFA lowering
-+ `ByteMap` equivalence classes** (`engine/byte.zig`): the zero-decode UTF-8 automaton
-substrate the lazy DFA will determinize, executed today by the new `bytepike` backend
-(the reference executor, conformance-proven against the code-point engines).
+mode, ASCII mode, dead-on-invalid UTF-8, and the **byte-NFA lowering + `ByteMap`
+equivalence classes** (`engine/byte.zig`): the zero-decode UTF-8 automaton substrate,
+executed by the `bytepike` reference backend.
 
-The **first prefilter tier is wired** (`literal` scans with `std.mem.indexOf`; `auto`
-reads the HIR `Analysis` for a leading-literal `memchr` prefilter, a `^`/`\A` start
-short-circuit, and a min-length gate). There is still **no lazy-DFA backend** — the
-byte substrate it needs now exists, and the DFA is the focus of `0.3.0-dev`; until it
-lands, throughput on general (non-prefixable) patterns is below RE2/Rust. The
-architecture absorbs a DFA without API changes — see *Performance*.
+`0.3.0-dev` adds the **lazy DFA** (`engine/backends/dfa.zig`) — the throughput backend
+that **determinizes the byte automaton on the fly** (one cached DFA state per input
+byte, keyed on the compressed byte-class alphabet). It is span-only (the Pike VM still
+fills captures and `\b`), runtime-only, and leftmost-first — its span never disagrees
+with the Pike VM (conformance-proven). It is **opt-in** today via
+`Options.strategy.byte_engine = .enabled`, which routes `auto`'s span scan through the
+DFA while captures stay on the Pike VM. The **first prefilter tier is also wired**
+(`literal` scans with `std.mem.indexOf`; `auto` reads the HIR `Analysis` for a
+leading-literal `memchr` prefilter, a `^`/`\A` start short-circuit, and a min-length
+gate). The architecture absorbs all of this without API changes — see *Performance*.
 
 ## Installing
 
@@ -336,9 +339,12 @@ treated as `\z`. See [`docs/architecture.md`](docs/architecture.md) §Caveats.
 | `backtrack` | bounded depth-first NFA | ✅ | ✅ | small inputs |
 | `literal` | substring / literal-alternation | whole-match | ✅ | pure-literal patterns |
 | `bytepike` | byte-stepping Pike VM (zero-decode) | ✅ | ✅ | byte-automaton substrate (no `\X`/`\b`) |
+| `dfa` | lazy DFA over the byte automaton (cached transitions) | span-only | ✗ (runtime-only) | fast span scan; opt in via `auto` + `byte_engine = .enabled` |
 
 `compileRuntime`/`compileComptime` use `auto`. Force one with the `*With` variants:
-`gex.compileRuntimeWith(gex.backends.pikevm, gpa, pat, &diag, .{})`.
+`gex.compileRuntimeWith(gex.backends.pikevm, gpa, pat, &diag, .{})`. To turn on the byte
+lazy DFA inside `auto`, compile with `.{ .strategy = .{ .byte_engine = .enabled } }` —
+`auto` uses the DFA for the span scan and the Pike VM for captures.
 
 The usage guide covers [choosing a backend](docs/usage-guide.md#choosing-a-specific-backend)
 and walks the whole [*write your own backend*](docs/usage-guide.md#8-writing-your-own-backend)

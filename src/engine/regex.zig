@@ -430,6 +430,23 @@ pub fn compileComptime(comptime pattern: []const u8, comptime opts: Options) Com
     return compileComptimeWith(default_backend, pattern, opts);
 }
 
+/// Project the front-door `Options` onto a backend's build `Options`. Most backends
+/// take an empty `Options{}`; a backend that exposes a `byte_engine` field (the `auto`
+/// dispatcher) receives the strategy tier's `byte_engine`, so a user can opt the byte
+/// lazy DFA in/out from the front door. Backends without the field are unaffected (the
+/// `@hasField` branch is comptime-pruned for them).
+fn backendOptions(comptime B: type, comptime opts: Options) B.Options {
+    var bo: B.Options = .{};
+    if (comptime @hasField(B.Options, "byte_engine")) {
+        bo.byte_engine = switch (opts.strategy.byte_engine) {
+            .auto => .auto,
+            .enabled => .enabled,
+            .disabled => .disabled,
+        };
+    }
+    return bo;
+}
+
 /// `compileRuntime` with an explicit backend.
 ///
 /// @stable-since: v0.1.0
@@ -452,7 +469,7 @@ pub fn compileRuntimeWith(comptime B: type, allocator: std.mem.Allocator, patter
     };
     defer hir.deinitHir(allocator, h);
 
-    var program = try B.buildAlloc(allocator, h, .{});
+    var program = try B.buildAlloc(allocator, h, backendOptions(B, opts));
     errdefer if (@hasDecl(B, "freeProgram")) B.freeProgram(allocator, &program);
 
     const group_names = try buildGroupNames(allocator, h);
@@ -478,7 +495,7 @@ pub fn compileComptimeWith(comptime B: type, comptime pattern: []const u8, compt
         .ok => |x| x,
         .fail => @compileError("ezi_gex: HIR build failed for pattern \"" ++ pattern ++ "\""),
     };
-    const program = comptime B.buildComptime(h, .{});
+    const program = comptime B.buildComptime(h, backendOptions(B, opts));
     const names = comptime comptimeGroupNames(h);
     return .{
         .program = program,
