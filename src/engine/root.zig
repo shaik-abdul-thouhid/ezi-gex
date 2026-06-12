@@ -32,6 +32,14 @@ pub const backends = struct {
     /// the span scan on eligible patterns; `pikevm` fills captures. Refuses `\X`,
     /// `\b`/`\B`, and zero-width anchors (not yet byte-DFA-able).
     pub const dfa = @import("backends/dfa.zig");
+    /// Eager DFA — the **fully determinized**, frozen byte DFA. Span-only like `dfa`
+    /// but **stateless** (the complete table is the whole matcher) and so usable at
+    /// **comptime** (`buildComptime` bakes the table into `ro_data`) as well as runtime.
+    /// The CTRE-lane DFA: a literal / ASCII-class pattern is a handful of states
+    /// (`abc` → 5), ideal to bake; a big Unicode class is a few hundred (`\w+` → ~323).
+    /// Bounded — a pattern whose full DFA exceeds `edfa.max_states` is declined (use
+    /// `dfa` at runtime). Same capability gate as `dfa` (`supports`).
+    pub const edfa = @import("backends/edfa.zig");
     /// The default dispatcher — composes the above, switching on analysis + input.
     pub const auto = @import("backends/auto.zig");
 };

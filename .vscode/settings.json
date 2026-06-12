@@ -3,7 +3,10 @@
         "bytepike",
         "desugared",
         "multibyte",
-        "pikevm"
+        "pikevm",
+        "prefilter",
+        "backtracker",
+        "edfa"
     ]
 
 }

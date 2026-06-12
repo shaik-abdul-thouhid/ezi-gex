@@ -49,6 +49,149 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Results-invariant by contract (`conformance.zig` pins the enabled span to the default
   span and verifies captures still resolve). `auto.route` now also reports `"dfa"`. The
   default (`.auto`) behaviour is unchanged — the DFA is strictly opt-in for now.
+- **Byte substrate size compaction** (`engine/byte.zig`) — three changes shrink the
+  byte Thompson NFA a Unicode-class pattern lowers to (the input the lazy DFA
+  determinizes, and the artifact a future eager comptime DFA would freeze). Measured on
+  the real compiler; ASCII patterns are unchanged throughout:
+  - **UTF-8 suffix sharing.** A class's byte sequences are now built **back-to-front
+    through a `(lo, hi, next)` suffix cache** (RE2 / `regex-automata`'s technique): the
+    identical trailing UTF-8 continuation ranges (`[0x80, 0xBF]`) shared across hundreds
+    of a class's sequences are emitted **once** and converged on, instead of re-emitted
+    per branch. ~1.4–1.55× off a single Unicode class (`\w` 5691→3930 insts, `\p{L}`
+    4777→3337, `\d` 391→252). The class's sequences match disjoint scalars, so they are
+    mutually exclusive and the sharing is sound (`conformance.zig` and the exhaustive
+    lowering tests verify it).
+  - **Single-copy unbounded repetition.** `x{min,}` with a capture-free body compiles to
+    `x{min-1} · x+` (one looped body copy) instead of `x{min} · x*` (an extra full copy).
+    Combined with suffix sharing this is **~2.9× off** the common `+` cases — `\w+`
+    11381→3931, `\w+@\w+` 22760→7860 (~273 KB → ~94 KB), `\d+` 781→253. A capturing body
+    keeps the two-copy shape (final-iteration group spans unchanged); exact `{n}` still
+    needs `n` distinct copies (different successors), collapsed by the DFA, not the NFA.
+  - **Cost gate** — new public `byteWorthLowering(hir)` + `max_byte_insts` (`@stable-since
+    v0.3.0`): `auto` consults it (with `dfa.supports`) so a pathologically large byte
+    automaton (a big Unicode class repeated many times, e.g. `\p{L}{60}`) declines the
+    byte/DFA path and stays on the compact code-point engine. Results-invariant — only
+    which engine runs changes, never the match.
+
+  Enabling mechanism: `byte_range` now carries an **explicit `next` successor** (it used
+  to fall through to `pc + 1`), making the byte automaton a real graph so many
+  predecessors can share one tail node; a plain chain still sets `next = pc + 1`. The
+  byte VM (`bytepike`) and lazy DFA (`dfa`) follow `next` instead of `pc + 1` — a
+  behaviour-identical mechanical change.
+- **Eager DFA backend — now the DEFAULT span engine** (`engine/backends/edfa.zig`,
+  `backends.edfa`) — the **fully determinized**, frozen byte DFA, and the first DFA that runs
+  at **comptime**. Where the lazy `dfa` determinizes on the fly and caches into a `Scratch`,
+  this one determinizes the **whole** automaton at build time into an immutable
+  `states × byte_classes` table, so the matcher is a bare `state = trans[state][class]` table
+  walk with **no per-search state** — `caps.stateless = true`, an **empty `Scratch`**, and
+  `buildComptime` bakes the table into `ro_data` (the lazy DFA can't: its cache mutates while
+  matching). It is ~5–10× the lazy DFA on class scans and is what `auto` now prefers (below).
+  Properties:
+  - **O(input) `find` on every pattern, picked statically at build.** `computeProne` detects
+    whether the anchored DFA has a **non-accepting cycle reachable from a start** (it can
+    consume an unbounded run without ever accepting — `\w+@\w+`'s pre-`@` word run). A
+    **non-prone** pattern (`\w+`, `\d+`, `[A-Za-z]+`: their consuming loop is itself
+    accepting) uses **anchored restart** — one greedy table walk per match, the headline
+    ~1.1 GiB/s, O(input) because no start can scan far without accepting. A **prone** pattern
+    uses the **reverse-DFA two-pass**: a frozen *reverse* transition table (`RDet`, comptime +
+    runtime) — a forward one-pass (`utrans`) locates the match END, the reverse DFA the START
+    — replacing the old Θ(n²) anchored restart. No per-search probing.
+  - **One-pass unanchored `isMatch`** (prone patterns, via the `utrans` `.*?`-prefix table);
+    anchored-restart earliest-exit for non-prone.
+  - **`text_end` (`$`/`\z`) now runs on the DFA.** The closure records a pending `text_end` pc
+    as a state member and computes `accept_eoi` (does it reach `match` at end of input — a
+    `computeEndReaches` epsilon-fixpoint); the matcher checks it when the scan reaches
+    `input.len`. `$` patterns are forced non-prone (anchored restart + the end check).
+    `edfa.supports` now accepts **`text_start` and `text_end`** — broader than `dfa.supports`
+    (the lazy DFA still declines `$`). `(?m)` line anchors, `\b`/`\B`, `\X` are still declined.
+  - **Span-only** (`caps.captures = false`), **leftmost-first** (priority + cut-on-match),
+    dead-on-invalid; `conformance.zig` pins its span to the Pike VM's, runtime and comptime.
+  - **Builds only the tables it will use.** `utrans` and the reverse table are built **only**
+    for prone patterns; a non-prone `\w+` keeps just its `trans` table (~141 KB) instead of
+    trans + utrans + reverse (~1 MB) — the bulk of the eager DFA's memory is gone on the
+    common case. (Full Hopcroft minimization + a sparse encoding of the *kept* tables remain a
+    noted follow-up.)
+  - **Bounded.** Eager determinization writes into fixed storage (so the identical code runs
+    at comptime, allocator-free), so a pattern whose **full** DFA exceeds `edfa.max_states`
+    (4096) is declined — `error.Unsupported` at runtime (fall back to the lazy `dfa`), a
+    `@compileError` at comptime. Per-build buffers are sized to the pattern.
+  - New public surface: `backends.edfa`, `edfa.max_states`, `edfa.buildComptime`/`supports`
+    (`@stable-since v0.3.0`).
+- **The byte DFA is ON BY DEFAULT through `auto`, preferring the eager DFA**
+  (`engine/backends/auto.zig`, `engine/regex.zig`) — the single biggest throughput change.
+  `Options.strategy.byte_engine` defaulted to `.auto`, which used to be **inert**; it now
+  means *build and use the byte DFA* on an eligible pattern (`.auto` ≡ `.enabled`). `auto`
+  **prefers the eager DFA** (the frozen-table engine above; ~5–10× the lazy DFA on class
+  scans, and the only DFA that runs at **comptime**), falling back to the **lazy** DFA only
+  when the eager one overflows its `max_states` bound, then to the NFA. The class-scan family
+  (`\w+`, `\d+`, `[A-Za-z]+`, `\p{L}+`) is now **at Rust-`regex` parity** in the bench
+  (`bench-vs-rust/`, ~1–1.3× behind, was ~1.6–2.3×). Results-invariant — `conformance.zig`
+  pins every DFA span/captures to the Pike VM and fuzzes the strategy knobs. `.disabled` opts
+  back to the compact NFA-only program. `auto.route` reports `"nfa+edfa"` (preferred),
+  `"nfa+dfa"` (lazy fallback), `"nfa"`, or `"literal"`.
+  - **Comptime CTRE-lane.** `auto.buildComptime` now bakes a real frozen eager DFA into
+    `ro_data` for **tiny** patterns (small ASCII classes / alternations / counted reps — gated
+    by a cheap, measure-free `tinyForComptimeEdfa` HIR check). A big Unicode class (`\w`,
+    `\p{L}`) or `.` stays on the Pike VM at comptime (determinizing it in the const-evaluator
+    is too memory-hungry) but still gets the eager DFA at **runtime**.
+  - **Lazy DFA hot-loop pass** (`engine/backends/dfa.zig`). The warm path now reads through
+    cached raw `[*]const u32`/`[*]const bool` table pointers (refreshed only after a cold,
+    realloc-capable transition) and the per-byte cache-budget check moved out of the warm loop
+    into the cold path — ~336 → ~517 MiB/s on `\w+`. The lazy DFA is now the **fallback** for
+    patterns too big for the eager DFA's bounds.
+  - **Reverse DFA — `find` is now O(n)** (`engine/backends/dfa.zig`). A forward pass
+    locates the leftmost match **end** (`findEndForward`: re-seed the start each byte until
+    the first match, then extend it anchored), then a **reverse DFA** (`ReverseAdj` +
+    `revFind`), anchored at that end and scanning *backward*, locates the leftmost
+    **start**. This replaces the Θ(n²) anchored restart on the "begins-everywhere-but-
+    completes-rarely" class (`\w+@\w+` on a long word run, `[ab]*c`) with two linear passes.
+    The reverse is a plain subset construction (no priority/cut — the end is fixed, so only
+    *reachability* of the forward start matters), cached like the forward transitions and
+    honouring the same `max_bytes` budget. Leftmost-first, pinned to the Pike VM across the
+    wide corpus + a dedicated reverse-vs-anchored-restart differential. A pattern with an
+    *interior* `text_start` (rare, not fully `anchored_start`) keeps anchored restart so the
+    cached reverse transitions stay position-independent.
+  - **Capture handoff** (`auto.searchCaptures`): when the DFA arm is present, captures are
+    filled by the Pike VM **anchored at the DFA-found span start** (bounded to the match)
+    instead of an unanchored Pike VM scan over the whole input — an O(input) capture search
+    becomes O(match) on a sparse match. Same groups (the DFA span *is* the leftmost-first
+    match), conformance-pinned.
+  - **Prefilter, wired and configurable:** the new `strategy.prefilter` knob (default on)
+    is live, and the analysis prefilter gained a **rarest-required-byte fast-reject** —
+    a byte in `analysis.required_bytes` that occurs in *every* match drives a sound
+    `memchr`: if it is absent from the input there is no match, so the search returns at
+    once (the win for a prefix-less interior-literal pattern like `\w+@\w+` over text with
+    no `@`). The rarest member is chosen by a static byte-frequency heuristic so the probe
+    is as selective as possible. `prefilter = false` builds an all-permissive filter.
+  - New/updated public Options: `strategy.byte_engine` (now wired, default-on) and
+    `strategy.prefilter` (now wired), both `@stable-since v0.3.0`.
+- **Wide differential conformance corpus** (`engine/conformance.zig`) — ~85 (pattern,
+  input) cases spanning the whole syntax surface (empty/zero-width, greedy vs lazy,
+  alternation priority, counted reps, nested captures, multibyte UTF-8, `\p{}` classes,
+  special case folds, `^`/`$`/`(?m)`, `\b`/`\B`, dead-on-invalid `\xFF`, sparse matches,
+  pathological-but-linear shapes). Every applicable backend (pikevm / backtrack / auto /
+  lazy DFA / eager DFA) must produce the **byte-identical span** the Pike VM does, and a
+  companion test fuzzes `prefilter`/`byte_engine` on↔off and pins every span to the
+  default — the safety net for the DFA-on-by-default + prefilter wiring. The corpus now also
+  covers `text_end` (`a$`, `\d+$`, `^abc$`, `\w+@\w+$`) on the eager DFA, and the eager-DFA
+  differential builds each pattern **once** and reuses it across inputs (the heavy reverse-DFA
+  determinization is paid once, not once per input).
+- **Backtracker: touched-words visited clearing** (`engine/backends/backtrack.zig`). The
+  `(pc, sp)` visited bitset is no longer fully `@memset` every search — a touched-words list
+  records the dirtied words and clears only those next run, so an early-exit search no longer
+  pays an O(program × input) clear. The out-of-range `save` guard became an assertion, and the
+  program-structure-bounded recursion depth (only `split.a`/`save` recurse) is documented.
+  Behaviour is unchanged (proven by added results-invariance tests).
+
+### Fixed
+
+- **Literal alternation was accidentally Θ(input²)** (`engine/backends/literal.zig`). The
+  unanchored search did one `indexOfPos` per branch, so each `count` step scanned toward the
+  *rarest* needle's next occurrence — re-scanning the same region for a sparse branch on every
+  match. It now collects the distinct first bytes and skips to the next candidate with a single
+  SIMD `indexOfAny` pass, verifying branches in priority order at each candidate — O(input).
+  `foo|bar|baz|qux` went from **~7 MiB/s to ~460 MiB/s** in the bench (Rust's Teddy is still far
+  ahead, but it is no longer quadratic). A single-literal pattern is unchanged (one `indexOfPos`).
 
 ### Changed
 
@@ -62,9 +205,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Notes
 
-- A near-term follow-up remains: interning repeated classes in the byte compiler (the
-  code-point compiler already does), which shrinks the byte NFA and therefore the DFA's
-  state space on patterns that repeat a Unicode class.
+- The byte-compiler size follow-up flagged in 0.2.0 is **largely addressed** by the
+  suffix sharing + single-copy repetition above (a class's internal redundancy is shared;
+  an unbounded `x{min,}` no longer duplicates its body). What remains is structural, not a
+  bug: an **exact `x{n}`** still emits `n` copies because each has a distinct successor
+  (a flat Thompson NFA has no subroutine/return), and the un-shared cross-class
+  duplication of `\p{L}{3}`-style patterns is collapsed at match time by the lazy DFA
+  (`\w+` → ~10 DFA states regardless of its ~3.9 k-instruction NFA). The eager comptime
+  DFA (the deferred CTRE-lane backend, `DESIGN.md §7`) is what would carry that collapse
+  into `ro_data` for the comptime path.
 
 ## [0.2.0] - 2026-06-09
 

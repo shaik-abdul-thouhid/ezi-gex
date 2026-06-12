@@ -44,6 +44,8 @@ const literal = @import("literal.zig");
 const pikevm = @import("pikevm.zig");
 const backtrack = @import("backtrack.zig");
 const dfa = @import("dfa.zig");
+const edfa = @import("edfa.zig");
+const byte = @import("../byte.zig");
 
 const utils = @import("utils");
 const encoding = utils.unicode.encoding;
@@ -62,6 +64,34 @@ const Cell = backend.Cell;
 /// performance constants.
 const BACKTRACK_MAX_INPUT: usize = 4096;
 
+/// Cheap, **measure-free** HIR check for whether `auto` should build the eager DFA span arm
+/// **at comptime** (the CTRE-lane). It must be cheap because it gates a `comptime` call: the
+/// byte-lowering size probes (`dfa.supports`/`byteWorthLowering`, which run the count pass and
+/// `enumerate` a class's UTF-8 sequences) are *expensive in the const evaluator* — running
+/// them on a big Unicode class (`\w+@\w+`) at compile time exhausts the comptime allocator.
+/// So this short-circuits the big cases by inspecting only HIR node/range/literal counts (no
+/// byte lowering, no `enumerate`) and excluding `.` (`any`, which enumerates the whole scalar
+/// space), `\X` (grapheme), and `\b`/`\B`. A pattern that passes is tiny enough that the
+/// subsequent `dfa.supports` + `edfa.buildComptime` are cheap and can never overflow
+/// `edfa.max_states`. Runtime has no such gate — `buildAlloc` pays the determinization once
+/// for any DFA-eligible pattern (the throughput path); this comptime lane is the ro_data
+/// convenience for small ASCII classes / alternations / counted reps.
+///
+/// @stable-since: v0.3.0
+fn tinyForComptimeEdfa(h: hir.Hir) bool {
+    if (h.analysis.has_grapheme) return false; // `\X`
+    if (h.nodes.len > 24 or h.ranges.len > 8 or h.literals.len > 32) return false;
+    for (h.nodes) |n| switch (n.tag) {
+        .any => return false, // `.` lowers to the whole-scalar-space byte automaton — not tiny
+        .anchor => switch (n.data.anchor.kind) {
+            .word_boundary, .not_word_boundary => return false, // `\b`/`\B` — not byte-DFA-able
+            else => {},
+        },
+        else => {},
+    };
+    return true;
+}
+
 // ── Contract surface ────────────────────────────────────────────────────────────
 
 /// @stable-since: v0.1.0
@@ -78,6 +108,13 @@ pub const caps = Caps{ .captures = true, .stateless = false, .grapheme = true };
 pub const Options = struct {
     /// @stable-since: v0.3.0
     byte_engine: ByteEngine = .auto,
+    /// Whether to distil and apply the sound analysis prefilter (length gate,
+    /// leading-literal `memchr` start-skip, rarest-required-byte fast-reject). On by
+    /// default; `false` builds an all-permissive filter so the engine scans without
+    /// probing. Results-invariant.
+    ///
+    /// @stable-since: v0.3.0
+    prefilter: bool = true,
 
     /// @stable-since: v0.3.0
     pub const ByteEngine = enum { auto, enabled, disabled };
@@ -101,7 +138,29 @@ pub const Filter = struct {
     /// must begin with), or null when no fixed leading literal exists. Drives a
     /// `memchr` start-skip: a match can only begin where this byte appears.
     prefix_byte: ?u8 = null,
+    /// The **rarest** byte (by `byteRarity`) of `analysis.required_bytes` — a byte that
+    /// appears in *every* match — or null when nothing is unconditionally required.
+    /// Drives a sound **fast-reject**: if it does not occur in the remaining input, no
+    /// match exists there, so the search returns immediately (the big win for a
+    /// prefix-less interior-literal pattern like `\w+@\w+` on input with no `@`). Picked
+    /// rarest so the `memchr` is as selective as possible.
+    rare_byte: ?u8 = null,
 };
+
+/// A coarse "commonness" score for a byte: **higher = more common** in typical text, so
+/// the prefilter picks the lowest-scoring required byte as the most selective `memchr`
+/// target. Punctuation/symbols (often the discriminating byte of a pattern — `@`, `.`,
+/// `-`) score low; spaces and lowercase letters score high.
+fn byteRarity(b: u8) u8 {
+    return switch (b) {
+        ' ', '\t', '\n', '\r' => 100,
+        'a'...'z' => 90,
+        0x80...0xFF => 60, // UTF-8 lead/continuation — common in Unicode text
+        'A'...'Z' => 50,
+        '0'...'9' => 45,
+        else => 10, // ASCII punctuation / control — usually the rare, discriminating byte
+    };
+}
 
 /// Distil the sound prefilter facts from the HIR analysis.
 fn filterFromAnalysis(h: hir.Hir) Filter {
@@ -119,6 +178,21 @@ fn filterFromAnalysis(h: hir.Hir) Filter {
                     if (n > 0) f.prefix_byte = buf[0];
                 }
             }
+        }
+        // Rarest required byte for the fast-reject (only when there is no fixed prefix
+        // to memchr — with a prefix the start-skip already implies the byte is present).
+        if (f.prefix_byte == null and !an.required_bytes.isEmpty()) {
+            var best: ?u8 = null;
+            var best_score: u8 = 255;
+            var b: u16 = 0;
+            while (b < 256) : (b += 1) {
+                const by: u8 = @intCast(b);
+                if (an.required_bytes.has(by) and byteRarity(by) < best_score) {
+                    best = by;
+                    best_score = byteRarity(by);
+                }
+            }
+            f.rare_byte = best;
         }
     }
     return f;
@@ -140,11 +214,21 @@ pub const Program = struct {
     /// True when the program contains `\X` (grapheme). Such a program is matched
     /// only by the backtracker (variable-width consume) — `runNfa` routes it there.
     has_grapheme: bool = false,
-    /// The byte lazy DFA program, built **only at runtime** (`buildAlloc`) when
-    /// `byte_engine == .enabled` and the pattern is DFA-eligible (`dfa.supports`).
-    /// Non-null ⇒ `isMatch`/`search` use the DFA for the span scan; `searchCaptures`
-    /// always uses the Pike VM. Null on the comptime path and for `\b`/`\X`/anchored
-    /// patterns (which stay on the code-point engines, returning the same spans).
+    /// The **eager** DFA program — the preferred span arm (a fully frozen byte DFA;
+    /// ~5–10× the lazy DFA, stateless, builds at comptime **and** runtime). Non-null ⇒
+    /// `isMatch`/`search` use it for the span scan and `searchCaptures` hands its span to
+    /// the Pike VM for groups. Built when DFA-eligible (`dfa.supports`) and within
+    /// `edfa.max_states`; a pattern whose DFA overflows those bounds falls back to
+    /// `dfa_prog` (runtime) or the NFA arm. Results-invariant (`conformance.zig` pins it).
+    ///
+    /// @stable-since: v0.3.0
+    edfa_prog: ?edfa.Program = null,
+    /// The byte **lazy** DFA program — the fallback span arm, built **only at runtime**
+    /// (`buildAlloc`) when the pattern is DFA-eligible but its eager DFA overflows
+    /// `edfa`'s fixed bounds (a big Unicode class repeated many times). Unbounded (its
+    /// cache grows on demand). Non-null ⇒ used for the span scan when `edfa_prog` is null;
+    /// `searchCaptures` hands its span to the Pike VM. Null on the comptime path and for
+    /// `\b`/`\X`/`$`/line-anchor patterns (which stay on the code-point engines).
     ///
     /// @stable-since: v0.3.0
     dfa_prog: ?dfa.Program = null,
@@ -158,38 +242,70 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, opts: Options) BuildError!
     if (!nfa.supports(h)) return error.Unsupported;
     var program = Program{
         .inner = .{ .nfa = try nfa.buildAlloc(gpa, h) },
-        .filter = filterFromAnalysis(h),
+        .filter = if (opts.prefilter) filterFromAnalysis(h) else .{},
         .has_grapheme = h.analysis.has_grapheme,
     };
     errdefer nfa.freeProgram(gpa, &program.inner.nfa);
-    // Opt-in byte lazy DFA span arm (runtime-only). Best-effort: a pattern the DFA
-    // cannot run (`error.Unsupported`) just leaves `dfa_prog` null and the NFA arm
-    // handles it. OOM propagates.
-    if (opts.byte_engine == .enabled and dfa.supports(h)) {
-        program.dfa_prog = dfa.buildAlloc(gpa, h, .{}) catch |e| switch (e) {
+    // Byte DFA span arm, built by default (`byte_engine != .disabled`). The DFA serves
+    // `isMatch`/`find` and feeds the capture handoff; the bench shows it is **5–10× the
+    // code-point Pike VM** on class scans (and never slower), so building it by default is a
+    // strict throughput win, and it is **results-invariant** (`conformance.zig` pins its
+    // span and captures to the Pike VM's). Two-tier: prefer the **eager** DFA (fully frozen,
+    // stateless, fastest); fall back to the **lazy** DFA when the eager one overflows its
+    // fixed bounds (a big Unicode class repeated many times). `.disabled` opts back to the
+    // compact NFA-only program (minimal memory, no determinization). `byteWorthLowering`
+    // additionally declines a pathologically large byte automaton, keeping it on the NFA.
+    if (opts.byte_engine != .disabled and edfa.supports(h) and byte.byteWorthLowering(h)) {
+        if (edfa.buildAlloc(gpa, h, .{})) |ep| {
+            program.edfa_prog = ep;
+        } else |e| switch (e) {
             error.OutOfMemory => return e,
-            else => null,
-        };
+            else => { // eager DFA declined (exceeded its fixed bounds) — fall back to the lazy
+                // DFA when IT can run the pattern (the lazy DFA still declines `$`/`\z`, which
+                // the eager DFA supports, so a too-big `$` pattern lands on the NFA arm).
+                if (dfa.supports(h)) {
+                    program.dfa_prog = dfa.buildAlloc(gpa, h, .{}) catch |e2| switch (e2) {
+                        error.OutOfMemory => return e2,
+                        else => null,
+                    };
+                }
+            },
+        }
     }
     return program;
 }
 
 /// @stable-since: v0.1.0
-pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
+pub fn buildComptime(comptime h: hir.Hir, comptime opts: Options) Program {
     if (comptime literal.supports(h)) {
         return .{ .inner = .{ .literal = literal.buildComptime(h, .{}) } };
     }
-    // No DFA at comptime (its cache mutates at match time): the comptime path stays
-    // on the NFA program. `dfa_prog` defaults to null.
-    return .{
+    var program = Program{
         .inner = .{ .nfa = nfa.buildComptime(h) },
-        .filter = filterFromAnalysis(h),
+        .filter = if (opts.prefilter) filterFromAnalysis(h) else .{},
         .has_grapheme = h.analysis.has_grapheme,
     };
+    // Eager DFA span arm at comptime — the CTRE-lane fast path (a frozen `ro_data` table,
+    // ~5–10× the code-point engines). The **lazy** DFA can't run at comptime (its cache
+    // mutates while matching), but the eager one freezes everything at build, so it can.
+    // `searchCaptures` still hands the span to the Pike VM (the comptime buffer scratch
+    // backs it). Results-invariant.
+    //
+    // Gated on a *measure-free* tininess check FIRST (`tinyForComptimeEdfa`), so a big Unicode
+    // class short-circuits before any byte-lowering size probe runs in the const evaluator
+    // (those `enumerate` the class and exhaust the comptime allocator). Only a tiny, provably
+    // bounded pattern reaches `dfa.supports` + `edfa.buildComptime` — both cheap at that size,
+    // and unable to overflow `edfa.max_states`, so `buildComptime`'s `@compileError` branches
+    // are unreachable here. Big patterns still get the eager DFA at **runtime**.
+    if (opts.byte_engine != .disabled and tinyForComptimeEdfa(h) and edfa.supports(h)) {
+        program.edfa_prog = edfa.buildComptime(h, .{});
+    }
+    return program;
 }
 
 /// @stable-since: v0.1.0
 pub fn freeProgram(gpa: std.mem.Allocator, program: *Program) void {
+    if (program.edfa_prog) |*e| edfa.freeProgram(gpa, e);
     if (program.dfa_prog) |*d| dfa.freeProgram(gpa, d);
     switch (program.inner) {
         .literal => |*p| literal.freeProgram(gpa, p),
@@ -302,13 +418,13 @@ fn preferBacktrack(p: *const nfa.Program, back: *const backtrack.Scratch, input:
 /// First byte offset `≥ start` at which `byte` appears in `input`, or null. Runtime
 /// uses `std.mem.indexOfScalarPos` (SIMD memchr); comptime uses a plain scan (the
 /// project keeps `@Vector` out of const-eval). The prefilter's start-skip primitive.
-fn memchrFrom(input: []const u8, start: usize, byte: u8) ?usize {
+fn memchrFrom(input: []const u8, start: usize, b: u8) ?usize {
     if (@inComptime()) {
         var i = start;
-        while (i < input.len) : (i += 1) if (input[i] == byte) return i;
+        while (i < input.len) : (i += 1) if (input[i] == b) return i;
         return null;
     }
-    return std.mem.indexOfScalarPos(u8, input, start, byte);
+    return std.mem.indexOfScalarPos(u8, input, start, b);
 }
 
 // ── NFA-arm execution: dispatch + analysis-driven prefilter ───────────────────────
@@ -380,6 +496,15 @@ fn runNfa(p: *const nfa.Program, filter: Filter, s: *Scratch.NfaScratch, input: 
         return null;
     }
 
+    // Rarest-required-byte fast-reject: `rare_byte` appears in EVERY match, so if it is
+    // absent from the remaining input there is no match — return at once instead of
+    // scanning. Sound (one-sided). The big win for a prefix-less interior-literal pattern
+    // (`\w+@\w+` on text with no `@`). It does not pin the start (the match may begin
+    // before the byte), so it only rejects; when the byte IS present the dispatch scans.
+    if (filter.rare_byte) |rb| {
+        if (memchrFrom(input, opts.start, rb) == null) return null;
+    }
+
     // No usable filter: scan the whole range with the per-input engine choice.
     return dispatch(p, s, input, opts, slots);
 }
@@ -417,9 +542,54 @@ fn runByteDfa(dp: *const dfa.Program, filter: Filter, d: *dfa.Scratch, input: []
         }
         return null;
     }
+    // Rarest-required-byte fast-reject (sound; see `runNfa`).
+    if (filter.rare_byte) |rb| {
+        if (memchrFrom(input, opts.start, rb) == null) return null;
+    }
     if (match_only)
         return if (dfa.isMatch(dp, d, input, opts)) Match{ .start = opts.start, .end = opts.start } else null;
     return dfa.search(dp, d, input, opts);
+}
+
+// ── Eager-DFA arm: span ops with the same prefilter, but stateless (no scratch) ────
+
+/// Confirm/locate a match anchored at `at` via the **eager** DFA. The eager DFA is
+/// stateless, so a throwaway `edfa.Scratch{}` is all it needs. `match_only` selects the op.
+fn edfaConfirmAt(ep: *const edfa.Program, input: []const u8, at: usize, match_only: bool) ?Match {
+    var es = edfa.Scratch{};
+    const o = SearchOptions{ .start = at, .anchored = true };
+    if (match_only) return if (edfa.isMatch(ep, &es, input, o)) Match{ .start = at, .end = at } else null;
+    return edfa.search(ep, &es, input, o);
+}
+
+/// The eager-DFA arm's span search — the same sound prefilter as `runNfa`/`runByteDfa`
+/// (length gate, `anchored_start` short-circuit, leading-literal `memchr` start-skip,
+/// rarest-required-byte fast-reject) in front of the frozen-table walk. Stateless, so it
+/// needs no `Scratch`. Captures never come here — they always use the Pike VM.
+fn runEdfa(ep: *const edfa.Program, filter: Filter, input: []const u8, opts: SearchOptions, match_only: bool) ?Match {
+    if (opts.start > input.len) return null;
+    if (input.len - opts.start < filter.min_bytes) return null; // length gate
+    if (opts.anchored) return edfaConfirmAt(ep, input, opts.start, match_only);
+    if (filter.anchored_start) {
+        if (opts.start != 0) return null;
+        return edfaConfirmAt(ep, input, 0, match_only);
+    }
+    if (filter.prefix_byte) |fb| {
+        var pos = opts.start;
+        while (memchrFrom(input, pos, fb)) |hit| {
+            if (input.len - hit < filter.min_bytes) return null;
+            if (edfaConfirmAt(ep, input, hit, match_only)) |m| return m;
+            pos = hit + 1;
+        }
+        return null;
+    }
+    if (filter.rare_byte) |rb| {
+        if (memchrFrom(input, opts.start, rb) == null) return null;
+    }
+    var es = edfa.Scratch{};
+    if (match_only)
+        return if (edfa.isMatch(ep, &es, input, opts)) Match{ .start = opts.start, .end = opts.start } else null;
+    return edfa.search(ep, &es, input, opts);
 }
 
 // ── Contract: matching entry points ──────────────────────────────────────────────
@@ -429,8 +599,10 @@ pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, op
     switch (program.inner) {
         .literal => |*p| return literal.isMatch(p, &scratch.inner.literal, input, opts),
         .nfa => |*p| {
-            // Byte lazy DFA span scan (prefiltered) when built and not disabled — same
-            // result the NFA arm gives, faster on a long scan.
+            // Eager DFA span scan (prefiltered, stateless) when built — the fastest arm,
+            // same result the NFA arm gives.
+            if (program.edfa_prog) |*ep| return runEdfa(ep, program.filter, input, opts, true) != null;
+            // Lazy DFA fallback (prefiltered) when built and not disabled.
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
                     const r = runByteDfa(dp, program.filter, d, input, opts, true);
@@ -448,6 +620,7 @@ pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opt
     switch (program.inner) {
         .literal => |*p| return literal.search(p, &scratch.inner.literal, input, opts),
         .nfa => |*p| {
+            if (program.edfa_prog) |*ep| return runEdfa(ep, program.filter, input, opts, false);
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
                     const r = runByteDfa(dp, program.filter, d, input, opts, false);
@@ -464,19 +637,53 @@ pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opt
 pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const u8, slots: []?usize, opts: SearchOptions) ?Match {
     switch (program.inner) {
         .literal => |*p| return literal.searchCaptures(p, &scratch.inner.literal, input, slots, opts),
-        .nfa => |*p| return runNfa(p, program.filter, &scratch.inner.nfa, input, opts, slots, program.has_grapheme),
+        .nfa => |*p| {
+            // Capture handoff: when the byte DFA arm is available, locate the **span**
+            // cheaply with the DFA, then run the Pike VM **anchored at the span start**
+            // to fill captures — bounded to the match — instead of an unanchored Pike VM
+            // scan over the whole input. The DFA span *is* the leftmost-first match
+            // (`conformance.zig` pins it), so the anchored Pike VM finds the same match
+            // and the same groups, just without re-scanning to locate it. On a sparse
+            // match in a long input this turns an O(input) capture search into an
+            // O(match) one.
+            // Eager DFA span → anchored Pike VM for groups (the fastest handoff).
+            if (program.edfa_prog) |*ep| {
+                const m = runEdfa(ep, program.filter, input, opts, false) orelse return null;
+                var o = opts;
+                o.start = m.start;
+                o.anchored = true;
+                return pikevm.searchCaptures(p, &scratch.inner.nfa.pike, input, slots, o);
+            }
+            if (!scratch.dfa_disabled) {
+                if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
+                    const span = runByteDfa(dp, program.filter, d, input, opts, false);
+                    if (d.gave_up) {
+                        scratch.dfa_disabled = true; // cache thrashed → fall through to the NFA arm
+                    } else {
+                        const m = span orelse return null; // DFA is exact: no span ⇒ no match
+                        var o = opts;
+                        o.start = m.start;
+                        o.anchored = true;
+                        return pikevm.searchCaptures(p, &scratch.inner.nfa.pike, input, slots, o);
+                    }
+                };
+            }
+            return runNfa(p, program.filter, &scratch.inner.nfa, input, opts, slots, program.has_grapheme);
+        },
     }
 }
 
-/// Which way a built program routes (for diagnostics/tests): `"literal"`, `"nfa"`, or
-/// `"nfa+dfa"`. The last names what the program actually *is* — an NFA program (it backs
-/// captures, `\b`, and the buffer/comptime scratch path) **with** a byte-DFA span arm
-/// the heap-scratch span ops (`isMatch`/`find`) use. It is deliberately not `"dfa"`:
-/// captures never touch the DFA, and a buffer `Scratch` (no `dfa_sc`) runs the NFA arm.
+/// Which way a built program routes (for diagnostics/tests): `"literal"`, `"nfa"`,
+/// `"nfa+edfa"` (eager DFA span arm — the preferred fast path), or `"nfa+dfa"` (lazy DFA
+/// fallback span arm). The `nfa+…` names what the program actually *is* — an NFA program
+/// (it backs captures, `\b`, and the buffer/comptime scratch path) **with** a byte-DFA span
+/// arm the span ops (`isMatch`/`find`) use. It is deliberately not bare `"dfa"`: captures
+/// hand the DFA span to the Pike VM, and a buffer `Scratch` may run the NFA arm.
 ///
 /// @stable-since: v0.1.0
 pub fn route(program: *const Program) []const u8 {
-    if (program.dfa_prog != null) return "nfa+dfa";
+    if (program.edfa_prog != null) return "nfa+edfa"; // eager DFA span arm (preferred)
+    if (program.dfa_prog != null) return "nfa+dfa"; // lazy DFA fallback span arm
     return switch (program.inner) {
         .literal => "literal",
         .nfa => "nfa",
@@ -537,15 +744,16 @@ test "auto satisfies the backend contract" {
     comptime backend.verifyBackend(@This());
 }
 
-test "auto routes literal patterns to the literal backend" {
+test "auto routes literal patterns to the literal backend; DFA-eligible NFA patterns build the eager DFA by default" {
     const gpa = testing.allocator;
     const cases = [_]struct { pat: []const u8, route: []const u8 }{
-        .{ .pat = "abc", .route = "literal" },
-        .{ .pat = "cat|dog", .route = "literal" },
-        .{ .pat = "a.c", .route = "nfa" },
-        .{ .pat = "(a)(b)", .route = "nfa" },
-        .{ .pat = "\\d+", .route = "nfa" },
-        .{ .pat = "^abc$", .route = "nfa" },
+        .{ .pat = "abc", .route = "literal" }, // pure literal → literal backend
+        .{ .pat = "cat|dog", .route = "literal" }, // literal alternation → literal backend
+        .{ .pat = "a.c", .route = "nfa+edfa" }, // DFA-eligible & small → eager DFA built by default
+        .{ .pat = "(a)(b)", .route = "nfa+edfa" }, // captures don't block the DFA span arm
+        .{ .pat = "\\d+", .route = "nfa+edfa" },
+        .{ .pat = "^abc$", .route = "nfa+edfa" }, // `^`/`$` now both DFA-eligible (text_start + text_end)
+        .{ .pat = "(?m)^x", .route = "nfa" }, // line anchors stay DFA-ineligible → NFA only
     };
     for (cases) |c| {
         var diag: compile.Diagnostic = .{};

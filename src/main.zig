@@ -187,7 +187,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Through `auto`: opt in with `byte_engine = .enabled`. `auto` then runs the DFA
     // for the span scan and the Pike VM for captures — so you still get groups, just a
-    // faster span. `auto.route` reports which arm a compiled program took ("nfa+dfa").
+    // faster span. `auto.route` reports which arm a compiled program took ("nfa+edfa").
     var adiag: ezi_gex.Diagnostic = .{};
     var are = try ezi_gex.compileRuntimeWith(ezi_gex.backends.auto, gpa, "(\\w+)@(\\w+)", &adiag, .{ .strategy = .{ .byte_engine = .enabled } });
     defer are.deinit();
@@ -197,6 +197,51 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("auto+dfa /(\\w+)@(\\w+)/  route=\"{s}\"  ", .{ezi_gex.backends.auto.route(&are.program)});
     if (are.captures(&asc, aslots, "ping bob@example")) |c|
         std.debug.print("→ \"{s}\"  (g1=\"{s}\", g2=\"{s}\")\n", .{ c.match().slice("ping bob@example"), c.groupSlice(1).?, c.groupSlice(2).? });
+
+    // ══ Eager DFA: the frozen table — comptime-bakeable, and auto's default (v0.3.0) ══
+    // `edfa` fully determinizes the byte automaton at BUILD time into a frozen
+    // `states × byte_classes` table, so its `Scratch` is EMPTY and it matches at COMPTIME
+    // (into ro_data) as well as runtime — where the lazy `dfa` cannot, because its cache
+    // mutates while matching. It is now `auto`'s default span engine, O(input) on every
+    // pattern: a plain anchored table walk for patterns that complete at most positions
+    // (`\w+`), or a forward-end + reverse-DFA two-pass for begin-but-don't-complete ones
+    // (`\w+@\w+`) — the arm is chosen statically at build, so there is no per-search probing.
+    std.debug.print("\n── eager DFA (frozen table; comptime + runtime) ──\n", .{});
+
+    // Runtime, pinned to edfa: span-only, with a zero-sized Scratch.
+    var ediag: ezi_gex.Diagnostic = .{};
+    var ere = try ezi_gex.compileRuntimeWith(ezi_gex.backends.edfa, gpa, "[a-z]+[0-9]+", &ediag, .{});
+    defer ere.deinit();
+    var edsc = try @TypeOf(ere).Scratch.init(gpa, &ere.program); // empty struct — no per-search state
+    defer edsc.deinit(gpa);
+    if (ere.find(&edsc, "  abc123!  ")) |m|
+        std.debug.print("edfa /[a-z]+[0-9]+/ → \"{s}\"\n", .{m.slice("  abc123!  ")});
+
+    // `$` / `\z` (text_end) now runs on the DFA: the leftmost word run that ENDS the input.
+    var tdiag: ezi_gex.Diagnostic = .{};
+    var tre = try ezi_gex.compileRuntimeWith(ezi_gex.backends.edfa, gpa, "[a-z]+$", &tdiag, .{});
+    defer tre.deinit();
+    var tsc = try @TypeOf(tre).Scratch.init(gpa, &tre.program);
+    defer tsc.deinit(gpa);
+    if (tre.find(&tsc, "first second third")) |m|
+        std.debug.print("edfa /[a-z]+$/ on \"first second third\" → \"{s}\" (anchored to end)\n", .{m.slice("first second third")});
+
+    // Comptime: the table is baked into the binary and the match runs in const-eval —
+    // no allocator, no Scratch. The returned span is a compile-time constant.
+    const EagerRe = comptime ezi_gex.compileComptimeWith(ezi_gex.backends.edfa, "[0-9]{4}-[0-9]{2}", .{});
+    const stamp = comptime EagerRe.findComptime("y=2026-06!").?.slice("y=2026-06!");
+    std.debug.print("edfa comptime /[0-9]{{4}}-[0-9]{{2}}/ → \"{s}\" (matched in const-eval; table in ro_data)\n", .{stamp});
+
+    // `auto` picks edfa for DFA-eligible patterns by default — `route` names the arm
+    // ("nfa+edfa" preferred, "nfa+dfa" the lazy fallback, "nfa"/"literal" otherwise).
+    // Captures still come from the Pike VM, anchored at the DFA span.
+    std.debug.print("auto routing by pattern:\n", .{});
+    inline for (.{ "\\w+", "\\w+@\\w+", "\\d+$", "cat|dog", "(?m)^x" }) |pat| {
+        var rd: ezi_gex.Diagnostic = .{};
+        var r = try ezi_gex.compileRuntimeWith(ezi_gex.backends.auto, gpa, pat, &rd, .{});
+        defer r.deinit();
+        std.debug.print("  /{s}/  →  \"{s}\"\n", .{ pat, ezi_gex.backends.auto.route(&r.program) });
+    }
 }
 
 /// Compile `pat` on the byte lazy DFA, print the leftmost span it finds in `input`.
@@ -291,7 +336,7 @@ test "usage: auto opts into the DFA span arm (byte_engine=.enabled); captures st
     defer re.deinit();
     var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
     defer sc.deinit(gpa);
-    try std.testing.expectEqualStrings("nfa+dfa", ezi_gex.backends.auto.route(&re.program)); // DFA span arm built
+    try std.testing.expectEqualStrings("nfa+edfa", ezi_gex.backends.auto.route(&re.program)); // eager DFA span arm built
     const slots = try gpa.alloc(?usize, re.slotCount());
     defer gpa.free(slots);
     const c = re.captures(&sc, slots, "bob@example").?; // captures via the Pike VM

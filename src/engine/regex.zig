@@ -126,26 +126,37 @@ pub const Options = struct {
     unicode: bool = true,
 
     /// Execution-strategy knobs. **Results-invariant by contract:** changing any
-    /// field here may affect only speed/memory, never which text matches. Reserved
-    /// for the byte-engine work — the current engine does not consult
-    /// them yet; they lock the option shape so wiring them later is non-breaking.
+    /// field here may affect only speed/memory, never which text matches (the
+    /// conformance suite fuzzes over them and pins the match). The byte engine wiring
+    /// consults these at build; the shape is locked so growing it stays non-breaking.
     strategy: Strategy = .{},
 
-    /// The reserved strategy tier (see `strategy`). Kept physically separate from
-    /// the semantic flags above so "these never change a match result" is a
-    /// type-level boundary the conformance suite can fuzz over.
+    /// The strategy tier (see `strategy`). Kept physically separate from the semantic
+    /// flags above so "these never change a match result" is a type-level boundary the
+    /// conformance suite can fuzz over.
     ///
     /// @stable-since: v0.2.0
     pub const Strategy = struct {
-        /// Whether to use the (future) byte DFA: `.auto` lets analysis decide;
-        /// `.enabled`/`.disabled` force it. Currently inert.
+        /// Byte lazy-DFA selection (runtime only — the DFA's cache mutates while
+        /// matching, so the comptime path always stays on the code-point NFA):
+        ///   * `.auto` (default) / `.enabled` — build the byte DFA on an eligible
+        ///     pattern and use it for `isMatch`/`find` (one cached DFA state per byte;
+        ///     5–9× the code-point engine on class scans, never slower) with captures
+        ///     filled by the Pike VM anchored at the DFA span. **Results-invariant.**
+        ///   * `.disabled` — the compact code-point NFA only (minimal memory, no
+        ///     determinization cache; the right pick for match-once / tiny-input use).
+        ///
+        /// @stable-since: v0.3.0 (was inert before — now wired and on by default)
         byte_engine: enum { auto, enabled, disabled } = .auto,
         /// Bake full Unicode `\b` into the (future) byte-DFA state, vs. the default
-        /// quit-to-NFA fallback. Currently inert.
+        /// quit-to-NFA fallback. Currently inert (reserved).
         unicode_word_boundary_in_dfa: bool = false,
-        /// Enable literal prefiltering. Currently inert (the engine's analysis
-        /// prefilter is always on); reserved so it can be made configurable later
-        /// without a breaking change.
+        /// Enable the sound literal/required-byte prefilter (`memchr` start-skip and
+        /// fast-reject from the HIR `Analysis`). On by default; set `false` to force
+        /// the engine to scan without it (benchmarking / pathological inputs where the
+        /// prefilter's probe cost is not repaid).
+        ///
+        /// @stable-since: v0.3.0
         prefilter: bool = true,
     };
 
@@ -443,6 +454,9 @@ fn backendOptions(comptime B: type, comptime opts: Options) B.Options {
             .enabled => .enabled,
             .disabled => .disabled,
         };
+    }
+    if (comptime @hasField(B.Options, "prefilter")) {
+        bo.prefilter = opts.strategy.prefilter;
     }
     return bo;
 }

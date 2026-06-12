@@ -192,16 +192,22 @@ fn encBytes(
 
 // ── Byte-NFA instruction set ──────────────────────────────────────────────────────
 
-/// One byte-NFA instruction. `byte_range` consumes exactly one input byte and falls
-/// through to `pc + 1`; the rest are epsilon transitions or terminal. This is the
-/// byte analogue of `nfa.Inst` — there is no `char`/`range`/`any`/`grapheme`: every
+/// One byte-NFA instruction. `byte_range` consumes one input byte and continues at an
+/// **explicit** successor `next`; the rest are epsilon transitions or terminal. This is
+/// the byte analogue of `nfa.Inst` — there is no `char`/`range`/`any`/`grapheme`: every
 /// consuming construct (literal, class, `.`) is lowered to a chain/alternation of
 /// `byte_range`s by the compiler, so matching needs no decode.
 ///
 /// @stable-since: v0.2.0
 pub const Inst = union(enum) {
-    /// Consume one input byte inside `[lo, hi]`.
-    byte_range: ByteRange,
+    /// Consume one input byte inside `range`, then continue at `next`. The successor is
+    /// **explicit** rather than the implicit `pc + 1`: a linear chain still sets
+    /// `next = pc + 1`, but the class lowering's suffix cache points many predecessors'
+    /// `next` at one **shared tail** node, which is how a Unicode class's byte automaton
+    /// stays small (the common UTF-8 continuation tails are emitted once, not per branch).
+    ///
+    /// @stable-since: v0.3.0
+    byte_range: struct { range: ByteRange, next: u32 },
     /// Record the current byte offset into capture slot `n`.
     save: u32,
     /// Two-way epsilon branch; `a` has higher priority than `b` (leftmost-first).
@@ -258,6 +264,12 @@ const Sizes = struct { insts: u32 };
 
 const Mode = enum { count, emit };
 
+/// Placeholder successor for a `byte_range` whose real successor — the class's
+/// continuation — is not yet known; back-patched once the class is fully emitted (see
+/// `emitScalarRanges`). `maxInt(u32)` can never collide with a real pc (programs are
+/// far smaller), so the back-patch scan distinguishes a true terminal unambiguously.
+const EXIT_SENTINEL: u32 = std.math.maxInt(u32);
+
 /// One compiler body, two modes (`.count` measures the exact instruction count,
 /// `.emit` fills caller buffers with backpatching) — identical control flow, so the
 /// same code serves `buildAlloc` (heap) and `buildComptime` (ro_data), exactly like
@@ -272,17 +284,28 @@ fn Builder(comptime mode: Mode) type {
         patch: []u32 = &.{},
         inst_len: u32 = 0,
         patch_len: u32 = 0,
-        // Per-class alternation bookkeeping. Classes/`.` are HIR *leaves* (they never
-        // nest another class), so a single set of fields is reentrancy-safe.
-        alt_idx: u32 = 0,
-        alt_total: u32 = 0,
-        alt_patch_base: u32 = 0,
+        // Per-class scratch for the suffix-sharing class lowering (`emitScalarRanges`):
+        // `entries` holds each sequence's entry pc (the split tree forward-references
+        // them), `dag_start` bounds the suffix-cache scan to this class's byte-range
+        // DAG, and `seq_idx` walks the sequences. Classes/`.` are HIR *leaves* (never
+        // nested), so one set of fields is reentrancy-safe.
+        entries: if (is_emit) []u32 else void = if (is_emit) undefined else {},
+        seq_idx: u32 = 0,
+        dag_start: u32 = 0,
 
         fn emit(self: *Self, inst: Inst) u32 {
             const i = self.inst_len;
             if (is_emit) self.insts[i] = inst;
             self.inst_len += 1;
             return i;
+        }
+        /// Emit a `byte_range` that falls through to the next instruction (`pc + 1`) —
+        /// the default linear successor. `self.inst_len` is this instruction's own pc,
+        /// so `+ 1` is its fall-through target (the same value in both count and emit
+        /// passes). Suffix-shared tail nodes are emitted by `internTail` with an
+        /// explicit `next` instead.
+        fn emitByteRange(self: *Self, range: ByteRange) u32 {
+            return self.emit(.{ .byte_range = .{ .range = range, .next = self.inst_len + 1 } });
         }
         fn set(self: *Self, idx: u32, inst: Inst) void {
             if (is_emit) self.insts[idx] = inst;
@@ -308,7 +331,7 @@ fn Builder(comptime mode: Mode) type {
                     for (self.h.literals[r.start .. r.start + r.len]) |cp| {
                         var buf: [4]u8 = undefined;
                         const n = utf8.encodeCodePointUnchecked(cp, &buf);
-                        for (buf[0..n]) |b| _ = self.emit(.{ .byte_range = .{ .lo = b, .hi = b } });
+                        for (buf[0..n]) |b| _ = self.emitByteRange(.{ .lo = b, .hi = b });
                     }
                 },
                 .class => {
@@ -348,49 +371,115 @@ fn Builder(comptime mode: Mode) type {
             }
         }
 
-        /// Emit an alternation of the UTF-8 byte sequences covering `ranges` (a class
-        /// or `.`). Counts the sequences first so the LAST branch is emitted without a
-        /// split (mandatory + consuming → a non-matching class kills the thread, never
-        /// falls through). `enumerate` is deterministic, so the count pass and the
-        /// emit pass walk the same sequences in the same order.
+        /// Lower a class (or `.`) — the union of UTF-8 byte `Seq`uences covering
+        /// `ranges` — into a byte sub-automaton, **sharing common suffixes**. A class
+        /// like `\w` fans out to hundreds of sequences whose trailing UTF-8 continuation
+        /// ranges (`[0x80, 0xBF]`) are identical; emitting each sequence as its own
+        /// chain re-emits those tails once per branch — the source of the byte program's
+        /// size blow-up. Instead each sequence's chain is built **back-to-front** through
+        /// a suffix cache (`internTail`): a `(lo, hi, next)` byte-range node already in
+        /// this class's DAG is reused rather than re-emitted, so every sequence ending in
+        /// the same tail converges on one shared node (RE2 / `regex-automata`'s UTF-8
+        /// suffix cache). A class's sequences match disjoint scalars, so they are
+        /// mutually exclusive — the order among them is irrelevant to the result, which
+        /// is what makes the sharing sound.
+        ///
+        /// Shape: a `total - 1` **split tree** comes first (so the class's first
+        /// instruction is its entry, preserving the implicit concat fall-through) and
+        /// forward-references each sequence's entry pc; the shared byte-range DAG follows;
+        /// terminal nodes carry `EXIT_SENTINEL`, back-patched to the class's continuation
+        /// once it is known. Single-sequence classes (ASCII `[a-z]`, a literal scalar)
+        /// skip all of this and emit a plain fall-through chain — no split, no sharing.
         fn emitScalarRanges(self: *Self, ranges: []const Range) void {
-            var total: u32 = 0;
-            for (ranges) |r| total += countSeqs(r.lo, r.hi);
+            if (!is_emit) return self.countClass(ranges);
+
+            const total = countTotalSeqs(ranges);
             if (total == 0) {
-                // Unmatchable class (a fully-negated set): a byte range that no byte
-                // can satisfy, so the thread dies here.
-                _ = self.emit(.{ .byte_range = .{ .lo = 1, .hi = 0 } });
+                // Unmatchable class (a fully-negated set): a byte range no byte
+                // satisfies, so the thread dies here.
+                _ = self.emitByteRange(.{ .lo = 1, .hi = 0 });
                 return;
             }
-            self.alt_idx = 0;
-            self.alt_total = total;
-            self.alt_patch_base = self.patch_len;
-            for (ranges) |r| enumerate(r.lo, r.hi, self, emitSeqBranch);
-            const end = self.pc();
-            while (self.patch_len > self.alt_patch_base) {
-                self.patch_len -= 1;
-                if (is_emit) self.set(self.patch[self.patch_len], .{ .jmp = end });
+            if (total == 1) {
+                // One sequence: a plain chain whose last `byte_range` falls through
+                // (`next = pc + 1`) to the class continuation. Nothing to share.
+                for (ranges) |r| enumerate(r.lo, r.hi, self, emitSeq);
+                return;
             }
+
+            // Multi-sequence: split tree (the entry) → shared suffix DAG.
+            const split_base = self.inst_len;
+            var j: u32 = 0;
+            while (j + 1 < total) : (j += 1) _ = self.emit(.{ .split = .{ .a = 0, .b = 0 } });
+            self.dag_start = self.inst_len;
+            self.seq_idx = 0;
+            for (ranges) |r| enumerate(r.lo, r.hi, self, buildSeqChain);
+
+            // Back-patch the split tree to the sequence entries: `split[j]` tries entry
+            // `j`, else falls to the next split (or, last, to the final entry).
+            j = 0;
+            while (j + 1 < total) : (j += 1) {
+                const a = self.entries[j];
+                const b = if (j + 2 < total) split_base + j + 1 else self.entries[total - 1];
+                self.set(split_base + j, .{ .split = .{ .a = a, .b = b } });
+            }
+
+            // The continuation is the next instruction emitted; point every terminal
+            // (a `byte_range` still carrying `EXIT_SENTINEL`) at it.
+            const end = self.inst_len;
+            var p = self.dag_start;
+            while (p < end) : (p += 1) switch (self.insts[p]) {
+                .byte_range => |r| if (r.next == EXIT_SENTINEL)
+                    self.set(p, .{ .byte_range = .{ .range = r.range, .next = end } }),
+                else => {},
+            };
         }
 
-        /// Emit one alternation branch for `seq`: a split guarding all but the last
-        /// branch, the sequence's `byte_range`s, then a jump to the common end.
-        fn emitSeqBranch(self: *Self, seq: Seq) void {
-            const last = self.alt_idx + 1 == self.alt_total;
-            if (last) {
-                self.emitSeq(seq);
-            } else {
-                const split_at = self.emit(.{ .split = .{ .a = 0, .b = 0 } });
-                const branch = self.pc();
-                self.emitSeq(seq);
-                self.pushPatch(self.emit(.{ .jmp = 0 }));
-                self.set(split_at, .{ .split = .{ .a = branch, .b = self.pc() } });
+        /// Count-pass sizing for a class: the **un-shared** upper bound (`total - 1`
+        /// splits + every sequence's byte length). The emit pass's suffix sharing only
+        /// removes instructions, so this never under-counts — the buffers it sizes stay
+        /// large enough and the program is trimmed to its real length after `build`.
+        fn countClass(self: *Self, ranges: []const Range) void {
+            const total = countTotalSeqs(ranges);
+            if (total == 0) {
+                self.inst_len += 1; // the dead byte_range
+                return;
             }
-            self.alt_idx += 1;
+            const splits = if (total > 1) total - 1 else 0;
+            self.inst_len += splits + sumSeqLens(ranges);
+        }
+
+        /// Build one sequence's chain **back-to-front** through the suffix cache and
+        /// record its entry pc in `entries[seq_idx]`. Walking the last range first lets
+        /// the shared tail (interned with `EXIT_SENTINEL`, back-patched later) already be
+        /// present when the ranges preceding it are interned.
+        fn buildSeqChain(self: *Self, seq: Seq) void {
+            var next: u32 = EXIT_SENTINEL;
+            var k: usize = seq.len;
+            while (k > 0) {
+                k -= 1;
+                next = self.internTail(seq.ranges[k], next);
+            }
+            self.entries[self.seq_idx] = next;
+            self.seq_idx += 1;
+        }
+
+        /// Suffix cache: the pc of an existing `byte_range{range, next}` in this class's
+        /// DAG (scanned from `dag_start`), or a freshly emitted one. Identical
+        /// `(lo, hi, next)` nodes — the common UTF-8 continuation tails — are emitted
+        /// once and shared by every sequence that ends in them. The scan is bounded by
+        /// the class's own (shared, hence small) DAG, not the whole program.
+        fn internTail(self: *Self, range: ByteRange, next: u32) u32 {
+            var p = self.dag_start;
+            while (p < self.inst_len) : (p += 1) switch (self.insts[p]) {
+                .byte_range => |r| if (r.next == next and r.range.lo == range.lo and r.range.hi == range.hi) return p,
+                else => {},
+            };
+            return self.emit(.{ .byte_range = .{ .range = range, .next = next } });
         }
 
         fn emitSeq(self: *Self, seq: Seq) void {
-            for (seq.ranges[0..seq.len]) |br| _ = self.emit(.{ .byte_range = br });
+            for (seq.ranges[0..seq.len]) |br| _ = self.emitByteRange(br);
         }
 
         /// `a|b|c`: a chain of splits, each non-final branch jumping to a common end —
@@ -416,9 +505,36 @@ fn Builder(comptime mode: Mode) type {
             }
         }
 
+        /// Whether the subtree at `idx` contains a capturing group. Used to gate the
+        /// single-copy `x+` form (below): only a **capture-free** body may be deduped,
+        /// because the two encodings can otherwise disagree on the final iteration's
+        /// group spans. Reads only the HIR, so it works in both passes.
+        fn childHasCapture(self: *const Self, idx: u32) bool {
+            const node = self.h.nodes[idx];
+            return switch (node.tag) {
+                .capture => true,
+                .concat, .alternation => {
+                    const d = node.data.children;
+                    for (self.h.children[d.start .. d.start + d.len]) |c| if (self.childHasCapture(c)) return true;
+                    return false;
+                },
+                .repetition => self.childHasCapture(node.data.repetition.child),
+                else => false, // literal, class, any, anchor, grapheme, empty
+            };
+        }
+
         fn compileRepetition(self: *Self, rep: hir.Node.Repetition) error{Unsupported}!void {
+            // An UNBOUNDED `x{min,}` with `min ≥ 1` and a capture-free body compiles to
+            // `x{min-1}` followed by a single-copy `x+` (one body + a split that loops
+            // back), saving one full body copy versus `x{min} · x*` — a real win when
+            // the body is a big Unicode class (`\w+`, `\p{L}+`). A capturing body keeps
+            // the two-copy shape (so the last iteration's group spans are unchanged); an
+            // exact `{n}` / bounded `{n,m}` genuinely needs distinct copies (each has a
+            // different successor), so the DFA — not the NFA — dedups those.
+            const plus_loop = rep.max == null and rep.min >= 1 and !self.childHasCapture(rep.child);
+            const mandatory = if (plus_loop) rep.min - 1 else rep.min;
             var n: u32 = 0;
-            while (n < rep.min) : (n += 1) try self.compileNode(rep.child);
+            while (n < mandatory) : (n += 1) try self.compileNode(rep.child);
 
             if (rep.max) |max| {
                 const base = self.patch_len;
@@ -436,7 +552,15 @@ fn Builder(comptime mode: Mode) type {
                         self.set(si, if (rep.greedy) .{ .split = .{ .a = body, .b = end } } else .{ .split = .{ .a = end, .b = body } });
                     }
                 }
+            } else if (plus_loop) {
+                // `x+`: one body copy, then a split that greedily loops back to it.
+                const body = self.pc();
+                try self.compileNode(rep.child);
+                const split_at = self.emit(.{ .split = .{ .a = 0, .b = 0 } });
+                const after = self.pc();
+                self.set(split_at, if (rep.greedy) .{ .split = .{ .a = body, .b = after } } else .{ .split = .{ .a = after, .b = body } });
             } else {
+                // `x*` (min == 0): a split before the body so it may match zero times.
                 const split_at = self.emit(.{ .split = .{ .a = 0, .b = 0 } });
                 const body = self.pc();
                 try self.compileNode(rep.child);
@@ -460,6 +584,27 @@ fn countSeqs(lo: CodePoint, hi: CodePoint) u32 {
     return c;
 }
 
+/// Total `enumerate` sequences across a class's `ranges` (count and emit agree, since
+/// `enumerate` is deterministic). The split-tree size is `total - 1`.
+fn countTotalSeqs(ranges: []const Range) u32 {
+    var total: u32 = 0;
+    for (ranges) |r| total += countSeqs(r.lo, r.hi);
+    return total;
+}
+
+/// Sum of every sequence's byte length across `ranges` — the un-shared `byte_range`
+/// count, the class's count-pass upper bound (the emit pass shares suffixes and so
+/// emits no more than this).
+fn sumSeqLens(ranges: []const Range) u32 {
+    var sum: u32 = 0;
+    for (ranges) |r| enumerate(r.lo, r.hi, &sum, struct {
+        fn add(p: *u32, seq: Seq) void {
+            p.* += seq.len;
+        }
+    }.add);
+    return sum;
+}
+
 /// Count-only pass: the program is `save 0 · <root> · save 1 · match`.
 fn measure(h: hir.Hir) error{Unsupported}!Sizes {
     var b = Builder(.count){ .h = h };
@@ -470,9 +615,12 @@ fn measure(h: hir.Hir) error{Unsupported}!Sizes {
     return .{ .insts = b.inst_len };
 }
 
-/// Emit pass: fill caller buffers (`insts` ≥ the measured size, `patch` ≥ `insts.len`).
-fn build(h: hir.Hir, insts: []Inst, patch: []u32) error{Unsupported}!Program {
-    var b = Builder(.emit){ .h = h, .insts = insts, .patch = patch };
+/// Emit pass: fill caller buffers (`insts`/`entries` ≥ the measured size, `patch` ≥
+/// `insts.len`). Suffix sharing makes the used prefix of `insts` shorter than the
+/// measured upper bound; the returned `Program.insts` is sub-sliced to the real length
+/// (callers trim the backing store accordingly).
+fn build(h: hir.Hir, insts: []Inst, patch: []u32, entries: []u32) error{Unsupported}!Program {
+    var b = Builder(.emit){ .h = h, .insts = insts, .patch = patch, .entries = entries };
     _ = b.emit(.{ .save = 0 });
     try b.compileNode(h.root);
     _ = b.emit(.{ .save = 1 });
@@ -490,6 +638,49 @@ pub fn byteLowerable(h: hir.Hir) bool {
     return true;
 }
 
+/// Upper bound on a byte program's instruction count, above which lowering is judged
+/// **not worth it** (see `byteWorthLowering`). The byte lowering trades a compact
+/// code-point range *table* (one `range` instruction + a sorted side array) for an
+/// explicit byte *automaton* (see the module header); for a large Unicode class
+/// repeated many times — `\p{L}{40}` — that automaton can reach megabytes, a size at
+/// which the determinized DFA's scan speed no longer pays for the program it is built
+/// from. Ordinary Unicode patterns sit far below this ceiling (`\w+`, `\p{L}+`, and
+/// `\w+@\w+` are all well under it), so the gate only ever fires on pathological
+/// inputs. Deliberately generous: declining the byte path costs only throughput (the
+/// code-point engine is always correct), never a match.
+///
+/// @stable-since: v0.3.0
+pub const max_byte_insts: u32 = 100_000;
+
+/// Whether lowering this HIR to a **byte** program is worth it: byte-lowerable
+/// (`byteLowerable` — no `\X`/`\b`) **and** small enough that the resulting automaton
+/// stays at or under `max_byte_insts`. The `auto` dispatcher consults this (alongside
+/// `dfa.supports`) before building the byte lazy-DFA arm — a pattern that is
+/// byte-lowerable but whose byte automaton would be pathologically large (a big
+/// Unicode class repeated many times) returns `false`, so `auto` keeps it on the
+/// compact code-point engine instead of emitting a multi-megabyte program for a
+/// marginal speedup. The size estimate is the `.count`-pass instruction total, which
+/// is a sound **upper bound** on the final (suffix-shared, trimmed) program, so this
+/// never under-counts and a `true` is always safe. Results-invariant: the answer only
+/// changes which engine executes, never the match it produces.
+///
+/// @stable-since: v0.3.0
+pub fn byteWorthLowering(h: hir.Hir) bool {
+    const sizes = measure(h) catch return false; // not byte-lowerable (\X / \b)
+    return sizes.insts <= max_byte_insts;
+}
+
+/// The exact byte-program instruction count for `h`, or null if `h` is not byte-lowerable
+/// (`\X`/`\b`). A cheap size probe — it runs only the `.count` pass, no emit — for a caller
+/// choosing whether to pay for an eager determinization (e.g. `auto` gating its comptime
+/// CTRE-lane DFA on size, so a big Unicode class is not determinized at compile time).
+///
+/// @stable-since: v0.3.0
+pub fn instCount(h: hir.Hir) ?u32 {
+    const sizes = measure(h) catch return null;
+    return sizes.insts;
+}
+
 /// Compile a HIR into a heap-allocated byte `Program` (free with `freeProgram`).
 ///
 /// @stable-since: v0.2.0
@@ -499,7 +690,13 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir) BuildError!Program {
     errdefer gpa.free(insts);
     const patch = try gpa.alloc(u32, sizes.insts); // backpatch stack ≤ #insts
     defer gpa.free(patch);
-    return build(h, insts, patch) catch return error.Unsupported;
+    const entries = try gpa.alloc(u32, sizes.insts); // sequence entries ≤ #insts per class
+    defer gpa.free(entries);
+    var prog = build(h, insts, patch, entries) catch return error.Unsupported;
+    // Suffix sharing leaves `insts` shorter than the measured upper bound; return the
+    // slack so `freeProgram` releases exactly what `Program.insts` holds.
+    if (prog.insts.len != insts.len) prog.insts = try gpa.realloc(insts, prog.insts.len);
+    return prog;
 }
 
 /// Compile a HIR into a ro_data byte `Program` at comptime.
@@ -507,11 +704,18 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir) BuildError!Program {
 /// @stable-since: v0.2.0
 pub fn buildComptime(comptime h: hir.Hir) Program {
     const work: u64 = @as(u64, h.nodes.len) + h.literals.len + h.ranges.len;
-    @setEvalBranchQuota(@intCast(@min(20_000 + work * 200, std.math.maxInt(u32))));
+    // The suffix cache scans a class's growing DAG per tail node, so emit work scales
+    // roughly with the square of a class's sequence count (≈ its range count). Size the
+    // quota for that. (Unicode classes only build at comptime when a caller explicitly
+    // bakes a byte program — `auto` never does — so this floor stays unused in the
+    // common, small comptime patterns; a caller may always raise it further.)
+    const rsq: u64 = @as(u64, h.ranges.len) * h.ranges.len;
+    @setEvalBranchQuota(@intCast(@min(50_000 + work * 200 + rsq * 40, std.math.maxInt(u32))));
     const sizes = comptime (measure(h) catch @compileError("byte: HIR is not byte-lowerable (\\X grapheme or \\b word boundary)"));
     comptime var insts: [sizes.insts]Inst = undefined;
     comptime var patch: [sizes.insts]u32 = undefined;
-    const prog = build(h, &insts, &patch) catch unreachable;
+    comptime var entries: [sizes.insts]u32 = undefined;
+    const prog = build(h, &insts, &patch, &entries) catch unreachable;
     const final = insts[0..prog.insts.len].*;
     return .{ .insts = &final, .slot_count = prog.slot_count };
 }
@@ -561,9 +765,9 @@ pub fn byteClasses(prog: *const Program) ByteClasses {
     for (prog.insts) |inst| {
         switch (inst) {
             .byte_range => |r| {
-                if (r.lo > r.hi) continue; // dead range: matches nothing
-                boundary[r.hi] = true;
-                if (r.lo > 0) boundary[r.lo - 1] = true;
+                if (r.range.lo > r.range.hi) continue; // dead range: matches nothing
+                boundary[r.range.hi] = true;
+                if (r.range.lo > 0) boundary[r.range.lo - 1] = true;
             },
             else => {},
         }
@@ -684,7 +888,7 @@ const Acceptor = struct {
             .split => |s| return self.run(s.a, sp) orelse self.run(s.b, sp),
             .assertion => |k| return if (assertionHolds(k, self.input, sp)) self.run(pc + 1, sp) else null,
             .byte_range => |r| {
-                if (sp < self.input.len and r.contains(self.input[sp])) return self.run(pc + 1, sp + 1);
+                if (sp < self.input.len and r.range.contains(self.input[sp])) return self.run(r.next, sp + 1);
                 return null;
             },
         }
@@ -784,8 +988,8 @@ test "byte classes are sound and contiguous" {
                 if (classes.get(bx) != classes.get(by)) continue;
                 for (prog.insts) |inst| switch (inst) {
                     .byte_range => |r| {
-                        if (r.lo > r.hi) continue;
-                        if (r.contains(bx) != r.contains(by)) return error.ClassNotSound;
+                        if (r.range.lo > r.range.hi) continue;
+                        if (r.range.contains(bx) != r.range.contains(by)) return error.ClassNotSound;
                     },
                     else => {},
                 };
@@ -825,6 +1029,28 @@ test "byte program builds at comptime (ro_data)" {
     };
     const prog = comptime buildComptime(h);
     try testing.expect(prog.insts.len > 0);
+}
+
+test "byteWorthLowering gates pathological patterns, keeps normal ones" {
+    const gpa = testing.allocator;
+    const core = @import("../core/root.zig");
+    const Case = struct { pat: []const u8, worth: bool };
+    const cases = [_]Case{
+        .{ .pat = "[a-z]+", .worth = true },
+        .{ .pat = "\\w+", .worth = true },
+        .{ .pat = "\\p{L}+", .worth = true },
+        .{ .pat = "\\w+@\\w+", .worth = true }, // common, big-ish, still worth the DFA
+        .{ .pat = "\\p{L}{60}", .worth = false }, // ~60 copies of a 4.7k-inst class
+        .{ .pat = "a\\Xb", .worth = false }, // not byte-lowerable at all (\X)
+    };
+    inline for (cases) |c| {
+        var diag: core.errors.Diagnostic = .{};
+        const ast = try core.compile.parse(gpa, c.pat, &diag);
+        defer ast.deinit(gpa);
+        const h = try hir.buildAlloc(gpa, ast, .{});
+        defer hir.deinitHir(gpa, h);
+        try testing.expectEqual(c.worth, byteWorthLowering(h));
+    }
 }
 
 test {

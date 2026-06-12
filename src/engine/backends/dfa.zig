@@ -44,19 +44,22 @@
 //!     the *unanchored* automaton (`ustep`/`utrans`): every byte re-seeds the start into
 //!     the live state — the implicit `(?s:.)*?` prefix — and it accepts the instant the
 //!     state is accepting. A single forward scan; no per-position restart.
-//!   * **`find` locates the leftmost *start* by an anchored restart** (no reverse DFA
-//!     yet): it runs the DFA anchored at each candidate position, left to right; the
-//!     first that accepts is the leftmost start, and the last accepting position from
-//!     there is the leftmost-first end. The transition cache is shared across positions
-//!     and searches, so determinization is amortized. A non-matching start usually dies
-//!     in one `step`; the worst case is a pattern that can *begin* but not *complete* at
-//!     many positions — e.g. `\w+@\w+` on a long word run with sparse `@` — which is
-//!     **quadratic**. This is NOT helped by `auto`'s prefilter (below): `\w+@\w+` starts
-//!     with a class, so it has no leading literal. The real fix is an *interior*
-//!     required-byte prefilter (`memchr` the rare `@`, scan outward) — which needs HIR
-//!     `analysis.required_bytes` surfaced separately from `prefix_literal` — or a reverse
-//!     DFA; both are future work. A leading `\A`/`^` (`anchored_start`) tries only
-//!     offset 0, which is where anchored restart has no weakness.
+//!   * **`find` is O(input) via the reverse DFA** — a forward pass + a reverse pass, no
+//!     per-position restart. The **forward** pass (`findEndForward`) locates the leftmost
+//!     match *end*: it re-seeds the start each byte (`ustep`) until the first match — so
+//!     the earliest-starting thread wins by priority — then switches to the anchored
+//!     `step` to extend that match greedily; the last accepting position is the
+//!     leftmost-first end. The **reverse** DFA (`revFind`), anchored at that end and
+//!     scanning *backward* over the reverse automaton (`ReverseAdj`), locates the leftmost
+//!     *start*: the smallest position from which `[s, end)` is a full match. This kills
+//!     the old anchored-restart **quadratic** worst case — a pattern that can *begin* but
+//!     not *complete* at many positions (`\w+@\w+` on a long word run, `[ab]*c`) — which is
+//!     now two linear passes. The reverse transitions are a plain subset construction (no
+//!     priority or cut — the end is already fixed, so we only need *reachability* of the
+//!     forward start), cached like the forward ones. A leading `\A`/`^` (`anchored_start`)
+//!     still tries only offset 0; a pattern with an *interior* `text_start` (rare, not
+//!     fully `anchored_start`) keeps anchored restart so the reverse transitions stay
+//!     position-independent.
 //!
 //! ## Prefilter (only via `auto`, and only for *leading*-literal patterns)
 //!
@@ -157,6 +160,22 @@ pub const Program = struct {
     ///
     /// @stable-since: v0.3.0
     anchored_start: bool,
+    /// True when the byte program contains a `text_start` assertion (`\A`/`^`) yet is not
+    /// fully `anchored_start` (e.g. `^abc|def`). Such a pattern keeps `find` on the
+    /// anchored-restart scan (which evaluates `text_start` per start position), so the
+    /// reverse-DFA `find` — whose cached reverse transitions must be **position-
+    /// independent** — excludes it. The vast majority of patterns have no assertion and
+    /// take the O(n) reverse-DFA path.
+    ///
+    /// @stable-since: v0.3.0
+    has_text_start: bool,
+    /// Reverse adjacency of the byte automaton, driving the reverse-DFA `find` (forward
+    /// scan locates the leftmost match **end** in one pass; the reverse DFA, anchored at
+    /// that end, locates the leftmost **start** — replacing the Θ(n²) anchored restart).
+    /// `built == false` (and the slices empty) for `has_text_start` programs.
+    ///
+    /// @stable-since: v0.3.0
+    rev: ReverseAdj,
 };
 
 /// Whether this HIR can run on the lazy DFA: byte-lowerable (no `\X`/`\b`) **and**
@@ -175,6 +194,162 @@ pub fn supports(h: hir.Hir) bool {
     return true;
 }
 
+/// Reverse adjacency of the byte automaton: the predecessors of each pc, in CSR form, so
+/// the reverse DFA can walk the automaton **backward** from a match end to the match
+/// start. Built only for assertion-free programs (the reverse-DFA `find` path), where
+/// every epsilon edge is a plain `split`/`jmp`/`save` — no position-dependent `text_start`
+/// to evaluate — which is what keeps the reverse transitions cacheable.
+///
+/// @stable-since: v0.3.0
+pub const ReverseAdj = struct {
+    /// CSR reverse-epsilon: `eps[eps_off[pc] .. eps_off[pc+1]]` are the forward-epsilon
+    /// **predecessors** of `pc` (every `u` with a forward `u →ε pc`: a `split` to `pc`, a
+    /// `jmp` to `pc`, or a `save` at `pc-1`).
+    eps_off: []const u32,
+    eps: []const u32,
+    /// CSR reverse-byte: `[rb_off[pc] .. rb_off[pc+1]]` are the `byte_range`s whose
+    /// `next == pc` — consuming a byte in `[rb_lo, rb_hi]` *backward* goes from `pc` to
+    /// `rb_src` (the byte_range's own pc).
+    rb_off: []const u32,
+    rb_lo: []const u8,
+    rb_hi: []const u8,
+    rb_src: []const u32,
+    /// `byte_target[pc]` — is `pc` the `next` of some `byte_range` (i.e. has a reverse-byte
+    /// out-edge)? Only such pcs are reverse-DFA state members (the reverse analogue of a
+    /// forward state's `byte_range` pcs).
+    byte_target: []const bool,
+    /// The forward `match` pcs — the reverse DFA's start seeds (it begins "at the match"
+    /// and walks back to `pc 0`, the forward start = the reverse accept).
+    match_seed: []const u32,
+    /// Whether this adjacency was actually built (false + empty slices for a
+    /// `has_text_start` program, which uses anchored restart instead).
+    built: bool,
+};
+
+const empty_rev = ReverseAdj{
+    .eps_off = &.{},  .eps = &.{},     .rb_off = &.{},      .rb_lo = &.{}, .rb_hi = &.{},
+    .rb_src = &.{},   .byte_target = &.{}, .match_seed = &.{}, .built = false,
+};
+
+/// In-place exclusive prefix sum: each slot becomes the sum of all earlier slots, so an
+/// array of per-pc in-edge **counts** becomes the per-pc CSR **start offsets** (and the
+/// final slot the total).
+fn prefixSum(arr: []u32) void {
+    var acc: u32 = 0;
+    for (arr) |*v| {
+        const c = v.*;
+        v.* = acc;
+        acc += c;
+    }
+}
+
+/// Build the reverse adjacency from an assertion-free byte program (two passes: count
+/// in-edges per pc, prefix-sum to offsets, fill).
+fn buildReverse(gpa: std.mem.Allocator, bp: byte.Program) Err!ReverseAdj {
+    const n: u32 = @intCast(bp.insts.len);
+    const eps_off = try gpa.alloc(u32, n + 1);
+    errdefer gpa.free(eps_off);
+    const rb_off = try gpa.alloc(u32, n + 1);
+    errdefer gpa.free(rb_off);
+    const byte_target = try gpa.alloc(bool, n);
+    errdefer gpa.free(byte_target);
+    @memset(eps_off, 0);
+    @memset(rb_off, 0);
+    @memset(byte_target, false);
+
+    var n_match: u32 = 0;
+    for (bp.insts, 0..) |inst, i| switch (inst) {
+        .byte_range => |r| {
+            rb_off[r.next] += 1;
+            byte_target[r.next] = true;
+        },
+        .split => |s| {
+            eps_off[s.a] += 1;
+            eps_off[s.b] += 1;
+        },
+        .jmp => |t| eps_off[t] += 1,
+        .save => eps_off[i + 1] += 1,
+        .assertion => unreachable, // buildReverse is only called for assertion-free programs
+        .match => n_match += 1,
+    };
+    prefixSum(eps_off);
+    prefixSum(rb_off);
+
+    const eps = try gpa.alloc(u32, eps_off[n]);
+    errdefer gpa.free(eps);
+    const rb_lo = try gpa.alloc(u8, rb_off[n]);
+    errdefer gpa.free(rb_lo);
+    const rb_hi = try gpa.alloc(u8, rb_off[n]);
+    errdefer gpa.free(rb_hi);
+    const rb_src = try gpa.alloc(u32, rb_off[n]);
+    errdefer gpa.free(rb_src);
+    const match_seed = try gpa.alloc(u32, n_match);
+    errdefer gpa.free(match_seed);
+
+    const ec = try gpa.alloc(u32, n); // per-pc fill cursor (epsilon)
+    defer gpa.free(ec);
+    @memcpy(ec, eps_off[0..n]);
+    const rc = try gpa.alloc(u32, n); // per-pc fill cursor (byte)
+    defer gpa.free(rc);
+    @memcpy(rc, rb_off[0..n]);
+
+    var mi: u32 = 0;
+    for (bp.insts, 0..) |inst, i| {
+        const pc: u32 = @intCast(i);
+        switch (inst) {
+            .byte_range => |r| {
+                const k = rc[r.next];
+                rc[r.next] += 1;
+                rb_lo[k] = r.range.lo;
+                rb_hi[k] = r.range.hi;
+                rb_src[k] = pc;
+            },
+            .split => |s| {
+                eps[ec[s.a]] = pc;
+                ec[s.a] += 1;
+                eps[ec[s.b]] = pc;
+                ec[s.b] += 1;
+            },
+            .jmp => |t| {
+                eps[ec[t]] = pc;
+                ec[t] += 1;
+            },
+            .save => {
+                eps[ec[i + 1]] = pc;
+                ec[i + 1] += 1;
+            },
+            .assertion => unreachable,
+            .match => {
+                match_seed[mi] = pc;
+                mi += 1;
+            },
+        }
+    }
+    return .{
+        .eps_off = eps_off,
+        .eps = eps,
+        .rb_off = rb_off,
+        .rb_lo = rb_lo,
+        .rb_hi = rb_hi,
+        .rb_src = rb_src,
+        .byte_target = byte_target,
+        .match_seed = match_seed,
+        .built = true,
+    };
+}
+
+fn freeReverse(gpa: std.mem.Allocator, rev: *ReverseAdj) void {
+    if (!rev.built) return;
+    gpa.free(rev.eps_off);
+    gpa.free(rev.eps);
+    gpa.free(rev.rb_off);
+    gpa.free(rev.rb_lo);
+    gpa.free(rev.rb_hi);
+    gpa.free(rev.rb_src);
+    gpa.free(rev.byte_target);
+    gpa.free(rev.match_seed);
+}
+
 /// Compile a HIR into a heap-allocated DFA `Program` (free with `freeProgram`).
 /// A pattern this backend cannot run (`\X`/`\b`/`$`/line anchors) is rejected with
 /// `error.Unsupported`; `auto` then keeps it on the code-point engines.
@@ -185,20 +360,31 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     var bp = try byte.buildAlloc(gpa, h);
     errdefer byte.freeProgram(gpa, &bp);
     // Defensive: only `text_start` assertions are DFA-evaluable here (at offset 0);
-    // `supports` already excludes the rest, but double-check the lowered program.
+    // `supports` already excludes the rest, but double-check the lowered program — and
+    // note whether any `text_start` is present (it forces the anchored-restart `find`).
+    var has_text_start = false;
     for (bp.insts) |inst| switch (inst) {
-        .assertion => |k| if (k != .text_start) return error.Unsupported,
+        .assertion => |k| {
+            if (k != .text_start) return error.Unsupported;
+            has_text_start = true;
+        },
         else => {},
     };
     const classes = byte.byteClasses(&bp);
     var class_rep: [256]u8 = @splat(0);
     var b: u16 = 0;
     while (b < 256) : (b += 1) class_rep[classes.map[b]] = @intCast(b);
+    // Reverse adjacency for the O(n) reverse-DFA `find` — only for assertion-free
+    // programs (the common case); `has_text_start` patterns keep anchored restart.
+    var rev = if (has_text_start) empty_rev else try buildReverse(gpa, bp);
+    errdefer freeReverse(gpa, &rev);
     return .{
         .byte_prog = bp,
         .classes = classes,
         .class_rep = class_rep,
         .anchored_start = h.analysis.anchored_start,
+        .has_text_start = has_text_start,
+        .rev = rev,
     };
 }
 
@@ -206,6 +392,7 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
 ///
 /// @stable-since: v0.3.0
 pub fn freeProgram(gpa: std.mem.Allocator, program: *Program) void {
+    freeReverse(gpa, &program.rev);
     byte.freeProgram(gpa, &program.byte_prog);
 }
 
@@ -284,6 +471,18 @@ pub const Scratch = struct {
     work_match: bool = false,
     seeds: []u32, // successor pcs feeding the next closure
 
+    // ── reverse-DFA cache (the O(n) reverse `find`; set-based, no priority/cut) ──
+    // Reverse states are sets of forward pcs (sorted, so set-equal states intern equal),
+    // independent of the forward cache (they hold program pcs, not forward state ids), so
+    // a forward eviction never invalidates them. The work buffers above are reused (a
+    // `find` runs the forward scan to completion, then the reverse — never interleaved).
+    r_intern: InternMap = .empty,
+    r_states: std.ArrayListUnmanaged([]const u32) = .empty,
+    r_accept: std.ArrayListUnmanaged(bool) = .empty, // does the state contain pc 0 (reverse accept)?
+    r_trans: std.ArrayListUnmanaged(u32) = .empty, // r_state × nclass, UNKNOWN until computed
+    r_start: u32 = DEAD,
+    r_start_ready: bool = false,
+
     /// Construct a cache-backed `Scratch` with the default cache budget
     /// (`ScratchOptions{}`).
     ///
@@ -348,6 +547,11 @@ pub const Scratch = struct {
         self.trans.deinit(gpa);
         self.utrans.deinit(gpa);
         self.intern.deinit(gpa);
+        for (self.r_states.items) |o| gpa.free(o);
+        self.r_states.deinit(gpa);
+        self.r_accept.deinit(gpa);
+        self.r_trans.deinit(gpa);
+        self.r_intern.deinit(gpa);
         gpa.free(self.seen);
         gpa.free(self.stack);
         gpa.free(self.work);
@@ -502,8 +706,8 @@ pub const Scratch = struct {
         const cached = self.trans.items[idx];
         if (cached != UNKNOWN) return cached;
 
-        // Successors: pc+1 of every `byte_range` in this state that contains the class
-        // representative, in the state's (priority) order.
+        // Successors: the `next` of every `byte_range` in this state that contains the
+        // class representative, in the state's (priority) order.
         const rep = program.class_rep[class];
         var ns: usize = 0;
         self.collectSeeds(program, state_id, rep, &ns);
@@ -533,12 +737,12 @@ pub const Scratch = struct {
         return next;
     }
 
-    /// Append `pc+1` for every `byte_range` in `state_id` that contains `rep`, in the
-    /// state's priority order. Shared by `step`/`ustep`.
+    /// Append the explicit successor `next` of every `byte_range` in `state_id` that
+    /// contains `rep`, in the state's priority order. Shared by `step`/`ustep`.
     fn collectSeeds(self: *Scratch, program: *const Program, state_id: u32, rep: u8, ns: *usize) void {
         for (self.states.items[state_id]) |pc| switch (program.byte_prog.insts[pc]) {
-            .byte_range => |r| if (r.lo <= r.hi and r.contains(rep)) {
-                self.seeds[ns.*] = pc + 1;
+            .byte_range => |r| if (r.range.lo <= r.range.hi and r.range.contains(rep)) {
+                self.seeds[ns.*] = r.next;
                 ns.* += 1;
             },
             .match => {}, // terminal: no outgoing edge
@@ -567,21 +771,58 @@ pub const Scratch = struct {
         var match_end: ?usize = if (self.state_match.items[state]) s else null;
         if (match_end != null and earliest) return match_end;
 
+        // ── Warm-path pointer cache ──
+        // The per-byte loop is a tight array walk over raw `[*]` pointers, *not* the
+        // ArrayList `.items[...]` accessor: that accessor reloads `.ptr` on every byte
+        // (the bound `self`-mutating `step` call boundary forces it), turning each
+        // transition into a pointer reload + slice-bounds check. Hoisting the bases here
+        // and indexing `[*]` directly keeps the warm transition a single load.
+        //
+        // INVALIDATION: a COLD `step` may grow `trans`/`state_match` (an all-UNKNOWN row
+        // is appended per new state) and so **realloc** their backing buffer — every
+        // cached pointer below would dangle. A `flushPreserving` reallocs everything too.
+        // So both bases are **re-fetched after any cold transition or flush** (and never
+        // touched on the warm path, which cannot grow the tables).
+        var trans: [*]const u32 = self.trans.items.ptr;
+        var accept: [*]const bool = self.state_match.items.ptr;
+        const map: *const [256]u8 = &program.classes.map;
+        const nclass: usize = self.nclass;
+
         var pos = s;
         while (pos < input.len) {
-            const class = program.classes.get(input[pos]);
+            const class = map[input[pos]];
+            const next = trans[@as(usize, state) * nclass + class];
+            if (next != UNKNOWN) {
+                // Warm path: memoized edge. No `try`, no table growth, no budget check —
+                // `cache_bytes` cannot change here.
+                state = next;
+                if (state == DEAD) break;
+                pos += 1;
+                if (accept[state]) {
+                    match_end = pos;
+                    if (earliest) break;
+                }
+                continue;
+            }
+            // Cold path: compute + memoize the edge (may realloc the tables, and may push
+            // `cache_bytes` over budget). Re-fetch the bases, then enforce the budget — the
+            // only point `cache_bytes` grows, so the per-byte budget check is gone.
             state = try self.step(program, state, class);
+            trans = self.trans.items.ptr;
+            accept = self.state_match.items.ptr;
             if (state == DEAD) break;
             pos += 1;
-            if (self.state_match.items[state]) {
+            if (accept[state]) {
                 match_end = pos;
                 if (earliest) break;
             }
-            // Bound the cache mid-scan. Inlined (not a per-byte call): `cache_bytes` only
-            // grows on a cold transition, so this compare is branch-predicted false on
-            // every warm byte; the flush itself is rare.
-            if (self.opts.on_full != .grow and self.cache_bytes > self.opts.max_bytes)
+            // Bound the cache mid-scan (only reachable just after a cold transition that
+            // grew `cache_bytes`). After a flush, the tables are reallocated → re-fetch.
+            if (self.opts.on_full != .grow and self.cache_bytes > self.opts.max_bytes) {
                 state = try self.flushPreserving(program, state, flushes);
+                trans = self.trans.items.ptr;
+                accept = self.state_match.items.ptr;
+            }
         }
         return match_end;
     }
@@ -593,16 +834,272 @@ pub const Scratch = struct {
     fn runUnanchored(self: *Scratch, program: *const Program, input: []const u8, start: usize, flushes: *u32) Err!bool {
         var state = if (start == 0) self.start0 else self.startN;
         if (self.state_match.items[state]) return true;
+
+        // Warm-path pointer cache — same rationale as `runAnchored`, over the *unanchored*
+        // table `utrans`. INVALIDATION: a cold `ustep` may realloc `utrans`/`state_match`
+        // (new-state row append), and a flush reallocs everything, so both bases are
+        // re-fetched after any cold transition or flush; the warm path never grows them.
+        var utrans: [*]const u32 = self.utrans.items.ptr;
+        var accept: [*]const bool = self.state_match.items.ptr;
+        const map: *const [256]u8 = &program.classes.map;
+        const nclass: usize = self.nclass;
+
         var pos = start;
         while (pos < input.len) {
-            const class = program.classes.get(input[pos]);
+            const class = map[input[pos]];
+            const next = utrans[@as(usize, state) * nclass + class];
+            if (next != UNKNOWN) {
+                // Warm path: no `try`, no growth, no budget check.
+                state = next;
+                if (accept[state]) return true;
+                pos += 1;
+                continue;
+            }
+            // Cold path: compute + cache (may realloc → re-fetch the bases) and, only here,
+            // honour the budget (the sole place `cache_bytes` grows).
             state = try self.ustep(program, state, class);
-            if (self.state_match.items[state]) return true;
+            utrans = self.utrans.items.ptr;
+            accept = self.state_match.items.ptr;
+            if (accept[state]) return true;
             pos += 1;
-            if (self.opts.on_full != .grow and self.cache_bytes > self.opts.max_bytes)
+            if (self.opts.on_full != .grow and self.cache_bytes > self.opts.max_bytes) {
                 state = try self.flushPreserving(program, state, flushes);
+                utrans = self.utrans.items.ptr;
+                accept = self.state_match.items.ptr;
+            }
         }
         return false;
+    }
+
+    // ── Reverse-DFA find: forward leftmost END, then reverse leftmost START (O(n)) ──
+
+    /// Find the END offset of the leftmost-first match at or after `start`, or null.
+    /// Phase 1 (unmatched): scan with `ustep` (re-seeding the start each byte — the
+    /// implicit `.*?` prefix) so the FIRST accepting state corresponds to the earliest
+    /// starting thread (priority order makes older threads win the match cut). Phase 2
+    /// (matched): once a match is seen the leftmost start is fixed, so switch to the
+    /// anchored `step` and extend the matched thread greedily; the last accepting position
+    /// before it dies is the leftmost-first end. (Assertion-free programs only —
+    /// `searchImpl` routes `text_start` patterns to anchored restart.)
+    fn findEndForward(self: *Scratch, program: *const Program, input: []const u8, start: usize, flushes: *u32) Err!?usize {
+        var state = if (start == 0) self.start0 else self.startN;
+        var matched = self.state_match.items[state];
+        var end: ?usize = if (matched) start else null;
+
+        // Warm-path pointer cache — both forward tables are live here: `utrans` drives the
+        // pre-match re-seeding scan (phase 1), `trans` the post-match greedy extension
+        // (phase 2); `state_match` (`accept`) is read in both. INVALIDATION: a cold
+        // `step`/`ustep` may realloc any of the three (new-state row append), and a flush
+        // reallocs everything — so every base is re-fetched after any cold transition or
+        // flush. The warm path never grows the tables.
+        var trans: [*]const u32 = self.trans.items.ptr;
+        var utrans: [*]const u32 = self.utrans.items.ptr;
+        var accept: [*]const bool = self.state_match.items.ptr;
+        const map: *const [256]u8 = &program.classes.map;
+        const nclass: usize = self.nclass;
+
+        var pos = start;
+        while (pos < input.len) {
+            const class = map[input[pos]];
+            if (matched) {
+                const idx = @as(usize, state) * nclass + class;
+                var next = trans[idx];
+                if (next == UNKNOWN) {
+                    // Cold: compute + cache (may realloc → re-fetch), then budget-check.
+                    next = try self.step(program, state, class);
+                    trans = self.trans.items.ptr;
+                    utrans = self.utrans.items.ptr;
+                    accept = self.state_match.items.ptr;
+                    if (next == DEAD) break; // the matched thread is exhausted
+                    state = next;
+                    pos += 1;
+                    if (accept[state]) end = pos;
+                    if (self.opts.on_full != .grow and self.cache_bytes > self.opts.max_bytes) {
+                        state = try self.flushPreserving(program, state, flushes);
+                        trans = self.trans.items.ptr;
+                        utrans = self.utrans.items.ptr;
+                        accept = self.state_match.items.ptr;
+                    }
+                    continue;
+                }
+                // Warm: memoized edge, no growth, no budget check.
+                if (next == DEAD) break;
+                state = next;
+                pos += 1;
+                if (accept[state]) end = pos;
+            } else {
+                // Re-seeding scan: never breaks on an empty state — `ustep` re-seeds the
+                // start, so a match can still begin at a later byte.
+                const idx = @as(usize, state) * nclass + class;
+                const next = utrans[idx];
+                if (next == UNKNOWN) {
+                    // Cold: compute + cache (may realloc → re-fetch), then budget-check.
+                    state = try self.ustep(program, state, class);
+                    trans = self.trans.items.ptr;
+                    utrans = self.utrans.items.ptr;
+                    accept = self.state_match.items.ptr;
+                    pos += 1;
+                    if (accept[state]) {
+                        matched = true;
+                        end = pos;
+                    }
+                    if (self.opts.on_full != .grow and self.cache_bytes > self.opts.max_bytes) {
+                        state = try self.flushPreserving(program, state, flushes);
+                        trans = self.trans.items.ptr;
+                        utrans = self.utrans.items.ptr;
+                        accept = self.state_match.items.ptr;
+                    }
+                    continue;
+                }
+                // Warm: memoized edge, no growth, no budget check.
+                state = next;
+                pos += 1;
+                if (accept[state]) {
+                    matched = true;
+                    end = pos;
+                }
+            }
+        }
+        return end;
+    }
+
+    /// Epsilon-closure (reverse) of `seeds` into `work`: follow reverse-epsilon edges,
+    /// collecting `byte_target` pcs (the reverse state members) and setting `work_match`
+    /// when pc 0 (the forward start = reverse accept) is reached. No priority, no cut — a
+    /// reverse state is a plain set, since the end is already fixed and we only need "is
+    /// `[s, end)` a match" (reachability of pc 0).
+    fn revClosure(self: *Scratch, program: *const Program, seeds: []const u32) void {
+        const rev = &program.rev;
+        self.seen_gen +%= 1;
+        const gen = self.seen_gen;
+        self.work_len = 0;
+        self.work_match = false;
+        for (seeds) |seed| {
+            var top: usize = 0;
+            self.stack[top] = seed;
+            top += 1;
+            while (top > 0) {
+                top -= 1;
+                const pc = self.stack[top];
+                if (self.seen[pc] == gen) continue;
+                self.seen[pc] = gen;
+                if (pc == 0) self.work_match = true; // forward start reachable = reverse accept
+                // Collect byte_target pcs (have reverse-byte out-edges) AND pc 0 (the
+                // accept). Including pc 0 as a member is what keeps an "accepting but no
+                // byte edges" state's key (`[0]`) distinct from the DEAD empty set (`[]`)
+                // when interned — otherwise its accept flag would collide with DEAD's.
+                if (rev.byte_target[pc] or pc == 0) {
+                    self.work[self.work_len] = pc;
+                    self.work_len += 1;
+                }
+                var e: usize = rev.eps_off[pc];
+                const e_end = rev.eps_off[pc + 1];
+                while (e < e_end) : (e += 1) {
+                    const u = rev.eps[e];
+                    if (self.seen[u] != gen) {
+                        self.stack[top] = u;
+                        top += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Intern the reverse state in `work[0..work_len]` (sorted, so set-equal states
+    /// collapse to one id) to a dense reverse-state id, appending its accept flag and an
+    /// all-`UNKNOWN` transition row on first sight.
+    fn revInternState(self: *Scratch) Err!u32 {
+        std.mem.sort(u32, self.work[0..self.work_len], {}, std.sort.asc(u32));
+        const key = self.work[0..self.work_len];
+        const gop = try self.r_intern.getOrPut(self.gpa, key);
+        if (gop.found_existing) return gop.value_ptr.*;
+        const owned = try self.gpa.dupe(u32, key);
+        gop.key_ptr.* = owned;
+        const id: u32 = @intCast(self.r_states.items.len);
+        gop.value_ptr.* = id;
+        try self.r_states.append(self.gpa, owned);
+        try self.r_accept.append(self.gpa, self.work_match);
+        try self.r_trans.appendNTimes(self.gpa, UNKNOWN, self.nclass);
+        return id;
+    }
+
+    /// The next reverse state from `state_id` on byte-`class` (memoized): consume the
+    /// class representative *backward* — from each byte_target pc in the state, follow its
+    /// reverse-byte edges to the `byte_range`s that lead into it — then close.
+    fn revStep(self: *Scratch, program: *const Program, state_id: u32, class: u32) Err!u32 {
+        const idx = @as(usize, state_id) * self.nclass + class;
+        const cached = self.r_trans.items[idx];
+        if (cached != UNKNOWN) return cached;
+        const rep = program.class_rep[class];
+        const rev = &program.rev;
+        var ns: usize = 0;
+        for (self.r_states.items[state_id]) |pc| {
+            var b: usize = rev.rb_off[pc];
+            const b_end = rev.rb_off[pc + 1];
+            while (b < b_end) : (b += 1) {
+                if (rep >= rev.rb_lo[b] and rep <= rev.rb_hi[b]) {
+                    self.seeds[ns] = rev.rb_src[b];
+                    ns += 1;
+                }
+            }
+        }
+        self.revClosure(program, self.seeds[0..ns]);
+        const next = try self.revInternState();
+        self.r_trans.items[@as(usize, state_id) * self.nclass + class] = next;
+        return next;
+    }
+
+    /// Intern the reverse DEAD sink (empty set, id 0) and the reverse start (the closure
+    /// of the forward `match` pcs). Idempotent across searches.
+    fn ensureRevStart(self: *Scratch, program: *const Program) Err!void {
+        if (self.r_start_ready) return;
+        self.work_len = 0;
+        self.work_match = false;
+        std.debug.assert((try self.revInternState()) == DEAD); // empty set = DEAD
+        self.revClosure(program, program.rev.match_seed);
+        self.r_start = try self.revInternState();
+        self.r_start_ready = true;
+    }
+
+    /// Leftmost match START for a match known to end at `end`, searching down to `lo`
+    /// (the search's `opts.start`). Runs the reverse DFA anchored at `end`, scanning
+    /// backward; the smallest position at which pc 0 is reachable — i.e. `[s, end)` is a
+    /// full match — is the leftmost-first start. (The forward already fixed `end` as the
+    /// leftmost match's end, so no earlier start ≥ `lo` matches `[·, end)`.)
+    fn revFind(self: *Scratch, program: *const Program, input: []const u8, end: usize, lo: usize) Err!usize {
+        try self.ensureRevStart(program);
+        var state = self.r_start;
+        var found: ?usize = if (self.r_accept.items[state]) end else null; // empty match at `end`?
+
+        // Warm-path pointer cache over the *reverse* tables `r_trans`/`r_accept`. The
+        // reverse cache is never flushed (it grows unbounded; only the forward cache is
+        // budgeted), so the sole invalidation is a cold `revStep` realloc'ing the reverse
+        // tables on a new-state row append — re-fetch both bases after every cold step.
+        var r_trans: [*]const u32 = self.r_trans.items.ptr;
+        var r_accept: [*]const bool = self.r_accept.items.ptr;
+        const map: *const [256]u8 = &program.classes.map;
+        const nclass: usize = self.nclass;
+
+        var pos = end;
+        while (pos > lo) {
+            pos -= 1;
+            const class = map[input[pos]];
+            const next = r_trans[@as(usize, state) * nclass + class];
+            if (next != UNKNOWN) {
+                // Warm path: memoized reverse edge, no growth.
+                state = next;
+                if (r_accept[state]) found = pos;
+                if (state == DEAD) break;
+                continue;
+            }
+            // Cold path: compute + cache the reverse edge (may realloc → re-fetch bases).
+            state = try self.revStep(program, state, class);
+            r_trans = self.r_trans.items.ptr;
+            r_accept = self.r_accept.items.ptr;
+            if (r_accept[state]) found = pos;
+            if (state == DEAD) break;
+        }
+        return found orelse end; // the forward guaranteed a match, so non-null in practice
     }
 };
 
@@ -626,12 +1123,28 @@ fn searchImpl(program: *const Program, scratch: *Scratch, input: []const u8, opt
             return Match{ .start = 0, .end = end };
         return null;
     }
+    if (opts.anchored) {
+        // Pinned start: one anchored run.
+        if (try scratch.runAnchored(program, input, opts.start, earliest, &flushes)) |end|
+            return Match{ .start = opts.start, .end = end };
+        return null;
+    }
+
+    // Unanchored find. The reverse-DFA path is **O(input)**: one forward pass (`ustep`
+    // then anchored `step`) locates the leftmost match END, then the reverse DFA — anchored
+    // at that end, scanning backward — locates the leftmost START, replacing the Θ(n²)
+    // anchored restart. A `text_start` pattern (rare, and not fully `anchored_start`) keeps
+    // anchored restart, since the reverse transitions must stay position-independent.
+    if (program.rev.built) {
+        const e0 = (try scratch.findEndForward(program, input, opts.start, &flushes)) orelse return null;
+        const s0 = try scratch.revFind(program, input, e0, opts.start);
+        return Match{ .start = s0, .end = e0 };
+    }
 
     var s = opts.start;
     while (s <= input.len) : (s += 1) {
         if (try scratch.runAnchored(program, input, s, earliest, &flushes)) |end|
             return Match{ .start = s, .end = end };
-        if (opts.anchored) break; // anchored: only the start position
     }
     return null;
 }
@@ -1019,6 +1532,52 @@ test "byte classes are actually consumed (the alphabet the DFA keys on)" {
     while (b < 256) : (b += 1) {
         const c = program.classes.get(@intCast(b));
         try testing.expectEqual(c, program.classes.get(program.class_rep[c]));
+    }
+}
+
+test "reverse-DFA find: O(n) leftmost-first on the anchored-restart-pathological class" {
+    // `\w+@\w+` can BEGIN at every word position but only completes at an `@`, so the
+    // old anchored-restart `find` is Θ(n²). The reverse-DFA path (forward locates the
+    // match END in one pass, the reverse DFA locates the START) is O(n) and must stay
+    // leftmost-first. These run instantly only because the path is linear.
+    const gpa = testing.allocator;
+    var re = try Compiled.init("\\w+@\\w+");
+    defer re.deinit();
+    const big = try gpa.alloc(u8, 8000);
+    defer gpa.free(big);
+    // No `@` at all: every one of the 8000 word positions begins a long run that never
+    // completes — the Θ(n²) worst case — yet the reverse-DFA path rejects in O(n).
+    @memset(big, 'a');
+    try testing.expect(re.find(big) == null);
+    // A single match bounded by non-word separators, deep inside the buffer.
+    @memset(big, '.');
+    @memcpy(big[4000..][0..5], "ab@cd");
+    try testing.expectEqualStrings("ab@cd", re.find(big).?.slice(big));
+    try testing.expectEqual(@as(usize, 4000), re.find(big).?.start);
+}
+
+test "reverse-DFA find agrees with anchored restart (has_text_start) across a corpus" {
+    // The reverse-DFA path (assertion-free) and the anchored-restart path (`text_start`)
+    // must return identical spans. Pair each pattern with a `^`-prefixed variant that is
+    // semantically the same on these inputs but forced onto anchored restart.
+    const pairs = [_]struct { rev: []const u8, anc: []const u8, in: []const u8, exp: ?[]const u8 }{
+        .{ .rev = "a.*c", .anc = "(?:a.*c|\\Az)", .in = "xabXcYc", .exp = "abXcYc" },
+        .{ .rev = "\\w+", .anc = "(?:\\w+|\\Az)", .in = "  héllo  ", .exp = "héllo" },
+        .{ .rev = "[0-9]+", .anc = "(?:[0-9]+|\\Az)", .in = "ab123cd", .exp = "123" },
+    };
+    for (pairs) |p| {
+        var r = try Compiled.init(p.rev);
+        defer r.deinit();
+        var a = try Compiled.init(p.anc);
+        defer a.deinit();
+        const rm = r.find(p.in);
+        const am = a.find(p.in);
+        try testing.expectEqual(rm == null, am == null);
+        if (rm) |m| {
+            try testing.expectEqual(m.start, am.?.start);
+            try testing.expectEqual(m.end, am.?.end);
+            if (p.exp) |e| try testing.expectEqualStrings(e, m.slice(p.in));
+        }
     }
 }
 

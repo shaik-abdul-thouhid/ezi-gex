@@ -31,23 +31,36 @@ development** on `main`. Pre-1.0, so the API may still change, but everything in
 public surface is annotated `@stable-since: vX.Y.Z` and is covered by SemVer. Tracks a
 recent Zig dev build (`0.17.0-dev`); it will not compile on stable 0.16.
 
-**What works is tested** (≈270 tests: per-module behaviour, cross-backend
-conformance, runtime + comptime parity). `0.2.0` added full case folding, grapheme
+**What works is tested** (**297 tests**, all passing: per-module behaviour, cross-backend
+conformance — including a wide differential corpus where every backend must agree with
+the Pike VM — and runtime + comptime parity). `0.2.0` added full case folding, grapheme
 `\X`, a two-tier `Options` (semantic + results-invariant strategy), `(?x)` verbose
 mode, ASCII mode, dead-on-invalid UTF-8, and the **byte-NFA lowering + `ByteMap`
 equivalence classes** (`engine/byte.zig`): the zero-decode UTF-8 automaton substrate,
 executed by the `bytepike` reference backend.
 
-`0.3.0-dev` adds the **lazy DFA** (`engine/backends/dfa.zig`) — the throughput backend
-that **determinizes the byte automaton on the fly** (one cached DFA state per input
-byte, keyed on the compressed byte-class alphabet). It is span-only (the Pike VM still
-fills captures and `\b`), runtime-only, and leftmost-first — its span never disagrees
-with the Pike VM (conformance-proven). It is **opt-in** today via
-`Options.strategy.byte_engine = .enabled`, which routes `auto`'s span scan through the
-DFA while captures stay on the Pike VM. The **first prefilter tier is also wired**
-(`literal` scans with `std.mem.indexOf`; `auto` reads the HIR `Analysis` for a
-leading-literal `memchr` prefilter, a `^`/`\A` start short-circuit, and a min-length
-gate). The architecture absorbs all of this without API changes — see *Performance*.
+`0.3.0-dev` makes the **byte DFA the default span engine, on by default** — and the
+primary engine is the **eager DFA** (`engine/backends/edfa.zig`): it **fully determinizes
+the byte automaton at build time** into a frozen `states × byte_classes` table, so the
+matcher is a bare table walk with **no per-search state**, and — unlike the lazy DFA, whose
+cache mutates while matching — it runs at **comptime as well as runtime** (so the default
+`auto` now bakes a real frozen DFA into `ro_data` for *tiny* patterns at comptime — the
+genuine CTRE-lane — while a big Unicode class stays on the Pike VM at comptime but still gets
+the eager DFA at runtime). Its `find` is **O(input) on every pattern**, via a
+static, build-time strategy choice (`program.prone`): a pattern whose consuming loop is
+itself accepting (`\w+`, `\d+`, `[A-Za-z]+`) gets a single greedy **anchored restart**; a
+*prone* pattern that can consume an unbounded run before it can accept (e.g. `\w+@\w+`'s
+pre-`@` word run) gets the **reverse-DFA two-pass** (a forward pass locates the match end, a
+frozen reverse DFA the start) — no Θ(n²) anchored restart. It now also supports **`$`/`\z`**
+(`text_end`), so it is broader than the lazy DFA. The **lazy DFA**
+(`engine/backends/dfa.zig`) is now the **fallback** — it determinizes the byte automaton on
+the fly (one cached DFA state per input byte) and serves patterns whose full eager table
+overflows the state bound. Both are span-only (the Pike VM still fills captures and `\b`)
+and leftmost-first, conformance-proven against the Pike VM. The **first prefilter tier is
+also wired** (`literal` scans with `std.mem.indexOf`, and a literal *alternation* skips with
+a single SIMD `indexOfAny` pass; `auto` reads the HIR `Analysis` for a leading-literal
+`memchr` prefilter, a `^`/`\A` start short-circuit, and a min-length gate). The architecture
+absorbs all of this without API changes — see *Performance*.
 
 ## Installing
 
@@ -339,12 +352,16 @@ treated as `\z`. See [`docs/architecture.md`](docs/architecture.md) §Caveats.
 | `backtrack` | bounded depth-first NFA | ✅ | ✅ | small inputs |
 | `literal` | substring / literal-alternation | whole-match | ✅ | pure-literal patterns |
 | `bytepike` | byte-stepping Pike VM (zero-decode) | ✅ | ✅ | byte-automaton substrate (no `\X`/`\b`) |
-| `dfa` | lazy DFA over the byte automaton (cached transitions) | span-only | ✗ (runtime-only) | fast span scan; opt in via `auto` + `byte_engine = .enabled` |
+| `edfa` *(default span engine)* | **eager** DFA — frozen `states × byte_classes` table | span-only | ✅ | fast span scan; O(n) `find`; `auto` prefers it |
+| `dfa` | lazy DFA over the byte automaton (cached transitions) | span-only | ✗ (runtime-only) | the fallback when the eager DFA overflows its state bound |
 
-`compileRuntime`/`compileComptime` use `auto`. Force one with the `*With` variants:
-`gex.compileRuntimeWith(gex.backends.pikevm, gpa, pat, &diag, .{})`. To turn on the byte
-lazy DFA inside `auto`, compile with `.{ .strategy = .{ .byte_engine = .enabled } }` —
-`auto` uses the DFA for the span scan and the Pike VM for captures.
+`compileRuntime`/`compileComptime` use `auto`, which now **prefers the eager DFA**
+(`edfa`) for the span scan on an eligible pattern (no `\b`/`\X`/`(?m)` line anchors — but
+`$`/`\z` *is* fine), falling back to the lazy `dfa` only when the eager table overflows its
+state bound, then to the NFA; the Pike VM fills captures anchored at the DFA span. The DFA
+is **on by default** (`byte_engine = .auto`/`.enabled`); `.disabled` opts back to the
+NFA-only program. Force a specific backend with the `*With` variants:
+`gex.compileRuntimeWith(gex.backends.pikevm, gpa, pat, &diag, .{})`.
 
 The usage guide covers [choosing a backend](docs/usage-guide.md#choosing-a-specific-backend)
 and walks the whole [*write your own backend*](docs/usage-guide.md#8-writing-your-own-backend)
@@ -445,14 +462,49 @@ wired:**
    on NFA patterns: when every match must begin
    with a fixed literal, its first byte drives a `memchr` that skips straight to each
    candidate start (each confirmed with an *anchored* NFA run); a `^`/`\A` pattern
-   skips the leftward scan entirely; and a min-length gate rejects inputs too short to
-   hold any match. Every `Analysis` fact is a sound one-sided bound, so the prefilter
-   never drops a real match — it only avoids running the NFA where one cannot start.
+   skips the leftward scan entirely; the **rarest required byte** drives a sound
+   fast-reject (no `@` in the input ⇒ no `\w+@\w+` match, return at once); and a
+   min-length gate rejects inputs too short to hold any match. Every `Analysis` fact is a
+   sound one-sided bound, so the prefilter never drops a real match — it only avoids
+   running the engine where one cannot start. Toggle with `strategy.prefilter`.
 
-**Still open (additive, no API change):** a one-pass NFA capture path, and a lazy-DFA
-backend (the RE2/Rust core — runtime-only, since it mutates state at match time). The
-backend contract is exactly the seam to drop a DFA in without disturbing the comptime
-path or the API. See [`docs/architecture.md`](docs/architecture.md) for the planned tiers.
+**Tier 3 — the byte DFA — is wired and now ON BY DEFAULT, with the *eager* DFA as the
+primary span engine** (`backends/edfa.zig`, reached through `auto`). On an eligible pattern
+(no `\b`/`\X`/`(?m)` line anchors — but `$`/`\z` *is* eligible), `auto` builds the eager
+DFA, a fully-determinized frozen `states × byte_classes` table, and uses it for
+`isMatch`/`find`; captures are filled by the Pike VM **anchored at the DFA span** (the
+capture handoff). The lazy DFA (`backends/dfa.zig`) is the **fallback** — used only when the
+eager table overflows its state bound — and it took a hot-loop perf pass (cached raw table
+pointers refreshed only on a cold transition; `\w+` ~336 → ~517 MiB/s). The bench
+(`bench-vs-rust/`) shows the default is **at Rust parity (~1.1×–1.3×) on every class scan**
+and **≥ the code-point Pike VM in every cell** (5–10× on character-class scans), and it is
+**results-invariant** (`conformance.zig` pins the span and captures to the Pike VM, and
+fuzzes the strategy knobs). `strategy.byte_engine = .disabled` opts back to the compact
+NFA-only program.
+
+**`find` is O(n) on every pattern — via a build-time strategy choice.** `computeProne`
+detects, at build, whether the anchored DFA has a **non-accepting cycle reachable from a
+start** (it can consume an unbounded run without ever accepting):
+
+- **Non-prone** (`\w+`, `\d+`, `[A-Za-z]+` — the consuming loop is itself accepting) →
+  **anchored restart**: one greedy frozen-table walk per match. O(input) because no start
+  can scan far without hitting an accepting state (~1.1 GiB/s).
+- **Prone** (`\w+@\w+` on long word runs, `[ab]*c`) → the **reverse-DFA two-pass**: a
+  forward one-pass (`utrans` `.*?`-prefix table) locates the match **end**, a frozen
+  **reverse** DFA (determinized at comptime *and* runtime) the leftmost **start**. O(input),
+  replacing the old Θ(n²) anchored restart on this begins-everywhere-completes-rarely class.
+
+There is **no per-search probing** — the arm is fixed at build. `$` patterns are forced
+non-prone (anchored restart + an end-of-input check). The eager DFA also **builds only the
+tables it will use**: `utrans` + the reverse table are built **only for prone patterns**, so
+a non-prone `\w+` now stores just its forward `trans` table (~141 KB) instead of all three
+(~1 MB). Leftmost-first, conformance-pinned to the Pike VM.
+
+**Still open (additive, no API change):** an interior-literal `memmem`/Teddy prefilter
+(multi-substring SIMD for literal alternations — the single biggest remaining gap), DFA
+**Hopcroft minimization + a sparse table encoding** (to shrink the Unicode-class eager
+tables that *are* kept), line anchors `(?m)` / `\b` in the DFA, and a one-pass NFA capture
+path. See [`docs/architecture.md`](docs/architecture.md) §10 for the tier roadmap.
 
 ## Binary size
 
@@ -478,6 +530,25 @@ is `ro_data` for the `compileComptime` programs you choose to bake in, and even 
 **identical classes are interned** (a class used N times in one pattern is stored once;
 `\w{3,32}` costs one `\w`, not 35). `compileRuntime` adds nothing to the binary beyond
 the shared tables.
+
+> **The byte engine** (on by default; `byte_engine = .disabled` opts out) builds a
+> separate *byte* automaton on the **heap** — never linked into the binary — and it is
+> larger than the code-point program because a Unicode class becomes automaton structure
+> rather than a flat table. Two passes keep it bounded: **UTF-8 suffix sharing** (a
+> `(lo,hi,next)` cache that emits each class's shared continuation tails once) and
+> **single-copy `x+`** compilation. Measured: `\w+` is ~3.9 k instructions (down from
+> ~11 k), `\w+@\w+` ~7.9 k (down from ~23 k); ASCII patterns are unchanged. A
+> `byteWorthLowering` cost-gate keeps a pathological pattern (a big class repeated dozens
+> of times) on the compact code-point engine entirely. The **lazy** DFA (the fallback)
+> never builds the whole automaton — it materializes only the states an input visits (a
+> handful over ordinary text), so the NFA's bulk is build-time, not per-search, memory.
+> The **eager** DFA (`backends.edfa`, the default span engine) *does* freeze the whole DFA
+> into a `states × byte_classes` table — into `ro_data` at comptime — and is also the
+> CTRE/bake-it-in path: tiny for literal/ASCII patterns (`abc` is 5 states / ~100 B), a
+> few hundred states for a Unicode class. It now **builds only the tables it uses** (a
+> non-prone `\w+` keeps just its forward table, ~141 KB, not the forward + `.*?`-prefix +
+> reverse trio, ~1 MB). See [`docs/architecture.md`](docs/architecture.md) → *The byte
+> substrate* / *The eager DFA*.
 
 Reference point: the bundled `main.zig` demo (which exercises runtime *and* comptime
 compilation, classes, captures, replace, split, and `\p{L}`) is **~2.76 MB** in `Debug`

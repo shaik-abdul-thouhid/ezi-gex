@@ -278,8 +278,8 @@ fn run(program: *const Program, sc: *Scratch, input: []const u8, opts: SearchOpt
             const t_pc: u32 = @intCast(c_list.pcs[i].w);
             const t_slots = c_list.slots[i * c_list.sc .. i * c_list.sc + c_list.sc];
             switch (program.insts[t_pc]) {
-                .byte_range => |r| if (!at_end and r.contains(b))
-                    addThread(program, n_list, t_pc + 1, t_slots, sp + 1, input, sc.stack),
+                .byte_range => |r| if (!at_end and r.range.contains(b))
+                    addThread(program, n_list, r.next, t_slots, sp + 1, input, sc.stack),
                 .match => {
                     @memcpy(sc.match_slots, t_slots);
                     matched = true;

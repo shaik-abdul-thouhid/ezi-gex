@@ -240,6 +240,34 @@ fn firstMatchPos(input: []const u8, start: usize, needle: []const u8) ?usize {
     return std.mem.indexOfPos(u8, input, start, needle);
 }
 
+/// First offset `≥ start` whose byte is **any** of `set` (the distinct first bytes of the
+/// alternation's needles), or null. Runtime is `std.mem.indexOfAnyPos` (a SIMD multi-byte
+/// memchr); comptime is a plain scan (the project keeps `@Vector` out of const-eval). This
+/// is what lets a literal alternation skip to the next candidate in **one** pass instead of
+/// one `indexOfPos` per branch — the latter re-scans toward the *rarest* needle on every
+/// `count` step, an accidental Θ(input²) when one branch is sparse.
+fn firstAnyPos(input: []const u8, start: usize, set: []const u8) ?usize {
+    if (@inComptime()) {
+        var i = start;
+        while (i < input.len) : (i += 1) {
+            for (set) |b| if (input[i] == b) return i;
+        }
+        return null;
+    }
+    return std.mem.indexOfAnyPos(u8, input, start, set);
+}
+
+/// The leftmost-first match **at exactly** `pos`: the first branch (in alternation/priority
+/// order) whose bytes occur at `pos`, or null. An empty branch matches here (length 0).
+fn matchAtPos(program: *const Program, input: []const u8, pos: usize) ?Match {
+    for (program.bounds) |b| {
+        const needle = program.needles[b.start .. b.start + b.len];
+        if (pos + needle.len <= input.len and std.mem.eql(u8, input[pos .. pos + needle.len], needle))
+            return .{ .start = pos, .end = pos + needle.len };
+    }
+    return null;
+}
+
 /// @stable-since: v0.1.0
 pub fn search(program: *const Program, _: *Scratch, input: []const u8, opts: SearchOptions) ?Match {
     if (opts.start > input.len) return null;
@@ -255,14 +283,57 @@ pub fn search(program: *const Program, _: *Scratch, input: []const u8, opts: Sea
         return null;
     }
 
-    // Unanchored, leftmost-first. The leftmost byte position where *any* branch
-    // matches wins; ties at that position go to the earliest-listed (highest
-    // priority) branch. For each branch take its first occurrence `≥ start` with the
-    // fast substring search, then keep the strictly-earliest — iterating branches in
-    // priority order means an equal-position later branch never displaces an earlier
-    // one. As soon as a branch matches at `opts.start` itself (the minimum possible
-    // position) nothing can beat it, so stop. A single needle reduces to one
-    // `indexOfPos` call.
+    // Unanchored, leftmost-first. The leftmost byte position where *any* branch matches
+    // wins; ties at that position go to the earliest-listed (highest priority) branch.
+    //
+    // A single needle is one `indexOfPos`. For an **alternation**, we collect the distinct
+    // first bytes of the branches and skip to the next position holding any of them with a
+    // single SIMD `indexOfAny` pass (`firstAnyPos`), then verify the branches in priority
+    // order there (`matchAtPos`). This is O(input) per search — unlike one `indexOfPos`
+    // per branch, which scans toward each needle's next occurrence and so re-scans the
+    // whole region looking for a *rare* branch on every `count` step (an accidental
+    // Θ(input²): `foo|bar|baz|qux` with a sparse `qux` was the worst cell in the bench).
+    var lead: [64]u8 = undefined;
+    var nlead: usize = 0;
+    var has_empty = false;
+    var overflow = false;
+    for (program.bounds) |b| {
+        if (b.len == 0) {
+            has_empty = true;
+            continue;
+        }
+        const fb = program.needles[b.start];
+        var seen = false;
+        for (lead[0..nlead]) |x| {
+            if (x == fb) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            if (nlead == lead.len) {
+                overflow = true; // > 64 distinct first bytes (pathological) — use the scalar fallback
+                break;
+            }
+            lead[nlead] = fb;
+            nlead += 1;
+        }
+    }
+
+    // An empty branch matches (length 0) at every position, so the leftmost match is at
+    // `opts.start` — whatever the highest-priority branch matching there is (possibly empty).
+    if (has_empty or nlead == 0) return matchAtPos(program, input, opts.start);
+
+    if (!overflow) {
+        var pos = opts.start;
+        while (firstAnyPos(input, pos, lead[0..nlead])) |cand| : (pos = cand + 1) {
+            if (matchAtPos(program, input, cand)) |m| return m;
+        }
+        return null;
+    }
+
+    // Scalar fallback (only for a pathological >64-distinct-first-byte alternation): the
+    // earliest-of-all-branches scan. Correct, just without the multi-byte skip.
     var best: ?usize = null;
     var best_len: usize = 0;
     for (program.bounds) |b| {

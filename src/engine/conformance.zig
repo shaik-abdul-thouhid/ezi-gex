@@ -26,6 +26,7 @@ const backtrack = @import("backends/backtrack.zig");
 const literal = @import("backends/literal.zig");
 const bytepike = @import("backends/bytepike.zig");
 const dfa = @import("backends/dfa.zig");
+const edfa = @import("backends/edfa.zig");
 const auto = @import("backends/auto.zig");
 
 const byte = @import("byte.zig");
@@ -53,6 +54,114 @@ const byte_comptime_cases = [_]Case{
     .{ .pat = "cat|dog", .input = "a dog", .expect = "dog" },
     .{ .pat = "a{2,4}", .input = "aaaaaa", .expect = "aaaa" },
     .{ .pat = "ab*c", .input = "xabbbc", .expect = "abbbc" },
+};
+
+/// A wide differential corpus spanning the syntax surface (empty/zero-width, greedy vs
+/// lazy, alternation priority, counted reps, nested captures, multibyte UTF-8, `\p{}`
+/// classes, case folding incl. special folds, `^`/`$`/`(?m)`, `\b`/`\B`, dead-on-invalid
+/// `\xFF`, no-match, sparse matches, and pathological-but-linear shapes). Every case is
+/// run through every applicable backend and they must all agree (see the test below);
+/// the hand-computed leftmost-first `expect` is also checked, catching a systematic bug
+/// all engines might share. Authored to be byte-exact (the `\xFF` cases use a real 0xFF).
+const wide_cases = [_]Case{
+    // empty / zero-width
+    .{ .pat = "", .input = "x", .expect = "" },
+    .{ .pat = "a*", .input = "bbb", .expect = "" },
+    .{ .pat = "a*", .input = "aaab", .expect = "aaa" },
+    .{ .pat = "b*", .input = "aaabbb", .expect = "" },
+    .{ .pat = "a|", .input = "b", .expect = "" },
+    .{ .pat = "^", .input = "abc", .expect = "" },
+    .{ .pat = "\\A", .input = "abc", .expect = "" },
+    .{ .pat = "\\z", .input = "abc", .expect = "" },
+    .{ .pat = "^$", .input = "x", .expect = null },
+    .{ .pat = "^abc$", .input = "abc", .expect = "abc" },
+    .{ .pat = "^abc$", .input = "abc\n", .expect = null },
+    .{ .pat = "a$", .input = "ba", .expect = "a" },
+    .{ .pat = "a$", .input = "ab", .expect = null },
+    // greedy vs lazy
+    .{ .pat = "a.*b", .input = "axbxb", .expect = "axbxb" },
+    .{ .pat = "a.*?b", .input = "axbxb", .expect = "axb" },
+    .{ .pat = "<.+>", .input = "<a><b>", .expect = "<a><b>" },
+    .{ .pat = "<.+?>", .input = "<a><b>", .expect = "<a>" },
+    .{ .pat = "a+?", .input = "aaaa", .expect = "a" },
+    .{ .pat = "a??", .input = "a", .expect = "" },
+    .{ .pat = "x*?y", .input = "xxxy", .expect = "xxxy" },
+    .{ .pat = ".*?", .input = "hello", .expect = "" },
+    // alternation priority
+    .{ .pat = "a|ab", .input = "abc", .expect = "a" },
+    .{ .pat = "ab|a", .input = "abc", .expect = "ab" },
+    .{ .pat = "abc|ab|a", .input = "abc", .expect = "abc" },
+    .{ .pat = "(ab|a)(c|bc)", .input = "abc", .expect = "abc" },
+    .{ .pat = "(a|ab)(c|bcd)", .input = "abcd", .expect = "abcd" },
+    .{ .pat = "rat|cat|bat", .input = "the bat sat", .expect = "bat" },
+    // counted reps
+    .{ .pat = "a{3}", .input = "aaaaa", .expect = "aaa" },
+    .{ .pat = "a{2,4}?", .input = "aaaaaa", .expect = "aa" },
+    .{ .pat = "a{0,3}", .input = "bbb", .expect = "" },
+    .{ .pat = "a{3,}", .input = "aaaaa", .expect = "aaaaa" },
+    .{ .pat = "a{3,}", .input = "aa", .expect = null },
+    .{ .pat = "(ab){2,3}", .input = "abababab", .expect = "ababab" },
+    .{ .pat = "\\d{2,4}", .input = "12345", .expect = "1234" },
+    // nested groups / captures
+    .{ .pat = "(a(b(c)))", .input = "zabcz", .expect = "abc" },
+    .{ .pat = "((a)|(b))+", .input = "abab", .expect = "abab" },
+    .{ .pat = "(\\w+)@(\\w+)\\.(\\w+)", .input = "x a@b.io y", .expect = "a@b.io" },
+    .{ .pat = "(\\d{4})-(\\d{2})-(\\d{2})", .input = "d=2026-06-12!", .expect = "2026-06-12" },
+    .{ .pat = "(?<word>\\w+)", .input = "  hi ", .expect = "hi" },
+    .{ .pat = "(a+)(a+)", .input = "aaaa", .expect = "aaaa" },
+    // multibyte UTF-8
+    .{ .pat = "café", .input = "the café here", .expect = "café" },
+    .{ .pat = "αβγ", .input = "xαβγy", .expect = "αβγ" },
+    .{ .pat = "[α-ω]+", .input = "λόγος!", .expect = "λόγος" },
+    .{ .pat = "Привет", .input = "—Привет!", .expect = "Привет" },
+    .{ .pat = "日本語", .input = "→日本語←", .expect = "日本語" },
+    .{ .pat = "مرحبا", .input = "قل مرحبا", .expect = "مرحبا" },
+    .{ .pat = "\\p{Nd}+", .input = "x٤٥٦y", .expect = "٤٥٦" },
+    .{ .pat = "😀+", .input = "a😀😀b", .expect = "😀😀" },
+    .{ .pat = "é{2,3}", .input = "xééééy", .expect = "ééé" },
+    .{ .pat = "\\w+", .input = "héllo wörld", .expect = "héllo" },
+    // \p{...} classes & scripts
+    .{ .pat = "\\P{L}+", .input = "abc123!!", .expect = "123!!" },
+    .{ .pat = "\\p{Lu}+", .input = "abcDEFghi", .expect = "DEF" },
+    .{ .pat = "\\p{Greek}+", .input = "abcαβγdef", .expect = "αβγ" },
+    .{ .pat = "\\p{Han}+", .input = "ab漢字cd", .expect = "漢字" },
+    .{ .pat = "[\\p{L}\\p{N}]+", .input = "  a1b2!! ", .expect = "a1b2" },
+    // case folding incl. special folds
+    .{ .pat = "(?i)hello", .input = "HeLLo world", .expect = "HeLLo" },
+    .{ .pat = "(?i)[a-z]+", .input = "ABCdef", .expect = "ABCdef" },
+    .{ .pat = "(?i)k", .input = "\u{212A}", .expect = "\u{212A}" },
+    .{ .pat = "(?i)\u{017F}", .input = "S", .expect = "S" },
+    .{ .pat = "(?i)\u{00C5}", .input = "\u{212B}", .expect = "\u{212B}" },
+    // ^/$ with and without (?m)
+    .{ .pat = "(?m)^line2", .input = "line1\nline2\nline3", .expect = "line2" },
+    .{ .pat = "(?m)line2$", .input = "line2\nline3", .expect = "line2" },
+    .{ .pat = "^b$", .input = "a\nb\nc", .expect = null },
+    .{ .pat = "(?m)^\\w+", .input = "\nword", .expect = "word" },
+    .{ .pat = "foo$", .input = "foo\nbar", .expect = null },
+    // \b / \B
+    .{ .pat = "\\bcat\\b", .input = "a cat!", .expect = "cat" },
+    .{ .pat = "\\bcat\\b", .input = "category", .expect = null },
+    .{ .pat = "\\Bcat\\B", .input = "locator", .expect = "cat" },
+    .{ .pat = "\\b\\w+\\b", .input = "(héllo)", .expect = "héllo" },
+    .{ .pat = "s\\b", .input = "cats dogs", .expect = "s" },
+    // dead-on-invalid (real 0xFF byte)
+    .{ .pat = "abc", .input = "ab\xFFabc", .expect = "abc" },
+    .{ .pat = "a.c", .input = "a\xFFc", .expect = null },
+    .{ .pat = ".", .input = "\xFFa", .expect = "a" },
+    .{ .pat = "\\w+", .input = "ab\xFFcd", .expect = "ab" },
+    .{ .pat = "a+b", .input = "aa\xFFb", .expect = null },
+    .{ .pat = "foo", .input = "\xFF\xFFfoo", .expect = "foo" },
+    // no-match / boundaries / sparse
+    .{ .pat = "xyz", .input = "abcdef", .expect = null },
+    .{ .pat = "\\d+", .input = "no digits here", .expect = null },
+    .{ .pat = "\\d+$", .input = "id 9999", .expect = "9999" },
+    .{ .pat = "needle", .input = "haystack haystack haystack needle haystack", .expect = "needle" },
+    .{ .pat = "\\d+", .input = "........................................42...", .expect = "42" },
+    // pathological-but-linear
+    .{ .pat = "(a*)*b", .input = "aaaaaaaaaaaaaaaaaaaaaaaaX", .expect = null },
+    .{ .pat = "(a*)*b", .input = "aaaaaaaab", .expect = "aaaaaaaab" },
+    .{ .pat = "(a+)+b", .input = "aaaaaaaaaaaaaaaaaaaaac", .expect = null },
+    .{ .pat = "(a?){10}a{10}", .input = "aaaaaaaaaa", .expect = "aaaaaaaaaa" },
 };
 
 const Case = struct { pat: []const u8, input: []const u8, expect: ?[]const u8 };
@@ -228,6 +337,119 @@ test "lazy DFA agrees with the code-point engines on its eligible subset (span-o
     try testing.expect(ran > 0); // guard against the gate silently skipping everything
 }
 
+/// Whether the eager DFA can actually build `pattern` — `edfa.supports` AND its full
+/// DFA fits `edfa.max_states` (it is bounded by design; the lazy DFA covers the rest).
+fn edfaBuildable(pattern: []const u8) bool {
+    const gpa = testing.allocator;
+    var diag: regex.Diagnostic = .{};
+    const ast = ccompile.parse(gpa, pattern, &diag) catch return false;
+    defer ast.deinit(gpa);
+    const h = hir.buildAlloc(gpa, ast, .{}) catch return false;
+    defer hir.deinitHir(gpa, h);
+    var prog = edfa.buildAlloc(gpa, h, .{}) catch return false;
+    edfa.freeProgram(gpa, &prog);
+    return true;
+}
+
+test "eager DFA agrees with the code-point engines on its eligible subset (span-only)" {
+    // The eager DFA fully determinizes at build time; its frozen-table span must equal
+    // what pikevm/backtrack/auto are pinned to. It is bounded (declines a pattern whose
+    // whole DFA exceeds `max_states`), so we check the cases it can actually build — the
+    // lazy DFA covers the rest, already pinned above.
+    var ran: usize = 0;
+    for (general_cases) |c| {
+        if (!edfaBuildable(c.pat)) continue;
+        try checkRuntime(edfa, c);
+        ran += 1;
+    }
+    for (literal_cases) |c| {
+        if (!edfaBuildable(c.pat)) continue;
+        try checkRuntime(edfa, c);
+        ran += 1;
+    }
+    try testing.expect(ran > 0);
+}
+
+/// `find` a backend's span for `(pat, input)`, or `.skip` when the pattern does not
+/// compile for it (an unsupported `\p{…}` name, or a backend declining the shape) — so
+/// the differential corpus tolerates patterns outside a given backend's domain without
+/// trusting any hand-computed expectation.
+const Outcome = union(enum) { skip, span: ?backend.Match };
+fn findOutcome(comptime B: type, pat: []const u8, input: []const u8) !Outcome {
+    const gpa = testing.allocator;
+    var diag: regex.Diagnostic = .{};
+    var re = regex.compileRuntimeWith(B, gpa, pat, &diag, .{}) catch return .skip;
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+    defer sc.deinit(gpa);
+    return .{ .span = re.find(&sc, input) };
+}
+fn expectSameSpan(pat: []const u8, ref: ?backend.Match, other: Outcome) !void {
+    const o = switch (other) {
+        .skip => return,
+        .span => |s| s,
+    };
+    testing.expectEqual(ref == null, o == null) catch {
+        std.debug.print("/{s}/ disagreed on match presence\n", .{pat});
+        return error.Mismatch;
+    };
+    if (ref) |r| {
+        try testing.expectEqual(r.start, o.?.start);
+        try testing.expectEqual(r.end, o.?.end);
+    }
+}
+
+test "wide differential corpus: every backend agrees with the Pike VM (byte/eager DFA on eligible patterns)" {
+    // Pure differential: the Pike VM is the oracle and every other applicable backend
+    // must produce the byte-identical span. (Hand-computed `expect`s are intentionally
+    // NOT trusted here — the human-verified `general_cases` guard against a shared bug;
+    // this table is for breadth and cross-backend consistency.) The safety net for
+    // DFA-on-by-default + the prefilter: any divergence among pikevm / backtrack / auto /
+    // dfa / edfa fails.
+    for (wide_cases) |c| {
+        const ref = switch (try findOutcome(pikevm, c.pat, c.input)) {
+            .skip => continue, // unsupported property name etc. — skip the whole case
+            .span => |s| s,
+        };
+        try expectSameSpan(c.pat, ref, try findOutcome(backtrack, c.pat, c.input));
+        try expectSameSpan(c.pat, ref, try findOutcome(auto, c.pat, c.input));
+        if (dfaRoutablePattern(c.pat)) try expectSameSpan(c.pat, ref, try findOutcome(dfa, c.pat, c.input));
+        if (edfaBuildable(c.pat)) try expectSameSpan(c.pat, ref, try findOutcome(edfa, c.pat, c.input));
+    }
+}
+
+test "prefilter on/off and byte_engine on/off are results-invariant on the wide corpus" {
+    // The strategy tier must never change a match. Compile each case four ways and pin
+    // every span to the default `auto`. Patterns that do not compile are skipped.
+    const gpa = testing.allocator;
+    const variants = [_]regex.Options{
+        .{}, // default (DFA on, prefilter on)
+        .{ .strategy = .{ .prefilter = false } },
+        .{ .strategy = .{ .byte_engine = .disabled } },
+        .{ .strategy = .{ .byte_engine = .disabled, .prefilter = false } },
+    };
+    for (wide_cases) |c| {
+        var diag: regex.Diagnostic = .{};
+        var ref = regex.compileRuntimeWith(auto, gpa, c.pat, &diag, .{}) catch continue;
+        defer ref.deinit();
+        var rsc = try @TypeOf(ref).Scratch.init(gpa, &ref.program);
+        defer rsc.deinit(gpa);
+        const rm = ref.find(&rsc, c.input);
+        inline for (variants) |opts| {
+            var re = try regex.compileRuntimeWith(auto, gpa, c.pat, &diag, opts);
+            defer re.deinit();
+            var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+            defer sc.deinit(gpa);
+            const m = re.find(&sc, c.input);
+            try testing.expectEqual(rm == null, m == null);
+            if (rm) |r| {
+                try testing.expectEqual(r.start, m.?.start);
+                try testing.expectEqual(r.end, m.?.end);
+            }
+        }
+    }
+}
+
 test "auto's byte_engine=.enabled is results-invariant (DFA span == NFA span) and routes to dfa" {
     // Flipping the strategy knob must not change a single match (DESIGN §3). For every
     // DFA-eligible case, the .enabled build and the default build must return
@@ -251,8 +473,8 @@ test "auto's byte_engine=.enabled is results-invariant (DFA span == NFA span) an
             defer sc1.deinit(gpa);
 
             const r = auto.route(&re1.program);
-            try testing.expect(!std.mem.eql(u8, r, "nfa")); // eligible+enabled ⇒ nfa+dfa or literal, never plain nfa
-            if (std.mem.eql(u8, r, "nfa+dfa")) dfa_routed += 1;
+            try testing.expect(!std.mem.eql(u8, r, "nfa")); // eligible+enabled ⇒ nfa+edfa / nfa+dfa / literal, never plain nfa
+            if (std.mem.eql(u8, r, "nfa+edfa") or std.mem.eql(u8, r, "nfa+dfa")) dfa_routed += 1;
 
             const m0 = re0.find(&sc0, c.input);
             const m1 = re1.find(&sc1, c.input);
@@ -279,7 +501,7 @@ test "auto with byte_engine=.enabled still fills captures via the Pike VM" {
     var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
     defer sc.deinit(gpa);
 
-    try testing.expectEqualStrings("nfa+dfa", auto.route(&re.program));
+    try testing.expectEqualStrings("nfa+edfa", auto.route(&re.program));
     var slots: [6]?usize = undefined;
     const c = re.captures(&sc, &slots, "ping bob@example").?;
     try testing.expectEqualStrings("bob@example", c.match().slice("ping bob@example"));
