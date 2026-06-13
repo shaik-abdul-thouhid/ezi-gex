@@ -345,6 +345,19 @@ pub const Scratch = struct {
     ///
     /// @stable-since: v0.3.0
     dfa_disabled: bool = false,
+    /// ReDoS observable: the number of **per-occurrence prefilter confirms** the eager-DFA
+    /// arm (`runEdfa`) has performed on this scratch. The prefilter's leading-literal
+    /// `memchr` start-skip confirms anchored at each prefix-byte occurrence; for a
+    /// `prone`/`end_anchored` program that confirm can scan an unbounded run, so doing it
+    /// per occurrence is Θ(n²) — the fix routes those programs to the DFA's O(n) native
+    /// find instead, and this counter therefore stays **0** for them. A non-zero value on a
+    /// `prone`/`end_anchored` program is exactly the quadratic regression; `engine/redos.zig`
+    /// asserts it is 0 (a revert-failing guard). Bounded by the prefix-byte occurrence count
+    /// for the fast-confirm case (`foo\d+`). Observational only — never affects a result, never
+    /// read by matching. Accumulates across searches on the scratch; `reset` zeroes it.
+    ///
+    /// @stable-since: v0.3.1
+    confirm_probes: u64 = 0,
 
     /// @stable-since: v0.1.0
     pub fn bufferLen(program: *const Program) usize {
@@ -399,6 +412,7 @@ pub const Scratch = struct {
     /// @stable-since: v0.1.0
     pub fn reset(self: *Scratch) void {
         if (self.dfa_sc) |*d| d.reset();
+        self.confirm_probes = 0; // the ReDoS observable is per-reuse
         switch (self.inner) {
             .literal => |*s| s.reset(),
             .nfa => |*s| {
@@ -466,6 +480,13 @@ fn runNfa(p: *const nfa.Program, filter: Filter, s: *Scratch.NfaScratch, input: 
     // backtracker — it scans unanchored itself, honouring `opts`. This deliberately
     // skips the Pike-VM-based anchored-confirm prefilter, which also assumes one
     // code point per step.
+    //
+    // NOTE (resource bound): this path is **not** length-capped like the non-grapheme
+    // dispatch (no `BACKTRACK_MAX_INPUT` gate) — backtrack is the only `\X`-capable
+    // backend, so there is nowhere else to route. The backtracker recurses with depth
+    // ∝ matched length (see backtrack.zig → "Resource bounds"), so a *large quantified*
+    // `\X` input (e.g. `\X+` over many graphemes) can overflow the stack. Documented
+    // constraint; the fix is an iterative backtracker. Bounded/typical `\X` use is fine.
     if (has_grapheme) {
         if (slots) |sl| return backtrack.searchCaptures(p, &s.back, input, sl, opts);
         return backtrack.search(p, &s.back, input, opts);
@@ -481,32 +502,28 @@ fn runNfa(p: *const nfa.Program, filter: Filter, s: *Scratch.NfaScratch, input: 
         return confirmAt(p, s, input, 0, slots);
     }
 
-    // Leading-literal memchr prefilter: every match begins with `prefix_byte`, so
-    // jump to each occurrence and confirm anchored there. Leftmost by construction —
-    // positions are visited left→right and the first confirmed match wins. A
-    // false-positive byte (prefix's first byte without the full match) just fails the
-    // confirm; a real match's start is always one of these positions, so none is missed.
+    // Leading-literal memchr start-skip: every match begins with `prefix_byte`, so no match
+    // begins before its first occurrence — skip straight to it. We deliberately do NOT confirm
+    // at *each* occurrence: a per-occurrence anchored confirm is O(match-attempt), and on a
+    // begin-but-don't-complete pattern with a dense prefix byte (`\ba+b` on `aaaa…a!`) that
+    // makes the loop **Θ(n²)**. The Pike VM's unanchored `dispatch` is a single linear
+    // O(input×program) pass, so one leading skip + dispatch stays leftmost-first AND linear.
+    // (The eager-DFA arm keeps the per-occurrence memchr-jump where its `prone`/`end_anchored`
+    // flags prove confirms fail fast; the NFA arm has no such flag, so it always takes the
+    // linear unanchored scan.)
+    var o = opts;
     if (filter.prefix_byte) |fb| {
-        var pos = opts.start;
-        while (memchrFrom(input, pos, fb)) |hit| {
-            if (input.len - hit < filter.min_bytes) return null; // no later hit can fit either
-            if (confirmAt(p, s, input, hit, slots)) |m| return m;
-            pos = hit + 1;
-        }
-        return null;
+        o.start = memchrFrom(input, o.start, fb) orelse return null;
+        if (input.len - o.start < filter.min_bytes) return null;
+    } else if (filter.rare_byte) |rb| {
+        // Rarest-required-byte fast-reject: `rare_byte` appears in EVERY match, so if it is
+        // absent there is no match — return at once. Sound (one-sided). The big win for a
+        // prefix-less interior-literal pattern (`\w+@\w+` on text with no `@`).
+        if (memchrFrom(input, o.start, rb) == null) return null;
     }
 
-    // Rarest-required-byte fast-reject: `rare_byte` appears in EVERY match, so if it is
-    // absent from the remaining input there is no match — return at once instead of
-    // scanning. Sound (one-sided). The big win for a prefix-less interior-literal pattern
-    // (`\w+@\w+` on text with no `@`). It does not pin the start (the match may begin
-    // before the byte), so it only rejects; when the byte IS present the dispatch scans.
-    if (filter.rare_byte) |rb| {
-        if (memchrFrom(input, opts.start, rb) == null) return null;
-    }
-
-    // No usable filter: scan the whole range with the per-input engine choice.
-    return dispatch(p, s, input, opts, slots);
+    // Scan the (possibly skipped-into) range with the per-input engine choice.
+    return dispatch(p, s, input, o, slots);
 }
 
 // ── Byte-DFA arm: span ops with the same prefilter the NFA arm uses ────────────────
@@ -533,22 +550,22 @@ fn runByteDfa(dp: *const dfa.Program, filter: Filter, d: *dfa.Scratch, input: []
         if (opts.start != 0) return null;
         return dfaConfirmAt(dp, d, input, 0, match_only);
     }
+    // Leading-literal start-skip (single memchr, then the lazy DFA's own O(input) reverse-DFA
+    // find) — NOT a per-occurrence anchored-confirm loop, which would be Θ(n²) on a
+    // begin-but-don't-complete dense-prefix input (same hazard as `runEdfa`). The lazy DFA's
+    // native `find` is already O(input) (reverse DFA; `has_text_start` short-circuits via
+    // `anchored_start` above), so one leading skip + native find is leftmost-first and linear.
+    var o = opts;
     if (filter.prefix_byte) |fb| {
-        var pos = opts.start;
-        while (memchrFrom(input, pos, fb)) |hit| {
-            if (input.len - hit < filter.min_bytes) return null;
-            if (dfaConfirmAt(dp, d, input, hit, match_only)) |m| return m;
-            pos = hit + 1;
-        }
-        return null;
-    }
-    // Rarest-required-byte fast-reject (sound; see `runNfa`).
-    if (filter.rare_byte) |rb| {
-        if (memchrFrom(input, opts.start, rb) == null) return null;
+        o.start = memchrFrom(input, o.start, fb) orelse return null;
+        if (input.len - o.start < filter.min_bytes) return null;
+    } else if (filter.rare_byte) |rb| {
+        // Rarest-required-byte fast-reject (sound; see `runNfa`).
+        if (memchrFrom(input, o.start, rb) == null) return null;
     }
     if (match_only)
-        return if (dfa.isMatch(dp, d, input, opts)) Match{ .start = opts.start, .end = opts.start } else null;
-    return dfa.search(dp, d, input, opts);
+        return if (dfa.isMatch(dp, d, input, o)) Match{ .start = opts.start, .end = opts.start } else null;
+    return dfa.search(dp, d, input, o);
 }
 
 // ── Eager-DFA arm: span ops with the same prefilter, but stateless (no scratch) ────
@@ -564,9 +581,10 @@ fn edfaConfirmAt(ep: *const edfa.Program, input: []const u8, at: usize, match_on
 
 /// The eager-DFA arm's span search — the same sound prefilter as `runNfa`/`runByteDfa`
 /// (length gate, `anchored_start` short-circuit, leading-literal `memchr` start-skip,
-/// rarest-required-byte fast-reject) in front of the frozen-table walk. Stateless, so it
-/// needs no `Scratch`. Captures never come here — they always use the Pike VM.
-fn runEdfa(ep: *const edfa.Program, filter: Filter, input: []const u8, opts: SearchOptions, match_only: bool) ?Match {
+/// rarest-required-byte fast-reject) in front of the frozen-table walk. The eager DFA is
+/// stateless; the only state is `probes`, the ReDoS observable (`Scratch.confirm_probes`)
+/// incremented per per-occurrence confirm. Captures never come here — they always use the Pike VM.
+fn runEdfa(ep: *const edfa.Program, filter: Filter, input: []const u8, opts: SearchOptions, match_only: bool, probes: *u64) ?Match {
     if (opts.start > input.len) return null;
     if (input.len - opts.start < filter.min_bytes) return null; // length gate
     if (opts.anchored) return edfaConfirmAt(ep, input, opts.start, match_only);
@@ -574,22 +592,39 @@ fn runEdfa(ep: *const edfa.Program, filter: Filter, input: []const u8, opts: Sea
         if (opts.start != 0) return null;
         return edfaConfirmAt(ep, input, 0, match_only);
     }
+    var o = opts;
     if (filter.prefix_byte) |fb| {
-        var pos = opts.start;
-        while (memchrFrom(input, pos, fb)) |hit| {
-            if (input.len - hit < filter.min_bytes) return null;
-            if (edfaConfirmAt(ep, input, hit, match_only)) |m| return m;
-            pos = hit + 1;
+        // The leading-literal `memchr` start-skip confirms anchored at each prefix-byte
+        // occurrence. Each confirm is O(match-attempt); when a confirm can walk an unbounded
+        // run before failing — `prone` (a non-accepting cycle, `(x+x+)+y`) or `end_anchored`
+        // (`$`, the confirm runs to end, `(a+)+$`) — this loop is **Θ(n²)** on a dense-prefix
+        // begin-but-don't-complete input (`a+b`/`(a+)+$` on `aaaa…a!`: a leading-byte at every
+        // position, each confirm re-walking the whole run). For exactly those programs the eager
+        // DFA's *native* find is already O(input) (reverse two-pass / reverse-from-end), so skip
+        // to the first candidate once and hand off to it — no per-position confirm. The fast-
+        // confirm case (`foo\d+`: bounded literal, confirm fails within a few bytes) keeps the
+        // memchr-jump loop, its intended speedup. (Both are leftmost-first; no match begins
+        // before the first prefix byte.)
+        if (ep.prone or ep.end_anchored) {
+            o.start = memchrFrom(input, o.start, fb) orelse return null;
+            if (input.len - o.start < filter.min_bytes) return null;
+        } else {
+            var pos = o.start;
+            while (memchrFrom(input, pos, fb)) |hit| {
+                if (input.len - hit < filter.min_bytes) return null;
+                probes.* += 1; // ReDoS observable: a per-occurrence confirm (0 for prone/end_anchored)
+                if (edfaConfirmAt(ep, input, hit, match_only)) |m| return m;
+                pos = hit + 1;
+            }
+            return null;
         }
-        return null;
-    }
-    if (filter.rare_byte) |rb| {
-        if (memchrFrom(input, opts.start, rb) == null) return null;
+    } else if (filter.rare_byte) |rb| {
+        if (memchrFrom(input, o.start, rb) == null) return null;
     }
     var es = edfa.Scratch{};
     if (match_only)
-        return if (edfa.isMatch(ep, &es, input, opts)) Match{ .start = opts.start, .end = opts.start } else null;
-    return edfa.search(ep, &es, input, opts);
+        return if (edfa.isMatch(ep, &es, input, o)) Match{ .start = opts.start, .end = opts.start } else null;
+    return edfa.search(ep, &es, input, o);
 }
 
 // ── Contract: matching entry points ──────────────────────────────────────────────
@@ -601,7 +636,7 @@ pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, op
         .nfa => |*p| {
             // Eager DFA span scan (prefiltered, stateless) when built — the fastest arm,
             // same result the NFA arm gives.
-            if (program.edfa_prog) |*ep| return runEdfa(ep, program.filter, input, opts, true) != null;
+            if (program.edfa_prog) |*ep| return runEdfa(ep, program.filter, input, opts, true, &scratch.confirm_probes) != null;
             // Lazy DFA fallback (prefiltered) when built and not disabled.
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
@@ -620,7 +655,7 @@ pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opt
     switch (program.inner) {
         .literal => |*p| return literal.search(p, &scratch.inner.literal, input, opts),
         .nfa => |*p| {
-            if (program.edfa_prog) |*ep| return runEdfa(ep, program.filter, input, opts, false);
+            if (program.edfa_prog) |*ep| return runEdfa(ep, program.filter, input, opts, false, &scratch.confirm_probes);
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
                     const r = runByteDfa(dp, program.filter, d, input, opts, false);
@@ -648,7 +683,7 @@ pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const
             // O(match) one.
             // Eager DFA span → anchored Pike VM for groups (the fastest handoff).
             if (program.edfa_prog) |*ep| {
-                const m = runEdfa(ep, program.filter, input, opts, false) orelse return null;
+                const m = runEdfa(ep, program.filter, input, opts, false, &scratch.confirm_probes) orelse return null;
                 var o = opts;
                 o.start = m.start;
                 o.anchored = true;

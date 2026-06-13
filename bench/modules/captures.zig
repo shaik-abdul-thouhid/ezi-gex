@@ -13,8 +13,8 @@ const Case = framework.Case;
 const Context = framework.Context;
 const RunResult = framework.RunResult;
 
-const PikeVM = ezi_gex.engine.backends.pikevm;
-const RX = ezi_gex.Compiled(PikeVM);
+const Auto = ezi_gex.engine.backends.auto;
+const RX = ezi_gex.Compiled(Auto);
 
 const State = struct {
     re: RX,
@@ -31,7 +31,7 @@ fn Pattern(comptime pat: []const u8, comptime tmpl: []const u8) type {
             if (cached == null) {
                 const a = std.heap.page_allocator;
                 var diag: ezi_gex.Diagnostic = .{};
-                var re = try ezi_gex.compileRuntimeWith(PikeVM, a, pat, &diag, .{});
+                var re = try ezi_gex.compileRuntimeWith(Auto, a, pat, &diag, .{});
                 cached = .{
                     .re = re,
                     .sc = try RX.Scratch.init(a, &re.program),

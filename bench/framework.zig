@@ -52,6 +52,11 @@ pub const Case = struct {
 pub const Suite = struct {
     module_name: []const u8,
     description: []const u8 = "",
+    /// When true the result is independent of which corpus is used (e.g. compile
+    /// throughput depends only on the pattern, not the match target). The runner
+    /// then times the suite against ONE corpus instead of all three — the other
+    /// rows would be identical by construction, so running them only wastes time.
+    corpus_independent: bool = false,
     cases: []const Case,
 };
 
@@ -217,14 +222,19 @@ fn runCaseOnCorpus(case: Case, base_allocator: std.mem.Allocator, sample_runs: u
 pub fn runSuite(suite: Suite, allocator: std.mem.Allocator, sample_runs: usize, corpora: []const Corpus) void {
     std.debug.print("\n## {s}\n", .{suite.module_name});
     if (suite.description.len > 0) std.debug.print("   {s}\n", .{suite.description});
+    if (suite.corpus_independent) std.debug.print("   (corpus-independent — timed on one corpus only)\n", .{});
     std.debug.print("   columns: corpus  mean ± stddev (n={d})  throughput  ops/sec  memory\n", .{sample_runs});
+
+    // A corpus-independent suite produces identical rows per corpus, so time it
+    // against a single corpus rather than re-running the same work three times.
+    const used = if (suite.corpus_independent and corpora.len > 0) corpora[0..1] else corpora;
 
     for (suite.cases) |case| {
         std.debug.print("\n• {s}", .{case.name});
         if (case.notes.len > 0) std.debug.print("   — /{s}/", .{case.notes});
         std.debug.print("\n", .{});
 
-        for (corpora) |c| {
+        for (used) |c| {
             const samples = runCaseOnCorpus(case, allocator, sample_runs, &c) orelse continue;
             printCorpusRow(allocator, sample_runs, c.name, samples);
             allocator.free(samples);

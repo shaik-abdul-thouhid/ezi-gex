@@ -5,9 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.1] - 2026-06-14
 
-`0.4.0-dev` on `main` — nothing yet.
+A patch release: a real **Θ(n²) ReDoS in the default engine** (found by a new ReDoS bench)
+and the test/bench machinery that catches it. Additive and results-invariant — no public
+signature or match-result changes.
+
+### Fixed
+
+- **Quadratic (Θ(n²)) ReDoS in the default `auto` engine — the headline linear-time claim
+  was violated for a broad class of common patterns.** `auto`'s prefilter applied a
+  leading-literal `memchr` start-skip that **confirmed anchored at every occurrence** of the
+  prefix byte. On a *begin-but-don't-complete* input where the prefix byte is dense — e.g.
+  `a+b` (or `(a+)+$`, `(x+x+)+y`) on `aaaa…a!` — that is O(n) confirms each re-walking the
+  O(n) run, i.e. **Θ(n²)**: ~1.1 s at 64 KiB, ~17 s at 256 KiB. The eager DFA's *own* find is
+  O(n); the prefilter was pre-empting it. (It went unnoticed because a *rare* discriminating
+  byte — `@` in `\w+@\w+`, `!` in `\d+!` — lets the prefilter fast-reject before the loop runs;
+  `a+b` has no rare byte, so it fell straight through.) **Fix:** for programs whose anchored
+  confirm can scan an unbounded run (`prone` — a non-accepting cycle — or `end_anchored` — a
+  trailing `$`), `runEdfa` now skips to the first candidate once and hands off to the eager
+  DFA's O(n) native find (reverse two-pass / reverse-from-end) instead of confirming per
+  occurrence; the per-occurrence memchr-jump is kept only for the fast-confirm case (`foo\d+`),
+  its intended speedup. The lazy-DFA and NFA prefilter arms (`runByteDfa`/`runNfa`) had the
+  same hazard and now likewise take a single leading skip + their O(n)/O(n·m) native find.
+  `a+b` on 64 KiB: **1.1 s → 186 µs**, and now scales linearly. Results-invariant
+  (`conformance.zig` pins every backend's spans/captures unchanged).
+- **Corrected a false claim in `backtrack.zig`.** The backtracker's native recursion depth is
+  **proportional to the matched-repetition length, not bounded by the program** (the old doc
+  said the opposite) — so a long enough input overflows the stack. This is a *stack-exhaustion*
+  limit, **not** a time blowup: the `(pc, sp)` memo keeps the step count strictly linear
+  (pinned by `engine/redos.zig`). Documented the consequence — the bare `backtrack` backend is
+  a **bounded-input** tool; `auto` shields the common path by routing inputs over
+  `BACKTRACK_MAX_INPUT` (4096) to the iterative Pike VM. The one uncapped path is grapheme
+  (`\X`) matching (backtrack is the only `\X`-capable backend), so a large *quantified*-`\X`
+  input is a documented constraint pending an iterative-backtracker rewrite.
+
+### Added
+
+- **ReDoS-immunity regression suite** (`engine/redos.zig`) — makes the linear-time claim
+  *testable*, not just asserted. (1) A **deterministic, machine-independent** check that the
+  bounded backtracker's exact work count (the new `Scratch.steps`, one tick per `(pc, sp)`
+  memo probe — bounded by `program × (input+1)`) grows **~linearly** (≤ 3× per input doubling;
+  a quadratic regression reads 4×, an exponential one astronomically more) on the textbook
+  catastrophic corpus (`(a+)+$`, `(a*)*$`, `(a|ab)*$`, `(x+x+)+y`, quantified classes, …).
+  (2) Cross-backend completion + span agreement at scale through the default `auto` engine, the
+  `a+b`/`(a+)+$`/`(x+x+)+y` quadratic regression, the trailing-`$` Θ(n²) guard, and a bounded
+  comptime match.
+- **`backtrack.Scratch.steps`** (`@stable-since: v0.3.1`) — observable backtracking work count
+  for the run just executed; the deterministic ReDoS observable. Read-only, never consulted by
+  matching.
+- **`auto.Scratch.confirm_probes`** (`@stable-since: v0.3.1`) — observable count of the eager-DFA
+  arm's per-occurrence prefilter confirms. Stays **0** for `prone`/`end_anchored` programs (the
+  fix above), so `engine/redos.zig` asserts it as a hard, revert-failing guard against the Θ(n²)
+  regression. Read-only, never affects a result.
+- **`redos` benchmark module** (`bench/modules/redos.zig`) — the catastrophic corpus at growing
+  sizes through `auto`; a flat throughput column down each pattern's rows is visible linearity, a
+  collapse is ReDoS. This is the bench that caught the Θ(n²) above.
 
 ## [0.3.0] - 2026-06-13
 

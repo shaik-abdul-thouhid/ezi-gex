@@ -1,7 +1,10 @@
-//! Compile throughput: pattern → AST → HIR → Pike VM program, then free. This is
-//! corpus-independent, so the three rows are ~equal (a sanity check that compile
-//! cost doesn't depend on match input). Throughput is pattern-bytes/sec; ops/sec
-//! is patterns-compiled/sec. The memory column shows per-compile allocation.
+//! Compile throughput: pattern → AST → HIR → `auto` program, then free. `auto`'s
+//! build eagerly determinizes the full eager DFA for DFA-eligible patterns (the
+//! "pay once at compile, win on every match" tradeoff), so for the Unicode-heavy
+//! patterns below this row is dominated by DFA construction, not parsing/HIR.
+//! Corpus-independent (cost depends only on the pattern), so the framework times
+//! it against a single corpus. Throughput is pattern-bytes/sec; ops/sec is
+//! patterns-compiled/sec. The memory column shows per-compile allocation.
 
 const std = @import("std");
 const framework = @import("../framework.zig");
@@ -10,7 +13,7 @@ const ezi_gex = @import("ezi_gex");
 const Context = framework.Context;
 const RunResult = framework.RunResult;
 
-const PikeVM = ezi_gex.engine.backends.pikevm;
+const Auto = ezi_gex.engine.backends.auto;
 
 const patterns = [_][]const u8{
     "the",
@@ -25,7 +28,11 @@ const patterns = [_][]const u8{
     "^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$",
 };
 
-const inner: u32 = 20;
+// One compile per pattern per sample. Each `compileRuntimeWith(Auto, …)` here
+// eagerly determinizes the full eager DFA (auto.buildAlloc) — ~tens of ms for the
+// Unicode-heavy patterns below — which already dwarfs timer resolution, so there is
+// no need to loop it. The framework's `sample_runs` (default 7) gives the stddev.
+const inner: u32 = 1;
 
 fn run(ctx: *Context) anyerror!RunResult {
     var bytes: u64 = 0;
@@ -34,7 +41,7 @@ fn run(ctx: *Context) anyerror!RunResult {
     while (n < inner) : (n += 1) {
         for (patterns) |p| {
             var diag: ezi_gex.Diagnostic = .{};
-            var re = ezi_gex.compileRuntimeWith(PikeVM, ctx.allocator, p, &diag, .{}) catch continue;
+            var re = ezi_gex.compileRuntimeWith(Auto, ctx.allocator, p, &diag, .{}) catch continue;
             re.deinit();
             bytes += p.len;
             ops += 1;
@@ -45,8 +52,9 @@ fn run(ctx: *Context) anyerror!RunResult {
 
 pub const suite: framework.Suite = .{
     .module_name = "compile",
-    .description = "compileRuntime() over a 10-pattern set (corpus-independent; rows ~equal).",
+    .description = "compileRuntime() over a 10-pattern set — pattern → HIR → NFA + eager-DFA build, then free.",
+    .corpus_independent = true,
     .cases = &.{
-        .{ .name = "compileRuntime x10 patterns", .notes = "parse + HIR + Pike VM build + free", .run = run },
+        .{ .name = "compileRuntime x10 patterns", .notes = "parse + HIR + Auto build + free", .run = run },
     },
 };

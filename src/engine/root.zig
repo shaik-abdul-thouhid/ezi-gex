@@ -47,6 +47,9 @@ pub const backends = struct {
 /// Cross-backend conformance tests (every backend agrees, runtime + comptime).
 pub const conformance = @import("conformance.zig");
 
+/// ReDoS-immunity regression suite — deterministic linear-work + crash-free guards.
+pub const redos = @import("redos.zig");
+
 /// The front door: `compileRuntime` / `compileComptime` → `Compiled`.
 pub const regex = @import("regex.zig");
 pub const compileRuntime = regex.compileRuntime;

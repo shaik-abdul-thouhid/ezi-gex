@@ -20,11 +20,13 @@ const corpus = @import("corpus.zig");
 const search = @import("modules/search.zig");
 const captures = @import("modules/captures.zig");
 const compile = @import("modules/compile.zig");
+const redos = @import("modules/redos.zig");
 
 const registry: []const framework.Suite = &.{
     search.suite,
     captures.suite,
     compile.suite,
+    redos.suite,
 };
 
 fn printUsage() void {
@@ -97,7 +99,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print(
         \\ezi_gex benchmarks
         \\==================
-        \\backend:          pikevm (codepoint Thompson NFA)
+        \\backend:          auto (backend dispatcher)
         \\samples per case: {d} (plus 1 warmup, discarded)
         \\corpus size:      {d} bytes × 3 (ASCII / Multilingual / Pathological)
         \\

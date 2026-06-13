@@ -22,6 +22,24 @@
 //! the `Scratch` carves one `[]Cell` buffer, so the same `initBuffer` runs at
 //! comptime (tiny inputs always fit a modest buffer) and at runtime.
 //!
+//! ## Resource bounds (read before using this backend directly)
+//!
+//! *Time* is linear and ReDoS-immune: the `(pc, sp)` memo admits each state once, so
+//! the work count is bounded by `program × (input+1)` for **every** pattern, including
+//! `(a+)+$` / `(a*)*b` (`Scratch.steps` exposes the count; `engine/redos.zig` pins the
+//! linearity deterministically). *Stack* is the catch: `backtrack()` recurses natively,
+//! and on a quantified subpattern the recursion depth grows with the **matched length**
+//! (see its doc) — so a long enough input **overflows the stack and crashes**. This is a
+//! stack-exhaustion limit, not a time blowup.
+//!
+//! Therefore the bare `backtrack` backend is a **bounded-input** tool. The default
+//! `auto` dispatcher shields you: it routes only inputs `≤ BACKTRACK_MAX_INPUT` (4096)
+//! here and runs the iterative Pike VM above that, so the default non-grapheme path
+//! never recurses deep. The one uncapped path is grapheme (`\X`) — backtrack is the only
+//! `\X`-capable backend, so `auto` sends it the full input; a large *quantified*-`\X`
+//! match is a documented constraint, not yet fixed (an explicit heap-stack rewrite would
+//! lift it). If you select `backtrack` explicitly, keep inputs bounded or use `auto`.
+//!
 //! Per-search clearing — only what was dirtied. A naive backtracker `@memset`s the
 //! whole `program × (input+1)`-bit visited set before every search, which is
 //! `O(program × input)` even when the match is found at offset 0 after touching a
@@ -106,6 +124,17 @@ pub const Scratch = struct {
     touched: []Cell, // .w   — indices of dirtied visited words (cleared next run)
     touched_count: usize = 0, // how many of `touched` are live for the pending clear
     cleared_words: usize = 0, // high-water mark: visited[0..cleared_words] is known-zero
+    /// Backtracking work performed by the LAST `run` — one unit per `(pc, sp)` memo
+    /// probe (`seen`). The visited memo admits each `(pc, sp)` exactly once, so this is
+    /// bounded by `program × (input + 1)` and therefore grows **linearly** with the
+    /// input on *every* pattern, catastrophic ones included (`(a+)+$`, `(a*)*b`). It is
+    /// the observable that makes ReDoS-immunity *testable* rather than wall-clock-flaky:
+    /// a super-linear jump in `steps` across a doubling input is a memo regression (see
+    /// `engine/redos.zig`). Observational only — never read by matching, never affects a
+    /// result.
+    ///
+    /// @stable-since: v0.3.1
+    steps: u64 = 0,
     nprog: u32,
     slot_count: u32,
     gpa: ?std.mem.Allocator = null, // non-null ⇒ heap, visited may grow
@@ -234,6 +263,7 @@ const Ctx = struct {
     slots: []Cell,
     match_slots: []Cell,
     stride: usize, // input.len + 1
+    steps: u64, // `(pc, sp)` memo probes this run (persisted to Scratch.steps)
 };
 
 /// Test-and-set the `(pc, sp)` memo bit; returns whether it was already set. On the
@@ -243,6 +273,7 @@ const Ctx = struct {
 /// per word per run (a word stays nonzero afterwards), so the list holds each touched
 /// word exactly once and is bounded by the distinct words touched.
 fn seen(ctx: *Ctx, pc: u32, sp: usize) bool {
+    ctx.steps += 1; // one unit of backtracking work — the linear-time observable
     const idx = @as(usize, pc) * ctx.stride + sp;
     const w = idx / WORD_BITS;
     const bit = @as(usize, 1) << @intCast(idx % WORD_BITS);
@@ -257,20 +288,29 @@ fn seen(ctx: *Ctx, pc: u32, sp: usize) bool {
 
 /// Depth-first match from `(pc0, sp0)`. Returns whether a match was found; on the
 /// first (highest-priority) match it snapshots captures into `match_slots`. The
-/// `seen` memo prunes already-explored states, giving linear time and termination
+/// `seen` memo prunes already-explored states, giving linear *time* and termination
 /// (an empty-width cycle revisits a `(pc, sp)` and is cut).
 ///
-/// Recursion depth — bounded by the PROGRAM, not the input. Native recursion happens
-/// on exactly two arms: `split.a` (the higher-priority branch — its lower-priority
-/// `split.b` continuation is carried by the while-loop's tail) and `.save` (which
-/// must recurse so it can undo the slot on backtrack). Every other instruction —
-/// `jmp`/`char`/`range`/`any`/`grapheme`/`assertion`, and a split's `.b` arm — is a
-/// linear chain carried by the `while (true)` loop WITHOUT recursing. So stack depth
-/// tracks the pattern's branch/capture nesting (bounded by program structure), never
-/// the input length on a straight run — a long `a+` over a megabyte of `a`s recurses
-/// at constant depth, not a megabyte deep. (An explicit stack would erase even that
-/// program-bounded depth, but the recursion here is small and well-bounded, so the
-/// native form is kept for clarity.)
+/// Recursion depth — **proportional to the matched-repetition length, NOT bounded by
+/// the program.** Native recursion happens on two arms: `split.a` (the higher-priority
+/// branch — its `split.b` continuation is carried by the while-loop's tail) and `.save`
+/// (which must recurse so it can undo the slot on backtrack). The catch: a quantified
+/// subpattern loops back into its OWN `split` after consuming input, and each
+/// iteration's `split.a`/`.save` frame stays live until the whole match resolves — so a
+/// long run matched by `a+`, `(a|a)*`, `\X+`, … recurses once per consumed unit. Depth
+/// therefore grows with the input, and a long enough input **overflows the native stack
+/// (a crash)**. This is a stack-exhaustion limit, NOT a time blowup — `seen` keeps the
+/// step count strictly linear regardless (`engine/redos.zig` pins that with a
+/// deterministic work-count test, and `Scratch.steps` exposes it).
+///
+/// Consequence (see the module header → "Resource bounds"): the bare `backtrack`
+/// backend is a **bounded-input** tool. `auto` enforces this by routing only inputs
+/// `≤ BACKTRACK_MAX_INPUT` here and running the iterative Pike VM (no input-proportional
+/// stack) above it. The sole uncapped path is grapheme (`\X`) matching — backtrack is
+/// the only `\X`-capable backend, so `auto` hands it the full input; a large
+/// *quantified*-`\X` input is therefore a documented constraint. (An explicit
+/// heap-stack rewrite would erase the limit entirely; deferred — the cap covers the
+/// default non-grapheme path.)
 fn backtrack(ctx: *Ctx, pc0: u32, sp0: usize) bool {
     var pc = pc0;
     var sp = sp0;
@@ -373,6 +413,7 @@ fn run(program: *const Program, scratch: *Scratch, input: []const u8, opts: Sear
         .slots = scratch.slots,
         .match_slots = scratch.match_slots,
         .stride = input.len + 1,
+        .steps = 0,
     };
     // Leftmost: try start positions in order; the visited memo is shared across
     // starts (a `(pc, sp)` failure is start-independent), so the whole scan stays
@@ -383,11 +424,13 @@ fn run(program: *const Program, scratch: *Scratch, input: []const u8, opts: Sear
         @memset(scratch.slots, .{ .slot = null });
         if (backtrack(&ctx, 0, start)) {
             scratch.touched_count = ctx.touched_count; // persist for the next clear
+            scratch.steps = ctx.steps; // persist the work count (ReDoS observable)
             return true;
         }
         if (opts.anchored) break;
     }
     scratch.touched_count = ctx.touched_count; // persist for the next clear
+    scratch.steps = ctx.steps; // persist the work count (ReDoS observable)
     return false;
 }
 
