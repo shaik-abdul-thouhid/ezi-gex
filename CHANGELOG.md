@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-`0.3.0-dev`.
+`0.4.0-dev` on `main` — nothing yet.
+
+## [0.3.0] - 2026-06-13
 
 ### Added
 
@@ -141,10 +143,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when *every* branch is anchored, so they take the same fast path. A **mixed** `$` (text_end in
   only *some* branches, e.g. `a$|b`) is **declined** by `edfa.supports` and routed to the linear
   Pike VM — correct + O(input), just not DFA-accelerated; a documented, intentionally-deferred
-  limitation (the rare shape doesn't justify a two-seed reverse DFA). **Build-time note:** the
-  reverse DFA a trailing-`$` *Unicode-class* pattern now builds (`\w+@\w+$`, `\p{L}+$`) uses the
-  O(states²) state interner, so it is **slow to _compile_** (~seconds) though O(input) to
-  *match* — prefer `compileRuntime`; a hash-based interner is the planned fix.
+  limitation (the rare shape doesn't justify a two-seed reverse DFA).
+- **Eager-DFA hash interner — O(states²) → ~O(states) determinization** (`engine/backends/edfa.zig`).
+  `Det.intern`/`RDet.intern` now intern DFA states through an **open-addressing hash index**
+  (`hashPcs`, in caller-supplied fixed buffers so it stays comptime-compatible) instead of a
+  linear scan over all prior states. Determinizing a big Unicode class — and especially the
+  reverse DFA a *prone* or *trailing-`$`* pattern builds (`\w+@\w+`, `\w+@\w+$`, `\p{L}+$`) — drops
+  from **~seconds to ~milliseconds to *compile*** (the demo's old ~3 s `\w+@\w+` stall is gone).
+  Build-time only — **match time is unchanged (O(input))**, and there is **no semantic change**
+  (same states, same frozen tables; conformance + differential suites guard it).
 - **The byte DFA is ON BY DEFAULT through `auto`, preferring the eager DFA**
   (`engine/backends/auto.zig`, `engine/regex.zig`) — the single biggest throughput change.
   `Options.strategy.byte_engine` defaulted to `.auto`, which used to be **inert**; it now

@@ -19,8 +19,9 @@
 //! supported pattern** — quadratic-immune, including `$`/`\z` (matched by a reverse-DFA-from-end
 //! pass; covers `anchored_end` patterns and all-branch-`$` alternations like `foo$|bar$`).
 //! **Known, intentional gaps**, each declined to the code-point engines (correct + linear, just
-//! not DFA-accelerated): *mixed* `$` (`a$|b`), `(?m)` line anchors, and `\b`/`\B`. **Build-time
-//! caveat:** a big Unicode-class pattern is slow to *build* (not to match). All detailed below.
+//! not DFA-accelerated): *mixed* `$` (`a$|b`), `(?m)` line anchors, and `\b`/`\B`. **Build-time:**
+//! determinization is hash-interned (~O(states)), so even big Unicode-class builds stay fast — a
+//! one-time cost, match time is O(input). All detailed below.
 //!
 //! ## What it is (and is not)
 //!
@@ -74,17 +75,14 @@
 //! could keep it on the DFA, but the shape is rare and already linear, so it is intentionally
 //! deferred (see `DESIGN.md` §7).
 //!
-//! ## ⚠️ Build-time cost — **determinizing a big Unicode class is slow to BUILD (not to match)**
+//! ## Build-time cost — determinization is ~O(states) (hash-interned)
 //!
-//! **A pattern over a large Unicode class (`\w`, `\p{L}`) can take ~seconds to *compile*, even
-//! though matching it is O(input).** The forward and reverse determinizers intern DFA states by
-//! a linear scan (**O(states²)**), and such a class produces hundreds-to-thousands of states
-//! over a ~100-symbol byte alphabet. The **reverse** DFA (built for *prone* and *trailing-`$`*
-//! patterns) is the heaviest: `\w+@\w+` and — now that `$` is reverse-handled — `\w+@\w+$` /
-//! `\p{L}+$` are the slow cases. It is a **one-time build cost; match time is unaffected.** For
-//! such patterns prefer `compileRuntime` over `compileComptime`, or the lazy `dfa`/NFA. A
-//! hash-based state interner (O(1) lookup) is the planned fix. ASCII-class and literal patterns
-//! build instantly.
+//! The forward and reverse determinizers intern DFA states through an **open-addressing hash
+//! index** (`hashPcs`), so building a big Unicode-class DFA is **~linear in the state count**.
+//! (This was an O(states²) linear scan — `\w+@\w+`, `\w+@\w+$`, `\p{L}+$` took ~seconds to
+//! *compile*; now milliseconds.) Determinizing a large Unicode class (hundreds-to-thousands of
+//! states over a ~100-symbol alphabet) is still the dominant build cost, but it is a **one-time
+//! cost; match time is O(input), unaffected**. ASCII-class and literal patterns build instantly.
 //!
 //! ## Invalid UTF-8 — dead-on-invalid, for free
 //!
@@ -292,6 +290,27 @@ const DetError = error{Unsupported};
 /// `(state, class)` edge is computed up front and written into `trans`, rather than
 /// memoized on demand. State sets are interned by their priority-ordered pc list (a
 /// flat pool + per-state offset/length), the same identity the lazy DFA uses.
+/// FNV-1a hash of a canonical pc list — the key the determinizers intern DFA states by. Pure
+/// integer ops (no `@Vector`), so it runs at comptime as well as runtime.
+fn hashPcs(pcs: []const u32) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for (pcs) |v| {
+        h ^= v;
+        h *%= 0x100000001b3;
+    }
+    return h;
+}
+
+/// Open-addressing table capacity for up to `state_count` states: the next power of two that
+/// keeps the load factor ≤ 0.5 (so linear probing always finds an empty slot), floored at 16.
+/// Caller-sized, so the hash index is a fixed buffer — comptime-able like the rest of the
+/// determinizer.
+fn htCap(state_count: u32) u32 {
+    var c: u32 = 16;
+    while (c < state_count *| 2) c *|= 2;
+    return c;
+}
+
 const Det = struct {
     insts: []const byte.Inst,
     classes: *const byte.ByteClasses,
@@ -310,6 +329,8 @@ const Det = struct {
     trans: []u32, // n_states × n_classes (anchored)
     utrans: []u32, // n_states × n_classes (unanchored: ∪ a fresh start each edge)
     pc_pool: []u32, // concatenated, priority-ordered pc lists
+    state_hash: []u32, // open-addressing index keyed on the pc list: slot → state id + 1 (0 = empty)
+    htmask: u32, // state_hash.len - 1 (a power of two)
     n_states: u32 = 0,
     pool_len: u32 = 0,
 
@@ -395,20 +416,24 @@ const Det = struct {
         }
     }
 
-    /// Intern the state currently in `work[0..work_len]` to a dense id (linear search;
-    /// state counts are tiny). On a fresh state, copies the pc list into `pc_pool` and
-    /// records its accepting flag. Declines (`error.Unsupported`) on overflow of either
-    /// the state cap or the pc pool.
+    /// Intern the state currently in `work[0..work_len]` to a dense id via the open-addressing
+    /// hash index (`state_hash`, keyed by `hashPcs`): O(1) amortized — a hash collision falls
+    /// back to a pc-list compare. On a fresh state, copies the pc list into `pc_pool` and records
+    /// its accepting flags. Declines (`error.Unsupported`) on overflow of the state cap or pc
+    /// pool. (Replaces the former O(states²) linear scan — the build-time hot spot for big
+    /// Unicode classes; semantics are identical, so the conformance suite guards it.)
     fn intern(self: *Det) DetError!u32 {
         const key = self.work[0..self.work_len];
-        var id: u32 = 0;
-        while (id < self.n_states) : (id += 1) {
+        var slot: u32 = @as(u32, @truncate(hashPcs(key))) & self.htmask;
+        while (self.state_hash[slot] != 0) : (slot = (slot + 1) & self.htmask) {
+            const id = self.state_hash[slot] - 1;
             const off = self.state_off[id];
             if (self.state_len[id] == key.len and std.mem.eql(u32, self.pc_pool[off .. off + key.len], key))
                 return id;
         }
         if (self.n_states >= self.state_off.len) return error.Unsupported; // > max_states
         if (self.pool_len + key.len > self.pc_pool.len) return error.Unsupported; // pool full
+        const id = self.n_states;
         const off = self.pool_len;
         @memcpy(self.pc_pool[off .. off + key.len], key);
         self.state_off[id] = off;
@@ -417,6 +442,7 @@ const Det = struct {
         self.accept_eoi[id] = self.work_match_eoi;
         self.pool_len += @intCast(key.len);
         self.n_states += 1;
+        self.state_hash[slot] = id + 1;
         return id;
     }
 
@@ -445,6 +471,7 @@ const Det = struct {
     /// them. Returns nothing; fills `state_*`, `accept`, `trans`, `start0`, `startN`.
     fn run(self: *Det) DetError!void {
         @memset(self.seen, 0);
+        @memset(self.state_hash, 0); // empty index (0 = empty slot)
 
         // DEAD = the empty set (work_len already 0).
         self.work_len = 0;
@@ -539,6 +566,8 @@ const RDet = struct {
     n_rstates: u32 = 0,
     rpool_len: u32 = 0,
     rstart: u32 = DEAD,
+    r_state_hash: []u32, // open-addressing index keyed on the (sorted) pc list: slot → rstate id + 1
+    r_htmask: u32, // r_state_hash.len - 1 (a power of two)
 
     // ── per-closure work buffers ──
     seen: []u32,
@@ -672,20 +701,24 @@ const RDet = struct {
         }
     }
 
-    /// Intern the reverse state in `work[0..work_len]` (sorted, so set-equal states collapse
-    /// to one id) to a dense reverse-state id, recording its accept flag on first sight.
-    /// Declines (`error.Unsupported`) on state-cap or pc-pool overflow.
+    /// Intern the reverse state in `work[0..work_len]` (sorted first, so set-equal states collapse
+    /// to one id) via the open-addressing hash index (`r_state_hash`, keyed by `hashPcs` on the
+    /// sorted list): O(1) amortized, collision → pc-list compare. Records its accept flag on first
+    /// sight. Declines (`error.Unsupported`) on state-cap or pc-pool overflow. (Replaces the former
+    /// O(states²) linear scan — semantics identical, conformance-guarded.)
     fn intern(self: *RDet) DetError!u32 {
         sortAsc(self.work[0..self.work_len]);
         const key = self.work[0..self.work_len];
-        var id: u32 = 0;
-        while (id < self.n_rstates) : (id += 1) {
+        var slot: u32 = @as(u32, @truncate(hashPcs(key))) & self.r_htmask;
+        while (self.r_state_hash[slot] != 0) : (slot = (slot + 1) & self.r_htmask) {
+            const id = self.r_state_hash[slot] - 1;
             const off = self.r_state_off[id];
             if (self.r_state_len[id] == key.len and std.mem.eql(u32, self.r_pc_pool[off .. off + key.len], key))
                 return id;
         }
         if (self.n_rstates >= self.r_state_off.len) return error.Unsupported;
         if (self.rpool_len + key.len > self.r_pc_pool.len) return error.Unsupported;
+        const id = self.n_rstates;
         const off = self.rpool_len;
         @memcpy(self.r_pc_pool[off .. off + key.len], key);
         self.r_state_off[id] = off;
@@ -693,6 +726,7 @@ const RDet = struct {
         self.raccept[id] = self.work_match;
         self.rpool_len += @intCast(key.len);
         self.n_rstates += 1;
+        self.r_state_hash[slot] = id + 1;
         return id;
     }
 
@@ -721,6 +755,7 @@ const RDet = struct {
     fn run(self: *RDet) DetError!void {
         self.buildAdj();
         @memset(self.seen, 0);
+        @memset(self.r_state_hash, 0); // empty index (0 = empty slot)
 
         self.work_len = 0;
         self.work_match = false;
@@ -791,6 +826,9 @@ fn reverseAlloc(gpa: std.mem.Allocator, insts: []const byte.Inst, class_rep: *co
     defer gpa.free(work);
     const seeds = try gpa.alloc(u32, n + 1);
     defer gpa.free(seeds);
+    const r_ht = htCap(r_state_cap);
+    const r_state_hash = try gpa.alloc(u32, r_ht); // open-addressing intern index (≤ 0.5 load)
+    defer gpa.free(r_state_hash);
 
     var rdet = RDet{
         .insts = insts,
@@ -813,6 +851,8 @@ fn reverseAlloc(gpa: std.mem.Allocator, insts: []const byte.Inst, class_rep: *co
         .stack = stack,
         .work = work,
         .seeds = seeds,
+        .r_state_hash = r_state_hash,
+        .r_htmask = r_ht - 1,
     };
     rdet.run() catch return error.Unsupported;
 
@@ -962,6 +1002,9 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     defer gpa.free(work);
     const seeds = try gpa.alloc(u32, 2 * ic + 2); // unanchored row unions two states' seeds
     defer gpa.free(seeds);
+    const ht = htCap(state_cap);
+    const state_hash = try gpa.alloc(u32, ht); // open-addressing intern index (≤ 0.5 load)
+    defer gpa.free(state_hash);
 
     var det = Det{
         .insts = bp.insts,
@@ -980,6 +1023,8 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
         .stack = stack,
         .work = work,
         .seeds = seeds,
+        .state_hash = state_hash,
+        .htmask = ht - 1,
     };
     det.run() catch return error.Unsupported;
 
@@ -1101,6 +1146,8 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
     comptime var stack: [2 * ic + 1]u32 = undefined;
     comptime var work: [ic + 1]u32 = undefined;
     comptime var seeds: [2 * ic + 2]u32 = undefined; // unanchored row unions two states' seeds
+    const ht = htCap(state_cap);
+    comptime var state_hash: [ht]u32 = undefined; // open-addressing intern index (zeroed in run)
 
     comptime var det = Det{
         .insts = bp.insts,
@@ -1119,6 +1166,8 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
         .stack = &stack,
         .work = &work,
         .seeds = &seeds,
+        .state_hash = &state_hash,
+        .htmask = ht - 1,
     };
     det.run() catch @compileError("edfa: pattern's DFA exceeds max_states; use the runtime lazy DFA (backends.dfa) instead");
 
@@ -1178,6 +1227,8 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
     comptime var rstack: [4 * ic + 4]u32 = undefined;
     comptime var rwork: [ic + 1]u32 = undefined;
     comptime var rseeds: [ic + 1]u32 = undefined;
+    const r_ht = htCap(r_state_cap);
+    comptime var r_state_hash: [r_ht]u32 = undefined; // open-addressing intern index (zeroed in run)
     comptime var rdet = RDet{
         .insts = bp.insts,
         .class_rep = &class_rep,
@@ -1199,6 +1250,8 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
         .stack = &rstack,
         .work = &rwork,
         .seeds = &rseeds,
+        .r_state_hash = &r_state_hash,
+        .r_htmask = r_ht - 1,
     };
     if (rev_built) rdet.run() catch @compileError("edfa: reverse DFA exceeds bounds; use the runtime lazy DFA (backends.dfa) instead");
     const rn = rdet.n_rstates;

@@ -727,13 +727,12 @@ lazy DFA **cannot** run at comptime at all (its cache mutates while matching); t
 freezes everything at build, so a tiny pattern's whole match folds into the binary — `ctre`'s
 trick, with full Unicode, decided per-pattern.
 
-**⚠️ Build-time cost — slow to *compile*, not to match.** Determinizing a big Unicode class
-into the eager DFA interns DFA states by an **O(states²)** linear scan, and the **reverse** DFA
-(built for *prone* and *trailing-`$`* patterns) is the heaviest. So `\w+@\w+`, `\w+@\w+$`, and
-`\p{L}+$` can take **~seconds to *compile*** — a one-time build cost; **match time stays
-O(input), unaffected**. Prefer `compileRuntime` over `compileComptime` for such patterns (or the
-lazy `dfa`/NFA). A hash-based state interner (O(1) lookup, replacing the linear scan) is the
-planned fix; ASCII-class and literal patterns build instantly.
+**Build-time cost — determinization is ~O(states) (hash-interned).** The forward and reverse
+determinizers intern DFA states through an open-addressing hash index, so building a big
+Unicode-class DFA is ~linear in its state count. (This was an O(states²) linear scan — `\w+@\w+`,
+`\w+@\w+$`, `\p{L}+$` took ~seconds to *compile*; now milliseconds.) Determinizing a large Unicode
+class is still the dominant build cost, but it is a one-time cost — **match time stays O(input),
+unaffected**; ASCII-class and literal patterns build instantly.
 
 **Limitation — *mixed* `$` is declined (run on the Pike VM), not run quadratically.** The
 reverse-from-end arm (§The eager DFA's `find`) needs the match end pinned at `input.len`

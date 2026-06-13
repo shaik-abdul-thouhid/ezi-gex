@@ -26,7 +26,7 @@ a **pluggable backend** architecture.
 
 ## Status
 
-Version `0.2.0` — the current tagged release; **`0.3.0-dev` is now under
+Version `0.3.0` — the current tagged release; **`0.4.0-dev` is now under
 development** on `main`. Pre-1.0, so the API may still change, but everything in the
 public surface is annotated `@stable-since: vX.Y.Z` and is covered by SemVer. Tracks a
 recent Zig dev build (`0.17.0-dev`); it will not compile on stable 0.16.
@@ -67,16 +67,16 @@ absorbs all of this without API changes — see *Performance*.
 Via git ref (resolves the tag at fetch time):
 
 ```sh
-zig fetch --save git+https://github.com/shaik-abdul-thouhid/ezi-gex.git#v0.2.0
+zig fetch --save git+https://github.com/shaik-abdul-thouhid/ezi-gex.git#v0.3.0
 ```
 
 Or via plain HTTP tarball (pins the content hash in `build.zig.zon`):
 
 ```sh
-zig fetch --save https://github.com/shaik-abdul-thouhid/ezi-gex/archive/refs/tags/v0.2.0.tar.gz
+zig fetch --save https://github.com/shaik-abdul-thouhid/ezi-gex/archive/refs/tags/v0.3.0.tar.gz
 ```
 
-**Tracking `main` (unreleased `0.3.0-dev`)** — if you want the latest, in-development
+**Tracking `main` (unreleased `0.4.0-dev`)** — if you want the latest, in-development
 surface before it's tagged, fetch the branch instead of a tag. This resolves `main`'s
 current commit and pins its hash in `build.zig.zon`; re-run it to move up:
 
@@ -85,7 +85,7 @@ zig fetch --save git+https://github.com/shaik-abdul-thouhid/ezi-gex.git#main
 ```
 
 `main` is the development branch: it builds and is tested, but APIs there are not yet
-covered by a tag, so they can still change before `0.3.0`. For reproducible builds,
+covered by a tag, so they can still change before `0.4.0`. For reproducible builds,
 prefer a tagged release; reach for `main` only when you specifically need unreleased work.
 
 Then in `build.zig` (the `ezi_code` dependency is resolved transitively — you only
@@ -553,13 +553,11 @@ the shared tables.
 > reverse trio, ~1 MB). See [`docs/architecture.md`](docs/architecture.md) → *The byte
 > substrate* / *The eager DFA*.
 >
-> **⚠️ Build-time caveat — slow to _compile_, not to match.** Determinizing a *big Unicode
-> class* into the eager DFA interns DFA states by an **O(states²)** linear scan, and the
-> **reverse** DFA (built for *prone* and *trailing-`$`* patterns — `\w+@\w+`, and now `\w+@\w+$`
-> / `\p{L}+$`) is the heaviest, so such a pattern can take **~seconds to compile**. It is a
-> **one-time build cost; match time is O(input), unaffected.** Prefer `compileRuntime` over
-> `compileComptime` for these (or the lazy `dfa`/NFA); a hash-based state interner (O(1) lookup)
-> is the planned fix. ASCII-class and literal patterns build instantly.
+> **Build-time note — determinization is ~O(states) (hash-interned).** The forward and reverse
+> determinizers intern DFA states through an open-addressing hash, so building a *big Unicode
+> class* DFA is ~linear in its state count. (Was an O(states²) scan — `\w+@\w+`, `\w+@\w+$`,
+> `\p{L}+$` took ~seconds to *compile*; now milliseconds.) It is a **one-time build cost; match
+> time is O(input), unaffected.** ASCII-class and literal patterns build instantly.
 
 Reference point: the bundled `main.zig` demo (which exercises runtime *and* comptime
 compilation, classes, captures, replace, split, and `\p{L}`) is **~2.76 MB** in `Debug`

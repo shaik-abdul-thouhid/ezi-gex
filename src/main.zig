@@ -203,9 +203,12 @@ pub fn main(init: std.process.Init) !void {
     // `states × byte_classes` table, so its `Scratch` is EMPTY and it matches at COMPTIME
     // (into ro_data) as well as runtime — where the lazy `dfa` cannot, because its cache
     // mutates while matching. It is now `auto`'s default span engine, O(input) on every
-    // pattern: a plain anchored table walk for patterns that complete at most positions
-    // (`\w+`), or a forward-end + reverse-DFA two-pass for begin-but-don't-complete ones
-    // (`\w+@\w+`) — the arm is chosen statically at build, so there is no per-search probing.
+    // pattern via one of three build-time-chosen arms (no per-search probing): a plain anchored
+    // table walk for patterns that complete at most positions (`\w+`); a forward-end +
+    // reverse-DFA two-pass for begin-but-don't-complete ones (`\w+@\w+`); and a single
+    // reverse-DFA-from-end pass for trailing-`$` patterns (`\w+$`, `\w+@\w+$`) — so even `$` is
+    // quadratic-immune. (Determinization is hash-interned, so big Unicode-class builds stay
+    // ~linear in states.)
     std.debug.print("\n── eager DFA (frozen table; comptime + runtime) ──\n", .{});
 
     // Runtime, pinned to edfa: span-only, with a zero-sized Scratch.
@@ -217,7 +220,8 @@ pub fn main(init: std.process.Init) !void {
     if (ere.find(&edsc, "  abc123!  ")) |m|
         std.debug.print("edfa /[a-z]+[0-9]+/ → \"{s}\"\n", .{m.slice("  abc123!  ")});
 
-    // `$` / `\z` (text_end) now runs on the DFA: the leftmost word run that ENDS the input.
+    // `$` / `\z` (text_end) runs on the DFA via a reverse-from-end pass — O(input), never the
+    // Θ(n²) anchored restart (the leftmost word run that ENDS the input).
     var tdiag: ezi_gex.Diagnostic = .{};
     var tre = try ezi_gex.compileRuntimeWith(ezi_gex.backends.edfa, gpa, "[a-z]+$", &tdiag, .{});
     defer tre.deinit();
