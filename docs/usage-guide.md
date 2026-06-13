@@ -232,7 +232,7 @@ defer re.deinit();
 ### Options
 
 `compile*` takes a comptime-known `Options` with two tiers — **semantic** flags
-(change what matches) and a reserved results-invariant **`strategy`** tier:
+(change what matches) and a results-invariant **`strategy`** tier (now wired):
 
 ```zig
 // case folding: .none / .simple (default) / .full (1→many, e.g. ß→ss)

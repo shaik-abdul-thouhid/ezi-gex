@@ -22,7 +22,7 @@ backend" walkthrough. This document goes a layer down: the *why* behind that *ho
                                                                   │  ← the contract
         ┌──────────────── PLUGGABLE BACKENDS (engine/) ───────────┼─────────────────┐
         │  a Backend = a comptime `type` satisfying engine/backend.zig              │
-        │     literal     pikevm     backtrack     auto(dispatcher)     <yours>     │
+        │  literal · pikevm · backtrack · bytepike · dfa · edfa · auto · <yours>   │
         │     each: build(Hir)→Program · Scratch · isMatch / search / searchCaptures│
         └───────────────────────────────────────────────────────────┬───────────────┘
                                                                     ▼
@@ -65,7 +65,8 @@ already `[Aa]`, `(?m)^` is already `line_start`.
 which *seed* the `(?i)`/`(?m)`/`(?s)` flag state for the whole pattern (inline `(?…)`
 flags OR-merge on top of the seed); and `unicode`, which toggles ASCII vs. Unicode
 `\d\w\s`. The **strategy** tier (`Options.strategy`) is **results-invariant by
-contract** — reserved for the byte engine, it may change only
+contract** — its knobs (`byte_engine`, the byte-DFA selector on by default, and
+`prefilter`, the literal/required-byte prefilter on by default) may change only
 speed/memory, never which text matches. (See `usage-guide.md` §Options for recipes.)
 
 - **Applies & drops flags.** `(?i)`/`(?m)`/`(?s)` and scoped `(?flags:…)` disappear:
@@ -445,8 +446,11 @@ match, so a prefilter or length gate built on them never yields a false negative
 > (a `^`/`\A` start short-circuit — only try offset 0), and `prefix_literal` (its first
 > UTF-8 byte seeds a `memchr` start-skip, each hit confirmed by an *anchored* NFA run).
 > The `literal` backend likewise scans with `std.mem.indexOf` (memchr / Boyer–Moore–
-> Horspool). `required_bytes` / `required_literal` / `is_one_pass` remain unconsumed —
-> scaffolding for a future one-pass / DFA path; any backend is free to read them.
+> Horspool). **Since 0.3.0 the rarest byte of `required_bytes` also drives a sound `memchr`
+> fast-reject** — a byte every match must contain, absent from the input, means no match
+> (no `@` ⇒ no `\w+@\w+`). `required_literal` and `is_one_pass` remain unconsumed —
+> scaffolding for a future `memmem` / one-pass path; any backend is free to read them.
+> Toggle the whole prefilter with `strategy.prefilter`.
 
 ---
 
@@ -610,10 +614,10 @@ Three design choices follow from the contract:
   (never on the immutable `Program`), bounded by `ScratchOptions{ max_bytes, on_full }`
   (its first real consumer). The comptime path stays on the Pike VM.
 - It is **span-only** (`caps.captures = false`): the DFA finds `[start, end)`. Through
-  `auto`, the DFA serves the span ops (`isMatch`/`search`) and the Pike VM serves
-  `searchCaptures` as a **full, independent search** — there is no DFA-span → Pike-VM
-  handoff yet (a possible future optimization), so captures are correct but not
-  DFA-accelerated.
+  `auto`, the DFA serves the span ops (`isMatch`/`search`) and the Pike VM fills captures
+  **anchored at the DFA-found span start** (the capture handoff, added this cycle for both
+  DFA arms — see *The eager DFA* below and `auto.searchCaptures`), turning an O(input)
+  capture search into O(match).
 - **`isMatch` is one-pass O(n)** (an unanchored automaton with an implicit `.*?`
   prefix); **`find` is O(n) via the reverse DFA** — a forward pass locates the leftmost
   match **end** (re-seed until the first match, then extend it anchored), then a
@@ -681,10 +685,14 @@ Three properties are specific to determinizing *eagerly*:
   determinizer's closure records a pending `text_end` pc as a state member and computes
   `accept_eoi` (does the state reach `match` at end of input, via a `computeEndReaches`
   epsilon-fixpoint with `text_end` passable); the matcher checks `accept_eoi` when the scan
-  reaches `input.len`. `$` patterns are forced **non-prone** (anchored restart + the
-  end-of-input check; the reverse DFA does not model `$`). So `edfa.supports` accepts **both**
-  `text_start` (`\A`/`^`) **and** `text_end` (`$`/`\z`) — strictly broader than
-  `dfa.supports` (the lazy DFA still declines `$`). `(?m)` line anchors and `\b`/`\X` are
+  reaches `input.len`. A **trailing-`$`** pattern (every match ends at input end —
+  `anchored_end`) is matched in **O(input)** by a single **reverse-DFA pass from `input.len`**:
+  the end is pinned, so the reverse DFA — which now models `$` via a passable `text_end` reverse
+  edge — finds the leftmost start in one backward scan, no anchored restart, no Θ(n²). A
+  **mixed** `$` (text_end in only some branches, e.g. `a$|b`) has no pinned end and is
+  **declined** (it routes to the linear Pike VM). So `edfa.supports` accepts `text_start`
+  (`\A`/`^`) and `anchored_end` `text_end` (`$`/`\z`) — broader than `dfa.supports` (the lazy
+  DFA declines `$` outright). `(?m)` line anchors and `\b`/`\X` are
   still declined and route to the code-point engines.
 - **It builds only the tables it will use.** `utrans` and the reverse table are built **only
   for prone patterns**; a non-prone `\w+` now stores just its forward `trans` table (~141 KB)
@@ -718,6 +726,25 @@ where it gets the eager DFA regardless). This is the asymmetry the empty `Scratc
 lazy DFA **cannot** run at comptime at all (its cache mutates while matching); the eager DFA
 freezes everything at build, so a tiny pattern's whole match folds into the binary — `ctre`'s
 trick, with full Unicode, decided per-pattern.
+
+**⚠️ Build-time cost — slow to *compile*, not to match.** Determinizing a big Unicode class
+into the eager DFA interns DFA states by an **O(states²)** linear scan, and the **reverse** DFA
+(built for *prone* and *trailing-`$`* patterns) is the heaviest. So `\w+@\w+`, `\w+@\w+$`, and
+`\p{L}+$` can take **~seconds to *compile*** — a one-time build cost; **match time stays
+O(input), unaffected**. Prefer `compileRuntime` over `compileComptime` for such patterns (or the
+lazy `dfa`/NFA). A hash-based state interner (O(1) lookup, replacing the linear scan) is the
+planned fix; ASCII-class and literal patterns build instantly.
+
+**Limitation — *mixed* `$` is declined (run on the Pike VM), not run quadratically.** The
+reverse-from-end arm (§The eager DFA's `find`) needs the match end pinned at `input.len`
+(`anchored_end`): a plain trailing `$`, or an alternation where **every** branch ends at `$`
+(`foo$|bar$` — `endsAnchored` proves it). A **mixed** `$`, where `text_end` is in only *some*
+branches (`a$|b`, `[ab]*c$|x`), leaves the end un-pinned, so neither the forward end-find nor the
+reverse-from-end applies. Rather than fall back to the Θ(n²) anchored restart, `edfa.supports`
+**declines** it and `auto` routes it to the **Pike VM** — correct and linear (O(input × program)),
+just not DFA-accelerated. A two-seed reverse DFA (a `text_end`-passable seed for matches ending at
+EOI, a plain seed for matches ending mid-input) could keep it on the DFA, but the shape is rare
+and already linear, so it is intentionally deferred.
 
 ---
 

@@ -26,8 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `replaceAll` are a `@compileError` (route them through `auto`/`pikevm`). This is the
     first contract-legal `captures = false` backend. When opted in via `auto`, the DFA
     accelerates the span ops (`isMatch`/`find`); capture ops run the code-point Pike VM
-    as a **full, independent search** (no DFA-span → Pike-VM handoff yet), so captures
-    are correct but not DFA-accelerated.
+    **anchored at the DFA-found span** (the *Capture handoff* below, added later this
+    cycle for both DFA arms), so captures are correct and bounded to the match.
   - **Runtime-only** (`buildAlloc` + `search`, no `buildComptime`): the cache mutates at
     match time, which const-eval cannot do. The transition cache lives in the
     caller-owned `Scratch` (never on the immutable `Program`), and is the first consumer
@@ -36,10 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Dead-on-invalid for free**: the byte lowering emits edges only for well-formed
     UTF-8, so a malformed byte has no transition and lands in the dead state; the
     anchored-restart wrapper resyncs to the next start. No validity check, no decode.
-  - **Match start without a reverse DFA**: an anchored restart locates the leftmost
-    start, with the cache shared across start positions and searches. Declines `\X`,
-    `\b`/`\B`, and zero-width anchors (`^ $ \A \z` and line anchors) — `dfa.supports(hir)`
-    — which keep routing to the code-point engines, exactly as `\b`/`\X` do today.
+  - **Match start via a reverse DFA** (see *Reverse DFA — `find` is now O(n)* below): a
+    forward pass locates the leftmost match end, then a reverse DFA, anchored at that end and
+    scanning backward, locates the leftmost start — O(n), replacing the original anchored
+    restart and its Θ(n²) worst case. The forward and reverse caches are shared across start
+    positions and searches. `dfa.supports(hir)` accepts `\A` / non-multiline `^`
+    (`text_start`); it declines `\X`, `\b`/`\B`, `$`/`\z`, and `(?m)` line anchors, which keep
+    routing to the code-point engines (the eager DFA additionally handles `$`/`\z`).
 - **`auto` byte-engine wiring** (`engine/backends/auto.zig`, `engine/regex.zig`) — the
   `Options.strategy.byte_engine` knob is no longer inert. The front door projects it
   onto the backend's build options (`backendOptions`); with
@@ -47,8 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alongside the NFA program and uses it for the span scan (`isMatch`/`find`), while
   `searchCaptures` still runs the Pike VM — so captures and `\b` are unaffected.
   Results-invariant by contract (`conformance.zig` pins the enabled span to the default
-  span and verifies captures still resolve). `auto.route` now also reports `"dfa"`. The
-  default (`.auto`) behaviour is unchanged — the DFA is strictly opt-in for now.
+  span and verifies captures still resolve). **Superseded below** — a later 0.3.0 change
+  (*The byte DFA is ON BY DEFAULT*) makes the byte DFA the default span engine
+  (eager-preferred), so `byte_engine` defaults to *on* and `auto.route` reports
+  `"nfa+edfa"` / `"nfa+dfa"`, not a bare `"dfa"`.
 - **Byte substrate size compaction** (`engine/byte.zig`) — three changes shrink the
   byte Thompson NFA a Unicode-class pattern lowers to (the input the lazy DFA
   determinizes, and the artifact a future eager comptime DFA would freeze). Measured on
@@ -101,9 +106,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **`text_end` (`$`/`\z`) now runs on the DFA.** The closure records a pending `text_end` pc
     as a state member and computes `accept_eoi` (does it reach `match` at end of input — a
     `computeEndReaches` epsilon-fixpoint); the matcher checks it when the scan reaches
-    `input.len`. `$` patterns are forced non-prone (anchored restart + the end check).
-    `edfa.supports` now accepts **`text_start` and `text_end`** — broader than `dfa.supports`
-    (the lazy DFA still declines `$`). `(?m)` line anchors, `\b`/`\B`, `\X` are still declined.
+    `input.len`. A **trailing-`$`** pattern (every match ends at input end) is matched in
+    **O(input)** by a single reverse-DFA pass from `input.len`, not anchored restart — see
+    *Quadratic immunity for `$` patterns* below. `edfa.supports` now accepts **`text_start` and
+    `anchored_end` `text_end`** — broader than `dfa.supports` (the lazy DFA declines `$`
+    outright). `(?m)` line anchors, `\b`/`\B`, `\X` are still declined.
   - **Span-only** (`caps.captures = false`), **leftmost-first** (priority + cut-on-match),
     dead-on-invalid; `conformance.zig` pins its span to the Pike VM's, runtime and comptime.
   - **Builds only the tables it will use.** `utrans` and the reverse table are built **only**
@@ -117,6 +124,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `@compileError` at comptime. Per-build buffers are sized to the pattern.
   - New public surface: `backends.edfa`, `edfa.max_states`, `edfa.buildComptime`/`supports`
     (`@stable-since v0.3.0`).
+- **Quadratic immunity for `$` (`text_end`) patterns** (`engine/backends/edfa.zig`) — a
+  trailing-`$` / `anchored_end` pattern (`[ab]*c$`, `\w+@\w+$`, `\w+$`) no longer falls onto the
+  Θ(n²) anchored restart it was previously forced onto (every start scanned to end-of-input and
+  failed — a ReDoS hole against the linear-time claim). Because `$`/`\z` pins the match end to
+  `input.len`, `find`/`isMatch` now run a single **O(input) reverse-DFA pass from the end**: the
+  reverse determinizer models `$` via a passable `text_end` reverse epsilon, so `revClosure(match)`
+  walks back through it into the pre-`$` states. New `Program.end_anchored` + `revFindEnd`
+  (`@stable-since v0.3.0`). A **mixed** `$` (text_end in only some branches, e.g. `a$|b`, where the
+  end is not pinned) is now **declined** by `edfa.supports` and routed to the linear Pike VM. Net:
+  the eager DFA never takes a super-linear path on any pattern it accepts — linear-time / ReDoS
+  immunity is a hard contract. Regression-tested with a 256 KiB no-completer input over
+  `[ab]*c$`-class shapes, a `$`-corpus differential vs the Pike VM, and a comptime-`$` match.
+  **All-branch `$` alternations** (`foo$|bar$`, `a$|b$`) are covered too: `core/hir.zig`
+  `endsAnchored`/`startsAnchored` now prove `anchored_end`/`anchored_start` for an alternation
+  when *every* branch is anchored, so they take the same fast path. A **mixed** `$` (text_end in
+  only *some* branches, e.g. `a$|b`) is **declined** by `edfa.supports` and routed to the linear
+  Pike VM — correct + O(input), just not DFA-accelerated; a documented, intentionally-deferred
+  limitation (the rare shape doesn't justify a two-seed reverse DFA). **Build-time note:** the
+  reverse DFA a trailing-`$` *Unicode-class* pattern now builds (`\w+@\w+$`, `\p{L}+$`) uses the
+  O(states²) state interner, so it is **slow to _compile_** (~seconds) though O(input) to
+  *match* — prefer `compileRuntime`; a hash-based interner is the planned fix.
 - **The byte DFA is ON BY DEFAULT through `auto`, preferring the eager DFA**
   (`engine/backends/auto.zig`, `engine/regex.zig`) — the single biggest throughput change.
   `Options.strategy.byte_engine` defaulted to `.auto`, which used to be **inert**; it now
@@ -124,8 +152,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **prefers the eager DFA** (the frozen-table engine above; ~5–10× the lazy DFA on class
   scans, and the only DFA that runs at **comptime**), falling back to the **lazy** DFA only
   when the eager one overflows its `max_states` bound, then to the NFA. The class-scan family
-  (`\w+`, `\d+`, `[A-Za-z]+`, `\p{L}+`) is now **at Rust-`regex` parity** in the bench
-  (`bench-vs-rust/`, ~1–1.3× behind, was ~1.6–2.3×). Results-invariant — `conformance.zig`
+  (`\w+`, `\d+`, `[A-Za-z]+`, `\p{L}+`) is now **at Rust-`regex` parity** (~1–1.3× behind, was ~1.6–2.3×). Results-invariant — `conformance.zig`
   pins every DFA span/captures to the Pike VM and fuzzes the strategy knobs. `.disabled` opts
   back to the compact NFA-only program. `auto.route` reports `"nfa+edfa"` (preferred),
   `"nfa+dfa"` (lazy fallback), `"nfa"`, or `"literal"`.

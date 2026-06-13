@@ -14,7 +14,7 @@ a **pluggable backend** architecture.
   the program lands in `ro_data`, the matcher runs in `comptime`. (The C++ `ctre`
   trick, in Zig, with full Unicode.)
 - **Pluggable.** Matching lives behind a small, vtable-free **backend contract**.
-  The library ships four backends and a dispatcher; you can write your own and
+  The library ships six backends and a dispatcher; you can write your own and
   drop it into the same front door. See [`docs/architecture.md`](docs/architecture.md)
   for the contract, and the step-by-step
   [*write your own backend*](docs/usage-guide.md#8-writing-your-own-backend) walkthrough
@@ -31,7 +31,7 @@ development** on `main`. Pre-1.0, so the API may still change, but everything in
 public surface is annotated `@stable-since: vX.Y.Z` and is covered by SemVer. Tracks a
 recent Zig dev build (`0.17.0-dev`); it will not compile on stable 0.16.
 
-**What works is tested** (**297 tests**, all passing: per-module behaviour, cross-backend
+**What works is tested** (**311 tests**, all passing: per-module behaviour, cross-backend
 conformance — including a wide differential corpus where every backend must agree with
 the Pike VM — and runtime + comptime parity). `0.2.0` added full case folding, grapheme
 `\X`, a two-tier `Options` (semantic + results-invariant strategy), `(?x)` verbose
@@ -192,8 +192,9 @@ defer sc.deinit(gpa);
 ```
 
 If the backend implements the **buffer convention** (its `Scratch` exposes
-`Buf` / `bufferLen` / `initBuffer` — all four built-ins do), you can hand it
-caller-owned storage instead, with no allocator and no allocation *during* a search:
+`Buf` / `bufferLen` / `initBuffer` — every built-in except the runtime-only lazy `dfa`
+does), you can hand it caller-owned storage instead, with no allocator and no allocation
+*during* a search:
 
 ```zig
 // Fixed buffer — `bufferLen` reports how many `Buf` words this program needs.
@@ -475,8 +476,7 @@ DFA, a fully-determinized frozen `states × byte_classes` table, and uses it for
 `isMatch`/`find`; captures are filled by the Pike VM **anchored at the DFA span** (the
 capture handoff). The lazy DFA (`backends/dfa.zig`) is the **fallback** — used only when the
 eager table overflows its state bound — and it took a hot-loop perf pass (cached raw table
-pointers refreshed only on a cold transition; `\w+` ~336 → ~517 MiB/s). The bench
-(`bench-vs-rust/`) shows the default is **at Rust parity (~1.1×–1.3×) on every class scan**
+pointers refreshed only on a cold transition; `\w+` ~336 → ~517 MiB/s). The default is **at Rust parity (~1.1×–1.3×) on every class scan**
 and **≥ the code-point Pike VM in every cell** (5–10× on character-class scans), and it is
 **results-invariant** (`conformance.zig` pins the span and captures to the Pike VM, and
 fuzzes the strategy knobs). `strategy.byte_engine = .disabled` opts back to the compact
@@ -494,11 +494,14 @@ start** (it can consume an unbounded run without ever accepting):
   **reverse** DFA (determinized at comptime *and* runtime) the leftmost **start**. O(input),
   replacing the old Θ(n²) anchored restart on this begins-everywhere-completes-rarely class.
 
-There is **no per-search probing** — the arm is fixed at build. `$` patterns are forced
-non-prone (anchored restart + an end-of-input check). The eager DFA also **builds only the
-tables it will use**: `utrans` + the reverse table are built **only for prone patterns**, so
-a non-prone `\w+` now stores just its forward `trans` table (~141 KB) instead of all three
-(~1 MB). Leftmost-first, conformance-pinned to the Pike VM.
+There is **no per-search probing** — the arm is fixed at build. A **trailing-`$`** pattern
+(`\w+@\w+$`, `[ab]*c$`, `\w+$`: every match ends at input end) takes a third O(input) arm —
+the end is pinned to `input.len`, so a single **reverse-DFA pass from the end** finds the
+leftmost start (no anchored restart, which would be Θ(n²) on these begin-but-don't-complete
+shapes). The eager DFA also **builds only the tables it will use**: `utrans` and the reverse
+table are built **only for prone or trailing-`$` patterns**, so a non-prone `\w+` stores just
+its forward `trans` table (~141 KB) instead of all three (~1 MB). Leftmost-first,
+conformance-pinned to the Pike VM.
 
 **Still open (additive, no API change):** an interior-literal `memmem`/Teddy prefilter
 (multi-substring SIMD for literal alternations — the single biggest remaining gap), DFA
@@ -549,6 +552,14 @@ the shared tables.
 > non-prone `\w+` keeps just its forward table, ~141 KB, not the forward + `.*?`-prefix +
 > reverse trio, ~1 MB). See [`docs/architecture.md`](docs/architecture.md) → *The byte
 > substrate* / *The eager DFA*.
+>
+> **⚠️ Build-time caveat — slow to _compile_, not to match.** Determinizing a *big Unicode
+> class* into the eager DFA interns DFA states by an **O(states²)** linear scan, and the
+> **reverse** DFA (built for *prone* and *trailing-`$`* patterns — `\w+@\w+`, and now `\w+@\w+$`
+> / `\p{L}+$`) is the heaviest, so such a pattern can take **~seconds to compile**. It is a
+> **one-time build cost; match time is O(input), unaffected.** Prefer `compileRuntime` over
+> `compileComptime` for these (or the lazy `dfa`/NFA); a hash-based state interner (O(1) lookup)
+> is the planned fix. ASCII-class and literal patterns build instantly.
 
 Reference point: the bundled `main.zig` demo (which exercises runtime *and* comptime
 compilation, classes, captures, replace, split, and `\p{L}`) is **~2.76 MB** in `Debug`
@@ -567,8 +578,8 @@ allocator), not regex data. `ReleaseSmall` is far smaller.
 - [`src/core/README.md`](src/core/README.md) — the frontend (scanner → AST → HIR).
 - [`src/engine/README.md`](src/engine/README.md) — the contract, the NFA, the
   backends, the front door, and a backend quickstart.
-- [`src/engine/backends/README.md`](src/engine/backends/README.md) — the four
-  backends and how `auto` chooses.
+- [`src/engine/backends/README.md`](src/engine/backends/README.md) — the built-in
+  backends (incl. `bytepike`/`dfa`/`edfa`) and how `auto` chooses.
 
 ## License
 

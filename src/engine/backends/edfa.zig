@@ -10,8 +10,17 @@
 //! a handful of states / a few hundred bytes of `ro_data` (`abc` is 5 states, `[a-z]+`
 //! is 3), and the matcher is a pure `state = trans[state][class]` loop with zero decode.
 //! A big *Unicode* class is a few hundred states with a correspondingly large **dense**
-//! table (`\w+` ≈ 323 states / ~145 KB) — minimization and a sparse encoding are the
+//! table (`\w+` ≈ 323 states / ~141 KB) — minimization and a sparse encoding are the
 //! obvious follow-ups; such patterns are usually better left to the runtime lazy DFA.
+//!
+//! ## Status
+//!
+//! `auto`'s **default span engine** (since 0.3.0). `find`/`isMatch` are **O(input) on every
+//! supported pattern** — quadratic-immune, including `$`/`\z` (matched by a reverse-DFA-from-end
+//! pass; covers `anchored_end` patterns and all-branch-`$` alternations like `foo$|bar$`).
+//! **Known, intentional gaps**, each declined to the code-point engines (correct + linear, just
+//! not DFA-accelerated): *mixed* `$` (`a$|b`), `(?m)` line anchors, and `\b`/`\B`. **Build-time
+//! caveat:** a big Unicode-class pattern is slow to *build* (not to match). All detailed below.
 //!
 //! ## What it is (and is not)
 //!
@@ -36,16 +45,46 @@
 //!     is declined: `error.Unsupported` at runtime, a `@compileError` at comptime. Such
 //!     patterns keep running on the lazy DFA (unbounded) or the code-point engines. The
 //!     CTRE lane is small, eager-friendly patterns; big Unicode classes repeated many
-//!     times are a runtime-lazy-DFA job. `supports(hir)` gates the same shapes
-//!     `dfa.supports` does (byte-lowerable, only `text_start` zero-width assertions).
+//!     times are a runtime-lazy-DFA job. `supports(hir)` is **broader than `dfa.supports`**:
+//!     byte-lowerable, with `text_start` (`\A`/`^`) and **`anchored_end` `text_end`** (`$`/`\z`
+//!     where every match ends at input end) zero-width assertions — see *find* below.
 //!
-//! ## `find` start location
+//! ## `find` start location — three O(input) arms, fixed statically per program
 //!
-//! Like the lazy DFA, this backend has **no reverse DFA**: `find` locates the leftmost
-//! start by an anchored restart from each candidate position (the table is shared, so
-//! every restart is a bare table walk). A leading `\A`/`^` (`anchored_start`) tries only
-//! offset 0. `isMatch` is the earliest-exit form of the same scan. (The lazy DFA's
-//! one-pass unanchored `isMatch` via a re-seeding table is a future addition here too.)
+//! The match-start strategy is chosen at build (`computeProne` + `anchored_end`), never probed
+//! per search, and **every arm is O(input)** (quadratic-immune by contract):
+//!
+//!   * **Anchored restart** — a non-prone pattern (its consuming loop is itself accepting:
+//!     `\w+`, `\d+`, `[A-Za-z]+`) walks the frozen table greedily from each candidate start;
+//!     O(input) because no start scans far without hitting an accepting state. A leading
+//!     `\A`/`^` (`anchored_start`) tries only offset 0. `isMatch` is the earliest-exit form.
+//!   * **Reverse-DFA two-pass** — a *prone* pattern (can consume an unbounded run before it can
+//!     accept, e.g. `\w+@\w+`'s pre-`@` run) locates the match END forward (`utrans`) then the
+//!     START with a frozen reverse DFA — replacing the old Θ(n²) anchored restart.
+//!   * **Reverse-DFA from end** — a trailing-`$` (`end_anchored`) pattern (`\w+$`, `[ab]*c$`,
+//!     `\w+@\w+$`, and `$`-in-every-branch alternations like `foo$|bar$`) pins the end at
+//!     `input.len`, so one reverse pass from there finds the start. The reverse determinizer
+//!     models `$` via a passable `text_end` reverse edge.
+//!
+//! **Limitation — *mixed* `$` is declined, not run slowly.** A `text_end` in only SOME branches
+//! of an alternation (`a$|b`, `[ab]*c$|x`) leaves the match end un-pinned, so neither the
+//! forward end-find nor reverse-from-end applies. Rather than fall back to a Θ(n²) anchored
+//! restart, `supports` **declines** it (`has_text_end and !anchored_end`) and `auto` routes it
+//! to the **Pike VM** — correct and linear, just not DFA-accelerated. A two-seed reverse DFA
+//! could keep it on the DFA, but the shape is rare and already linear, so it is intentionally
+//! deferred (see `DESIGN.md` §7).
+//!
+//! ## ⚠️ Build-time cost — **determinizing a big Unicode class is slow to BUILD (not to match)**
+//!
+//! **A pattern over a large Unicode class (`\w`, `\p{L}`) can take ~seconds to *compile*, even
+//! though matching it is O(input).** The forward and reverse determinizers intern DFA states by
+//! a linear scan (**O(states²)**), and such a class produces hundreds-to-thousands of states
+//! over a ~100-symbol byte alphabet. The **reverse** DFA (built for *prone* and *trailing-`$`*
+//! patterns) is the heaviest: `\w+@\w+` and — now that `$` is reverse-handled — `\w+@\w+$` /
+//! `\p{L}+$` are the slow cases. It is a **one-time build cost; match time is unaffected.** For
+//! such patterns prefer `compileRuntime` over `compileComptime`, or the lazy `dfa`/NFA. A
+//! hash-based state interner (O(1) lookup) is the planned fix. ASCII-class and literal patterns
+//! build instantly.
 //!
 //! ## Invalid UTF-8 — dead-on-invalid, for free
 //!
@@ -188,31 +227,55 @@ pub const Program = struct {
     raccept: []const bool,
     /// Reverse start state — the closure of the forward `match` pcs (the reverse DFA begins
     /// "at the match" and walks back to forward pc 0). Meaningful only when `rev_built`.
+    /// For an `end_anchored` (`$`) program the closure passes back through the trailing
+    /// `text_end`, so `rstart` represents "at end-of-input, `$` satisfied, ready to match
+    /// the pattern backward".
     ///
     /// @stable-since: v0.3.0
     rstart: u32,
+    /// True when every match ends at end-of-input (a trailing `$`/`\z`, fully `anchored_end`)
+    /// and the pattern is not `anchored_start`. The match end is then pinned to `input.len`,
+    /// so `find`/`isMatch` need no forward scan: a single reverse-DFA pass from `input.len`
+    /// finds the leftmost start in **O(input)** — the fix for the Θ(n²) anchored-restart
+    /// blowup on begin-but-don't-complete `$` shapes (`[ab]*c$`, `\w+@\w+$`, `\w+$`). Implies
+    /// `rev_built` (the reverse DFA models `$` via a passable `text_end` reverse edge). A
+    /// **mixed** `$` pattern (`text_end` in only some branches, e.g. `a$|b`) is declined by
+    /// `supports` and routed to the Pike VM, so it never reaches here.
+    ///
+    /// @stable-since: v0.3.0
+    end_anchored: bool,
 };
 
 /// Whether this HIR can run on the eager DFA: byte-lowerable (no `\X`/`\b`) **and** whose
 /// only zero-width assertions are `text_start` (`\A`/`^`, evaluated at offset 0 via two
-/// start closures) and `text_end` (`$`/`\z`, evaluated at end of input via `accept_eoi`).
-/// **Broader than `dfa.supports`** (the lazy DFA still declines `text_end`): `(?m)` line
-/// anchors and `\b`/`\X` stay on the code-point engines. (Whether the determinized DFA
-/// *fits* the fixed bounds is a separate build-time check; this is the capability gate.)
+/// start closures) and `text_end` (`$`/`\z`) — the latter only when **every match ends at
+/// input end** (`anchored_end`), where the reverse-DFA-from-end path matches it in O(input).
+/// Still **broader than `dfa.supports`** (the lazy DFA declines `text_end` outright). A
+/// **mixed** `$` (text_end in only some branches, e.g. `a$|b`, `[ab]*c$|x`) has no pinned
+/// end, so anchored restart on it would be Θ(n²) — it is **declined** here and `auto` routes
+/// it to the linear Pike VM. `(?m)` line anchors and `\b`/`\X` likewise stay on the
+/// code-point engines. (Whether the determinized DFA *fits* the fixed bounds is a separate
+/// build-time check; this is the capability gate.)
 ///
 /// @stable-since: v0.3.0
 pub fn supports(h: hir.Hir) bool {
     if (!byte.byteLowerable(h)) return false; // excludes \X and \b/\B
+    var has_text_end = false;
     for (h.nodes) |n| {
-        // The eager DFA evaluates `text_start` (`\A`/`^`) at offset 0 via two start
-        // closures, and `text_end` (`$`/`\z`) at end of input via an `accept_eoi` flag.
-        // Line anchors (`(?m)^`/`$`) are position-dependent on the previous/next byte and
-        // are not handled here (they route to the code-point engines, like `\b`).
+        // `text_start` (`\A`/`^`) is evaluated at offset 0 via two start closures; `text_end`
+        // (`$`/`\z`) at end of input. Line anchors (`(?m)^`/`$`) are position-dependent on the
+        // previous/next byte and route to the code-point engines, like `\b`.
         if (n.tag == .anchor) switch (n.data.anchor.kind) {
-            .text_start, .text_end => {},
+            .text_start => {},
+            .text_end => has_text_end = true,
             else => return false,
         };
     }
+    // Quadratic immunity is a hard contract — the eager DFA never takes a super-linear path.
+    // A `text_end` pattern is linear only when its end is pinned to input end (`anchored_end`),
+    // matched by the reverse-DFA-from-end pass. A mixed `$` (not `anchored_end`) would fall to
+    // the Θ(n²) anchored restart, so decline it; `auto` then uses the linear Pike VM.
+    if (has_text_end and !h.analysis.anchored_end) return false;
     return true;
 }
 
@@ -425,9 +488,12 @@ const Det = struct {
 // anchored at that end and scanning *backward*, locates the leftmost START — replacing the
 // Θ(n²) anchored restart on the begin-but-don't-complete class (`\w+@\w+` on a long word
 // run). It is the eager analogue of the lazy DFA's `revClosure`/`revStep`/`revFind`, fully
-// determinized into a frozen table at build (comptime + runtime). Built only for
-// assertion-free programs (a `text_start` is position-dependent, so its reverse
-// transitions are not cacheable — those keep anchored restart).
+// determinized into a frozen table at build (comptime + runtime). Built for assertion-free
+// programs AND trailing-`$` (`text_end`, `anchored_end`) programs: for the latter the match
+// end is pinned at `input.len`, so one reverse pass from there finds the leftmost start, and
+// the trailing `text_end` is treated as a passable reverse epsilon (`buildAdj`). A
+// `text_start` is position-dependent, so its reverse transitions are not cacheable — those
+// keep anchored restart.
 
 /// Tiny in-place ascending insertion sort — reverse states are small pc sets, and this is
 /// comptime-safe (no allocation, no std.sort dependency in const-eval). Sorting the pc
@@ -493,9 +559,11 @@ const RDet = struct {
         }
     }
 
-    /// Build the reverse adjacency from the (assertion-free) byte program: two passes —
-    /// count in-edges per pc, prefix-sum to offsets, fill. Reuses `work`/`seeds` as the
-    /// transient fill cursors (they are overwritten by the first closure afterward).
+    /// Build the reverse adjacency from the byte program: two passes — count in-edges per pc,
+    /// prefix-sum to offsets, fill. Programs reaching here are assertion-free except for a
+    /// trailing `text_end` (`$`/`\z`), which is recorded as a **passable reverse epsilon** so a
+    /// `$` pattern's `revClosure(match)` walks back through it into the pre-`$` states. Reuses
+    /// `work`/`seeds` as the transient fill cursors (overwritten by the first closure after).
     fn buildAdj(self: *RDet) void {
         const n: u32 = @intCast(self.insts.len);
         for (self.reps_off[0 .. n + 1]) |*v| v.* = 0;
@@ -513,7 +581,13 @@ const RDet = struct {
             },
             .jmp => |t| self.reps_off[t] += 1,
             .save => self.reps_off[i + 1] += 1,
-            .assertion => {}, // assertion-free programs only (caller gates on has_text_start)
+            // `text_end` ($/\z) is a passable epsilon (forward edge i → i+1): record its
+            // reverse predecessor so `revClosure(match)` walks back through it. Only `text_end`
+            // / assertion-free programs build the reverse DFA (a `text_start` keeps anchored
+            // restart), so no other assertion kind occurs here.
+            .assertion => |k| if (k == .text_end) {
+                self.reps_off[i + 1] += 1;
+            },
             .match => {},
         };
         prefixSum(self.reps_off[0 .. n + 1]);
@@ -548,7 +622,10 @@ const RDet = struct {
                     self.reps[ec[i + 1]] = pc;
                     ec[i + 1] += 1;
                 },
-                .assertion => {},
+                .assertion => |k| if (k == .text_end) { // passable epsilon — see the count pass
+                    self.reps[ec[i + 1]] = pc;
+                    ec[i + 1] += 1;
+                },
                 .match => {
                     self.match_seed[mi] = pc;
                     mi += 1;
@@ -915,11 +992,11 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     const accept_eoi = try gpa.dupe(bool, det.accept_eoi[0..n]);
     errdefer gpa.free(accept_eoi);
 
-    // Θ(n²)-proneness of anchored restart — decides which auxiliary tables are even needed. A
-    // `text_end` (`$`/`\z`) program is forced non-prone: it is matched by anchored restart with
-    // the `accept_eoi` end check (the reverse DFA does not model `$`), and that restart is still
-    // O(input) on the usual trailing-`$` shapes (each failed start dies quickly; the match scans
-    // to the end once).
+    // Θ(n²)-proneness of anchored restart — decides which auxiliary tables are built. `prone`
+    // (a non-accepting cycle reachable from a start) gets the forward+reverse two-pass; a
+    // `text_end` (`$`/`\z`) program — whose match end is pinned at `input.len` — gets the
+    // reverse-DFA-from-end pass (`end_anchored`, below). Both are O(input), neither uses
+    // anchored restart, so a trailing `$` is no longer the Θ(n²) hazard it once was.
     var has_text_end = false;
     for (bp.insts) |inst| switch (inst) {
         .assertion => |k| if (k == .text_end) {
@@ -950,8 +1027,14 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     };
     const utrans: []const u32 = if (prone) try gpa.dupe(u32, det.utrans[0 .. n * nc]) else &.{};
     errdefer if (prone) gpa.free(utrans);
+    // A trailing-`$` pattern (every match ends at input end — `supports` declined mixed `$`,
+    // so `has_text_end` ⟹ `anchored_end` here) takes the O(input) reverse-DFA-from-end path
+    // instead of anchored restart, so it needs the reverse table too. `prone` and
+    // `end_anchored` are mutually exclusive (`prone` requires no `$`), so one reverse
+    // table / `rstart` serves whichever applies; a `text_start` keeps anchored restart.
+    const end_anchored = has_text_end and h.analysis.anchored_end and !has_text_start;
     var rev = Reverse{ .rtrans = &.{}, .raccept = &.{}, .rstart = DEAD };
-    const rev_built = prone and !has_text_start;
+    const rev_built = (prone or end_anchored) and !has_text_start;
     if (rev_built) rev = try reverseAlloc(gpa, det.insts, &class_rep, nc);
     errdefer if (rev_built) {
         gpa.free(rev.rtrans);
@@ -974,6 +1057,7 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
         .rtrans = rev.rtrans,
         .raccept = rev.raccept,
         .rstart = rev.rstart,
+        .end_anchored = end_anchored,
     };
 }
 
@@ -1044,9 +1128,10 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
     const final_accept_eoi = accept_eoi_buf[0..n].*;
 
     // Θ(n²)-proneness of anchored restart — decides which auxiliary tables are built (the
-    // unanchored `utrans` and the reverse DFA are consulted only on the prone arm, so a
-    // non-prone pattern bakes neither: only `trans` reaches `ro_data`). A `text_end` program
-    // is forced non-prone (matched by anchored restart + the `accept_eoi` end check).
+    // unanchored `utrans` and the reverse DFA are consulted only on the prone / `end_anchored`
+    // arms, so a plain non-prone pattern bakes neither: only `trans` reaches `ro_data`). A
+    // `text_end` program takes the O(input) reverse-DFA-from-end pass (`end_anchored`), not
+    // anchored restart.
     comptime var has_text_end = false;
     comptime {
         for (bp.insts) |inst| switch (inst) {
@@ -1073,7 +1158,8 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
             else => {},
         };
     }
-    const rev_built = prone and !has_text_start;
+    const end_anchored = has_text_end and h.analysis.anchored_end and !has_text_start;
+    const rev_built = (prone or end_anchored) and !has_text_start;
     const r_state_cap = @min(ic + 256, max_states);
     comptime var reps_off: [ic + 1]u32 = undefined;
     comptime var reps: [2 * ic + 1]u32 = undefined;
@@ -1135,6 +1221,7 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
         .rtrans = &final_rtrans,
         .raccept = &final_raccept,
         .rstart = rdet.rstart,
+        .end_anchored = end_anchored,
     };
 }
 
@@ -1298,22 +1385,51 @@ fn revFindEager(program: *const Program, input: []const u8, end: usize, lo: usiz
     return found orelse end; // the forward guaranteed a match, so non-null in practice
 }
 
-/// Leftmost match span. A pinned (`opts.anchored`) or start-anchored (`\A`/`^`) pattern is a
-/// single anchored run. For the unanchored case the strategy is a **static, per-program
-/// choice** (`program.prone`, computed once at build):
+/// Leftmost match START for an `end_anchored` (trailing-`$`) program, where every match ends
+/// at `input.len`. One reverse-DFA pass from `input.len` down to `lo` (`opts.start`); the
+/// smallest position whose reverse state accepts (forward pc 0 reachable ⇒ `[pos, input.len)`
+/// is a full match) is the leftmost-first start, or null if no suffix `[·, input.len)` matches.
+/// Because `$`/`\z` pins the end at end-of-input, no forward end-find is needed — this single
+/// O(input) backward pass is the whole search, and the fix for the Θ(n²) anchored restart on
+/// begin-but-don't-complete `$` shapes (`[ab]*c$`, `\w+@\w+$`, `\w+$`).
 ///
-///   * **Anchored restart** — for a pattern that *completes* at most start positions (`\w+`,
-///     `[A-Za-z]+`, `\d+`: their consuming loop is itself accepting), this is one greedy table
-///     walk per match, the eager DFA's headline ~1.1 GiB/s. It is O(input) precisely because
-///     no start can scan far without hitting an accepting state.
+/// @stable-since: v0.3.0
+fn revFindEnd(program: *const Program, input: []const u8, lo: usize) ?usize {
+    const nc = program.n_classes;
+    const rtrans = program.rtrans;
+    const raccept = program.raccept;
+    const map = &program.classes.map;
+    var state = program.rstart;
+    var found: ?usize = if (raccept[state]) input.len else null; // empty match at end (`a*$` on "")
+    var pos = input.len;
+    while (pos > lo) {
+        pos -= 1;
+        const class = map[input[pos]];
+        state = rtrans[state * nc + class];
+        if (raccept[state]) found = pos;
+        if (state == DEAD) break;
+    }
+    return found;
+}
+
+/// Leftmost match span. A pinned (`opts.anchored`) or start-anchored (`\A`/`^`) pattern is a
+/// single anchored run. Otherwise the strategy is a **static, per-program choice** fixed at
+/// build (so there is **no per-search probing**) — and every arm is O(input):
+///
+///   * **Reverse-DFA from end** — for a trailing-`$` program (`program.end_anchored`: every
+///     match ends at `input.len`, e.g. `[ab]*c$`, `\w+@\w+$`, `\w+$`), the end is pinned, so a
+///     single reverse pass from `input.len` finds the leftmost start. No forward scan, no
+///     anchored restart (which would be Θ(n²) on these begin-but-don't-complete shapes).
 ///   * **Reverse-DFA two-pass** — for a **Θ(n²)-prone** pattern (`\w+@\w+`: a long pre-`@` word
 ///     run is a non-accepting cycle, so anchored restart re-scans it from every start), the
-///     forward one-pass locates the leftmost match END and the reverse DFA the START, in two
-///     linear passes. `program.prone` (a non-accepting cycle reachable from a start) selects
-///     this arm, so there is **no per-search probing** — the right strategy is fixed at build.
+///     forward one-pass locates the leftmost match END and the reverse DFA the START.
+///   * **Anchored restart** — otherwise (a pattern that *completes* at most start positions:
+///     `\w+`, `[A-Za-z]+`, `\d+` — their consuming loop is itself accepting), one greedy table
+///     walk per match, the eager DFA's headline ~1.1 GiB/s, O(input) because no start can scan
+///     far without hitting an accepting state.
 ///
-/// Both arms are leftmost-first and agree (`conformance.zig`). `text_start` programs (no
-/// reverse table) keep plain anchored restart. `earliest` only affects the anchored runs.
+/// All arms are leftmost-first and agree (`conformance.zig`). `text_start` programs (no reverse
+/// table) keep plain anchored restart. `earliest` only affects the anchored runs.
 fn searchImpl(program: *const Program, input: []const u8, opts: SearchOptions, earliest: bool) ?Match {
     if (opts.start > input.len) return null;
 
@@ -1323,6 +1439,14 @@ fn searchImpl(program: *const Program, input: []const u8, opts: SearchOptions, e
     if (program.anchored_start) {
         if (opts.start != 0) return null;
         return if (runAnchored(program, input, 0, earliest)) |end| Match{ .start = 0, .end = end } else null;
+    }
+
+    // Trailing `$` (every match ends at input.len): one reverse pass from the end finds the
+    // leftmost start in O(input). The end is pinned, so no forward scan — and crucially no
+    // anchored restart, which is Θ(n²) on `[ab]*c$`-style begin-but-don't-complete shapes.
+    if (program.end_anchored) {
+        const st = revFindEnd(program, input, opts.start) orelse return null;
+        return Match{ .start = st, .end = input.len };
     }
 
     // Θ(n²)-prone (non-accepting cycle) → the O(input) reverse-DFA two-pass.
@@ -1354,9 +1478,11 @@ pub fn isMatch(program: *const Program, _: *Scratch, input: []const u8, opts: Se
         if (opts.start != 0) return false;
         return runAnchored(program, input, 0, true) != null;
     }
-    // Prone → one-pass over `utrans` (O(input), no Θ(n²)). Non-prone → anchored restart,
-    // earliest-exit (also O(input): no start can scan far without hitting an accepting
-    // state), and it has no `utrans` table to consult.
+    // Trailing `$`: a single reverse pass from input.len — any start ⇒ a match. O(input).
+    if (program.end_anchored) return revFindEnd(program, input, opts.start) != null;
+    // Prone → one-pass over `utrans` (O(input), no Θ(n²)). Non-prone, non-`$` → anchored
+    // restart, earliest-exit (O(input): with no non-accepting cycle and no `$`, no start can
+    // scan far without hitting an accepting state), and it has no `utrans` table to consult.
     if (program.prone) return runUnanchoredOnePass(program, input, opts.start);
     var s = opts.start;
     while (s <= input.len) : (s += 1) {
@@ -1586,6 +1712,135 @@ test "differential vs Pike VM across a corpus (spans must agree)" {
         "word here",              "a word",     "alice@host now",      "trailing 42",
     };
     for (patterns) |p| try agreesWithPikeVM(testing.allocator, p, &inputs);
+}
+
+// ── Quadratic immunity for trailing-`$` patterns (the begin-but-don't-complete class) ──
+//
+// Before the reverse-DFA-from-end path, a `text_end` pattern was forced onto anchored
+// restart: from every start, walk to end-of-input and fail — Θ(n²) on `[ab]*c$`-style inputs
+// with no completer. These tests pin both correctness (vs the Pike VM) and linearity (a large
+// input finishes well under a budget a quadratic scan could never meet).
+
+test "differential vs Pike VM: trailing `$` corpus (spans must agree)" {
+    const patterns = [_][]const u8{
+        "[a-z]+$",  "[a-z]+@[a-z]+$",   "[ab]*c$",  "a+$",      "\\d+$",
+        "\\d{3}$",  "[0-9]+\\.[0-9]+$", ".*$",      ".*foo$",   "[a-z]+\\s*$",
+        "x*$",      "(foo|bar)$",       "a$|b$",    "abc$",     "[α-ω]+$",
+        "é+$",      "(?i)end$",
+    };
+    const inputs = [_][]const u8{
+        "",              "abc",        "trailing 42",  "ends with foo",
+        "no terminal c", "abcc",       "12.34",        "  spaced   ",
+        "alice@host",    "ALICE@HOST", "αβγ",          "café",
+        "the end",       "END",        "aaaaaaaa!",    "ababababc",
+        "a@b",           "foo",        "bar",          "αβγδ end",
+    };
+    for (patterns) |p| try agreesWithPikeVM(testing.allocator, p, &inputs);
+}
+
+test "trailing `$` is linear, not Θ(n²) (ReDoS immunity)" {
+    const gpa = testing.allocator;
+    // A begin-but-don't-complete `$` shape on a long input with no completer: under the old
+    // anchored restart this was Θ(n²) — every start walks to end-of-input and fails, so a
+    // 256 KiB input is ~7×10¹⁰ steps (seconds-to-minutes). The reverse-DFA-from-end path makes
+    // it ONE O(input) backward pass (~µs), so this test completing near-instantly is itself the
+    // signal; a quadratic regression makes it visibly hang. The deterministic guard that the
+    // O(n) path is actually taken is the `end_anchored` flag test below. ASCII keeps builds cheap.
+    const N = 1 << 18; // 262144
+    const buf = try gpa.alloc(u8, N);
+    defer gpa.free(buf);
+
+    for ([_][]const u8{ "[a-z]+$", "[a-z]+@[a-z]+$", "[ab]*c$" }) |pat| {
+        var re = try Compiled.init(pat);
+        defer re.deinit();
+        @memset(buf, 'a');
+        buf[N - 1] = '!'; // no `[a-z]` at the end ⇒ no match — the old anchored-restart worst case
+        try testing.expect(re.find(buf) == null);
+        try testing.expect(!E.isMatch(&re.program, &re.scratch, buf, .{}));
+        @memset(buf, 'a'); // all `[a-z]`: `[a-z]+$` matches the whole string; the `@`/`c` shapes do not
+        _ = re.find(buf);
+        _ = E.isMatch(&re.program, &re.scratch, buf, .{});
+    }
+}
+
+test "trailing `$` matches at COMPTIME (reverse-from-end in const-eval)" {
+    const found = comptime blk: {
+        @setEvalBranchQuota(20_000_000);
+        const a = compile.compile("[a-z]+$");
+        const h = switch (hir.buildComptime(a, .{})) {
+            .ok => |x| x,
+            .fail => @compileError("hir"),
+        };
+        const program = buildComptime(h, .{});
+        var sc = Scratch{};
+        const m = E.find(&program, &sc, "  hello", .{}) orelse @compileError("no `$` match at comptime");
+        break :blk m.slice("  hello");
+    };
+    try testing.expectEqualStrings("hello", found);
+
+    const no_match = comptime blk: {
+        @setEvalBranchQuota(20_000_000);
+        const a = compile.compile("[a-z]+$");
+        const h = switch (hir.buildComptime(a, .{})) {
+            .ok => |x| x,
+            .fail => @compileError("hir"),
+        };
+        const program = buildComptime(h, .{});
+        var sc = Scratch{};
+        break :blk E.find(&program, &sc, "hello!", .{}) == null; // ends with non-`[a-z]`
+    };
+    try testing.expect(no_match);
+}
+
+test "mixed `$` is declined; all-branch `$` (incl. `$`-in-every-branch alternations) is supported" {
+    const gpa = testing.allocator;
+    // Truly mixed: a branch that matches mid-input (`b`, `x`, `bar`) leaves the match end
+    // un-pinned, so anchored restart would be Θ(n²) — the eager DFA declines it and `auto`
+    // routes it to the linear Pike VM. `supports` and `buildAlloc` both reflect the decline.
+    for ([_][]const u8{ "a$|b", "[ab]*c$|x", "(foo$|bar)" }) |pat| {
+        var diag: compile.Diagnostic = .{};
+        const ast = try compile.parse(gpa, pat, &diag);
+        defer ast.deinit(gpa);
+        const h = try hir.buildAlloc(gpa, ast, .{});
+        defer hir.deinitHir(gpa, h);
+        try testing.expect(!supports(h));
+        try testing.expectError(error.Unsupported, buildAlloc(gpa, h, .{}));
+    }
+    // End pinned at input end (`anchored_end`): a plain trailing `$`, OR an alternation where
+    // EVERY branch ends at `$` (`endsAnchored` now proves it). All stay on the eager DFA, linear
+    // via the reverse-from-end pass.
+    for ([_][]const u8{ "[ab]*c$", "foo$|bar$", "a$|b$" }) |pat| {
+        var diag: compile.Diagnostic = .{};
+        const ast = try compile.parse(gpa, pat, &diag);
+        defer ast.deinit(gpa);
+        const h = try hir.buildAlloc(gpa, ast, .{});
+        defer hir.deinitHir(gpa, h);
+        try testing.expect(supports(h));
+        var prog = try buildAlloc(gpa, h, .{});
+        defer freeProgram(gpa, &prog);
+        try testing.expect(prog.end_anchored);
+    }
+}
+
+test "end_anchored / anchored_start flags route `$` patterns correctly" {
+    const gpa = testing.allocator;
+    const Case = struct { pat: []const u8, end_anchored: bool, anchored_start: bool };
+    for ([_]Case{
+        .{ .pat = "[a-z]+$", .end_anchored = true, .anchored_start = false }, // reverse-from-end
+        .{ .pat = "[ab]*c$", .end_anchored = true, .anchored_start = false },
+        .{ .pat = "^[a-z]+$", .end_anchored = false, .anchored_start = true }, // anchored-start path
+        .{ .pat = "\\A\\d+$", .end_anchored = false, .anchored_start = true },
+        .{ .pat = "[a-z]+", .end_anchored = false, .anchored_start = false }, // plain, anchored restart
+    }) |c| {
+        var prog = buildFrom(gpa, c.pat) catch |e| switch (e) {
+            error.Unsupported => continue,
+            else => return e,
+        };
+        defer freeProgram(gpa, &prog);
+        try testing.expectEqual(c.end_anchored, prog.end_anchored);
+        try testing.expectEqual(c.anchored_start, prog.anchored_start);
+        if (prog.end_anchored) try testing.expect(prog.rev_built); // end_anchored ⟹ reverse table built
+    }
 }
 
 test {

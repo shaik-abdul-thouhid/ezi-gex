@@ -1342,6 +1342,17 @@ fn startsAnchored(nodes: []const Node, children: []const u32, idx: u32) bool {
             if (d.len == 0) break :blk false;
             break :blk startsAnchored(nodes, children, children[d.start]);
         },
+        // An alternation starts anchored iff EVERY branch does (`^a|^b`): then every match
+        // begins at offset 0. (Sound widening of a one-sided fact — a branch that can start
+        // anywhere keeps the whole alternation un-anchored.)
+        .alternation => blk: {
+            const d = node.data.children;
+            if (d.len == 0) break :blk false;
+            for (children[d.start .. d.start + d.len]) |ci| {
+                if (!startsAnchored(nodes, children, ci)) break :blk false;
+            }
+            break :blk true;
+        },
         .capture => startsAnchored(nodes, children, node.data.capture.child),
         else => false,
     };
@@ -1357,6 +1368,19 @@ fn endsAnchored(nodes: []const Node, children: []const u32, idx: u32) bool {
             const d = node.data.children;
             if (d.len == 0) break :blk false;
             break :blk endsAnchored(nodes, children, children[d.start + d.len - 1]);
+        },
+        // An alternation ends anchored iff EVERY branch does (`foo$|bar$`, `a$|b$`): then every
+        // match ends at input end. This lets the eager DFA take its O(input) reverse-from-end
+        // path for these instead of declining to the Pike VM. A branch that can end mid-input
+        // (truly mixed `$`, e.g. `a$|b`) keeps the whole alternation un-anchored — see
+        // `engine/backends/edfa.zig` `supports`.
+        .alternation => blk: {
+            const d = node.data.children;
+            if (d.len == 0) break :blk false;
+            for (children[d.start .. d.start + d.len]) |ci| {
+                if (!endsAnchored(nodes, children, ci)) break :blk false;
+            }
+            break :blk true;
         },
         .capture => endsAnchored(nodes, children, node.data.capture.child),
         else => false,

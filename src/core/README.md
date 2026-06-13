@@ -9,9 +9,9 @@ library you could use on its own (e.g. to build a different engine).
 | `token.zig` | token types; every escape/`\p{…}` name fully resolved here (no ambiguity leaves the lexer) |
 | `error.zig` | the diagnostic catalogue — `ErrorCode`, `Span`, `Diagnostic` (code + byte span + message + caret renderer). Comptime-evaluable |
 | `ast.zig` | the flat AST: three parallel arrays (`nodes`/`children`/`class_items`), no heap pointers, root is the *last*-emitted node |
-| `scanner.zig` | the lexer + single-pass parser. **Storage-agnostic** (`scan` fills caller `Buffers`); explicit stack, no recursion |
+| `scanner.zig` | the lexer + single-pass parser. **Storage-agnostic** (`scan` fills caller `Buffers`); explicit stack, no recursion; handles the lex-time `(?x)` verbose flag (global + scoped) |
 | `compile.zig` | the comptime/runtime storage wrappers over `scan`: `parse` (heap), `parseComptime`/`compile` (ro_data) |
-| `hir.zig` | **AST → HIR**: applies/drops flags, resolves all Unicode to sorted/merged code-point ranges, simple folding, simplification, and the prefilter `Analysis` |
+| `hir.zig` | **AST → HIR**: applies/drops flags, resolves all Unicode to sorted/merged code-point ranges, case folding (simple + full 1→many for literals), simplification, and the prefilter `Analysis` |
 | `root.zig` | re-exports the above |
 
 ## Two ideas that recur
