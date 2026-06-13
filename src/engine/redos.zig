@@ -181,27 +181,33 @@ test "default engine (auto) stays linear and crash-free on catastrophic patterns
 
 // ── 2b. Default-engine prefilter is not quadratic (the `a+b` regression) ────────────
 
-test "default-engine prefilter does ZERO per-occurrence confirms on prone/end_anchored programs (hard ReDoS guard)" {
+test "default-engine prefilter: prone/end_anchored => 0 confirms; fast-confirm => loop kept (hard ReDoS guard)" {
     // Revert-failing guard for the real quadratic ReDoS the `redos` bench caught. The bug:
     // `auto`'s eager-DFA prefilter (`runEdfa`) did a leading-literal `memchr` that confirmed
-    // anchored at EVERY prefix-byte occurrence; on `aaaa...a!` the byte is at every position
-    // and each confirm re-walks the whole run, so `a+b` was Theta(n^2) (~1.1 s at 64 KiB) even
-    // though the eager DFA's own find is O(n). The fix routes prone/end_anchored programs to
-    // that O(n) native find and does NO per-occurrence confirms.
+    // anchored at EVERY prefix-byte occurrence. When a confirm can scan an unbounded run before
+    // failing -- a `prone` program (a non-accepting cycle) or an `end_anchored` one (trailing
+    // `$`, the confirm runs to end) -- that is O(n) confirms each O(n) = Theta(n^2) on a
+    // dense-prefix begin-but-don't-complete input (`a+b` on `aaaa...a!` was ~1.1 s at 64 KiB).
+    // The fix routes exactly those programs to the eager DFA's O(n) native find, doing NO
+    // per-occurrence confirms; `Scratch.confirm_probes` (the observable) is then 0 for them.
     //
-    // Deterministic and machine-independent -- no timing. `Scratch.confirm_probes` counts the
-    // per-occurrence confirms, so it must be 0 for these programs: with the bug it is ~input.len,
-    // with the fix it is 0. Reverting the prone/end_anchored gate in `runEdfa` makes this fail.
-    // The positive control at the end proves the counter is actually wired (a fast-confirm
-    // pattern DOES register probes), so a 0 above is real, not vacuous.
+    // Deterministic and machine-independent -- no timing. Two groups pin BOTH sides of the gate,
+    // so neither assertion is vacuous (the classifications are VERIFIED, not assumed -- see the
+    // bounded vs. unbounded contrast below).
     const gpa = testing.allocator;
-    const N: usize = 4096; // a buggy confirm loop racks up ~N probes here; the fix does 0
-    const cases = [_]Cat{
+    const N: usize = 4096; // a buggy confirm loop racks up ~N probes here
+
+    // (A) Dangerous class -- a confirm can scan an unbounded run, so the loop MUST be skipped:
+    // `confirm_probes == 0`. Reverting the prone/end_anchored gate in `runEdfa` makes this fail
+    // (the loop would run ~N times). `a{4,}b` has an UNBOUNDED tail (a non-accepting cycle) so it
+    // is `prone` and belongs here -- the precise contrast with the BOUNDED-tail `a{4}b` in (B).
+    const gated = [_]Cat{
         .{ .pat = "a+b", .fill = 'a', .tail = '!' }, // prone, prefix 'a' -- the headline regression
         .{ .pat = "(a+)+$", .fill = 'a', .tail = '!' }, // end_anchored, prefix 'a'
         .{ .pat = "(x+x+)+y", .fill = 'x', .tail = '!' }, // prone, prefix 'x' -- the canonical bomb
+        .{ .pat = "a{4,}b", .fill = 'a', .tail = '!' }, // prone (UNBOUNDED tail) -- cf. a{4}b in (B)
     };
-    for (cases) |c| {
+    for (gated) |c| {
         const input = try worstCase(gpa, N, c.fill, c.tail);
         defer gpa.free(input);
         var diag: regex.Diagnostic = .{};
@@ -216,9 +222,26 @@ test "default-engine prefilter does ZERO per-occurrence confirms on prone/end_an
         }
     }
 
-    // Positive control: a fast-confirm pattern (`foo\d+` — bounded literal prefix, confirm fails
-    // within a few bytes) legitimately KEEPS the per-occurrence memchr-jump loop, so it MUST
-    // register probes. If this were 0 the counter would be dead and the assertions above vacuous.
+    // (B) Fast-confirm class -- a confirm fails within a program-bounded window (non-prone,
+    // non-`$`), so the memchr-jump loop is KEPT (its intended speedup) and `confirm_probes > 0`.
+    // This is also the positive control: a 0 here would mean the counter is dead and (A) vacuous.
+    // `a{4}b` on a dense-prefix no-match input is the stress case -- the loop runs ~N times and
+    // must still return the correct no-match; it stays O(n) because each confirm is bounded by the
+    // program, not the input (the `redos` bench pins that linearity quantitatively). NOTE it is
+    // `a{4}b`, not `aaab`: `aaab` is a pure literal -> the `literal` backend, which bypasses this
+    // prefilter entirely (its 0 would be trivial -- not a test of the gate). Verified via the
+    // DIAG probe: a{4}b -> nfa+edfa, prone=no, probes=4092; a{4,}b -> prone=yes, probes=0.
+    {
+        const input = try worstCase(gpa, N, 'a', '!'); // 'a' at every position, no 'b' -> no match
+        defer gpa.free(input);
+        var diag: regex.Diagnostic = .{};
+        var re = try regex.compileRuntimeWith(auto, gpa, "a{4}b", &diag, .{});
+        defer re.deinit();
+        var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+        defer sc.deinit(gpa);
+        try testing.expect(re.find(&sc, input) == null); // correct no-match despite the loop running
+        try testing.expect(sc.confirm_probes > 0); // the loop is kept for fast-confirm patterns
+    }
     {
         var diag: regex.Diagnostic = .{};
         var re = try regex.compileRuntimeWith(auto, gpa, "foo\\d+", &diag, .{});
@@ -251,6 +274,17 @@ const diff_cases = [_]Diff{
     .{ .pat = "(x+x+)+y", .input = "xxxx!", .expect = null },
     .{ .pat = "([a-z]+)*$", .input = "abc", .expect = "abc" },
     .{ .pat = "(\\d+)*$", .input = "123", .expect = "123" },
+    // Counted ranges — bounded `a{4}b` (fast-confirm) vs. unbounded `a{4,}b` (prone): `{n,}`
+    // desugars to n copies + a star, a distinct NFA shape, so verify BOTH the kept confirm loop
+    // and the prone reverse-two-pass return the right span against the Pike VM oracle.
+    .{ .pat = "a{4}b", .input = "aaaab", .expect = "aaaab" }, // exactly 4 a's, then b
+    .{ .pat = "a{4}b", .input = "aaaaab", .expect = "aaaab" }, // leftmost is the start-1 window
+    .{ .pat = "a{4}b", .input = "aaab", .expect = null }, // only 3 a's
+    .{ .pat = "a{4}b", .input = "aaaa", .expect = null }, // no b
+    .{ .pat = "a{4,}b", .input = "aaaab", .expect = "aaaab" }, // 4-or-more, then b
+    .{ .pat = "a{4,}b", .input = "aaaaab", .expect = "aaaaab" }, // greedy: all a's, then b
+    .{ .pat = "a{4,}b", .input = "aaab", .expect = null }, // only 3 a's
+    .{ .pat = "a{4,}b", .input = "aaaa", .expect = null }, // no b
 };
 
 test "all NFA backends agree with the Pike VM on the catastrophic corpus" {

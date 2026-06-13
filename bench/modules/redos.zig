@@ -25,9 +25,9 @@ const RX = ezi_gex.Compiled(Auto);
 
 /// Sizes (bytes) each pattern is scanned at. Spanning 6 doublings makes a non-linear
 /// trend impossible to miss in the ns/byte column.
-// Capped at 64 KiB: the linear/quadratic split is already unmistakable across these three
-// (a flat MiB/s column vs. a ~16×-per-4× collapse), and a Θ(n²) pattern at 256 KiB would
-// make the bench take minutes. Raise this once the quadratic `find` paths are fixed.
+// 4 KiB → 64 KiB: three doublings — enough that any non-linear trend is unmistakable in the
+// MiB/s column (a flat column is linear; a ~16×-per-4× collapse was the Θ(n²) these patterns
+// had before the prefilter fix). Kept modest so the full bench stays quick.
 const sizes = [_]usize{ 4096, 16384, 65536 };
 
 const Pat = struct { pat: []const u8, fill: u8, tail: u8 };
@@ -40,6 +40,8 @@ const corpus = [_]Pat{
     .{ .pat = "a+b", .fill = 'a', .tail = '!' }, // prefix-literal begin-but-don't-complete (was Θ(n²))
     .{ .pat = "(a+)+$", .fill = 'a', .tail = '!' }, // nested +, end-anchored (was Θ(n²))
     .{ .pat = "(x+x+)+y", .fill = 'x', .tail = '!' }, // canonical bomb (was Θ(n²))
+    .{ .pat = "a{4}b", .fill = 'a', .tail = '!' }, // fast-confirm (bounded tail): the KEPT memchr loop — must stay flat
+    .{ .pat = "a{4,}b", .fill = 'a', .tail = '!' }, // unbounded tail → prone → reverse two-pass
     .{ .pat = "(a*)*$", .fill = 'a', .tail = '!' }, // nested *, end-anchored DFA
     .{ .pat = "(a|ab)*$", .fill = 'a', .tail = '!' }, // overlapping alternation
     .{ .pat = "\\w+@\\w+", .fill = 'a', .tail = '!' }, // interior literal, rare-byte prefilter
