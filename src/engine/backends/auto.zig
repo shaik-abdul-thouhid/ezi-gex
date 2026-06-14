@@ -719,7 +719,12 @@ fn inputAllAscii(scratch: *Scratch, input: []const u8) bool {
 /// DFA is used **only on ASCII input**; non-ASCII input falls through to the code-point Pike VM,
 /// which evaluates correct **Unicode** word boundaries. (For a non-`\b` program this is just
 /// `program.edfa_prog`.) This is what keeps `auto` correct for **every** input.
-fn edfaArm(program: *const Program, scratch: *Scratch, input: []const u8) ?*const edfa.Program {
+///
+/// `inline` is load-bearing: this runs **once per `find`**, so a `count`/`findAll` over a
+/// dense-match pattern (`\p{L}+`, 100k+ matches) would otherwise pay a function call per match —
+/// a measurable regression on the hot span arm. Inlined, the common (non-`\b`) path is just the
+/// `program.edfa_prog` test it replaced, plus one already-false `has_word_boundary` load.
+inline fn edfaArm(program: *const Program, scratch: *Scratch, input: []const u8) ?*const edfa.Program {
     if (program.edfa_prog) |*ep| {
         if (ep.has_word_boundary and !inputAllAscii(scratch, input)) return null; // Unicode \b → Pike VM
         return ep;

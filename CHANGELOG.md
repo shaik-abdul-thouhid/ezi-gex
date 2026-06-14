@@ -11,6 +11,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`\b`/`\B` word boundaries on the byte DFAs** (`backends.edfa` + `backends.dfa`) — previously a
+  `\b`/`\B` pattern always routed to the code-point Pike VM (the worst outlier in the cross-engine
+  benchmark, ~10× behind). Word boundaries now ride the DFA, distributed across the two byte DFAs:
+  - **Byte substrate** (`byte.zig`): `\b`/`\B` now **lower** to a byte `assertion` (so
+    `byteLowerable` no longer excludes them — only `\X` does). `assertionHolds` evaluates them as
+    **ASCII** word boundaries (new pub `isAsciiWordByte`), and `byteClasses` isolates the ASCII word
+    set `[0-9A-Za-z_]` into its own equivalence classes (mirroring how `\n` is isolated for `(?m)`).
+    The `bytepike` reference VM executes them directly.
+  - **Eager DFA** (`backends.edfa`) — **ASCII** word boundaries baked into the frozen table, via the
+    same machinery as `(?m)` line anchors lifted to word-ness: anchored restart where the start state
+    is chosen by the preceding byte's word-ness (`startNW`) and acceptance uses a one-byte
+    word-lookahead (`accept_before_word`/`accept_before_nonword`). Zero match-time decode; comptime +
+    runtime. The determinizer splits states on word-context **only** when a boundary is parked (no
+    state inflation otherwise), and `computeProne` treats the word-lookahead as an accepting exit so
+    `\b\w+\b` stays non-prone (fast anchored restart). Declined to the Pike VM: `\b` combined with
+    `$` or `(?m)`, a *prone* `\b` (`\b.*x`), and a chained `\b\b`.
+  - **Lazy DFA** (`backends.dfa`) — full **Unicode** word boundaries via a **decode-hybrid**:
+    consumption stays the cached byte-DFA walk, but a state holding a pending boundary
+    (`Scratch.state_has_wb`) is resolved at match time by **decoding the adjacent code points**
+    (`nfa.assertionHolds`, the Pike VM's own routine — Unicode-correct by construction), so only
+    sparse boundary positions pay a decode. The resolution is memoized to a single bit
+    (`Scratch.wb_cache`, two states per raw boundary-state) → O(1) per position.
+  - **`auto`** builds **both** arms for a `\b` program and routes by a cached whole-input ASCII check
+    (`Scratch.wb_*`, keyed on the input slice so a `count`/`findAll` scans once): ASCII input → the
+    fast eager DFA, **non-ASCII input → the lazy DFA** (Unicode boundaries) instead of the Pike VM,
+    anything declined → the Pike VM. `auto` stays **correct for every input** — comptime `\b` keeps to
+    the Pike VM. Results-invariant: a wide differential corpus pins every byte-engine `\b` span to the
+    Pike VM (the lazy DFA on **non-ASCII** too — e.g. `\bcafé\b` over `"cafés"`, where an ASCII-only
+    boundary would mismatch), runtime and comptime, alongside exhaustive per-backend `\b`/`\B` tests
+    and revert-failing regressions. **Benchmark** (`zig/regex-bench`, Apple M4): `\b\w+\b` **37 → 244
+    MiB/s (~6.6×)** — now ≈ plain `\w+` (the boundary is free) and 1.63× of Rust `regex` (was ~11×);
+    `\bthe\b` **89 MiB/s → 2.49 GiB/s (~28×)**. New decls `@stable-since v0.4.0`:
+    `byte.isAsciiWordByte`; `edfa.Program.{accept_before_word, accept_before_nonword, startNW,
+    has_word_boundary}`; `dfa.Program.has_word_boundary`; `dfa.Scratch.{state_has_wb, wb_cache}`.
+
 - **One-pass NFA capture fast path** (new `backends.onepass`). A linear-time, single-thread
   capture engine for **provably one-pass** patterns — the common structured shapes
   `(\d{4})-(\d{2})-(\d{2})`, `(\w+)@(\w+)`, `(\d+):(\d+)`, `(\w)+`, `(a|b)*` — where at every
@@ -67,8 +102,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   eager and lazy DFAs, so a trailing-`$` pattern too large for the eager DFA's fixed bounds now
   falls back to the lazy DFA (still on the fast span arm) instead of the NFA. A **mixed** `$` (a
   `text_end` in only some alternation branches, `a$|b`) stays declined — its end is not pinned,
-  so it would be Θ(n²) — and runs on the linear Pike VM, as do `\b`/`\B`, `\X`, and `(?m)` line
-  anchors. Results-invariant (lazy-DFA spans stay byte-identical to the Pike VM, pinned by a new
+  so it would be Θ(n²) — and runs on the linear Pike VM, as does `\X` (`\b`/`\B` and `(?m)` line
+  anchors are now handled on the byte DFAs — see their entries above). Results-invariant (lazy-DFA
+  spans stay byte-identical to the Pike VM, pinned by a new
   trailing-`$` differential corpus) and quadratic-immune (a new reverse-from-end linearity
   regression at 256 KiB). New `Program` fields `has_text_end`/`end_anchored`/`reaches_end`,
   `Scratch.state_match_eoi`, and the `revFindEnd` path are `@stable-since v0.4.0`.

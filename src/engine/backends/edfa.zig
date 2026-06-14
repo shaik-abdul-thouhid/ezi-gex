@@ -2125,14 +2125,12 @@ pub const Scratch = struct {
 /// end-of-input via a pending `$`/`(?m)$` (`accept_eoi`); or, for a `(?m)$` line program, just
 /// before a `\n` via a pending `line_end` (`accept_before_nl`, a one-byte lookahead). For a
 /// `$`-free program `accept_eoi == accept` and `has_line_anchor` is false, so only `accept` matters.
+/// **`\b`/`\B` programs do NOT use this** — they take the separate `runAnchoredWord`/`acceptsWord`
+/// path, so this stays small enough for the hot common loop to inline (see `runAnchored`).
 inline fn accepts(program: *const Program, state: u32, input: []const u8, pos: usize) bool {
     if (program.accept[state]) return true;
     if (pos == input.len) return program.accept_eoi[state];
     if (program.has_line_anchor and input[pos] == '\n') return program.accept_before_nl[state];
-    // A pending `\b`/`\B` accepts depending on the **next** byte's ASCII word-ness (a one-byte
-    // lookahead, the mirror of `accept_before_nl`). Mutually exclusive with line anchors.
-    if (program.has_word_boundary)
-        return if (byte.isAsciiWordByte(input[pos])) program.accept_before_word[state] else program.accept_before_nonword[state];
     return false;
 }
 
@@ -2144,56 +2142,67 @@ inline fn accepts(program: *const Program, state: u32, input: []const u8, pos: u
 /// count too. For a `(?m)^` line program the **start state** is chosen by the preceding byte:
 /// `start0` at offset 0, `startL` just after a `\n` (a line start), else `startN`.
 fn runAnchored(program: *const Program, input: []const u8, s: usize, earliest: bool) ?usize {
+    // BYTE-IDENTICAL to the pre-`\b` engine so the compiler inlines it into the anchored-restart
+    // scans exactly as before (no class-scan regression). `\b`/`\B` programs never reach here:
+    // `searchImpl`/`isMatch` route them to `runAnchoredWord` instead, keeping all word-boundary
+    // code out of this hot common loop.
     const nc = program.n_classes;
-    // Hoist the table/array bases to locals so the hot loop is pointer-chasing over
-    // registers, not re-loading `program.*` fields each byte (the other DFA loops —
-    // `runUnanchoredOnePass`/`findEndForwardEager` — already do this; this one didn't).
-    const trans = program.trans;
-    const map = &program.classes.map;
-    const accept = program.accept;
-
     var state = if (s == 0)
         program.start0
     else if (program.has_line_anchor and input[s - 1] == '\n')
         program.startL
-    else if (program.has_word_boundary and byte.isAsciiWordByte(input[s - 1]))
-        program.startNW // preceding byte is a word byte (the left context a leading `\b`/`\B` needs)
     else
         program.startN;
     var match_end: ?usize = if (accepts(program, state, input, s)) s else null;
     if (match_end != null and earliest) return match_end;
 
     var pos = s;
-    // `(?m)` line programs and `\b`/`\B` programs need the position-aware accept (a one-byte
-    // `\n` / word-ness lookahead), so they keep the full `accepts` call.
-    if (program.has_line_anchor or program.has_word_boundary) {
-        while (pos < input.len) {
-            const class = map[input[pos]];
-            state = trans[state * nc + class];
-            if (state == DEAD) break;
-            pos += 1;
-            if (accepts(program, state, input, pos)) {
-                match_end = pos;
-                if (earliest) break;
-            }
-        }
-        return match_end;
-    }
-
-    // Common case (no line anchor): mid-input acceptance is exactly `accept[state]`;
-    // end-of-input acceptance (`$`/`\z`) differs only at `pos == input.len`, so it is
-    // checked once there instead of branching on every accepting position.
-    const accept_eoi = program.accept_eoi;
     while (pos < input.len) {
-        const class = map[input[pos]];
-        state = trans[state * nc + class];
+        const class = program.classes.map[input[pos]];
+        state = program.trans[state * nc + class];
         if (state == DEAD) break;
         pos += 1;
-        if (accept[state]) {
+        if (accepts(program, state, input, pos)) {
             match_end = pos;
             if (earliest) break;
-        } else if (pos == input.len and accept_eoi[state]) {
-            match_end = pos; // trailing `$`/`\z` satisfied at end-of-input
+        }
+    }
+    return match_end;
+}
+
+/// `accepts` for a `\b`/`\B` program: a pending boundary accepts depending on the **next** byte's
+/// ASCII word-ness (a one-byte lookahead, the mirror of `accept_before_nl`). Word boundaries are
+/// declined in combination with `$`/`(?m)`, so no line/`$`-only term beyond `accept_eoi` is needed.
+inline fn acceptsWord(program: *const Program, state: u32, input: []const u8, pos: usize) bool {
+    if (program.accept[state]) return true;
+    if (pos == input.len) return program.accept_eoi[state];
+    return if (byte.isAsciiWordByte(input[pos])) program.accept_before_word[state] else program.accept_before_nonword[state];
+}
+
+/// Anchored run for a `\b`/`\B` program (the ASCII word-boundary path). Identical in shape to
+/// `runAnchored`, but the start state carries word-left context (`startNW` when the preceding byte
+/// is a word byte) and acceptance uses the word lookahead (`acceptsWord`). Split out so the common
+/// (non-`\b`) `runAnchored` stays minimal and inlinable.
+fn runAnchoredWord(program: *const Program, input: []const u8, s: usize, earliest: bool) ?usize {
+    const nc = program.n_classes;
+    var state = if (s == 0)
+        program.start0
+    else if (byte.isAsciiWordByte(input[s - 1]))
+        program.startNW // preceding byte is a word byte (the left context a leading `\b`/`\B` needs)
+    else
+        program.startN;
+    var match_end: ?usize = if (acceptsWord(program, state, input, s)) s else null;
+    if (match_end != null and earliest) return match_end;
+
+    var pos = s;
+    while (pos < input.len) {
+        const class = program.classes.map[input[pos]];
+        state = program.trans[state * nc + class];
+        if (state == DEAD) break;
+        pos += 1;
+        if (acceptsWord(program, state, input, pos)) {
+            match_end = pos;
+            if (earliest) break;
         }
     }
     return match_end;
@@ -2337,6 +2346,23 @@ fn revFindEnd(program: *const Program, input: []const u8, lo: usize) ?usize {
 fn searchImpl(program: *const Program, input: []const u8, opts: SearchOptions, earliest: bool) ?Match {
     if (opts.start > input.len) return null;
 
+    // `\b`/`\B` programs use the word-context anchored restart (`runAnchoredWord`); they are never
+    // prone/`$`/end-anchored (declined), so this covers them, and the common `runAnchored` below
+    // stays byte-identical to the pre-`\b` engine.
+    if (program.has_word_boundary) {
+        if (opts.anchored)
+            return if (runAnchoredWord(program, input, opts.start, earliest)) |end| Match{ .start = opts.start, .end = end } else null;
+        if (program.anchored_start) {
+            if (opts.start != 0) return null;
+            return if (runAnchoredWord(program, input, 0, earliest)) |end| Match{ .start = 0, .end = end } else null;
+        }
+        var s = opts.start;
+        while (s <= input.len) : (s += 1) {
+            if (runAnchoredWord(program, input, s, earliest)) |end| return Match{ .start = s, .end = end };
+        }
+        return null;
+    }
+
     if (opts.anchored)
         return if (runAnchored(program, input, opts.start, earliest)) |end| Match{ .start = opts.start, .end = end } else null;
 
@@ -2377,6 +2403,19 @@ fn searchImpl(program: *const Program, input: []const u8, opts: SearchOptions, e
 /// @stable-since: v0.3.0
 pub fn isMatch(program: *const Program, _: *Scratch, input: []const u8, opts: SearchOptions) bool {
     if (opts.start > input.len) return false;
+    // `\b`/`\B` programs: word-context anchored restart (earliest-exit). See `searchImpl`.
+    if (program.has_word_boundary) {
+        if (opts.anchored) return runAnchoredWord(program, input, opts.start, true) != null;
+        if (program.anchored_start) {
+            if (opts.start != 0) return false;
+            return runAnchoredWord(program, input, 0, true) != null;
+        }
+        var s = opts.start;
+        while (s <= input.len) : (s += 1) {
+            if (runAnchoredWord(program, input, s, true) != null) return true;
+        }
+        return false;
+    }
     if (opts.anchored) return runAnchored(program, input, opts.start, true) != null;
     if (program.anchored_start) {
         if (opts.start != 0) return false;
