@@ -228,7 +228,7 @@ test "default-engine prefilter: prone/end_anchored => 0 confirms; fast-confirm =
     }
 
     // (B) Fast-confirm class -- a confirm fails within a program-bounded window (non-prone,
-    // non-`$`), so the memchr-jump loop is KEPT (its intended speedup) and `confirm_probes > 0`.
+    // non-`$`), so the memmem-jump loop is KEPT (its intended speedup) and `confirm_probes > 0`.
     // This is also the positive control: a 0 here would mean the counter is dead and (A) vacuous.
     // `a{4}b` on a dense-prefix no-match input is the stress case -- the loop runs ~N times and
     // must still return the correct no-match; it stays O(n) because each confirm is bounded by the
@@ -253,7 +253,7 @@ test "default-engine prefilter: prone/end_anchored => 0 confirms; fast-confirm =
         defer re.deinit();
         var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
         defer sc.deinit(gpa);
-        _ = re.find(&sc, "fx fo food foo9 bar"); // several 'f's; the loop probes each candidate
+        _ = re.find(&sc, "fx fo food foo9 bar"); // two "foo" runs; the memmem loop probes each
         try testing.expect(sc.confirm_probes > 0);
     }
 }
@@ -262,7 +262,7 @@ test "prefilter: bounded-prefix proneness threshold (a{64}b on edfa vs a{65}b of
     // RESTART_SCAN_LIMIT = 64 (edfa.zig) is the longest non-accepting prefix that keeps a pattern
     // on the eager DFA's per-occurrence confirm loop. With the two-phase build (non-prone patterns
     // skip the unanchored `utrans` table), a{64}b's prefix is exactly 64 (≤ limit) → non-prone →
-    // it fits the eager DFA and KEEPS the memchr-jump loop bounded to ≤64 bytes/confirm
+    // it fits the eager DFA and KEEPS the memmem-jump loop bounded to ≤64 bytes/confirm
     // (probes > 0). a{65}b's is 65 (> limit) → prone → its `utrans` overflows the eager pool → it
     // falls to the lazy DFA, whose `find` is a single-skip + O(input) reverse pass (probes == 0).
     //

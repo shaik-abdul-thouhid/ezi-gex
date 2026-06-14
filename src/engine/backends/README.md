@@ -64,7 +64,7 @@ build time (by analysis):
 
 search time (span / prefilter): input shorter than min_utf8_len ?         → no match
                                 anchored_start ?                          → only offset 0
-                                leading fixed literal ?                   → memchr its 1st byte
+                                leading fixed literal ?                   → SIMD memmem its whole run
                                 rarest required byte absent from input ?  → no match (fast-reject)
 search time (NFA, by input):    no DFA arm, input ≤ 4096 B and fits ?     → backtrack : → pikevm
 ```

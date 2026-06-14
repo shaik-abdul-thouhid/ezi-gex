@@ -59,18 +59,21 @@ pub const SearchOptions = engine.SearchOptions;
 /// | `auto`      | yes      | yes      | everything — routes to a capable backend internally   |
 /// | `pikevm`    | yes      | yes      | every feature **except `\X`**; always O(input)        |
 /// | `backtrack` | yes      | yes      | every feature **including `\X`**; **bounded input**   |
-/// | `literal`   | no       | yes      | pure literals / literal alternations only             |
-/// | `bytepike`  | no       | yes      | byte-lowerable (no `\X`/`\b`); reference executor      |
-/// | `dfa`       | no       | **no**   | byte-lowerable + `\A`/`^` + **anchored-end** `$`/`\z`  |
-/// | `edfa`      | no       | yes      | as `dfa`, frozen tables; bounded determinized state    |
+/// | `literal`   | whole    | yes      | pure literals / literal alternations only (group 0)   |
+/// | `bytepike`  | yes      | yes      | byte-lowerable (no `\X`; ASCII `\b`); reference executor |
+/// | `dfa`       | no       | **no**   | byte-lowerable + `\A`/`^` + anchored-end `$`/`\z` + Unicode `\b` |
+/// | `edfa`      | no       | yes      | as `dfa` (frozen tables, bounded state) + ASCII `\b` + non-prone `(?m)` |
 /// | `onepass`   | yes      | yes      | provably one-pass, assertion-free patterns; anchored   |
 ///
 /// **Universal limits (true of every backend, by design — routing decisions, not missing
 /// features):**
-///   * `\b`/`\B` (word boundary) and `\X` (grapheme) are *codepoint* properties: only the
-///     **code-point** engines evaluate them (`\b`/`\B` on `pikevm`/`backtrack`; `\X` on
-///     `backtrack` only). The byte DFAs (`dfa`/`edfa`/`bytepike`) **never** support them —
-///     `auto` keeps such patterns on the code-point engines.
+///   * `\X` (grapheme) is `backtrack`-only — no other backend can consume a variable number of
+///     code points per step. `\b`/`\B` (word boundary) runs on `pikevm`/`backtrack` (Unicode) and,
+///     since 0.4.0, on the **byte DFAs**: the **eager** DFA bakes in **ASCII** `\b` (zero decode),
+///     the **lazy** DFA carries **Unicode** `\b` via a decode-hybrid. `auto` routes a `\b` pattern
+///     by a cached whole-input ASCII check (ASCII → eager, non-ASCII → lazy), and falls back to the
+///     Pike VM for a *prone* `\b`, a *chained* `\b\b`, or `\b` combined with `$`/`(?m)`. (`bytepike`
+///     evaluates ASCII `\b` too; it does **not** do `\X`.)
 ///   * A **mixed** `$` (a `text_end` in only some alternation branches, `a$|b`) runs on the Pike
 ///     VM. `(?m)` line anchors run on the **eager** DFA when non-prone (`(?m)^\w+`, `(?m)foo$`);
 ///     a *prone* `(?m)` (an unbounded run before the anchor, `(?m)\w+$`) and any `(?m)` on the
@@ -79,13 +82,14 @@ pub const SearchOptions = engine.SearchOptions;
 ///     oversized input — **linear-time** (no catastrophic backtracking), pinned by
 ///     `engine/conformance.zig` and `engine/redos.zig`.
 ///
-/// **Span-only** backends (`literal`/`bytepike`/`dfa`/`edfa`) locate `[start, end)` but do not
-/// fill captures; asking one for captures is a `@compileError`. **`dfa` is runtime-only** (its
-/// cache mutates while matching) — use `edfa`/`pikevm`/`auto` for comptime matching. **`onepass`**
-/// is the *capture* fast path: a single deterministic thread fills the slots in O(input) (no
-/// thread set) for a provably one-pass pattern — `auto` uses it for the anchored capture fill
-/// after a DFA arm locates the span, and declines (→ Pike VM) anything not one-pass. Each
-/// backend's module doc spells out precisely what it accepts and declines.
+/// **Span-only** backends `dfa` and `edfa` locate `[start, end)` but do not fill captures; asking
+/// one for captures is a `@compileError`. (`literal` and `bytepike` *do* fill captures — `literal`
+/// only the whole match, since pure literals have no groups; `bytepike` full groups.) **`dfa` is
+/// runtime-only** (its cache mutates while matching) — use `edfa`/`pikevm`/`auto` for comptime
+/// matching. **`onepass`** is the *capture* fast path: a single deterministic thread fills the slots
+/// in O(input) (no thread set) for a provably one-pass pattern — `auto` uses it for the anchored
+/// capture fill after a DFA arm locates the span, and declines (→ Pike VM) anything not one-pass.
+/// Each backend's module doc spells out precisely what it accepts and declines.
 pub const backends = engine.backends;
 /// Front-door pipeline options (`case_fold`, …), comptime-known on both paths.
 pub const Options = engine.Options;

@@ -188,12 +188,13 @@ std.debug.print("{s}\n", .{w.buffered()});   // from b.a to d.c
 
 ### Choosing a specific backend
 
-The default backend is `auto` (picks literal / backtrack / Pike VM from the pattern and
-input). To pin one, use the `*With` constructors — the returned `Compiled` has the exact
-same API:
+The default backend is `auto` — it picks the span engine from the pattern (literal scan /
+eager DFA / lazy DFA / Pike VM) and the capture engine (`onepass` for one-pass patterns, else
+the Pike VM), switching per search (backtrack vs. Pike VM, eager vs. lazy DFA). To pin one,
+use the `*With` constructors — the returned `Compiled` has the exact same API:
 
 ```zig
-const pikevm = gex.backends.pikevm; // or .backtrack / .literal / .auto / .bytepike / .dfa / .edfa
+const pikevm = gex.backends.pikevm; // or .backtrack / .literal / .onepass / .auto / .bytepike / .dfa / .edfa
 var re = try gex.compileRuntimeWith(pikevm, gpa, "\\w+", &diag, .{});
 defer re.deinit();
 ```
@@ -205,14 +206,15 @@ defer re.deinit();
 > **comptime** (`compileComptimeWith(edfa, …)` bakes the table into `ro_data`) as well as
 > runtime. It finds the match *span* fast but does not fill captures
 > (`re.captures`/`re.replaceAll` are a `@compileError` on it; use `auto`/`pikevm`). Its
-> capability gate runs patterns with `\A`/`^` (`text_start`), `$`/`\z` (`text_end`), and
-> **isolated `\b`/`\B`** (evaluated as **ASCII** word boundaries baked into the byte classes — the
-> lazy `dfa` carries the *Unicode* `\b` for non-ASCII input). It declines `\X`, `(?m)` line anchors,
-> and `\b` combined with `$`/`(?m)` (those route to the code-point engines / the lazy DFA). It is
-> **bounded**: a pattern whose full
-> DFA exceeds `edfa.max_states` is declined (`error.Unsupported` / a `@compileError`) — `auto`
-> then falls back to the lazy `dfa`. Pin it directly when you want a comptime-bakeable DFA;
-> otherwise just use `auto`, which prefers it.
+> capability gate runs patterns with `\A`/`^` (`text_start`), anchored-end `$`/`\z`
+> (`text_end`), **non-prone `(?m)` line anchors** (`(?m)^`/`(?m)$`, via anchored restart with
+> line context), and **isolated `\b`/`\B`** (evaluated as **ASCII** word boundaries baked into the
+> byte classes — the lazy `dfa` carries the *Unicode* `\b` for non-ASCII input). It declines
+> `\X`, a **mixed** `$` (`a$|b`), a **prone** `(?m)`/`\b`, a *chained* `\b\b`, and `\b` combined
+> with `$`/`(?m)` (those route to the code-point engines / the lazy DFA). It is **bounded**: a
+> pattern whose full DFA exceeds `edfa.max_states` is declined (`error.Unsupported` / a
+> `@compileError`) — `auto` then falls back to the lazy `dfa`. Pin it directly when you want a
+> comptime-bakeable DFA; otherwise just use `auto`, which prefers it.
 >
 > **The strategy is fixed at build, not probed per search.** A *non-prone* pattern (its
 > consuming loop is itself accepting, e.g. `\w+`, `\d+`, `[A-Za-z]+`) uses a single greedy
@@ -225,11 +227,17 @@ defer re.deinit();
 > **The `dfa` backend is the lazy DFA — span-only, runtime-only, the *fallback*.**
 > `gex.backends.dfa` determinizes the byte automaton on the fly (one cached DFA state per
 > byte). It does not fill captures (`re.captures`/`re.replaceAll` are a `@compileError` on
-> it; use `auto`/`pikevm`). It runs patterns without `\b`/`\X`/`$`/line anchors (`\A`/`^`
-> are fine — note it is **narrower than `edfa`, which also takes `$`**) and only at runtime
-> (no `compileComptimeWith(dfa, …)`, because its cache mutates while matching). Through
-> `auto` it is reached only when the eager `edfa` overflows its `max_states` bound; you
-> rarely pin it.
+> it; use `auto`/`pikevm`). It runs `\A`/`^` (`text_start`), anchored-end `$`/`\z`, and
+> **Unicode `\b`/`\B`** (via the *decode-hybrid* — it decodes the adjacent code points only at
+> boundary positions), and only at runtime (no `compileComptimeWith(dfa, …)`, because its cache
+> mutates while matching). It declines `\X` and `(?m)` line anchors (the eager DFA covers those).
+> Through `auto` it is the arm reached when the eager `edfa` overflows its `max_states` bound, or
+> for **Unicode** `\b` on non-ASCII input; you rarely pin it. When you *do* pin it, its
+> determinization cache is bounded by a `ScratchOptions`: plain `Scratch.init` uses the default
+> (`max_bytes = 1 MiB`, `on_full = .reset` — clear the cache and continue), and
+> `Scratch.initOptions(gpa, &re.program, .{ .max_bytes = …, .on_full = … })` overrides it
+> (`on_full`: `.reset` / `.give_up` (fail the search; `auto` then routes to the NFA) / `.grow`).
+> Only the lazy `dfa` has a growable cache; every other backend's `Scratch.init` takes no options.
 
 ### Options
 
@@ -255,17 +263,18 @@ _ = try gex.compileRuntime(gpa, "\\w+", &diag, .{ .unicode = false });          
 // strategy tier — results-invariant: flipping any field changes only speed/memory,
 // never which text matches.
 //   byte_engine: .auto (default) ≡ .enabled → `auto` builds the byte DFA and uses it for
-//                isMatch/find on an eligible pattern (no \b/\X/(?m) line anchors — but $/\z
-//                is now fine). It PREFERS the eager DFA (a frozen table, O(n) find on every
-//                pattern), falling back to the lazy DFA only if the eager table overflows
-//                its state bound; captures come from the Pike VM anchored at the DFA span,
-//                so the result is identical, just 5–10× faster on a class scan (Rust
-//                parity). .disabled = compact NFA-only (minimal memory; right for
-//                match-once / tiny inputs).
+//                isMatch/find on an eligible pattern (most patterns — incl. $/\z, ASCII \b,
+//                and non-prone (?m); only \X, a mixed $, a prone (?m)/\b stay on the Pike VM).
+//                It PREFERS the eager DFA (a frozen table, O(n) find on every pattern),
+//                falling back to the lazy DFA when the eager table overflows its state bound
+//                (or for Unicode \b on non-ASCII input); captures come from `onepass` or the
+//                Pike VM anchored at the DFA span, so the result is identical, just 5–10×
+//                faster on a class scan (Rust parity). .disabled = compact NFA-only (minimal
+//                memory; right for match-once / tiny inputs).
 _ = try gex.compileRuntime(gpa, "\\w+", &diag, .{}); // DFA on by default — no flag needed
 _ = try gex.compileRuntime(gpa, "\\w+", &diag, .{ .strategy = .{ .byte_engine = .disabled } });
-//   prefilter (default true) → memchr start-skip + rarest-required-byte fast-reject;
-//   set false to scan without probing. unicode_word_boundary_in_dfa stays reserved.
+//   prefilter (default true) → whole-run SIMD memmem start-skip + rarest-required-byte
+//   fast-reject; set false to scan without probing. unicode_word_boundary_in_dfa stays reserved.
 _ = try gex.compileRuntime(gpa, "abc", &diag, .{ .strategy = .{ .prefilter = false } });
 ```
 
@@ -535,7 +544,9 @@ Script name — only literals, sorted positive ranges, anchors, and the tree str
 `h.analysis` carries cheap, **sound** facts about *every* match — each holds for every
 match, so a prefilter or length gate built on them never drops a real match. The `auto`
 dispatcher consumes several to skip work; you can read them too (e.g. to pick a `memchr`
-needle, or gate a search before calling the engine).
+needle, or gate a search before calling the engine). Since **0.4.0** `auto` skips on the
+*whole* `prefix_literal` run (a SIMD `memmem`-style leap — `\bthe\b` jumps "the"→"the",
+not 't'→'t'), not just its first byte.
 
 ```zig
 const h = try gex.buildHir(gpa, try gex.parse(gpa, "abc[0-9]+xy$", &diag), .{});
@@ -859,8 +870,10 @@ Read these before trusting edge cases (full list in [`architecture.md`](architec
   All built-in backends agree bit-for-bit (the NFA backends share one compiler).
 - **`$` is `\z`.** Without `(?m)`, `$` matches **only** end-of-input — *not* before a
   trailing `\n`. `abc$` does not match `"abc\n"` (JS/Go/RE2/Rust semantics). `\Z` == `\z`.
-  (`$`/`\z` is now **DFA-eligible** — the eager DFA handles `text_end`; the lazy DFA still
-  declines it. What the DFA still declines: `(?m)` line anchors, `\b`/`\B`, and `\X`.)
+  (`$`/`\z`, `(?m)` line anchors, and `\b`/`\B` are all now **DFA-handled** — anchored-end `$`
+  on both byte DFAs, non-prone `(?m)` + ASCII `\b` on the eager DFA, Unicode `\b` on the lazy
+  DFA. Only `\X`, a *mixed* `$`, a *prone* `(?m)`/`\b`, and `\b`+`$`/`(?m)` stay on the Pike VM;
+  `auto` routes it all.)
 - **`\X` (grapheme cluster) is `backtrack`-only** — it matches one whole UAX #29 cluster
   and compiles to a variable-width instruction the breadth-first `pikevm`/`literal`
   can't run, so `auto` routes any `\X` pattern to the backtracker (forcing `pikevm`

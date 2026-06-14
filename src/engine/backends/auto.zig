@@ -19,10 +19,12 @@
 //!     (a tiny POD `Filter`): a `min_utf8_len` length gate rejects inputs too short
 //!     to hold any match; an `anchored_start` pattern (`^…`/`\A…`) only ever matches
 //!     at offset 0, so the leftward scan is skipped entirely; and when every match
-//!     must begin with a fixed literal, its first byte drives a `memchr` that skips
-//!     straight to each candidate start, confirming there with an anchored NFA run.
-//!     Every `Analysis` fact is a sound one-sided bound, so the prefilter never drops
-//!     a real match — it only avoids running the NFA where one provably cannot start.
+//!     must begin with a fixed literal, that whole literal run drives a SIMD `memmem`-style
+//!     skip (a `memchr` for the run's rarest byte + an inline verify, see `memmemFrom`) that
+//!     leaps straight to each candidate start — literal-to-literal, not byte-to-byte (`\bthe\b`
+//!     jumps "the"→"the") — confirming there with an anchored NFA/DFA run. Every `Analysis`
+//!     fact is a sound one-sided bound, so the prefilter never drops a real match — it only
+//!     avoids running the engine where one provably cannot start.
 //!
 //! This is the backend a casual user gets by default (`compileRuntime` /
 //! `compileComptime`); power users opt into a specific backend explicitly. It works
@@ -110,7 +112,7 @@ pub const Options = struct {
     /// @stable-since: v0.3.0
     byte_engine: ByteEngine = .auto,
     /// Whether to distil and apply the sound analysis prefilter (length gate,
-    /// leading-literal `memchr` start-skip, rarest-required-byte fast-reject). On by
+    /// leading-literal SIMD `memmem` start-skip, rarest-required-byte fast-reject). On by
     /// default; `false` builds an all-permissive filter so the engine scans without
     /// probing. Results-invariant.
     ///
@@ -127,6 +129,15 @@ pub const Options = struct {
 /// never drops a real match. Only consulted on the NFA arm; the literal arm does its
 /// own scanning.
 ///
+/// The longest leading literal kept for the `memmem` start-skip: `analysis.prefix_literal`
+/// is truncated to this many UTF-8 bytes (always at a code-point boundary). A truncated run
+/// is still a **sound necessary prefix** (every match begins with it), and ~8–16 bytes is
+/// already maximally selective for a `memmem` skip — a longer needle only grows the `Filter`
+/// POD (which bakes into `ro_data` at comptime, so it must stay small and pointer-free).
+///
+/// @stable-since: v0.4.0
+const MAX_PREFIX_LEN = 16;
+
 /// @stable-since: v0.1.0
 pub const Filter = struct {
     /// `analysis.min_utf8_len`: a match needs at least this many bytes, so an input
@@ -135,9 +146,9 @@ pub const Filter = struct {
     /// `analysis.anchored_start`: every match begins at offset 0 (`^`/`\A`, no
     /// multiline) — an unanchored scan need only try position 0.
     anchored_start: bool = false,
-    /// First UTF-8 byte of `analysis.prefix_literal` (the literal run every match
-    /// must begin with), or null when no fixed leading literal exists. Drives a
-    /// `memchr` start-skip: a match can only begin where this byte appears.
+    /// First UTF-8 byte of `analysis.prefix_literal`, or null when no fixed leading
+    /// literal exists. Retained as the degenerate single-byte fact (== `prefix[0]` when
+    /// `prefix_len > 0`); the engine now skips on the whole `prefix[0..prefix_len]` run.
     prefix_byte: ?u8 = null,
     /// The **rarest** byte (by `byteRarity`) of `analysis.required_bytes` — a byte that
     /// appears in *every* match — or null when nothing is unconditionally required.
@@ -146,6 +157,20 @@ pub const Filter = struct {
     /// prefix-less interior-literal pattern like `\w+@\w+` on input with no `@`). Picked
     /// rarest so the `memchr` is as selective as possible.
     rare_byte: ?u8 = null,
+    /// UTF-8 bytes of `analysis.prefix_literal` — the literal run every match must begin
+    /// with — truncated to `MAX_PREFIX_LEN` (at a code-point boundary). `prefix[0..prefix_len]`
+    /// is the **SIMD `memmem` start-skip needle**: a match can only begin where this whole run
+    /// occurs, so the scan leaps literal-to-literal (`\bthe\b` jumps "the"→"the") instead of
+    /// byte-to-byte (the old `prefix_byte` memchr). `prefix_len == 0` means no usable leading
+    /// literal; `prefix_len == 1` degrades to exactly the `prefix_byte` memchr. Strictly more
+    /// selective than the single byte and always sound (it is a necessary prefix of every match).
+    ///
+    /// @stable-since: v0.4.0
+    prefix: [MAX_PREFIX_LEN]u8 = @splat(0),
+    /// Number of valid bytes in `prefix` (0 = no usable leading literal).
+    ///
+    /// @stable-since: v0.4.0
+    prefix_len: u8 = 0,
 };
 
 /// A coarse "commonness" score for a byte: **higher = more common** in typical text, so
@@ -171,13 +196,23 @@ fn filterFromAnalysis(h: hir.Hir) Filter {
     // start short-circuit already pins the search to offset 0.
     if (!an.anchored_start) {
         if (an.prefix_literal) |run| {
-            if (run.len > 0) {
-                const cp = h.literals[run.start];
-                if (encoding.isValidCodePoint(cp)) {
-                    var buf: [4]u8 = undefined;
-                    const n = utf8.encodeCodePointUnchecked(cp, &buf);
-                    if (n > 0) f.prefix_byte = buf[0];
-                }
+            // Encode as many leading code points as fit in `prefix` (truncate at a code-point
+            // boundary — a shorter run is still a sound necessary prefix). This is the SIMD
+            // `memmem` needle every match must begin with; `prefix_byte` mirrors its first byte.
+            var n: usize = 0;
+            var k: u32 = 0;
+            while (k < run.len and n < MAX_PREFIX_LEN) : (k += 1) {
+                const cp = h.literals[run.start + k];
+                if (!encoding.isValidCodePoint(cp)) break;
+                var buf: [4]u8 = undefined;
+                const m = utf8.encodeCodePointUnchecked(cp, &buf);
+                if (m == 0 or n + m > MAX_PREFIX_LEN) break;
+                @memcpy(f.prefix[n .. n + m], buf[0..m]);
+                n += m;
+            }
+            if (n > 0) {
+                f.prefix_len = @intCast(n);
+                f.prefix_byte = f.prefix[0];
             }
         }
         // Rarest required byte for the fast-reject (only when there is no fixed prefix
@@ -385,14 +420,15 @@ pub const Scratch = struct {
     dfa_disabled: bool = false,
     /// ReDoS observable: the number of **per-occurrence prefilter confirms** the eager-DFA
     /// arm (`runEdfa`) has performed on this scratch. The prefilter's leading-literal
-    /// `memchr` start-skip confirms anchored at each prefix-byte occurrence; for a
+    /// `memmem` start-skip confirms anchored at each occurrence of the whole prefix run; for a
     /// `prone`/`end_anchored` program that confirm can scan an unbounded run, so doing it
     /// per occurrence is Θ(n²) — the fix routes those programs to the DFA's O(n) native
     /// find instead, and this counter therefore stays **0** for them. A non-zero value on a
     /// `prone`/`end_anchored` program is exactly the quadratic regression; `engine/redos.zig`
-    /// asserts it is 0 (a revert-failing guard). Bounded by the prefix-byte occurrence count
-    /// for the fast-confirm case (`foo\d+`). Observational only — never affects a result, never
-    /// read by matching. Accumulates across searches on the scratch; `reset` zeroes it.
+    /// asserts it is 0 (a revert-failing guard). Bounded by the prefix-run occurrence count
+    /// for the fast-confirm case (`foo\d+` — once per "foo", not per 'f'). Observational only —
+    /// never affects a result, never read by matching. Accumulates across searches on the scratch;
+    /// `reset` zeroes it.
     ///
     /// @stable-since: v0.3.1
     confirm_probes: u64 = 0,
@@ -493,6 +529,52 @@ fn memchrFrom(input: []const u8, start: usize, b: u8) ?usize {
     return std.mem.indexOfScalarPos(u8, input, start, b);
 }
 
+/// Index of the rarest (most selective) byte of `needle` by `byteRarity` — the byte to
+/// SIMD-scan for in `memmemFrom`. Ties keep the earliest. Requires `needle.len >= 1`.
+fn rarestByteIndex(needle: []const u8) usize {
+    var best: usize = 0;
+    var best_score: u8 = byteRarity(needle[0]);
+    var i: usize = 1;
+    while (i < needle.len) : (i += 1) {
+        const s = byteRarity(needle[i]);
+        if (s < best_score) {
+            best = i;
+            best_score = s;
+        }
+    }
+    return best;
+}
+
+/// First byte offset `≥ start` at which `needle` occurs in `input`, or null — the prefilter's
+/// **multi-byte** start-skip primitive (a generalisation of `memchrFrom` that leaps literal-to-
+/// literal instead of byte-to-byte). Implemented as a SIMD `memchr` (`std.mem.indexOfScalarPos`,
+/// `@Vector`) for the needle's *rarest* byte, then a cheap inline `eql` verify of the whole run
+/// at each hit — genuinely vectorised even for short needles.
+///
+/// We deliberately do **NOT** call `std.mem.indexOfPos`: it falls back to a *non-SIMD* linear
+/// scan for needles `≤ 4` bytes (`std.mem.findPos`) — exactly the "the"/"http"/"foo" sizes the
+/// prefilter sees — which scans slower than a SIMD `memchr` while only being more *selective*.
+/// Scanning the rarest byte gives the selectivity (few verifies) AND keeps the scan vectorised,
+/// so this beats both the single-byte memchr and `indexOfPos` here. A one-byte needle is exactly
+/// `memchrFrom`; an empty needle matches at `start`. Comptime uses the scalar `memchrFrom`/`eql`.
+///
+/// @stable-since: v0.4.0
+fn memmemFrom(input: []const u8, start: usize, needle: []const u8) ?usize {
+    if (needle.len == 0) return if (start <= input.len) start else null;
+    if (needle.len == 1) return memchrFrom(input, start, needle[0]);
+    if (start + needle.len > input.len) return null;
+    const off = rarestByteIndex(needle);
+    const key = needle[off];
+    var h = start + off; // earliest position of the key byte for a candidate at `start`
+    while (memchrFrom(input, h, key)) |p| {
+        const cand = p - off; // p ≥ start+off ⇒ cand ≥ start (no underflow)
+        if (cand + needle.len <= input.len and std.mem.eql(u8, input[cand .. cand + needle.len], needle))
+            return cand;
+        h = p + 1;
+    }
+    return null;
+}
+
 // ── NFA-arm execution: dispatch + analysis-driven prefilter ───────────────────────
 
 /// Confirm a match starting exactly at `at` (anchored). Uses the **Pike VM**: its
@@ -570,18 +652,18 @@ fn runNfa(p: *const nfa.Program, filter: Filter, s: *Scratch.NfaScratch, input: 
         return confirmAt(p, s, input, 0, slots);
     }
 
-    // Leading-literal memchr start-skip: every match begins with `prefix_byte`, so no match
-    // begins before its first occurrence — skip straight to it. We deliberately do NOT confirm
-    // at *each* occurrence: a per-occurrence anchored confirm is O(match-attempt), and on a
-    // begin-but-don't-complete pattern with a dense prefix byte (`\ba+b` on `aaaa…a!`) that
-    // makes the loop **Θ(n²)**. The Pike VM's unanchored `dispatch` is a single linear
-    // O(input×program) pass, so one leading skip + dispatch stays leftmost-first AND linear.
-    // (The eager-DFA arm keeps the per-occurrence memchr-jump where its `prone`/`end_anchored`
-    // flags prove confirms fail fast; the NFA arm has no such flag, so it always takes the
-    // linear unanchored scan.)
+    // Leading-literal memmem start-skip: every match begins with the `prefix` run, so no match
+    // begins before its first occurrence — skip straight to it with one SIMD `memmem` (`\bthe\b`
+    // leaps "the"→"the", not 't'→'t'). We deliberately do NOT confirm at *each* occurrence: a
+    // per-occurrence anchored confirm is O(match-attempt), and on a begin-but-don't-complete
+    // pattern with a dense prefix (`\ba+b` on `aaaa…a!`) that makes the loop **Θ(n²)**. The Pike
+    // VM's unanchored `dispatch` is a single linear O(input×program) pass, so one leading skip +
+    // dispatch stays leftmost-first AND linear. (The eager-DFA arm keeps the per-occurrence
+    // memmem-jump where its `prone`/`end_anchored` flags prove confirms fail fast; the NFA arm has
+    // no such flag, so it always takes the linear unanchored scan.)
     var o = opts;
-    if (filter.prefix_byte) |fb| {
-        o.start = memchrFrom(input, o.start, fb) orelse return null;
+    if (filter.prefix_len > 0) {
+        o.start = memmemFrom(input, o.start, filter.prefix[0..filter.prefix_len]) orelse return null;
         if (input.len - o.start < filter.min_bytes) return null;
     } else if (filter.rare_byte) |rb| {
         // Rarest-required-byte fast-reject: `rare_byte` appears in EVERY match, so if it is
@@ -606,7 +688,7 @@ fn dfaConfirmAt(dp: *const dfa.Program, d: *dfa.Scratch, input: []const u8, at: 
 
 /// The byte-DFA arm's span search. It applies the **same sound prefilter as `runNfa`**
 /// — the `min_bytes` length gate, the `anchored_start` short-circuit, and the
-/// leading-literal `memchr` start-skip — before running the DFA, so opting the DFA in
+/// leading-literal SIMD `memmem` start-skip — before running the DFA, so opting the DFA in
 /// is never slower than the default on prefix-literal / sparse-hit patterns. With no
 /// usable filter it runs one DFA pass (one-pass O(n) for `isMatch`, anchored-restart
 /// for `find`). Captures never come here — they always use the Pike VM (`runNfa`).
@@ -618,14 +700,14 @@ fn runByteDfa(dp: *const dfa.Program, filter: Filter, d: *dfa.Scratch, input: []
         if (opts.start != 0) return null;
         return dfaConfirmAt(dp, d, input, 0, match_only);
     }
-    // Leading-literal start-skip (single memchr, then the lazy DFA's own O(input) reverse-DFA
+    // Leading-literal start-skip (single SIMD memmem, then the lazy DFA's own O(input) reverse-DFA
     // find) — NOT a per-occurrence anchored-confirm loop, which would be Θ(n²) on a
     // begin-but-don't-complete dense-prefix input (same hazard as `runEdfa`). The lazy DFA's
     // native `find` is already O(input) (reverse DFA; `has_text_start` short-circuits via
     // `anchored_start` above), so one leading skip + native find is leftmost-first and linear.
     var o = opts;
-    if (filter.prefix_byte) |fb| {
-        o.start = memchrFrom(input, o.start, fb) orelse return null;
+    if (filter.prefix_len > 0) {
+        o.start = memmemFrom(input, o.start, filter.prefix[0..filter.prefix_len]) orelse return null;
         if (input.len - o.start < filter.min_bytes) return null;
     } else if (filter.rare_byte) |rb| {
         // Rarest-required-byte fast-reject (sound; see `runNfa`).
@@ -648,7 +730,7 @@ fn edfaConfirmAt(ep: *const edfa.Program, input: []const u8, at: usize, match_on
 }
 
 /// The eager-DFA arm's span search — the same sound prefilter as `runNfa`/`runByteDfa`
-/// (length gate, `anchored_start` short-circuit, leading-literal `memchr` start-skip,
+/// (length gate, `anchored_start` short-circuit, leading-literal SIMD `memmem` start-skip,
 /// rarest-required-byte fast-reject) in front of the frozen-table walk. The eager DFA is
 /// stateless; the only state is `probes`, the ReDoS observable (`Scratch.confirm_probes`)
 /// incremented per per-occurrence confirm. Captures never come here — they always use the Pike VM.
@@ -661,24 +743,26 @@ fn runEdfa(ep: *const edfa.Program, filter: Filter, input: []const u8, opts: Sea
         return edfaConfirmAt(ep, input, 0, match_only);
     }
     var o = opts;
-    if (filter.prefix_byte) |fb| {
-        // The leading-literal `memchr` start-skip confirms anchored at each prefix-byte
-        // occurrence. Each confirm is O(match-attempt); when a confirm can walk a long run before
-        // failing it blows up on a dense-prefix begin-but-don't-complete input (`aaaa…a!`: a
-        // leading byte at every position, each confirm re-walking the run). `ep.prone` flags both
-        // hazardous shapes — a non-accepting *cycle* (`(x+x+)+y`, unbounded ⇒ Θ(n²)) AND a long
-        // *bounded* prefix (`a{4000}b`, Θ(n·k) with large k) — and `end_anchored` (`$`) flags the
-        // run-to-end shape (`(a+)+$`). For all of those the eager DFA's *native* find is O(input)
-        // (reverse two-pass / reverse-from-end), so skip to the first candidate once and hand off —
-        // no per-position confirm. The fast-confirm case (`foo\d+`, `a{4}b`: the confirm fails
-        // within a few bytes) keeps the memchr-jump loop, its intended speedup. (Both leftmost-first;
-        // no match begins before the first prefix byte.)
+    if (filter.prefix_len > 0) {
+        const pfx = filter.prefix[0..filter.prefix_len];
+        // The leading-literal SIMD `memmem` start-skip confirms anchored at each occurrence of the
+        // whole `prefix` run (`\bthe\b` jumps "the"→"the", not 't'→'t' — strictly fewer confirms).
+        // Each confirm is O(match-attempt); when a confirm can walk a long run before failing it
+        // blows up on a dense-prefix begin-but-don't-complete input (`aaaa…a!`: a leading run at
+        // every position, each confirm re-walking it). `ep.prone` flags both hazardous shapes — a
+        // non-accepting *cycle* (`(x+x+)+y`, unbounded ⇒ Θ(n²)) AND a long *bounded* prefix
+        // (`a{4000}b`, Θ(n·k) with large k) — and `end_anchored` (`$`) flags the run-to-end shape
+        // (`(a+)+$`). For all of those the eager DFA's *native* find is O(input) (reverse two-pass /
+        // reverse-from-end), so skip to the first candidate once and hand off — no per-position
+        // confirm. The fast-confirm case (`foo\d+`, `a{4}b`: the confirm fails within a few bytes)
+        // keeps the memmem-jump loop, its intended speedup. (Both leftmost-first; no match begins
+        // before the first occurrence of the prefix run.)
         if (ep.prone or ep.end_anchored) {
-            o.start = memchrFrom(input, o.start, fb) orelse return null;
+            o.start = memmemFrom(input, o.start, pfx) orelse return null;
             if (input.len - o.start < filter.min_bytes) return null;
         } else {
             var pos = o.start;
-            while (memchrFrom(input, pos, fb)) |hit| {
+            while (memmemFrom(input, pos, pfx)) |hit| {
                 if (input.len - hit < filter.min_bytes) return null;
                 probes.* += 1; // ReDoS observable: a per-occurrence confirm (0 for prone/end_anchored)
                 if (edfaConfirmAt(ep, input, hit, match_only)) |m| return m;
@@ -923,7 +1007,7 @@ test "auto captures (nfa route)" {
 }
 
 test "auto: backtrack and pikevm routes agree on a large input (crosses the switch)" {
-    // A pattern with a leading *class* (no fixed leading literal) bypasses the memchr
+    // A pattern with a leading *class* (no fixed leading literal) bypasses the memmem
     // prefilter and exercises the per-input dispatch directly: an input longer than
     // BACKTRACK_MAX_INPUT forces the Pike VM; a short one uses the backtracker. Both
     // must find the same thing. Dot filler is not in `[a-z]`, so the leftmost match
@@ -942,15 +1026,57 @@ test "auto: backtrack and pikevm routes agree on a large input (crosses the swit
     try testing.expectEqualStrings("abc!", m_small.slice("..abc!.."));
 }
 
-test "auto: prefix-literal memchr prefilter finds the leftmost match" {
-    // Every match of `foo\d` begins with the literal "foo" → analysis yields a
-    // prefix byte 'f' that drives the memchr skip. A false-positive 'f' ("food",
-    // no trailing digit) fails the anchored confirm and the scan moves on.
+test "auto: prefix-literal memmem prefilter finds the leftmost match" {
+    // Every match of `foo\d` begins with the literal "foo" → analysis yields the
+    // prefix run "foo" that drives a SIMD `memmem` skip (literal-to-literal). A
+    // false-positive "foo" ("food", no trailing digit) fails the anchored confirm
+    // and the scan moves on to the next "foo".
     try expectFind("foo\\d", "food foo5", "foo5");
     try expectFind("foo\\d+", "xx foo123 yy", "foo123");
     try expectNoMatch("foo\\d", "no digits here foo!");
-    // unicode prefix: 'é' is multi-byte; its first byte still seeds the memchr.
+    // unicode prefix: 'é' is multi-byte; the whole "été" run (UTF-8) is the memmem needle.
     try expectFind("été\\d", "l'été9", "été9");
+}
+
+test "auto: multi-byte prefix run drives the memmem skip (the \\bthe\\b lane)" {
+    // `\bthe\b` consumes the literal "the" after a zero-width `\b`, so the prefix run is the
+    // whole word "the" — the SIMD `memmem` leaps "the"→"the" instead of 't'→'t', skipping past
+    // every interior "the" (in "other", "there") far more cheaply than the old single-byte memchr.
+    try expectFind("\\bthe\\b", "soothe the other theory", "the");
+    try expectNoMatch("\\bthe\\b", "soothe theory bathear"); // every "the" is interior — no boundary
+    // findAll / count agree with the per-match scan over a boundary-heavy input.
+    var re = try Compiled.init("\\bthe\\b");
+    defer re.deinit();
+    const input = "the theatre then the end, other the";
+    try testing.expectEqual(@as(usize, 3), E.count(&re.program, &re.scratch, input, .{}));
+    // A leading multi-char literal before a class behaves identically.
+    try expectFind("abc[0-9]+", "ab abc abc7 x", "abc7");
+}
+
+test "auto: filterFromAnalysis distils the WHOLE leading literal run (revert-failing)" {
+    // White-box guard for the substring-skip upgrade: the prefilter needle must be the full
+    // leading literal run, not just its first byte. Reverting to a single-byte prefix collapses
+    // `prefix_len` back to 1 here and fails this test.
+    const gpa = testing.allocator;
+    const Case = struct { pat: []const u8, prefix: []const u8 };
+    const cases = [_]Case{
+        .{ .pat = "foo\\d+", .prefix = "foo" }, // leading literal "foo", len 3
+        .{ .pat = "\\bthe\\b", .prefix = "the" }, // zero-width `\b` is skipped; run is "the"
+        .{ .pat = "abc[0-9]+xy$", .prefix = "abc" }, // leading run is "abc" (not "xy")
+        .{ .pat = "été\\d", .prefix = "été" }, // multi-byte code points: 4 UTF-8 bytes
+        .{ .pat = "a{4}b", .prefix = "a" }, // counted repeat keeps a 1-byte run (memmem→memchr)
+    };
+    inline for (cases) |c| {
+        var diag: compile.Diagnostic = .{};
+        const ast = try compile.parse(gpa, c.pat, &diag);
+        defer ast.deinit(gpa);
+        const h = try hir.buildAlloc(gpa, ast, .{});
+        defer hir.deinitHir(gpa, h);
+        const f = filterFromAnalysis(h);
+        try testing.expectEqual(@as(u8, @intCast(c.prefix.len)), f.prefix_len);
+        try testing.expectEqualStrings(c.prefix, f.prefix[0..f.prefix_len]);
+        try testing.expectEqual(@as(?u8, c.prefix[0]), f.prefix_byte); // first byte still mirrored
+    }
 }
 
 test "auto: prefilter is correct under findAll / count (multiple matches)" {
@@ -989,7 +1115,7 @@ test "auto: prefilter preserves captures" {
     try testing.expectEqualStrings("42", c.groupSlice(2).?);
 }
 
-test "auto: prefilter path runs at COMPTIME (memchr + anchored confirm)" {
+test "auto: prefilter path runs at COMPTIME (memmem + anchored confirm)" {
     const got = comptime blk: {
         @setEvalBranchQuota(3_000_000);
         const a = compile.compile("foo\\d+");

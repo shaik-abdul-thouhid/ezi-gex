@@ -22,7 +22,7 @@ backend" walkthrough. This document goes a layer down: the *why* behind that *ho
                                                                   │  ← the contract
         ┌──────────────── PLUGGABLE BACKENDS (engine/) ───────────┼─────────────────┐
         │  a Backend = a comptime `type` satisfying engine/backend.zig              │
-        │  literal · pikevm · backtrack · bytepike · dfa · edfa · auto · <yours>   │
+        │  literal · pikevm · backtrack · onepass · bytepike · dfa · edfa · auto · <yours> │
         │     each: build(Hir)→Program · Scratch · isMatch / search / searchCaptures│
         └───────────────────────────────────────────────────────────┬───────────────┘
                                                                     ▼
@@ -32,8 +32,9 @@ backend" walkthrough. This document goes a layer down: the *why* behind that *ho
 
 - **Fixed (library-owned):** the scanner, AST, and the **HIR builder** — all the
   Unicode/flag/fold resolution and analysis. You consume the HIR; you don't change it.
-- **Pluggable:** anything implementing the backend contract — the four built-ins,
-  the `auto` dispatcher, and your own backend.
+- **Pluggable:** anything implementing the backend contract — the seven built-ins
+  (`literal`, `pikevm`, `backtrack`, `onepass`, `bytepike`, `dfa`, `edfa`), the `auto`
+  dispatcher, and your own backend.
 - **Dependency rule:** `engine/ → core/`, one way. `core/` never imports `engine/`.
   No backend imports another (except `auto`, which composes them).
 
@@ -133,15 +134,20 @@ A recurring worry is that resolving Unicode classes "pulls in huge tables." It d
 pull in tables, but the size is **bounded and constant**, not proportional to how many
 or how complex your patterns are:
 
-- **Range tables, linked once (~135 KB total).** All Unicode work is delegated to
-  `ezi_code`'s *enumerable range tables* — `category_runs`, `derived_runs`,
-  `script_runs`, and the simple case-fold table. The HIR resolves every class from
-  them, and `\b`/`isWord` and the scanner's group-name validation go through their
-  range-backed predicates too. These tables are a one-time link cost: **the same ~135 KB
-  whether the program compiles one regex or ten thousand.**
-- **No per-code-point page tries.** ezi_gex deliberately uses only the *range* tables,
-  never `ezi_code`'s two-level per-code-point page tries (General_Category + Derived­Core­Properties),
-  which alone are ~220 KB. They are not linked.
+- **Class matching uses range tables; assertions use property tables (~380 KB total,
+  linked once).** Class *matching* is delegated to `ezi_code`'s *enumerable range tables*
+  — `category_runs`, `derived_runs`, `script_runs` — which the HIR resolves every class
+  from (matched by a range check, no per-character lookup). The Unicode **assertions** are
+  the exception and pull the larger tables: match-time `\b`/`\B` (Unicode) tests word-ness
+  via `properties.isWord` (the **DerivedCoreProperties** table, ~161 KB — the single
+  biggest contributor; see `engine/nfa.zig`), `\X` via the **grapheme-break** table, and
+  full `(?i)` folding via the **case-fold** tables. Measured in the bundled demo (which
+  exercises `\p{L}`, scripts, classes, captures): **≈ 380 KB**, the same whether the
+  program compiles one regex or ten thousand.
+- **It is a fixed cost, not a growing one** — and a program that uses *no* Unicode
+  assertions and only ASCII classes pulls far less (`ezi_gex` still links none of
+  `ezi_code`'s per-code-point *General_Category* trie; only the tables the engine's
+  features actually reach are pulled in).
 - **Program interning.** When `nfa` compiles the HIR it **interns identical class
   range-blocks** in the `Program` (`engine/nfa.zig`, `addRanges`): two class instructions
   with the same resolved ranges share one block. So a class repeated within a pattern —
@@ -441,16 +447,24 @@ match, so a prefilter or length gate built on them never yields a false negative
   contain (pick the rarest for a `memchr` prefilter).
 - `has_grapheme`, `has_word_boundary`, `is_whole_literal`, `is_one_pass`.
 
-> **As of 0.1.0 the `auto` dispatcher consumes the prefilter facts on its NFA arm:**
-> `min_utf8_len` (a length gate — reject inputs too short to match), `anchored_start`
-> (a `^`/`\A` start short-circuit — only try offset 0), and `prefix_literal` (its first
-> UTF-8 byte seeds a `memchr` start-skip, each hit confirmed by an *anchored* NFA run).
+> **As of 0.1.0 the `auto` dispatcher consumes the prefilter facts on its NFA *and* DFA
+> arms:** `min_utf8_len` (a length gate — reject inputs too short to match), `anchored_start`
+> (a `^`/`\A` start short-circuit — only try offset 0), and `prefix_literal`. **Since 0.4.0 the
+> *whole* `prefix_literal` run (not just its first byte) drives the start-skip:** a SIMD
+> `memmem`-style leap to the next occurrence of the entire run (`\bthe\b` jumps "the"→"the", not
+> 't'→'t'), each hit confirmed by an *anchored* run. The skip is a SIMD `memchr`
+> (`std.mem.indexOfScalarPos`, `@Vector`) for the run's **rarest** byte plus an inline `eql`
+> verify — deliberately **not** `std.mem.indexOfPos`, whose multi-byte path is a *non-SIMD*
+> linear scan for needles ≤ 4 bytes (`std.mem.findPos`), the common "the"/"http" sizes.
 > The `literal` backend likewise scans with `std.mem.indexOf` (memchr / Boyer–Moore–
 > Horspool). **Since 0.3.0 the rarest byte of `required_bytes` also drives a sound `memchr`
 > fast-reject** — a byte every match must contain, absent from the input, means no match
-> (no `@` ⇒ no `\w+@\w+`). `required_literal` and `is_one_pass` remain unconsumed —
-> scaffolding for a future `memmem` / one-pass path; any backend is free to read them.
-> Toggle the whole prefilter with `strategy.prefilter`.
+> (no `@` ⇒ no `\w+@\w+`). The **one-pass capture path now exists** (`backends.onepass`,
+> since 0.4.0 — `auto` uses it for the anchored capture fill after a DFA locates the span),
+> though it proves one-pass-ness itself rather than reading the `is_one_pass` flag.
+> `required_literal` (a multi-substring **Teddy** prefilter) and `is_one_pass` remain
+> unconsumed *as Analysis fields*; any backend is free to read them. Toggle the whole
+> prefilter with `strategy.prefilter`.
 
 ---
 
@@ -461,8 +475,11 @@ match, so a prefilter or length gate built on them never yields a false negative
 - **`$` is `\z`.** Without `(?m)`, `$` matches **only** end-of-input — *not* before a
   trailing newline. `abc$` does **not** match `"abc\n"`. This is JS/Go/RE2/Rust
   semantics, not Perl/Python/PCRE. `\Z` is treated as `\z`. (`$`/`\z` is now
-  **DFA-eligible**: the eager DFA models `text_end`; see §10. The DFA still declines
-  `(?m)` line anchors, `\b`/`\B`, and `\X`.)
+  **DFA-eligible** on **both** byte DFAs — anchored-end `$` via a reverse-DFA-from-end
+  pass; see §10. So are `(?m)` line anchors and `\b`/`\B`: the **eager** DFA bakes in
+  non-prone `(?m)` and **ASCII** `\b`, the **lazy** DFA carries **Unicode** `\b` on
+  non-ASCII input. Only **`\X`**, a *prone* `(?m)`/`\b`, a *mixed* `$`, and `\b` combined
+  with `$`/`(?m)` stay on the code-point Pike VM — `auto` routes all of this transparently.)
 - **`\X` (grapheme cluster) is `backtrack`-only.** `\X` matches one whole UAX #29
   extended grapheme cluster; it compiles to a variable-width `grapheme` NFA
   instruction. `backtrack` and `auto` set `caps.grapheme = true`; the breadth-first
@@ -533,14 +550,15 @@ The contract is the seam that makes these drop-in:
 
 | Tier | Work | Effort | Lands at |
 |---|---|---|---|
-| 1 ✅ *(0.1.0)* | literal `eql` → `std.mem.indexOf`; `prefix_literal` first byte → `memchr` start-skip in `auto` (+ length/anchor gates); **0.3.0:** literal *alternation* skips with a single SIMD `indexOfAny` pass (was a Θ(n²) per-branch `indexOfPos`) | done | ~20× on memchr-friendly literals and prefixed NFA patterns; `foo\|bar\|baz\|qux` 7.5 → ~460 MiB/s (no longer quadratic) |
+| 1 ✅ *(0.1.0)* | literal `eql` → `std.mem.indexOf`; `prefix_literal` first byte → `memchr` start-skip in `auto` (+ length/anchor gates); **0.3.0:** literal *alternation* skips with a single SIMD `indexOfAny` pass (was a Θ(n²) per-branch `indexOfPos`); **0.4.0:** the start-skip now uses the **whole `prefix_literal` run** (a SIMD `memmem`-style leap — `memchr` on the run's rarest byte + inline verify, *not* `std.mem.indexOfPos` whose ≤4-byte path is non-SIMD), so `\bthe\b` jumps "the"→"the" not 't'→'t' | done | ~20× on memchr-friendly literals and prefixed NFA patterns; `foo\|bar\|baz\|qux` 7.5 → ~460 MiB/s (no longer quadratic); **0.4.0:** `\bthe\b` on Sherlock 3.15 → 1.27 ms (2.5×), `the\s+\p{L}+` 1.22 ms → 794 µs |
 | 3a ✅ *(0.2.0, compacted 0.3.0)* | **byte-NFA lowering + `ByteMap`** (`engine/byte.zig`) — UTF-8 `utf8-ranges`, a `byte_range` Thompson NFA, byte equivalence classes; executed by the `bytepike` reference VM. **0.3.0:** UTF-8 suffix sharing (`(lo,hi,next)` cache) + single-copy `x+` shrink the NFA ~1.5–2.9×; `byteWorthLowering` cost-gate | done | the substrate for the DFAs below; smaller NFA ⇒ faster determinization |
 | 3c ✅ *(0.3.0)* — **the default span engine** | **eager DFA** (`backends/edfa.zig`) — fully determinizes the byte NFA into a frozen `states × byte_classes` table; **stateless** matcher (a bare table walk, zero decode), comptime *and* runtime, span-only. **`find` is O(input) on every pattern** via the build-time `program.prone` strategy: non-prone → anchored restart, prone → the reverse-DFA two-pass (`utrans` forward-end + a frozen reverse table for the start). Supports `text_start` **and `text_end`** (`$`/`\z`). **Builds only the tables it uses** (a non-prone `\w+` keeps just its `trans`, ~141 KB, not + `utrans` + reverse, ~1 MB) | done | class scans (`\w+`, `\d+`, `[A-Za-z]+`, `\p{L}+`) at **Rust parity** (~1.1–1.3×); the email `\w+@\w+` Θ(n²) stays fixed; tiny + bakeable for literal/ASCII (`abc` 5 states / 105 B) |
-| 3b ✅ *(0.3.0)* — **the fallback** | **lazy DFA** over the **byte** automaton (`engine/backends/dfa.zig`) — caches `(state, class)` transitions; span-only, runtime-only, leftmost-first via priority + cut-on-match determinization; with an **O(n) reverse-DFA `find`**. Now the fallback when the eager DFA overflows its `max_states` bound. **0.3.0 hot-loop pass:** cached raw table pointers refreshed only after a cold transition (`\w+` ~336 → ~517 MiB/s) | done | one DFA state per byte (cached); serves patterns whose full eager table is too large; still declines `$`/`\z` |
-| 3c+ | **minimize + sparse-encode** the (kept) eager DFA tables (Hopcroft + a sparse transition table) | weeks | shrinks the Unicode-class eager tables that *are* built (the `\w+` ~141 KB dense → far smaller) |
+| 3b ✅ *(0.3.0)* — **the fallback** | **lazy DFA** over the **byte** automaton (`engine/backends/dfa.zig`) — caches `(state, class)` transitions; span-only, runtime-only, leftmost-first via priority + cut-on-match determinization; with an **O(n) reverse-DFA `find`**. Now the fallback when the eager DFA overflows its `max_states` bound. **0.3.0 hot-loop pass:** cached raw table pointers refreshed only after a cold transition (`\w+` ~336 → ~517 MiB/s). **0.4.0:** also matches anchored-end `$`/`\z` (reverse-from-end) and carries **Unicode `\b`** (decode-hybrid) | done | one DFA state per byte (cached); serves patterns whose full eager table is too large |
+| line anchors `(?m)` & `\b`/`\B` in the DFA ✅ *(0.4.0)* | **eager** DFA bakes in **ASCII** `\b`/`\B` (word-context byte classes + one-byte word-lookahead) and non-prone `(?m)` line anchors (anchored restart with line context, `\n` isolated); the **lazy** DFA carries **Unicode** `\b` via the decode-hybrid; `auto` routes ASCII→eager, non-ASCII→lazy, declined→Pike VM | done | `\b\w+\b` 37 → 244 MiB/s (~6.6×, now ≈ plain `\w+`); `\bthe\b` 89 MiB/s → multi-GiB/s |
+| one-pass NFA capture path ✅ *(0.4.0)* | **`backends.onepass`** — a single deterministic thread fills `slots` in O(input) for provably one-pass patterns; `auto` uses it for the anchored capture fill after a DFA locates the span (else the Pike VM) | done | `(\w+)` capture extraction ASCII 64 → 206 MiB/s (~3.2×) |
+| DFA minimization ✅ *(0.4.0)* | **Hopcroft/Moore** partition-refinement of the eager DFA tables (results-invariant; dense layout kept) | done | `\w+@\w+` reverse DFA ~3251 → ~1047 states (~3×) |
+| 3c+ | **sparse-encode** the (already minimized) eager DFA tables | weeks | shrinks the kept Unicode-class eager tables (the `\w+` ~141 KB dense → far smaller) — was paired with Hopcroft, which has landed |
 | — | **Teddy / Aho-Corasick prefilter** — multi-substring SIMD for literal alternations | weeks | closes the `foo\|bar\|baz\|qux` gap (the single biggest remaining one — Rust's Teddy is ~14–30× ahead) |
-| — | **line anchors `(?m)` and `\b` in the DFA** — position-context / word-context determinization (carry the boundary context in the DFA state) | weeks | routes `(?m)^\w+`, `\b…` off the NFA onto the DFA |
-| 2 | one-pass NFA fast capture path | weeks | kills the captures penalty on common patterns |
 
 ### The byte substrate (tier 3a, landed)
 
@@ -614,9 +632,10 @@ Three design choices follow from the contract:
   (never on the immutable `Program`), bounded by `ScratchOptions{ max_bytes, on_full }`
   (its first real consumer). The comptime path stays on the Pike VM.
 - It is **span-only** (`caps.captures = false`): the DFA finds `[start, end)`. Through
-  `auto`, the DFA serves the span ops (`isMatch`/`search`) and the Pike VM fills captures
-  **anchored at the DFA-found span start** (the capture handoff, added this cycle for both
-  DFA arms — see *The eager DFA* below and `auto.searchCaptures`), turning an O(input)
+  `auto`, the DFA serves the span ops (`isMatch`/`search`) and captures are filled
+  **anchored at the DFA-found span start** by `onepass` (for one-pass patterns) or the Pike
+  VM (the capture handoff, for both DFA arms — see *The eager DFA* below and
+  `auto.searchCaptures`), turning an O(input)
   capture search into O(match).
 - **`isMatch` is one-pass O(n)** (an unanchored automaton with an implicit `.*?`
   prefix); **`find` is O(n) via the reverse DFA** — a forward pass locates the leftmost
@@ -628,8 +647,8 @@ Three design choices follow from the contract:
   two linear passes. The reverse transitions are a plain subset construction — no priority
   or cut, just reachability of the forward start — cached like the forward ones, and
   results pinned leftmost-first to the Pike VM. The DFA also reuses `auto`'s sound
-  prefilter (length gate, `^`/`\A` short-circuit, leading-literal `memchr`,
-  rarest-required-byte fast-reject). A pattern with an *interior* `text_start` (rare, not
+  prefilter (length gate, `^`/`\A` short-circuit, leading-literal **whole-run SIMD `memmem`**
+  start-skip, rarest-required-byte fast-reject). A pattern with an *interior* `text_start` (rare, not
   fully `anchored_start`) keeps anchored restart so the cached reverse transitions stay
   position-independent. It supports `\A` / non-multiline `^`, anchored-end `$`, and **isolated
   `\b`/`\B`** (Unicode word boundaries via the **decode-hybrid** — consumption stays the cached
@@ -640,13 +659,14 @@ The **byte DFA is on by default** (`Options.strategy.byte_engine = .auto`, which
 and use the byte DFA* on an eligible pattern; `.disabled` opts back to the compact NFA-only
 program) — but `auto` now **prefers the eager DFA** and reaches this lazy one only as the
 overflow fallback. Through `auto` the chosen DFA serves `isMatch`/`find`, and
-`searchCaptures` runs the Pike VM **anchored at the DFA span** (the capture handoff) so
-captures are correct and bounded to the match. Results-invariant (`conformance.zig` pins the
-span and captures to the Pike VM and fuzzes the strategy knobs). That is the whole point of
-the backend abstraction: a runtime speed demon and a comptime-pure matcher in one library,
-no fork. (Note the lazy DFA still **declines `$`/`\z`** — only the eager DFA models
-`text_end` — so a `$` pattern routes straight to the eager DFA, or to the NFA if the eager
-table overflows.)
+`searchCaptures` runs `onepass` (one-pass patterns) or the Pike VM **anchored at the DFA
+span** (the capture handoff) so captures are correct and bounded to the match.
+Results-invariant (`conformance.zig` pins the span and captures to the Pike VM and fuzzes the
+strategy knobs). That is the whole point of the backend abstraction: a runtime speed demon
+and a comptime-pure matcher in one library, no fork. (As of 0.4.0 the lazy DFA **also models
+anchored-end `$`/`\z`** — a reverse-DFA-from-end pass, mirroring the eager DFA — so a `$`
+pattern too large for the eager table falls to the lazy DFA, not all the way to the NFA. A
+*mixed* `$` still routes to the Pike VM.)
 
 ### The eager DFA (tier 3c, landed — `backends/edfa.zig`) — the default span engine
 
@@ -693,14 +713,20 @@ Three properties are specific to determinizing *eagerly*:
   edge — finds the leftmost start in one backward scan, no anchored restart, no Θ(n²). A
   **mixed** `$` (text_end in only some branches, e.g. `a$|b`) has no pinned end and is
   **declined** (it routes to the linear Pike VM). So `edfa.supports` accepts `text_start`
-  (`\A`/`^`), `anchored_end` `text_end` (`$`/`\z`), and **isolated `\b`/`\B`** (as **ASCII** word
-  boundaries — the lazy `dfa` complements it with the *Unicode* boundary on non-ASCII input). `\X`,
-  `(?m)` line anchors, a mixed `$`, and `\b` combined with `$`/`(?m)` are declined and route to the
-  code-point engines.
-- **It builds only the tables it will use.** `utrans` and the reverse table are built **only
-  for prone patterns**; a non-prone `\w+` now stores just its forward `trans` table (~141 KB)
-  instead of `trans` + `utrans` + reverse (~1 MB). (Full Hopcroft minimization + a sparse
-  encoding remain a noted follow-up — tier 3c+ — for the tables that *are* kept.)
+  (`\A`/`^`), `anchored_end` `text_end` (`$`/`\z`), **non-prone `(?m)` line anchors**
+  (`line_start`/`line_end`, matched by *anchored restart with line context* — `\n` isolated into
+  its own byte class, the start state chosen per position by the preceding byte, `line_end` a
+  one-byte `\n`-lookahead), and **isolated `\b`/`\B`** (as **ASCII** word boundaries — the lazy
+  `dfa` complements it with the *Unicode* boundary on non-ASCII input). It **declines** `\X`, a
+  **mixed** `$`, a **prone** `(?m)` (`(?m)\w+$`) or **prone** `\b` (declined at *build*), a
+  *chained* `\b\b`, and `\b` combined with `$`/`(?m)` — all routed to the code-point engines
+  (correct + linear there).
+- **It builds only the tables it will use, and minimizes them.** `utrans` and the reverse
+  table are built **only for prone patterns**; a non-prone `\w+` stores just its forward `trans`
+  table (~141 KB) instead of `trans` + `utrans` + reverse (~1 MB). The kept tables are then
+  **Hopcroft/Moore minimized** (since 0.4.0, results-invariant, dense layout preserved — a prone
+  `\w+@\w+`'s reverse DFA shrinks ~3251 → ~1047 states). A **sparse** transition encoding remains
+  a noted follow-up — tier 3c+ — for the tables that *are* kept.
 - **It is bounded.** Eager determinization writes into fixed storage (so the identical code
   runs at comptime, where there is no allocator), so a pattern whose **full** DFA exceeds
   `max_states` is **declined**: `error.Unsupported` at runtime (`auto` falls back to the lazy
@@ -772,7 +798,7 @@ _ = re.find(&sc, input);
 
 - **A `Scratch`'s concurrency model is the backend's choice.** The contract only requires
   that a search takes `*Scratch`; whether that type is thread-safe is up to the backend — one
-  is free to implement a `Scratch` safe to share. **The four built-ins do not:** their
+  is free to implement a `Scratch` safe to share. **The built-ins do not:** their
   `Scratch` is mutated on every search, so sharing one across threads concurrently is a data
   race. For them: one per thread — never pool one across them.
 - **The built-in `backtrack` backend allocates *during* a search** — but through the
@@ -794,4 +820,4 @@ _ = re.find(&sc, input);
 - **The contract documents immutability but `verifyBackend` does not enforce it.** The
   `*const Program` signature blocks honest mutation, but a third-party backend that
   `@constCast`s or hides interior-mutable state inside its `Program` would break cross-thread
-  sharing. The four built-ins don't.
+  sharing. The built-ins don't.

@@ -11,6 +11,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Whole-run literal prefilter (SIMD `memmem` start-skip) in `auto`.** The analysis prefilter's
+  leading-literal start-skip previously used only the **first byte** of `prefix_literal` (a SIMD
+  `memchr`); it now skips on the **whole leading literal run**, so a structured pattern leaps
+  literal-to-literal instead of byte-to-byte — `\bthe\b` jumps "the"→"the" past every interior "the"
+  (in "other", "there") rather than stopping at every 't'. The skip (`auto.memmemFrom`,
+  `@stable-since v0.4.0`) is implemented as a SIMD `memchr` (`std.mem.indexOfScalarPos`, `@Vector`)
+  on the run's **rarest** byte plus a cheap inline `eql` verify — deliberately **not**
+  `std.mem.indexOfPos`, whose multi-byte path falls back to a *non-SIMD* linear scan for needles
+  ≤ 4 bytes (`std.mem.findPos`), i.e. exactly the common "the"/"http"/"foo" sizes (a first cut using
+  `indexOfPos` regressed `uri` 2.5× before the rarest-byte rewrite). The whole run drives the skip
+  across **all three arms** (Pike VM, lazy DFA, eager DFA), and in the eager DFA's per-occurrence
+  confirm loop it confirms once per literal-run occurrence instead of once per first-byte occurrence
+  (strictly fewer `Scratch.confirm_probes`). Sound and results-invariant: the run is a *necessary*
+  prefix of every match (truncated at `MAX_PREFIX_LEN` = 16 bytes, still sound), so no match is ever
+  skipped — pinned by the cross-backend conformance/differential suites and a revert-failing
+  white-box test (`filterFromAnalysis` must distil the *whole* run, not the first byte). The ReDoS
+  guard is unaffected: a counted repeat like `a{4}b` keeps a 1-byte prefix run (`prefixLiteral`
+  recurses through the `min≥1` repetition to its single-char child), so `memmemFrom` degrades to the
+  same `memchr` there. **Benchmark** (`zig/regex-bench`, Apple M4, matched thermal): `\bthe\b` on
+  Sherlock **3.15 → 1.27 ms (2.5×)**, `the\s+\p{L}+` **1.22 ms → 794 µs**, `\bthe\b` on logs
+  **209 → 158 µs**; `uri` (`https?://…`) holds parity (~270 µs). New decls `@stable-since v0.4.0`:
+  `auto.memmemFrom`, `auto.Filter.{prefix, prefix_len}`.
+
 - **`\b`/`\B` word boundaries on the byte DFAs** (`backends.edfa` + `backends.dfa`) — previously a
   `\b`/`\B` pattern always routed to the code-point Pike VM (the worst outlier in the cross-engine
   benchmark, ~10× behind). Word boundaries now ride the DFA, distributed across the two byte DFAs:

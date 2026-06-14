@@ -6,7 +6,8 @@
         "pikevm",
         "prefilter",
         "backtracker",
-        "edfa"
+        "edfa",
+        "memmem"
     ]
 
 }
