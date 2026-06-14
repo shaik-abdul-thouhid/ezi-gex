@@ -99,14 +99,24 @@
 //!   * **`text_end`** (`$`/`\z`) **when `anchored_end`** (every match ends at input end) —
 //!     matched in O(input) by the reverse-DFA-from-end pass (`@stable-since v0.4.0`).
 //!
+//! **`\b`/`\B` word boundaries (Unicode)** run here too, via the **decode-hybrid**: consumption is
+//! the cached byte-DFA walk, but at a state holding a pending boundary the position is resolved by
+//! **decoding the adjacent code points** (`nfa.assertionHolds` — the Pike VM's own routine, so it is
+//! Unicode-correct). Only code-point-boundary states pay a decode (sparse). This is the lazy DFA's
+//! complement to the eager DFA's *ASCII-only* `\b`: `auto` routes a `\b` program's ASCII input to
+//! the eager DFA (fastest) and its **non-ASCII** input here (correct Unicode boundaries) instead of
+//! the Pike VM. Admitted only in isolation (a `\b` combined with `$` is declined). The reverse DFA
+//! is never built for a `\b` program (a decoded boundary can't be woven into the reverse automaton),
+//! so `find`/`isMatch` use the anchored-restart decode-hybrid.
+//!
 //! **Declined** (→ code-point engines, where they are correct **and linear**, so this is a
 //! routing decision, not a limitation of the library):
 //!
-//!   * `\b`/`\B` and `\X` — *codepoint* properties a byte DFA cannot evaluate; a **permanent**
-//!     design choice, never built into the DFA.
+//!   * `\X` — a grapheme cluster is variable-width, not a byte (or single-code-point) property.
 //!   * a **mixed** `$` (a `text_end` in only some alternation branches, e.g. `a$|b`) — the end
 //!     is not pinned, so anchored restart would be Θ(n²); declined to stay quadratic-immune.
 //!   * `(?m)` line anchors (`line_start`/`line_end`) — position-dependent on the adjacent byte.
+//!   * `\b` **combined with** `$` — the boundary-vs-reverse-end interaction is deferred to the Pike VM.
 //!
 //! **Invariants this backend upholds for every pattern `supports` accepts:** matching is
 //! **O(input)** (no quadratic path — a hard contract), **leftmost-first** (byte-identical
@@ -121,6 +131,7 @@ const std = @import("std");
 const backend = @import("../backend.zig");
 const hir = @import("../../core/hir.zig");
 const byte = @import("../byte.zig");
+const nfa = @import("../nfa.zig"); // for the Unicode-correct `\b`/`\B` decode at match time (assertionHolds)
 
 const Match = backend.Match;
 const SearchOptions = backend.SearchOptions;
@@ -227,15 +238,25 @@ pub const Program = struct {
     ///
     /// @stable-since: v0.4.0
     reaches_end: []const bool,
+    /// True when the byte program carries a `\b`/`\B` word boundary. Such a program runs on the
+    /// **decode-hybrid** path: anchored restart where consumption is the cached byte-DFA walk, but
+    /// at a state holding a pending `\b`/`\B` (`Scratch.state_has_wb`) the boundary is resolved by
+    /// **decoding the adjacent code points** (`nfa.assertionHolds`) — a correct **Unicode** word
+    /// boundary, the lazy DFA's complement to the eager DFA's ASCII-only one. The reverse DFA is
+    /// never built for such a program (it can't be reversed through a decoded boundary), so
+    /// `rev.built` is false and `find`/`isMatch` use anchored restart.
+    ///
+    /// @stable-since: v0.4.0
+    has_word_boundary: bool,
 };
 
 /// Whether this HIR can run on the lazy DFA. The capability gate (read this if you opt
 /// directly into `backends.dfa` rather than `auto`):
 ///
-///   * **Required:** byte-lowerable — no `\X` (grapheme) and no `\b`/`\B` (word boundary).
-///     Those are *codepoint* properties the byte DFA cannot evaluate and **always** stay on
-///     the code-point engines (Pike VM / backtracker). This is a deliberate, permanent design
-///     choice, not a missing feature.
+///   * **Required:** byte-lowerable — no `\X` (a grapheme cluster is variable-width). `\b`/`\B`
+///     ARE accepted (in isolation): they are Unicode word boundaries resolved at match time by the
+///     decode-hybrid (`runAnchoredWb`/`resolveWb`), the lazy DFA's complement to the eager DFA's
+///     ASCII-only `\b`. `\X` still stays on the code-point engines.
 ///   * **Allowed assertions:** `text_start` (`\A`, non-multiline `^`) — evaluable purely from
 ///     the search position (true only at offset 0), handled by two start closures with no
 ///     position-dependent transition state; and **`text_end` (`$`/`\z`) when the pattern is
@@ -253,19 +274,29 @@ pub const Program = struct {
 ///
 /// @stable-since: v0.3.0
 pub fn supports(h: hir.Hir) bool {
-    if (!byte.byteLowerable(h)) return false; // excludes \X and \b/\B (codepoint properties)
+    if (!byte.byteLowerable(h)) return false; // excludes \X (grapheme)
     var has_text_end = false;
+    var has_word = false;
     for (h.nodes) |n| {
         if (n.tag == .anchor) switch (n.data.anchor.kind) {
             .text_start => {},
             .text_end => has_text_end = true,
-            else => return false, // (?m) line anchors → code-point engines
+            .word_boundary, .not_word_boundary => has_word = true, // Unicode \b/\B (decode-hybrid, below)
+            .line_start, .line_end => return false, // (?m) line anchors → code-point engines
         };
     }
     // `text_end` is linear here only when the match end is pinned to input end
     // (`anchored_end`), matched by the reverse-DFA-from-end pass. A mixed `$` would fall to the
     // Θ(n²) anchored restart, so decline it; `auto` then routes it to the linear Pike VM.
     if (has_text_end and !h.analysis.anchored_end) return false;
+    // `\b`/`\B` are evaluated as **Unicode** word boundaries by decoding the adjacent code points
+    // at match time (the decode-hybrid anchored-restart path — consumption stays DFA-cached, only
+    // boundary positions decode). Admitted only in ISOLATION: combined with `$` the boundary-vs-
+    // reverse-end interaction is deferred to the Pike VM. (Linearity for `\b` programs assumes
+    // non-prone, which `auto` guarantees — it builds this arm only for an eager-DFA-accepted, i.e.
+    // non-prone, pattern; a direct `backends.dfa` user on a prone `\b` like `\b.*x` should prefer
+    // `auto`.)
+    if (has_word and has_text_end) return false;
     return true;
 }
 
@@ -495,11 +526,13 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     // takes the reverse-from-end path (and `supports` guarantees it is `anchored_end`).
     var has_text_start = false;
     var has_text_end = false;
+    var has_word = false;
     for (bp.insts) |inst| switch (inst) {
         .assertion => |k| switch (k) {
             .text_start => has_text_start = true,
             .text_end => has_text_end = true,
-            else => return error.Unsupported,
+            .word_boundary, .not_word_boundary => has_word = true, // Unicode \b/\B (decode-hybrid)
+            else => return error.Unsupported, // line anchors (declined by supports)
         },
         else => {},
     };
@@ -507,12 +540,13 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     var class_rep: [256]u8 = @splat(0);
     var b: u16 = 0;
     while (b < 256) : (b += 1) class_rep[classes.map[b]] = @intCast(b);
-    // Reverse adjacency for the O(n) reverse-DFA `find` — built for `!has_text_start`
-    // programs: the assertion-free case (forward-end + reverse-start two-pass) and the
-    // `text_end` case (reverse-from-end, trailing `$` woven in as a passable reverse epsilon).
-    // `has_text_start` patterns keep anchored restart (reverse transitions must stay
-    // position-independent).
-    var rev = if (has_text_start) empty_rev else try buildReverse(gpa, bp);
+    // Reverse adjacency for the O(n) reverse-DFA `find` — built for `!has_text_start` programs: the
+    // assertion-free case (forward-end + reverse-start two-pass) and the `text_end` case
+    // (reverse-from-end, trailing `$` woven in as a passable reverse epsilon). `has_text_start`
+    // patterns keep anchored restart (reverse transitions must stay position-independent); a `\b`
+    // program likewise keeps anchored restart (a decoded boundary cannot be woven into the reverse
+    // automaton — `find`/`isMatch` run the decode-hybrid `runAnchoredWb`).
+    var rev = if (has_text_start or has_word) empty_rev else try buildReverse(gpa, bp);
     errdefer freeReverse(gpa, &rev);
     // `reaches_end` drives `accept_eoi`; only a `text_end` program needs it (empty otherwise,
     // and the closure never indexes it for a `$`-free program).
@@ -532,6 +566,7 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
         .has_text_end = has_text_end,
         .end_anchored = end_anchored,
         .reaches_end = reaches_end,
+        .has_word_boundary = has_word,
     };
 }
 
@@ -594,6 +629,23 @@ pub const Scratch = struct {
     ///
     /// @stable-since: v0.4.0
     state_match_eoi: std.ArrayListUnmanaged(bool) = .empty,
+    /// `state_has_wb.items[id]` — does state `id` hold a pending `\b`/`\B` member? Such a state is
+    /// **boundary-resolved at match time** (`resolveWb`) by decoding the adjacent code points, rather
+    /// than via a cached transition. All-false for a non-`\b` program (the decode path is dormant).
+    ///
+    /// @stable-since: v0.4.0
+    state_has_wb: std.ArrayListUnmanaged(bool) = .empty,
+    /// Memoized boundary resolution for the decode-hybrid: `wb_cache.items[id*2 + b]` is the
+    /// boundary-free effective state `resolveWb` produces for raw `\b` state `id` when the word
+    /// boundary `b` (= `\b` holds at the position; `\B` is its negation) is the resolution outcome.
+    /// `UNKNOWN` until first computed; the resolved state depends ONLY on that one bit (every parked
+    /// boundary fires as a function of it), so two entries per state suffice — turning the per-byte
+    /// boundary work from a closure into an O(1) lookup (+ one decode for the bit). Only the
+    /// position-independent `pos > 0` case is cached (`pos == 0` also depends on `text_start`).
+    /// All-empty for a non-`\b` program.
+    ///
+    /// @stable-since: v0.4.0
+    wb_cache: std.ArrayListUnmanaged(u32) = .empty,
     /// Flat `id * nclass + class` **anchored** transition table; `UNKNOWN` until first
     /// computed. Used by `search` (anchored restart from each start).
     trans: std.ArrayListUnmanaged(u32) = .empty,
@@ -625,6 +677,7 @@ pub const Scratch = struct {
     work_len: usize = 0,
     work_match: bool = false,
     work_match_eoi: bool = false, // a pending `text_end` in this closure reaches match at end
+    work_has_wb: bool = false, // this closure parked a `\b`/`\B` member (resolved at match time by decode)
     seeds: []u32, // successor pcs feeding the next closure
 
     // ── reverse-DFA cache (the O(n) reverse `find`; set-based, no priority/cut) ──
@@ -687,6 +740,8 @@ pub const Scratch = struct {
         }
         errdefer sc.state_match.deinit(gpa);
         errdefer sc.state_match_eoi.deinit(gpa);
+        errdefer sc.state_has_wb.deinit(gpa);
+        errdefer sc.wb_cache.deinit(gpa);
         errdefer sc.trans.deinit(gpa);
         errdefer sc.utrans.deinit(gpa);
 
@@ -702,6 +757,8 @@ pub const Scratch = struct {
         self.states.deinit(gpa);
         self.state_match.deinit(gpa);
         self.state_match_eoi.deinit(gpa);
+        self.state_has_wb.deinit(gpa);
+        self.wb_cache.deinit(gpa);
         self.trans.deinit(gpa);
         self.utrans.deinit(gpa);
         self.intern.deinit(gpa);
@@ -738,6 +795,10 @@ pub const Scratch = struct {
         self.state_match = .empty;
         self.state_match_eoi.deinit(self.gpa);
         self.state_match_eoi = .empty;
+        self.state_has_wb.deinit(self.gpa);
+        self.state_has_wb = .empty;
+        self.wb_cache.deinit(self.gpa);
+        self.wb_cache = .empty;
         self.trans.deinit(self.gpa);
         self.trans = .empty;
         self.utrans.deinit(self.gpa);
@@ -769,8 +830,10 @@ pub const Scratch = struct {
         @memcpy(self.work[0..plen], pcs); // stage across the clear (clearCache spares `work`)
         const is_match = self.state_match.items[state_id];
         const is_match_eoi = self.state_match_eoi.items[state_id];
+        const has_wb = self.state_has_wb.items[state_id];
         self.clearCache();
         self.work_len = plen;
+        self.work_has_wb = has_wb; // preserve across the flush (internState reads it)
         const new_id = try self.internState(is_match, is_match_eoi);
         try self.ensureStart(program); // start0/startN are invalid after the clear
         flushes.* += 1;
@@ -797,10 +860,12 @@ pub const Scratch = struct {
         try self.states.append(self.gpa, owned);
         try self.state_match.append(self.gpa, is_match);
         try self.state_match_eoi.append(self.gpa, is_match_eoi);
+        try self.state_has_wb.append(self.gpa, self.work_has_wb); // set by the closure that built `work`
+        try self.wb_cache.appendNTimes(self.gpa, UNKNOWN, 2); // two resolution outcomes per state
         try self.trans.appendNTimes(self.gpa, UNKNOWN, self.nclass);
         try self.utrans.appendNTimes(self.gpa, UNKNOWN, self.nclass);
 
-        self.cache_bytes += owned.len * @sizeOf(u32) + 2 * @as(usize, self.nclass) * @sizeOf(u32) + 49;
+        self.cache_bytes += owned.len * @sizeOf(u32) + 2 * @as(usize, self.nclass) * @sizeOf(u32) + 58;
         return id;
     }
 
@@ -819,6 +884,7 @@ pub const Scratch = struct {
         self.work_len = 0;
         self.work_match = false;
         self.work_match_eoi = false;
+        self.work_has_wb = false;
 
         seeds_loop: for (seeds) |seed| {
             var top: usize = 0;
@@ -854,7 +920,16 @@ pub const Scratch = struct {
                                 if (program.reaches_end[pc]) self.work_match_eoi = true;
                                 break :follow;
                             },
-                            else => break :follow, // line anchors etc. — gated out by supports()
+                            // `\b`/`\B` park as a member with NO baked context — they are resolved at
+                            // match time by decoding the adjacent code points (`resolveWb`), so this
+                            // state is `state_has_wb` and the run path resolves it per position.
+                            .word_boundary, .not_word_boundary => {
+                                self.work[self.work_len] = pc;
+                                self.work_len += 1;
+                                self.work_has_wb = true;
+                                break :follow;
+                            },
+                            else => break :follow, // line anchors — gated out by supports()
                         },
                         .byte_range => {
                             self.work[self.work_len] = pc;
@@ -1012,6 +1087,97 @@ pub const Scratch = struct {
                 accept = self.state_match.items.ptr;
                 accept_eoi = self.state_match_eoi.items.ptr;
             }
+        }
+        return match_end;
+    }
+
+    // ── Decode-hybrid `\b`/`\B` (Unicode word boundaries on the lazy DFA) ──────────────
+    //
+    // A byte cannot classify a *code point's* word-ness (a continuation byte is part of a word char
+    // after one lead and a non-word char after another), so the eager DFA's byte-class trick only
+    // does the ASCII boundary. The lazy DFA runs over the live input, so it resolves `\b`/`\B` at
+    // match time by **decoding the adjacent code points** (`nfa.assertionHolds` — the very routine
+    // the Pike VM uses, so it is Unicode-correct by construction). Consumption stays the cached
+    // byte-DFA walk; only a state holding a pending boundary (`state_has_wb`) pays a decode, and
+    // only at code-point boundaries (a mid-multi-byte state never parks one).
+
+    /// Resolve a state that holds pending `\b`/`\B` members at byte offset `pos`, by decoding the
+    /// adjacent code points. Returns the **boundary-free** effective state: every consuming member
+    /// carried over, plus the continuation of each boundary that holds at `pos`, re-closed. The
+    /// caller resolves to a fixpoint (chained boundaries are rare and converge). `at_start` reflects
+    /// `pos == 0` for any `text_start` reachable from a fired continuation.
+    fn resolveWb(self: *Scratch, program: *const Program, state: u32, input: []const u8, pos: usize) Err!u32 {
+        // The single bit that decides every parked boundary: `\b` holds at `pos` iff the adjacent
+        // code points differ in word-ness (`nfa.assertionHolds`, Unicode-correct); `\B` is its
+        // negation. So the resolved state depends only on (state, b) — memoize it (`pos > 0` only;
+        // `pos == 0` also depends on `text_start`, so it is recomputed).
+        const b = nfa.assertionHolds(.word_boundary, input, pos);
+        const at_start = pos == 0;
+        if (!at_start) {
+            const cached = self.wb_cache.items[@as(usize, state) * 2 + @intFromBool(b)];
+            if (cached != UNKNOWN) return cached;
+        }
+        const insts = program.byte_prog.insts;
+        var ns: usize = 0;
+        for (self.states.items[state]) |pc| switch (insts[pc]) {
+            .assertion => |k| switch (k) {
+                // `\b` fires iff b; `\B` fires iff !b. A fired boundary's continuation joins (zero-width).
+                .word_boundary => if (b) {
+                    self.seeds[ns] = pc + 1;
+                    ns += 1;
+                },
+                .not_word_boundary => if (!b) {
+                    self.seeds[ns] = pc + 1;
+                    ns += 1;
+                },
+                else => { // a pending `text_end` (none in a `\b` program, but keep general)
+                    self.seeds[ns] = pc;
+                    ns += 1;
+                },
+            },
+            else => { // byte_range / match members carry over (closure re-adds them idempotently)
+                self.seeds[ns] = pc;
+                ns += 1;
+            },
+        };
+        self.closure(program, self.seeds[0..ns], at_start);
+        const eff = try self.internState(self.work_match, self.work_match_eoi);
+        // `internState` may have grown `wb_cache` (realloc) — index through `.items` after it.
+        if (!at_start) self.wb_cache.items[@as(usize, state) * 2 + @intFromBool(b)] = eff;
+        return eff;
+    }
+
+    /// Anchored run for a `\b`/`\B` (word-boundary) program: the decode-hybrid. Consumption is the
+    /// cached byte-DFA walk; at each state holding a pending boundary the position is resolved by
+    /// decoding the adjacent code points (`resolveWb`) into a boundary-free effective state, used for
+    /// both acceptance and the next transition. Leftmost-first; O(input) for the non-prone shapes
+    /// `auto` routes here. (Decodes only at code-point-boundary `\b` states — sparse.)
+    fn runAnchoredWb(self: *Scratch, program: *const Program, input: []const u8, s: usize, earliest: bool, flushes: *u32) Err!?usize {
+        var state = if (s == 0) self.start0 else self.startN;
+        var match_end: ?usize = null;
+        var pos = s;
+        while (true) {
+            // Resolve any pending boundary at this position to a fixpoint (chained `\b` converge).
+            var eff = state;
+            var guard: usize = 0;
+            while (self.state_has_wb.items[eff]) {
+                const r = try self.resolveWb(program, eff, input, pos);
+                if (r == eff) break; // degenerate zero-width loop (`\b*`): no progress → stop
+                eff = r;
+                guard += 1;
+                if (guard > self.states.items.len) break; // safety bound
+            }
+            if (self.state_match.items[eff] or (pos == input.len and self.state_match_eoi.items[eff])) {
+                match_end = pos;
+                if (earliest) break;
+            }
+            if (pos >= input.len) break;
+            const class = program.classes.map[input[pos]];
+            state = try self.step(program, eff, class); // eff is boundary-free → a normal cached step
+            if (state == DEAD) break;
+            pos += 1;
+            if (self.opts.on_full != .grow and self.cache_bytes > self.opts.max_bytes)
+                state = try self.flushPreserving(program, state, flushes);
         }
         return match_end;
     }
@@ -1352,6 +1518,22 @@ fn searchImpl(program: *const Program, scratch: *Scratch, input: []const u8, opt
     try scratch.ensureStart(program);
     var flushes: u32 = 0;
 
+    // `\b`/`\B` programs run the decode-hybrid on anchored restart (no reverse DFA for `\b`):
+    // consumption is the cached byte-DFA walk, boundary positions decode the adjacent code points.
+    if (program.has_word_boundary) {
+        if (opts.anchored)
+            return if (try scratch.runAnchoredWb(program, input, opts.start, earliest, &flushes)) |e| Match{ .start = opts.start, .end = e } else null;
+        if (program.anchored_start) {
+            if (opts.start != 0) return null;
+            return if (try scratch.runAnchoredWb(program, input, 0, earliest, &flushes)) |e| Match{ .start = 0, .end = e } else null;
+        }
+        var s = opts.start;
+        while (s <= input.len) : (s += 1) {
+            if (try scratch.runAnchoredWb(program, input, s, earliest, &flushes)) |e| return Match{ .start = s, .end = e };
+        }
+        return null;
+    }
+
     if (program.anchored_start and !opts.anchored) {
         // Every match begins at offset 0 — try only there.
         if (opts.start != 0) return null;
@@ -1403,6 +1585,20 @@ fn isMatchImpl(program: *const Program, scratch: *Scratch, input: []const u8, op
     scratch.maybeEvict();
     try scratch.ensureStart(program);
     var flushes: u32 = 0;
+
+    // `\b`/`\B` programs run the decode-hybrid (anchored restart, earliest-exit).
+    if (program.has_word_boundary) {
+        if (opts.anchored) return (try scratch.runAnchoredWb(program, input, opts.start, true, &flushes)) != null;
+        if (program.anchored_start) {
+            if (opts.start != 0) return false;
+            return (try scratch.runAnchoredWb(program, input, 0, true, &flushes)) != null;
+        }
+        var s = opts.start;
+        while (s <= input.len) : (s += 1) {
+            if ((try scratch.runAnchoredWb(program, input, s, true, &flushes)) != null) return true;
+        }
+        return false;
+    }
 
     if (opts.anchored)
         return (try scratch.runAnchored(program, input, opts.start, true, &flushes)) != null;
@@ -1575,20 +1771,24 @@ test "invalid UTF-8 input is dead-on-invalid (a match never spans a bad byte)" {
     try expectNoMatch("\\w+", "\xFF\xFE");
 }
 
-test "supports(): accepts byte-class + \\A/^ + anchored-end $; declines mixed-$/(?m)/\\b/\\X" {
+test "supports(): accepts byte-class + \\A/^ + anchored-end $ + isolated \\b/\\B; declines mixed-$/(?m)/\\X/\\b-combos" {
     const gpa = testing.allocator;
     // \A and non-multiline ^ lower to a text_start assertion; an `anchored_end` $/\z lowers to
-    // a text_end assertion matched by the reverse-from-end pass — both DFA-evaluable.
+    // a text_end assertion matched by the reverse-from-end pass — both DFA-evaluable. `\b`/`\B`
+    // (Unicode word boundaries) are accepted in isolation and run on the decode-hybrid path.
     const accepts = [_][]const u8{
         "[a-z]+",  "\\w+\\d*", "cat|dog",         "héllo", "a.*c",
         "\\p{L}+", "^abc",     "\\Aword",         "^\\d+",
         // text_end, anchored_end (every match ends at input end):
         "abc$",    "\\w+$",    "[a-z]+@[a-z]+$",  "^abc$", "x\\z",  "foo$|bar$",
+        // isolated word boundaries (decode-hybrid):
+        "\\bcat\\b", "\\Bx",   "\\b\\w+\\b",      "s\\b",  "\\bword\\b",
     };
-    // \b/\B/\X are codepoint properties; (?m) line anchors are position-dependent; a *mixed* $
-    // (text_end in only some branches) is not anchored_end → would be Θ(n²), so declined.
+    // \X is a grapheme (variable-width); (?m) line anchors are position-dependent; a *mixed* $
+    // (text_end in only some branches) is not anchored_end → Θ(n²); a `\b` COMBINED with `$` is
+    // deferred — all declined to the code-point engines.
     const declines = [_][]const u8{
-        "\\bcat\\b", "\\Bx", "a\\Xb", "(?m)^line", "(?m)$", "a$|b", "(foo$|bar)",
+        "a\\Xb", "(?m)^line", "(?m)$", "a$|b", "(foo$|bar)", "\\bword$", "\\bword\\b$",
     };
     inline for (accepts) |pat| {
         var diag: compile.Diagnostic = .{};
@@ -1780,6 +1980,38 @@ test "differential vs Pike VM across a corpus (spans must agree)" {
     for (patterns) |p| {
         for (inputs) |in| try expectAgreesWithPikeVM(p, in);
     }
+}
+
+test "lazy DFA \\b/\\B is UNICODE-correct (decode-hybrid; non-ASCII boundaries agree with Pike VM)" {
+    // The decode-hybrid resolves word boundaries over CODE POINTS (`nfa.assertionHolds`), so the
+    // boundary is correct even when a non-ASCII word char sits right at it — the case the eager
+    // DFA's ASCII byte-classes get wrong (and route to the Pike VM for). The lazy DFA must AGREE
+    // with the Pike VM on every one of these.
+    const patterns = [_][]const u8{
+        "\\bword\\b", "\\b\\w+\\b", "\\w+\\b",  "\\b\\w+",   "\\Bcat\\B",
+        "\\bété\\b",  "\\b\\p{L}+\\b", "\\p{L}+\\b", "s\\b",  "\\bx",
+        "x\\b",       "café\\b",    "\\bcafé\\b", "\\b\\w+",  "(\\w+)\\b",
+    };
+    const inputs = [_][]const u8{
+        "",              "the café is",  "déjà vu",       "naïve approach",
+        "café au lait",  "Ολα καλά",     "Привет мир",    "日本語 text",
+        "über alles",    "x café y",     "_id_ über",     "résumé done",
+        "a wörd here",   "ÀÉÎ",          "cafés",         "l'été chaud",
+    };
+    for (patterns) |p| for (inputs) |in| try expectAgreesWithPikeVM(p, in);
+}
+
+test "lazy DFA \\b/\\B: direct Unicode-correct spans (ASCII would differ)" {
+    try expectFind("\\bword\\b", "a word here", "word");
+    try expectFind("\\b\\w+\\b", "  café au lait", "café"); // é is a word char (Unicode)
+    try expectFind("\\bété\\b", "l'été chaud", "été"); // boundary adjacent to é
+    try expectFind("café\\b", "le café noir", "café");
+    // The decisive case: "cafés" = café + 's' (both word at the seam) → NO boundary after é, so
+    // `\bcafé\b` must NOT match. ASCII byte-`\b` (treating the é continuation byte as non-word)
+    // would WRONGLY match "café" here; the Unicode decode-hybrid gets it right.
+    try expectNoMatch("\\bcafé\\b", "cafés");
+    try expectFind("\\Bcat\\B", "locator", "cat");
+    try expectFind("\\b\\w+\\b", "Привет мир", "Привет"); // Cyrillic word
 }
 
 test "byte classes are actually consumed (the alphabet the DFA keys on)" {

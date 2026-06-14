@@ -205,9 +205,11 @@ defer re.deinit();
 > **comptime** (`compileComptimeWith(edfa, …)` bakes the table into `ro_data`) as well as
 > runtime. It finds the match *span* fast but does not fill captures
 > (`re.captures`/`re.replaceAll` are a `@compileError` on it; use `auto`/`pikevm`). Its
-> capability gate is **broader than the lazy `dfa`**: it runs patterns with `\A`/`^`
-> (`text_start`) **and `$`/`\z`** (`text_end`); it declines `\b`/`\X` and `(?m)` line
-> anchors (those route to the code-point engines). It is **bounded**: a pattern whose full
+> capability gate runs patterns with `\A`/`^` (`text_start`), `$`/`\z` (`text_end`), and
+> **isolated `\b`/`\B`** (evaluated as **ASCII** word boundaries baked into the byte classes — the
+> lazy `dfa` carries the *Unicode* `\b` for non-ASCII input). It declines `\X`, `(?m)` line anchors,
+> and `\b` combined with `$`/`(?m)` (those route to the code-point engines / the lazy DFA). It is
+> **bounded**: a pattern whose full
 > DFA exceeds `edfa.max_states` is declined (`error.Unsupported` / a `@compileError`) — `auto`
 > then falls back to the lazy `dfa`. Pin it directly when you want a comptime-bakeable DFA;
 > otherwise just use `auto`, which prefers it.

@@ -6,7 +6,7 @@
 |---|---|
 | `backend.zig` | the **backend contract** + shared types (`Caps`, `Match`, `SearchOptions`, `Meta`, `Captures`, the `Cell`/`Carver` scratch helpers), `verifyBackend`, and **`Engine(Backend)`** — the agnostic op layer that implements `find`/`findAll`/`captures`/`split`/`replaceAll`/`count` once, for any backend |
 | `nfa.zig` | the **shared** Thompson-NFA: instruction set, the HIR→program compiler, and the code-point primitives (`inRanges`, `decodeAt`, `assertionHolds`). **Not a backend** — pikevm and backtrack both execute it |
-| `byte.zig` | the **byte-NFA substrate** (also not a backend): UTF-8 `utf8-ranges` lowering, a `byte_range` Thompson NFA (zero-decode), and `ByteMap` byte equivalence classes. The substrate the eager DFA (`backends/edfa.zig`, the default span engine) and lazy DFA (`backends/dfa.zig`) determinize and `bytepike` executes. Gated by `byteLowerable(hir)` (no `\X`/`\b`) |
+| `byte.zig` | the **byte-NFA substrate** (also not a backend): UTF-8 `utf8-ranges` lowering, a `byte_range` Thompson NFA (zero-decode), and `ByteMap` byte equivalence classes. The substrate the eager DFA (`backends/edfa.zig`, the default span engine) and lazy DFA (`backends/dfa.zig`) determinize and `bytepike` executes. Gated by `byteLowerable(hir)` (no `\X`; `\b`/`\B` **do** lower — as ASCII word boundaries, evaluated by `assertionHolds`) |
 | `backends/` | the built-in backends (see [`backends/README.md`](backends/README.md)) — incl. `edfa`/`dfa`, the eager + lazy DFAs over `byte.zig` |
 | `conformance.zig` | cross-backend tests: every backend agrees, runtime + comptime |
 | `regex.zig` | the **front door** — `compileRuntime`/`compileComptime`(`With`) → `Compiled(Backend)`, the user-facing API |

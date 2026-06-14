@@ -26,12 +26,19 @@
 //! context** (`\n` isolated into its own byte class; the start state chosen by the preceding byte;
 //! a one-byte `\n`-lookahead for `line_end`) — but only when **non-prone** (`(?m)^\w+`, `(?m)foo$`);
 //! a *prone* `(?m)` (an unbounded run before the anchor, `(?m)\w+$`) is declined (anchored restart
-//! would be Θ(n²) and the reverse fix can't carry line context). **Known, intentional gaps**, each
-//! declined to the code-point engines (correct + linear, just not DFA-accelerated): *mixed* `$`
-//! (`a$|b`), *prone* `(?m)`, and `\b`/`\B`/`\X` (the last three are *codepoint* properties a byte
-//! DFA cannot evaluate — a permanent design choice, not a missing feature). **Build-time:**
-//! determinization is hash-interned (~O(states)), so even big
-//! Unicode-class builds stay fast — a one-time cost, match time is O(input). All detailed below.
+//! would be Θ(n²) and the reverse fix can't carry line context). **`\b`/`\B` word boundaries** run
+//! here too, via the **same anchored-restart machinery applied to ASCII word-ness**: the ASCII word
+//! set `[0-9A-Za-z_]` is isolated into its own byte classes, the start state is chosen by the
+//! preceding byte's word-ness (`startNW`), and acceptance uses a one-byte **word-lookahead**
+//! (`accept_before_word`/`accept_before_nonword`) — the mirror of `(?m)$`'s `\n`-lookahead. This is
+//! an **ASCII** word boundary (exact for ASCII text); the dispatcher (`auto`) keeps a `\b` program's
+//! **non-ASCII** input on the code-point Pike VM (correct **Unicode** boundaries), and `\b` combined
+//! with `$`/`(?m)`, a *prone* `\b` (`\b.*x`), or a *chained* `\b\b` are declined. **Known,
+//! intentional gaps**, each declined to the code-point engines (correct + linear, just not
+//! DFA-accelerated): *mixed* `$` (`a$|b`), *prone* `(?m)`/`\b`, `\b`+`$`/`(?m)`, chained `\b\b`, and
+//! `\X` (a grapheme — variable-width, not a byte property). **Build-time:** determinization is
+//! hash-interned (~O(states)), so even big Unicode-class builds stay fast — a one-time cost, match
+//! time is O(input). All detailed below.
 //!
 //! **Invariant:** every pattern `supports` accepts matches in **O(input)** (a hard contract — the
 //! eager DFA never takes a super-linear path) and **leftmost-first** (byte-identical spans to the
@@ -206,6 +213,20 @@ pub const Program = struct {
     ///
     /// @stable-since: v0.4.0
     accept_before_nl: []const bool,
+    /// `accept_before_word[state]` — is this state accepting **just before an ASCII word byte**:
+    /// it holds a pending `\b`/`\B` whose fire-on-word continuation reaches `match`. Consulted
+    /// (with a one-byte word-lookahead) only for `has_word_boundary` programs; equal to `accept`
+    /// otherwise.
+    ///
+    /// @stable-since: v0.4.0
+    accept_before_word: []const bool,
+    /// `accept_before_nonword[state]` — is this state accepting **just before a non-word byte**:
+    /// a pending `\b`/`\B` whose fire-on-non-word continuation reaches `match`. Consulted (one-byte
+    /// lookahead) only for `has_word_boundary` programs; equal to `accept` otherwise. (At end of
+    /// input the "next byte" is treated as non-word, folded into `accept_eoi`.)
+    ///
+    /// @stable-since: v0.4.0
+    accept_before_nonword: []const bool,
     /// Start state with `text_start` + `line_start` TRUE (used at offset 0).
     start0: u32,
     /// Start state with `text_start` + `line_start` FALSE (offset > 0, not just after a `\n`).
@@ -217,6 +238,13 @@ pub const Program = struct {
     ///
     /// @stable-since: v0.4.0
     startL: u32,
+    /// Start state with `word_left` TRUE (`text_start`/`line_start` FALSE) — the entry for a match
+    /// beginning at offset > 0 whose **preceding byte is an ASCII word byte** (the left context a
+    /// leading `\b`/`\B` needs). `runAnchored` picks it when `isAsciiWordByte(input[s-1])`. Equals
+    /// `startN` for a program with no `\b`/`\B`. Only consulted for `has_word_boundary` programs.
+    ///
+    /// @stable-since: v0.4.0
+    startNW: u32,
     /// True when the program carries a `(?m)` line anchor (`line_start`/`line_end`). Such a
     /// program runs on **anchored restart** with line context: the start state is chosen per
     /// position by the preceding byte (`start0`/`startL`/`startN`), and `line_end` is matched via
@@ -225,6 +253,16 @@ pub const Program = struct {
     ///
     /// @stable-since: v0.4.0
     has_line_anchor: bool,
+    /// True when the program carries a `\b`/`\B` word boundary. Such a program runs on
+    /// **anchored restart** with word context: the start state is chosen per position by the
+    /// preceding byte's ASCII word-ness (`start0`/`startNW`/`startN`), and acceptance uses a
+    /// one-byte word-lookahead (`accept_before_word`/`accept_before_nonword`). The boundary is an
+    /// **ASCII** word boundary; `auto` keeps non-ASCII input for such a program on the code-point
+    /// Pike VM (Unicode word boundaries). Mutually exclusive with `has_line_anchor` and `$`
+    /// (`supports` declines those combos).
+    ///
+    /// @stable-since: v0.4.0
+    has_word_boundary: bool,
     /// True when every match must begin at offset 0 (a leading `\A` / non-multiline `^`).
     /// The search then tries only `s == 0`.
     anchored_start: bool,
@@ -283,7 +321,7 @@ pub const Program = struct {
     end_anchored: bool,
 };
 
-/// Whether this HIR can run on the eager DFA: byte-lowerable (no `\X`/`\b`) **and** whose
+/// Whether this HIR can run on the eager DFA: byte-lowerable (no `\X` grapheme) **and** whose
 /// zero-width assertions are a supported subset:
 ///   * `text_start` (`\A`/`^`) — evaluated at offset 0 via the start closures.
 ///   * `text_end` (`$`/`\z`) — only when **every match ends at input end** (`anchored_end`),
@@ -295,18 +333,28 @@ pub const Program = struct {
 ///     anchor); a *prone* line pattern (`(?m)\w+$`, `(?m).*^x`) is declined at **build** time
 ///     (`buildAlloc`) and routed to the linear Pike VM, since the reverse-DFA fix does not carry
 ///     line context. So `supports` admits line anchors here; the proneness gate is in the build.
-/// `\b`/`\X` stay on the code-point engines. (Whether the determinized DFA *fits* the fixed
-/// bounds is a separate build-time check; this is the capability gate.)
+///   * `word_boundary`/`not_word_boundary` (`\b`/`\B`) — matched by **anchored restart** with ASCII
+///     **word context** (the ASCII word set is isolated into its own byte classes; the start state
+///     is chosen by the preceding byte's word-ness; acceptance uses a one-byte word-lookahead).
+///     Admitted ONLY in isolation — combined with `$` or `(?m)` line anchors it is declined here
+///     (the lookahead interactions are deferred), and a *prone* `\b` (`\b.*x`) or *chained* `\b\b`
+///     is declined at **build**. The boundary is an **ASCII** word boundary; `auto` keeps a `\b`
+///     program's **non-ASCII** input on the code-point Pike VM (correct Unicode boundaries).
+/// `\X` stays on the code-point engines. (Whether the determinized DFA *fits* the fixed bounds is a
+/// separate build-time check; this is the capability gate.)
 ///
 /// @stable-since: v0.3.0
 pub fn supports(h: hir.Hir) bool {
-    if (!byte.byteLowerable(h)) return false; // excludes \X and \b/\B
+    if (!byte.byteLowerable(h)) return false; // excludes \X (grapheme)
     var has_text_end = false;
+    var has_line = false;
+    var has_word = false;
     for (h.nodes) |n| {
         if (n.tag == .anchor) switch (n.data.anchor.kind) {
-            .text_start, .line_start, .line_end => {}, // text_start at offset 0; line anchors via anchored restart
+            .text_start => {}, // text_start at offset 0 (the start closures)
+            .line_start, .line_end => has_line = true, // line anchors via anchored restart
             .text_end => has_text_end = true,
-            else => return false, // \b/\B
+            .word_boundary, .not_word_boundary => has_word = true, // ASCII \b/\B (see below)
         };
     }
     // Quadratic immunity is a hard contract — the eager DFA never takes a super-linear path.
@@ -315,6 +363,13 @@ pub fn supports(h: hir.Hir) bool {
     // the Θ(n²) anchored restart, so decline it; `auto` then uses the linear Pike VM. (Line
     // anchors' analogous proneness gate is in `buildAlloc`, which knows the determinized DFA.)
     if (has_text_end and !h.analysis.anchored_end) return false;
+    // `\b`/`\B` are baked into the byte DFA as **ASCII** word boundaries (start-context + a
+    // one-byte word-lookahead at acceptance — see the determinizer/`runAnchored`), but only in
+    // ISOLATION: combined with `$` (`text_end`) or `(?m)` line anchors the lookahead interactions
+    // are deferred to the Pike VM (correct + linear there). `auto` keeps a `\b` program's
+    // **non-ASCII** input on the Pike VM too (Unicode word boundaries). Chained boundaries
+    // (`\b\b`) are declined at build (`buildAlloc`/`buildComptime`).
+    if (has_word and (has_text_end or has_line)) return false;
     return true;
 }
 
@@ -366,21 +421,35 @@ const Det = struct {
     /// not** (the before-a-`\n` view: at a non-final `\n`, `line_end` holds, `text_end` does
     /// not)? Drives `accept_before_nl`. All-false unless the program has a `(?m)$` line anchor.
     reaches_nl: []const bool,
+    /// `reaches_meps[pc]` — does `pc` reach `match` via **pure epsilon** edges (`jmp`/`split`/`save`)
+    /// only, with every assertion and `byte_range` blocking? Drives word-boundary acceptance: a
+    /// parked `\b`/`\B` whose continuation (`pc+1`) `reaches_meps` and that fires for the next
+    /// byte's word-ness makes its state accepting before such a byte. All-false for a `$`-style
+    /// program; chained boundaries (a `\b` whose continuation epsilon-reaches another assertion)
+    /// are declined at build, so this stays a sound acceptance signal for `\b` programs.
+    reaches_meps: []const bool,
     /// The byte class of `\n` (0x0A), or `maxInt` for a non-line program (so `c == nl_class`
     /// is never true and the line-context fork is dormant). `byteClasses` isolates `\n` into
     /// its own class exactly when the program has a `(?m)` line anchor.
     nl_class: u32 = std.math.maxInt(u32),
-    /// Skip building the unanchored `utrans` rows. Line-anchor programs run on **anchored
-    /// restart** only (the `.*?`-prefix unanchored automaton can't carry line-start context),
-    /// so their `utrans` would be unused dead weight that also inflates the state count.
+    /// True when the program carries a `\b`/`\B` word boundary (drives word-context determinization:
+    /// the closure carries `at_word_left`, boundaries park, and acceptance/transitions resolve the
+    /// next byte's ASCII word-ness). False ⇒ the word-context machinery is dormant (no state split).
+    has_word: bool = false,
+    /// Skip building the unanchored `utrans` rows. Line-anchor and word-boundary programs run on
+    /// **anchored restart** only (the `.*?`-prefix unanchored automaton can't carry line-start /
+    /// word-left context), so their `utrans` would be unused dead weight that also inflates states.
     skip_utrans: bool = false,
 
     // ── frozen-DFA outputs (caller buffers) ──
     state_off: []u32, // state id → start of its pc list in `pc_pool`
     state_len: []u32, // state id → length of its pc list
     accept: []bool, // state id → accepting mid-input?
-    accept_eoi: []bool, // state id → accepting at end of input (accept ∨ a pending `$`)?
+    accept_eoi: []bool, // state id → accepting at end of input (accept ∨ a pending `$`/`\b`-at-end)?
     accept_before_nl: []bool, // state id → accepting just before a `\n` (a pending `(?m)$` line_end)?
+    accept_before_word: []bool, // state id → accepting just before an ASCII word byte (pending `\b`/`\B`)?
+    accept_before_nonword: []bool, // state id → accepting just before a non-word byte (pending `\b`/`\B`)?
+    state_wl: []bool, // state id → the `word_left` context it was closed with (only meaningful when it parks a boundary)
     trans: []u32, // n_states × n_classes (anchored)
     utrans: []u32, // n_states × n_classes (unanchored: ∪ a fresh start each edge)
     pc_pool: []u32, // concatenated, priority-ordered pc lists
@@ -398,11 +467,16 @@ const Det = struct {
     work_match: bool = false,
     work_match_eoi: bool = false, // a pending end-of-input assertion in this closure reaches match
     work_match_nl: bool = false, // a pending `(?m)$` (line_end) in this closure reaches match before a `\n`
+    work_match_word: bool = false, // a pending `\b`/`\B` fires before a word byte and reaches match
+    work_match_nonword: bool = false, // a pending `\b`/`\B` fires before a non-word byte and reaches match
+    work_word_left: bool = false, // the `word_left` context this closure was computed with
+    work_has_wb: bool = false, // this closure parked at least one `\b`/`\B` member
     seeds: []u32, // successor pcs feeding a closure
 
-    start0: u32 = DEAD, // text_start + line_start true (offset 0)
-    startN: u32 = DEAD, // text_start + line_start false (offset > 0, not after `\n`)
+    start0: u32 = DEAD, // text_start + line_start true (offset 0); word_left false
+    startN: u32 = DEAD, // text_start + line_start false (offset > 0, not after `\n`); word_left false
     startL: u32 = DEAD, // line_start true, text_start false (offset > 0, just after a `\n`); == startN if no line_start
+    startNW: u32 = DEAD, // word_left true (offset > 0, preceding byte a word byte); == startN if no `\b`/`\B`
 
     /// Epsilon-closure of `seeds` into `work` (priority order, deduplicated, cut on
     /// match) — the byte analogue of the Pike VM's thread closure, minus capture slots,
@@ -413,13 +487,17 @@ const Det = struct {
     /// byte, so the thread parks): `work_match_eoi` is set when it reaches `match` at end of
     /// input, and `work_match_nl` when a `line_end` reaches `match` before a `\n`. Writes
     /// `work`/`work_len`/`work_match`/`work_match_eoi`/`work_match_nl`.
-    fn closure(self: *Det, seeds: []const u32, at_start: bool, at_line_start: bool) void {
+    fn closure(self: *Det, seeds: []const u32, at_start: bool, at_line_start: bool, at_word_left: bool) void {
         self.seen_gen +%= 1;
         const gen = self.seen_gen;
         self.work_len = 0;
         self.work_match = false;
         self.work_match_eoi = false;
         self.work_match_nl = false;
+        self.work_match_word = false;
+        self.work_match_nonword = false;
+        self.work_has_wb = false;
+        self.work_word_left = at_word_left;
 
         seeds_loop: for (seeds) |seed| {
             var top: usize = 0;
@@ -467,7 +545,27 @@ const Det = struct {
                                 if (self.reaches_nl[pc]) self.work_match_nl = true;
                                 break :follow;
                             },
-                            else => break :follow, // \b/\B — gated out by supports()
+                            // `\b`/`\B` (ASCII) park here: their fire depends on the **next** byte's
+                            // word-ness, resolved per-class at the transition (see collectBoundarySeeds).
+                            // For acceptance we know the left context (`at_word_left`); if the boundary's
+                            // continuation reaches `match` via pure epsilon, the state accepts when the
+                            // boundary fires. `\b` fires iff word_left != word_right; `\B` iff equal.
+                            .word_boundary, .not_word_boundary => {
+                                self.work[self.work_len] = pc;
+                                self.work_len += 1;
+                                self.work_has_wb = true;
+                                if (self.reaches_meps[pc + 1]) {
+                                    const is_b = k == .word_boundary;
+                                    const fire_word = if (is_b) !at_word_left else at_word_left; // next byte a word byte
+                                    const fire_nonword = if (is_b) at_word_left else !at_word_left; // next byte non-word / eoi
+                                    if (fire_word) self.work_match_word = true;
+                                    if (fire_nonword) {
+                                        self.work_match_nonword = true;
+                                        self.work_match_eoi = true; // end of input: the "next byte" is non-word
+                                    }
+                                }
+                                break :follow;
+                            },
                         },
                         .byte_range => {
                             self.work[self.work_len] = pc;
@@ -479,7 +577,9 @@ const Det = struct {
                             self.work_len += 1;
                             self.work_match = true;
                             self.work_match_eoi = true; // a mid-input match also accepts at end…
-                            self.work_match_nl = true; // …and before a `\n`
+                            self.work_match_nl = true; // …before a `\n`…
+                            self.work_match_word = true; // …and before a word or non-word byte
+                            self.work_match_nonword = true;
                             // Cut: every lower-priority thread (on the stack or in later
                             // seeds) is discarded — the Pike VM's match cut.
                             break :seeds_loop;
@@ -498,11 +598,17 @@ const Det = struct {
     /// Unicode classes; semantics are identical, so the conformance suite guards it.)
     fn intern(self: *Det) DetError!u32 {
         const key = self.work[0..self.work_len];
-        var slot: u32 = @as(u32, @truncate(hashPcs(key))) & self.htmask;
+        // A boundary-bearing closure's identity includes its `word_left` context (it transitions /
+        // accepts differently for the same pc list), so fold it into the key — but ONLY then, so a
+        // boundary-free program never splits states on word context (zero state inflation).
+        var h = hashPcs(key);
+        if (self.work_has_wb) h = (h ^ @intFromBool(self.work_word_left)) *% 0x100000001b3;
+        var slot: u32 = @as(u32, @truncate(h)) & self.htmask;
         while (self.state_hash[slot] != 0) : (slot = (slot + 1) & self.htmask) {
             const id = self.state_hash[slot] - 1;
             const off = self.state_off[id];
-            if (self.state_len[id] == key.len and std.mem.eql(u32, self.pc_pool[off .. off + key.len], key))
+            if (self.state_len[id] == key.len and std.mem.eql(u32, self.pc_pool[off .. off + key.len], key) and
+                (!self.work_has_wb or self.state_wl[id] == self.work_word_left))
                 return id;
         }
         if (self.n_states >= self.state_off.len) return error.Unsupported; // > max_states
@@ -512,9 +618,12 @@ const Det = struct {
         @memcpy(self.pc_pool[off .. off + key.len], key);
         self.state_off[id] = off;
         self.state_len[id] = @intCast(key.len);
+        self.state_wl[id] = self.work_word_left;
         self.accept[id] = self.work_match;
         self.accept_eoi[id] = self.work_match_eoi;
         self.accept_before_nl[id] = self.work_match_nl;
+        self.accept_before_word[id] = self.work_match_word;
+        self.accept_before_nonword[id] = self.work_match_nonword;
         self.pool_len += @intCast(key.len);
         self.n_states += 1;
         self.state_hash[slot] = id + 1;
@@ -525,19 +634,71 @@ const Det = struct {
     /// `next` of every `byte_range` in the state that contains `rep`, in priority order,
     /// appended starting at `seeds[base]`. Returns the COUNT appended (so callers can
     /// union two states' successors by chaining `base`s — the unanchored row does this).
-    fn collectSeeds(self: *Det, state_id: u32, rep: u8, base: u32) u32 {
+    fn collectSeeds(self: *Det, state_id: u32, rep: u8, base: u32, word_right: bool) u32 {
         var ns: u32 = base;
         const off = self.state_off[state_id];
+        const wl = self.state_wl[state_id];
         for (self.pc_pool[off .. off + self.state_len[state_id]]) |pc| switch (self.insts[pc]) {
             .byte_range => |r| if (r.range.lo <= r.range.hi and r.range.contains(rep)) {
                 self.seeds[ns] = r.next;
                 ns += 1;
             },
             .match => {}, // terminal: no outgoing edge
-            .assertion => {}, // a pending end-assertion member ($/\z or (?m)$): no byte transition
-            else => unreachable, // a canonical state holds only byte_range / match / end-assertion pcs
+            .assertion => |k| switch (k) {
+                // A parked `\b`/`\B` fires for the consumed class iff its left/right word-ness
+                // match (`\b`: differ; `\B`: equal). When it fires, its continuation contributes
+                // byte transitions — followed here in the boundary's priority position.
+                .word_boundary, .not_word_boundary => {
+                    const is_b = k == .word_boundary;
+                    const fires = if (is_b) (wl != word_right) else (wl == word_right);
+                    if (fires) ns = self.followBoundary(pc + 1, rep, ns);
+                },
+                else => {}, // pending end-assertion ($/\z or (?m)$): no byte transition
+            },
+            else => unreachable, // a canonical state holds only byte_range / match / assertion pcs
         };
         return ns - base;
+    }
+
+    /// Priority-ordered pure-epsilon walk from a fired boundary's continuation `start_pc`,
+    /// appending the `next` of every `byte_range` reachable (without consuming) that contains
+    /// `rep`. Reuses `seen`/`stack` with a fresh generation (no `closure` runs concurrently — a
+    /// transition first `collectSeeds`, then `closure`s the result). `text_start` is dead mid-input;
+    /// chained boundaries are declined at build, so no `\b`/`\B` appears here. Returns the new count.
+    fn followBoundary(self: *Det, start_pc: u32, rep: u8, base: u32) u32 {
+        var ns = base;
+        self.seen_gen +%= 1;
+        const gen = self.seen_gen;
+        var top: usize = 0;
+        self.stack[top] = start_pc;
+        top += 1;
+        while (top > 0) {
+            top -= 1;
+            var pc = self.stack[top];
+            follow: while (true) {
+                if (self.seen[pc] == gen) break :follow;
+                self.seen[pc] = gen;
+                switch (self.insts[pc]) {
+                    .jmp => |t| pc = t,
+                    .split => |s| {
+                        self.stack[top] = s.b;
+                        top += 1;
+                        pc = s.a;
+                    },
+                    .save => pc += 1,
+                    .byte_range => |r| {
+                        if (r.range.lo <= r.range.hi and r.range.contains(rep)) {
+                            self.seeds[ns] = r.next;
+                            ns += 1;
+                        }
+                        break :follow;
+                    },
+                    .assertion => break :follow, // text_start dead mid; end-assertions park; \b chains declined
+                    .match => break :follow, // accepting position, not a byte transition
+                }
+            }
+        }
+        return ns;
     }
 
     /// Determinize fully. Reserve DEAD = the empty set (state 0), intern the start states,
@@ -553,17 +714,22 @@ const Det = struct {
         self.work_match = false;
         self.work_match_eoi = false;
         self.work_match_nl = false;
+        self.work_match_word = false;
+        self.work_match_nonword = false;
+        self.work_has_wb = false;
         std.debug.assert((try self.intern()) == DEAD);
 
-        // Start states: closure of pc 0 in the three position contexts. `startL` (line start,
-        // not text start) equals `startN` when the program has no `line_start`, so it costs
-        // nothing there; a line program uses it after a `\n`.
-        self.closure(&[_]u32{0}, true, true); // offset 0: text_start ✓, line_start ✓
+        // Start states: closure of pc 0 in the position contexts. `startL` (line start, not text
+        // start) equals `startN` when the program has no `line_start`; `startNW` (word_left true)
+        // equals `startN` when the program has no `\b`/`\B` — so each costs nothing when dormant.
+        self.closure(&[_]u32{0}, true, true, false); // offset 0: text_start ✓, line_start ✓, word_left ✗
         self.start0 = try self.intern();
-        self.closure(&[_]u32{0}, false, false); // offset > 0, not after `\n`
+        self.closure(&[_]u32{0}, false, false, false); // offset > 0, not after `\n`, preceding non-word
         self.startN = try self.intern();
-        self.closure(&[_]u32{0}, false, true); // offset > 0, just after a `\n` (line start)
+        self.closure(&[_]u32{0}, false, true, false); // offset > 0, just after a `\n` (line start)
         self.startL = try self.intern();
+        self.closure(&[_]u32{0}, false, false, true); // offset > 0, preceding byte a word byte
+        self.startNW = try self.intern();
 
         // Worklist = the growing `0..n_states` range (intern appends, the loop reaches them).
         // DEAD (the empty set) is NOT special-cased: `collectSeeds(DEAD)` yields nothing.
@@ -572,21 +738,24 @@ const Det = struct {
             var c: u32 = 0;
             while (c < self.n_classes) : (c += 1) {
                 const rep = self.class_rep[c];
-                // The destination is a **line start** iff the byte just consumed was `\n` — that
-                // is how the anchored DFA carries `(?m)^` context forward (`nl_class` is `maxInt`
-                // for a non-line program, so this is always false there).
+                // The destination is a **line start** iff the byte just consumed was `\n` — how the
+                // anchored DFA carries `(?m)^` context forward. The destination's **word_left** is
+                // the consumed byte's ASCII word-ness — how it carries `\b`/`\B` context forward
+                // (`has_word` is false for a non-`\b` program, so this stays false there).
                 const at_line_start = (c == self.nl_class);
-                // Anchored row: successors of this state only.
-                const na = self.collectSeeds(sid, rep, 0);
-                self.closure(self.seeds[0..na], false, at_line_start); // a transition is always at sp > 0
+                const word_right = self.has_word and byte.isAsciiWordByte(rep);
+                // Anchored row: successors of this state only (a parked boundary that fires for this
+                // class contributes its continuation's byte transitions — see collectSeeds).
+                const na = self.collectSeeds(sid, rep, 0, word_right);
+                self.closure(self.seeds[0..na], false, at_line_start, word_right); // a transition is always at sp > 0
                 self.trans[sid * self.n_classes + c] = try self.intern();
-                // Unanchored row: this state's successors ∪ a fresh start (`startN`) — the
-                // implicit `(?s:.)*?` prefix. Skipped for line programs (they run on anchored
-                // restart, and the position-independent re-seed can't carry line-start context).
+                // Unanchored row: this state's successors ∪ a fresh start (`startN`) — the implicit
+                // `(?s:.)*?` prefix. Skipped for line / word-boundary programs (they run on anchored
+                // restart; the position-independent re-seed can't carry line-start / word-left context).
                 if (!self.skip_utrans) {
-                    var nu = self.collectSeeds(sid, rep, 0);
-                    nu += self.collectSeeds(self.startN, rep, nu);
-                    self.closure(self.seeds[0..nu], false, false);
+                    var nu = self.collectSeeds(sid, rep, 0, word_right);
+                    nu += self.collectSeeds(self.startN, rep, nu, word_right);
+                    self.closure(self.seeds[0..nu], false, false, word_right);
                     self.utrans[sid * self.n_classes + c] = try self.intern();
                 }
             }
@@ -1002,11 +1171,14 @@ const RESTART_SCAN_LIMIT: u32 = 64;
 fn computeProne(
     trans: []const u32,
     accept: []const bool,
+    accept_before_word: []const bool,
+    accept_before_nonword: []const bool,
     n_states: u32,
     nc: u32,
     start0: u32,
     startN: u32,
     startL: u32,
+    startNW: u32,
     color: []u8,
     stack: []u32,
     iter: []u32,
@@ -1015,13 +1187,28 @@ fn computeProne(
     const WHITE: u8 = 0;
     const GRAY: u8 = 1;
     const BLACK: u8 = 2;
+    // A state is a **safe exit** if it accepts mid-input OR via a one-byte lookahead (`\b`/`\B`'s
+    // `accept_before_word`/`accept_before_nonword`): the anchored-restart run terminates there (it
+    // accepts as soon as the run meets the boundary's expected next byte), so it is NOT an
+    // unbounded non-accepting run. Folding the word-lookahead in keeps `\b\w+\b` (whose `\w+`
+    // self-loop accepts before a non-word byte) correctly classed **non-prone**.
+    const Acc = struct {
+        a: []const bool,
+        w: []const bool,
+        nw: []const bool,
+        fn at(self: @This(), id: u32) bool {
+            return self.a[id] or self.w[id] or self.nw[id];
+        }
+    };
+    const acc = Acc{ .a = accept, .w = accept_before_word, .nw = accept_before_nonword };
     var i: u32 = 0;
     while (i < n_states) : (i += 1) color[i] = WHITE;
 
-    // All entry states a search can begin from — including the line-start start (`startL`,
-    // which equals `startN` for a non-line program, so the visited check dedups it).
-    for ([_]u32{ start0, startN, startL }) |start| {
-        if (start == DEAD or accept[start] or color[start] != WHITE) continue;
+    // All entry states a search can begin from — including the line-start (`startL`) and word-left
+    // (`startNW`) starts (each equals `startN` for a non-line / non-`\b` program, so the visited
+    // check dedups it).
+    for ([_]u32{ start0, startN, startL, startNW }) |start| {
+        if (start == DEAD or acc.at(start) or color[start] != WHITE) continue;
         var top: u32 = 0;
         stack[0] = start;
         iter[0] = 0;
@@ -1033,7 +1220,7 @@ fn computeProne(
                 const c = iter[top - 1];
                 iter[top - 1] += 1;
                 const nxt = trans[@as(usize, s) * nc + c];
-                if (nxt == DEAD or accept[nxt]) continue; // dead / accepting = a safe exit, not a Θ(n²) run
+                if (nxt == DEAD or acc.at(nxt)) continue; // dead / accepting = a safe exit, not a Θ(n²) run
                 if (color[nxt] == GRAY) return true; // back-edge ⇒ non-accepting cycle
                 if (color[nxt] == WHITE) {
                     color[nxt] = GRAY;
@@ -1049,7 +1236,7 @@ fn computeProne(
                 var cc: u32 = 0;
                 while (cc < nc) : (cc += 1) {
                     const nx = trans[@as(usize, s) * nc + cc];
-                    if (nx == DEAD or accept[nx]) continue;
+                    if (nx == DEAD or acc.at(nx)) continue;
                     if (longest[nx] + 1 > best) best = longest[nx] + 1;
                 }
                 longest[s] = best;
@@ -1125,6 +1312,83 @@ fn computeNlReaches(insts: []const byte.Inst, out: []bool) void {
             }
         }
     }
+}
+
+/// `out[pc]` ← does `pc` reach `match` via **pure epsilon** edges (`jmp`/`split`/`save`) only —
+/// every assertion AND `byte_range` blocking? Drives `\b`/`\B` acceptance: a parked boundary whose
+/// continuation `pc+1` is `reaches_meps` makes its state accepting (when the boundary fires) before
+/// the relevant next byte. Chained boundaries are declined at build, so for a `\b` program this is
+/// the exact "the boundary's continuation directly reaches match" signal. Monotone backward
+/// fixpoint; all-false unless there is a `\b`/`\B`. Caller buffer, comptime + runtime.
+fn computeMepsReaches(insts: []const byte.Inst, out: []bool) void {
+    const n = insts.len;
+    for (out[0..n]) |*v| v.* = false;
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var i: usize = n;
+        while (i > 0) {
+            i -= 1;
+            if (out[i]) continue;
+            const r = switch (insts[i]) {
+                .match => true,
+                .jmp => |t| out[t],
+                .split => |s| out[s.a] or out[s.b],
+                .save => out[i + 1],
+                .assertion => false, // any zero-width assertion blocks a pure-epsilon path to match
+                .byte_range => false,
+            };
+            if (r) {
+                out[i] = true;
+                changed = true;
+            }
+        }
+    }
+}
+
+/// `out[pc]` ← does `pc`, via pure epsilon (`jmp`/`split`/`save`), reach a zero-width **assertion**
+/// (the assertion node itself counts)? A `\b`/`\B` whose continuation `pc+1` does is *chained* — its
+/// fire/acceptance would need nested word-context resolution (deferred) — so the program is declined
+/// to the Pike VM (`hasChainedBoundary`). Real patterns never chain boundaries; this only guards the
+/// pathological `\b\b`/`\b\B` shapes. Caller buffer; comptime + runtime.
+fn computeEpsReachesAssertion(insts: []const byte.Inst, out: []bool) void {
+    const n = insts.len;
+    for (out[0..n]) |*v| v.* = false;
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var i: usize = n;
+        while (i > 0) {
+            i -= 1;
+            if (out[i]) continue;
+            const r = switch (insts[i]) {
+                .assertion => true,
+                .jmp => |t| out[t],
+                .split => |s| out[s.a] or out[s.b],
+                .save => out[i + 1],
+                .byte_range, .match => false,
+            };
+            if (r) {
+                out[i] = true;
+                changed = true;
+            }
+        }
+    }
+}
+
+/// Whether any `\b`/`\B` in `insts` is chained (its continuation `pc+1` epsilon-reaches another
+/// assertion). `era` is a caller scratch buffer (`computeEpsReachesAssertion` fills it). A chained
+/// program is declined to the Pike VM. Comptime + runtime.
+fn hasChainedBoundary(insts: []const byte.Inst, era: []bool) bool {
+    computeEpsReachesAssertion(insts, era);
+    for (insts, 0..) |inst, idx| switch (inst) {
+        .assertion => |k| switch (k) {
+            .word_boundary, .not_word_boundary => if (era[idx + 1]) return true,
+            else => {},
+        },
+        else => {},
+    };
+    return false;
 }
 
 // ── DFA minimization (Moore partition-refinement, dense; comptime + runtime) ─────────
@@ -1257,18 +1521,29 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     var has_text_start = false;
     var has_text_end = false;
     var has_line = false;
+    var has_word = false;
     for (bp.insts) |inst| switch (inst) {
         .assertion => |k| switch (k) {
             .text_start => has_text_start = true,
             .text_end => has_text_end = true,
             .line_start, .line_end => has_line = true,
-            else => {},
+            .word_boundary, .not_word_boundary => has_word = true,
         },
         else => {},
     };
     const nl_class: u32 = if (has_line) classes.map['\n'] else std.math.maxInt(u32);
 
     const ic: u32 = @intCast(bp.insts.len);
+
+    // Decline a CHAINED `\b`/`\B` (a boundary whose continuation epsilon-reaches another assertion):
+    // its nested word-context resolution is deferred to the Pike VM. Real patterns never chain
+    // boundaries; this guards the pathological `\b\b`. Done before the big allocations (fail fast).
+    if (has_word) {
+        const era = try gpa.alloc(bool, ic);
+        defer gpa.free(era);
+        if (hasChainedBoundary(bp.insts, era)) return error.Unsupported;
+    }
+
     const state_cap = @min(ic + 256, max_states); // pattern-proportional, capped
     const pool_sz = ic *| pool_factor;
 
@@ -1283,12 +1558,21 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     defer gpa.free(accept_eoi_buf);
     const accept_before_nl_buf = try gpa.alloc(bool, state_cap);
     defer gpa.free(accept_before_nl_buf);
+    const accept_before_word_buf = try gpa.alloc(bool, state_cap);
+    defer gpa.free(accept_before_word_buf);
+    const accept_before_nonword_buf = try gpa.alloc(bool, state_cap);
+    defer gpa.free(accept_before_nonword_buf);
+    const state_wl_buf = try gpa.alloc(bool, state_cap);
+    defer gpa.free(state_wl_buf);
     const reaches_end = try gpa.alloc(bool, ic);
     defer gpa.free(reaches_end);
     computeEndReaches(bp.insts, reaches_end);
     const reaches_nl = try gpa.alloc(bool, ic);
     defer gpa.free(reaches_nl);
     if (has_line) computeNlReaches(bp.insts, reaches_nl) else @memset(reaches_nl, false);
+    const reaches_meps = try gpa.alloc(bool, ic);
+    defer gpa.free(reaches_meps);
+    if (has_word) computeMepsReaches(bp.insts, reaches_meps) else @memset(reaches_meps, false);
     const trans_buf = try gpa.alloc(u32, @as(usize, state_cap) * nc);
     defer gpa.free(trans_buf);
     const utrans_buf = try gpa.alloc(u32, @as(usize, state_cap) * nc);
@@ -1314,13 +1598,18 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
         .n_classes = nc,
         .reaches_end = reaches_end,
         .reaches_nl = reaches_nl,
+        .reaches_meps = reaches_meps,
         .nl_class = nl_class,
+        .has_word = has_word,
         .skip_utrans = true, // phase 1: trans only (utrans is built in phase 2, prone-only — below)
         .state_off = state_off,
         .state_len = state_len,
         .accept = accept_buf,
         .accept_eoi = accept_eoi_buf,
         .accept_before_nl = accept_before_nl_buf,
+        .accept_before_word = accept_before_word_buf,
+        .accept_before_nonword = accept_before_nonword_buf,
+        .state_wl = state_wl_buf,
         .trans = trans_buf,
         .utrans = utrans_buf,
         .pc_pool = pc_pool,
@@ -1347,7 +1636,7 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
         defer gpa.free(piter);
         const plong = try gpa.alloc(u32, pc);
         defer gpa.free(plong);
-        break :blk computeProne(det.trans[0 .. pc * nc], det.accept, pc, nc, det.start0, det.startN, det.startL, pcolor, pstack, piter, plong);
+        break :blk computeProne(det.trans[0 .. pc * nc], det.accept, det.accept_before_word, det.accept_before_nonword, pc, nc, det.start0, det.startN, det.startL, det.startNW, pcolor, pstack, piter, plong);
     };
 
     // Quadratic-immunity gate for line anchors: a *prone* `(?m)` pattern (an unbounded/long run
@@ -1355,6 +1644,12 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     // the reverse fix can't carry line context — so decline it to the linear Pike VM. Non-prone
     // line patterns (`(?m)^\w+`, `(?m)foo$`) stay on anchored restart, O(input).
     if (has_line and prone) return error.Unsupported;
+    // Same quadratic-immunity gate for word boundaries: a *prone* `\b` pattern (`\b.*x` — an
+    // unbounded non-accepting run after the boundary) can't run linearly on anchored restart, and
+    // the reverse DFA can't evaluate `\b`. Decline it to the linear Pike VM. The common `\b`
+    // shapes (`\bword\b`, `\b\w+\b`, `s\b`) are non-prone (their loop accepts via the word
+    // lookahead, which `computeProne` honours), so they keep the fast anchored restart.
+    if (has_word and prone) return error.Unsupported;
 
     // **Phase 2 (prone, non-line only): re-determinize with the unanchored `utrans` table** for the
     // O(input) reverse two-pass. A NON-prone pattern runs entirely on anchored restart (`trans`),
@@ -1386,7 +1681,9 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
         while (i < n0) : (i += 1)
             blk[i] = @as(u32, @intFromBool(det.accept[i])) |
                 (@as(u32, @intFromBool(det.accept_eoi[i])) << 1) |
-                (@as(u32, @intFromBool(det.accept_before_nl[i])) << 2);
+                (@as(u32, @intFromBool(det.accept_before_nl[i])) << 2) |
+                (@as(u32, @intFromBool(det.accept_before_word[i])) << 3) |
+                (@as(u32, @intFromBool(det.accept_before_nonword[i])) << 4);
         const n_new = minimizeDfa(det.trans, det.utrans, prone, n0, nc, blk, nblk, rep, state_hash, ht - 1);
         var b: u32 = 0;
         while (b < n_new) : (b += 1) { // rep[b] >= b ⇒ writing row b while reading row rep[b] is in-place safe
@@ -1394,6 +1691,8 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
             det.accept[b] = det.accept[r];
             det.accept_eoi[b] = det.accept_eoi[r];
             det.accept_before_nl[b] = det.accept_before_nl[r];
+            det.accept_before_word[b] = det.accept_before_word[r];
+            det.accept_before_nonword[b] = det.accept_before_nonword[r];
             var c: u32 = 0;
             while (c < nc) : (c += 1) {
                 det.trans[b * nc + c] = blk[det.trans[r * nc + c]];
@@ -1403,6 +1702,7 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
         det.start0 = blk[det.start0];
         det.startN = blk[det.startN];
         det.startL = blk[det.startL];
+        det.startNW = blk[det.startNW];
         n = n_new;
     }
 
@@ -1415,6 +1715,10 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     errdefer gpa.free(accept_eoi);
     const accept_before_nl = try gpa.dupe(bool, det.accept_before_nl[0..n]);
     errdefer gpa.free(accept_before_nl);
+    const accept_before_word = try gpa.dupe(bool, det.accept_before_word[0..n]);
+    errdefer gpa.free(accept_before_word);
+    const accept_before_nonword = try gpa.dupe(bool, det.accept_before_nonword[0..n]);
+    errdefer gpa.free(accept_before_nonword);
 
     // The unanchored `utrans` table and the reverse DFA are consulted **only** on the prone
     // arm (one-pass `isMatch` + reverse-DFA `find`). A non-prone pattern runs entirely on
@@ -1431,7 +1735,9 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     // table / `rstart` serves whichever applies; a `text_start` keeps anchored restart.
     const end_anchored = has_text_end and h.analysis.anchored_end and !has_text_start;
     var rev = Reverse{ .rtrans = &.{}, .raccept = &.{}, .rstart = DEAD };
-    const rev_built = (prone or end_anchored) and !has_text_start;
+    // `\b` programs never build the reverse DFA: they use anchored restart (and a prone one is
+    // already declined above), and `RDet` cannot evaluate a word boundary anyway.
+    const rev_built = (prone or end_anchored) and !has_text_start and !has_word;
     if (rev_built) rev = try reverseAlloc(gpa, det.insts, &class_rep, nc);
     errdefer if (rev_built) {
         gpa.free(rev.rtrans);
@@ -1446,10 +1752,14 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
         .accept = accept,
         .accept_eoi = accept_eoi,
         .accept_before_nl = accept_before_nl,
+        .accept_before_word = accept_before_word,
+        .accept_before_nonword = accept_before_nonword,
         .start0 = det.start0,
         .startN = det.startN,
         .startL = det.startL,
+        .startNW = det.startNW,
         .has_line_anchor = has_line,
+        .has_word_boundary = has_word,
         .anchored_start = h.analysis.anchored_start,
         .prone = prone,
         .has_text_start = has_text_start,
@@ -1470,7 +1780,7 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
 ///
 /// @stable-since: v0.3.0
 pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
-    if (!comptime supports(h)) @compileError("edfa: HIR is not byte/DFA-lowerable (\\X, \\b/\\B, or a mixed `$`)");
+    if (!comptime supports(h)) @compileError("edfa: HIR is not byte/DFA-lowerable (\\X grapheme, a mixed `$`, or `\\b`/`\\B` combined with `$`/`(?m)`)");
     // Comptime-size guard (DX): determinizing a big Unicode class (`\w`, `\p{L}`) or `.` (the whole
     // scalar space) at compile time exhausts the const-eval allocator — an opaque `OutOfMemory` —
     // long before `max_states`. Refuse those up front with a clear message instead. `auto` never
@@ -1497,13 +1807,14 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
     comptime var has_text_start = false;
     comptime var has_text_end = false;
     comptime var has_line = false;
+    comptime var has_word = false;
     comptime {
         for (bp.insts) |inst| switch (inst) {
             .assertion => |k| switch (k) {
                 .text_start => has_text_start = true,
                 .text_end => has_text_end = true,
                 .line_start, .line_end => has_line = true,
-                else => {},
+                .word_boundary, .not_word_boundary => has_word = true,
             },
             else => {},
         };
@@ -1511,6 +1822,16 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
     const nl_class: u32 = if (has_line) classes.map['\n'] else std.math.maxInt(u32);
 
     const ic: u32 = bp.insts.len;
+
+    // Decline a CHAINED `\b`/`\B` (see `buildAlloc`/`hasChainedBoundary`): a `@compileError` here
+    // (a direct comptime `edfa` use; `auto` keeps comptime `\b` on the Pike VM via `tinyForComptimeEdfa`).
+    comptime {
+        if (has_word) {
+            var era: [ic]bool = undefined;
+            if (hasChainedBoundary(bp.insts, &era))
+                @compileError("edfa: chained word boundary (\\b\\b); route to the Pike VM (use compileComptime, not edfa directly)");
+        }
+    }
     // Determinization closure work is ~states × classes × (split-tree traversal); a prone pattern
     // determinizes twice (trans-only, then again with `utrans`) and the reverse determinization
     // adds a comparable pass — size the quota for all of them. Large Unicode classes are slow to
@@ -1523,11 +1844,18 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
     comptime var accept_buf: [state_cap]bool = undefined;
     comptime var accept_eoi_buf: [state_cap]bool = undefined;
     comptime var accept_before_nl_buf: [state_cap]bool = undefined;
+    comptime var accept_before_word_buf: [state_cap]bool = undefined;
+    comptime var accept_before_nonword_buf: [state_cap]bool = undefined;
+    comptime var state_wl_buf: [state_cap]bool = undefined;
     comptime var reaches_end: [ic]bool = undefined;
     comptime computeEndReaches(bp.insts, &reaches_end);
     comptime var reaches_nl: [ic]bool = undefined;
     comptime {
         if (has_line) computeNlReaches(bp.insts, &reaches_nl) else @memset(&reaches_nl, false);
+    }
+    comptime var reaches_meps: [ic]bool = undefined;
+    comptime {
+        if (has_word) computeMepsReaches(bp.insts, &reaches_meps) else @memset(&reaches_meps, false);
     }
     comptime var trans_buf: [state_cap * @as(usize, nc)]u32 = undefined;
     comptime var utrans_buf: [state_cap * @as(usize, nc)]u32 = undefined;
@@ -1546,13 +1874,18 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
         .n_classes = nc,
         .reaches_end = &reaches_end,
         .reaches_nl = &reaches_nl,
+        .reaches_meps = &reaches_meps,
         .nl_class = nl_class,
+        .has_word = has_word,
         .skip_utrans = true, // phase 1: trans only (utrans built in phase 2, prone-only — below)
         .state_off = &state_off,
         .state_len = &state_len,
         .accept = &accept_buf,
         .accept_eoi = &accept_eoi_buf,
         .accept_before_nl = &accept_before_nl_buf,
+        .accept_before_word = &accept_before_word_buf,
+        .accept_before_nonword = &accept_before_nonword_buf,
+        .state_wl = &state_wl_buf,
         .trans = &trans_buf,
         .utrans = &utrans_buf,
         .pc_pool = &pc_pool,
@@ -1571,11 +1904,14 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
     comptime var pstack: [state_cap]u32 = undefined;
     comptime var piter: [state_cap]u32 = undefined;
     comptime var plong: [state_cap]u32 = undefined;
-    const prone = computeProne(trans_buf[0 .. det.n_states * nc], accept_buf[0..det.n_states], det.n_states, nc, det.start0, det.startN, det.startL, &pcolor, &pstack, &piter, &plong);
+    const prone = computeProne(trans_buf[0 .. det.n_states * nc], accept_buf[0..det.n_states], accept_before_word_buf[0..det.n_states], accept_before_nonword_buf[0..det.n_states], det.n_states, nc, det.start0, det.startN, det.startL, det.startNW, &pcolor, &pstack, &piter, &plong);
     // A prone `(?m)` line pattern can't run linearly on anchored restart and the reverse fix can't
     // carry line context — decline it (a `@compileError`; `auto` only calls `buildComptime` for
     // tiny patterns that never reach this).
     if (has_line and prone) @compileError("edfa: prone (?m) line pattern; route to the Pike VM (use compileComptime, not edfa directly)");
+    // Same for a prone `\b` pattern (`\b.*x`): anchored restart would be Θ(n²) and the reverse DFA
+    // can't evaluate `\b`. (Common `\b` shapes are non-prone — they keep anchored restart.)
+    if (has_word and prone) @compileError("edfa: prone \\b pattern; route to the Pike VM (use compileComptime, not edfa directly)");
 
     // Phase 2 (prone, non-line only): re-determinize WITH the unanchored `utrans` table for the
     // O(input) reverse two-pass. A non-prone pattern runs on anchored restart (`trans` only), so it
@@ -1604,7 +1940,9 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
         while (i < n0) : (i += 1)
             blk[i] = @as(u32, @intFromBool(accept_buf[i])) |
                 (@as(u32, @intFromBool(accept_eoi_buf[i])) << 1) |
-                (@as(u32, @intFromBool(accept_before_nl_buf[i])) << 2);
+                (@as(u32, @intFromBool(accept_before_nl_buf[i])) << 2) |
+                (@as(u32, @intFromBool(accept_before_word_buf[i])) << 3) |
+                (@as(u32, @intFromBool(accept_before_nonword_buf[i])) << 4);
         const n_new = minimizeDfa(&trans_buf, &utrans_buf, prone, n0, nc, &blk, &nblk, &rep, &state_hash, ht - 1);
         var b: u32 = 0;
         while (b < n_new) : (b += 1) { // rep[b] >= b ⇒ in-place compaction is safe
@@ -1612,6 +1950,8 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
             accept_buf[b] = accept_buf[r];
             accept_eoi_buf[b] = accept_eoi_buf[r];
             accept_before_nl_buf[b] = accept_before_nl_buf[r];
+            accept_before_word_buf[b] = accept_before_word_buf[r];
+            accept_before_nonword_buf[b] = accept_before_nonword_buf[r];
             var c: u32 = 0;
             while (c < nc) : (c += 1) {
                 trans_buf[b * nc + c] = blk[trans_buf[r * nc + c]];
@@ -1621,6 +1961,7 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
         det.start0 = blk[det.start0];
         det.startN = blk[det.startN];
         det.startL = blk[det.startL];
+        det.startNW = blk[det.startNW];
         break :min_fwd n_new;
     };
 
@@ -1628,13 +1969,15 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
     const final_accept = accept_buf[0..n].*;
     const final_accept_eoi = accept_eoi_buf[0..n].*;
     const final_accept_before_nl = accept_before_nl_buf[0..n].*;
+    const final_accept_before_word = accept_before_word_buf[0..n].*;
+    const final_accept_before_nonword = accept_before_nonword_buf[0..n].*;
     const final_utrans = if (prone) utrans_buf[0 .. n * nc].* else [_]u32{};
 
     // Reverse frozen DFA — only for a prone, assertion-free program or a trailing-`$`
     // (`end_anchored`) program (a `text_start` keeps `find` on anchored restart). Determinized
     // into ro_data at comptime via the same `RDet`.
     const end_anchored = has_text_end and h.analysis.anchored_end and !has_text_start;
-    const rev_built = (prone or end_anchored) and !has_text_start;
+    const rev_built = (prone or end_anchored) and !has_text_start and !has_word; // `\b` uses anchored restart; RDet can't evaluate it
     const r_state_cap = @min(ic + 256, max_states);
     comptime var reps_off: [ic + 1]u32 = undefined;
     comptime var reps: [2 * ic + 1]u32 = undefined;
@@ -1712,10 +2055,14 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
         .accept = &final_accept,
         .accept_eoi = &final_accept_eoi,
         .accept_before_nl = &final_accept_before_nl,
+        .accept_before_word = &final_accept_before_word,
+        .accept_before_nonword = &final_accept_before_nonword,
         .start0 = det.start0,
         .startN = det.startN,
         .startL = det.startL,
+        .startNW = det.startNW,
         .has_line_anchor = has_line,
+        .has_word_boundary = has_word,
         .anchored_start = h.analysis.anchored_start,
         .prone = prone,
         .has_text_start = has_text_start,
@@ -1734,6 +2081,8 @@ pub fn freeProgram(gpa: std.mem.Allocator, program: *Program) void {
     gpa.free(program.accept);
     gpa.free(program.accept_eoi);
     gpa.free(program.accept_before_nl);
+    gpa.free(program.accept_before_word);
+    gpa.free(program.accept_before_nonword);
     if (program.rev_built) {
         gpa.free(program.rtrans);
         gpa.free(program.raccept);
@@ -1780,6 +2129,10 @@ inline fn accepts(program: *const Program, state: u32, input: []const u8, pos: u
     if (program.accept[state]) return true;
     if (pos == input.len) return program.accept_eoi[state];
     if (program.has_line_anchor and input[pos] == '\n') return program.accept_before_nl[state];
+    // A pending `\b`/`\B` accepts depending on the **next** byte's ASCII word-ness (a one-byte
+    // lookahead, the mirror of `accept_before_nl`). Mutually exclusive with line anchors.
+    if (program.has_word_boundary)
+        return if (byte.isAsciiWordByte(input[pos])) program.accept_before_word[state] else program.accept_before_nonword[state];
     return false;
 }
 
@@ -1792,24 +2145,55 @@ inline fn accepts(program: *const Program, state: u32, input: []const u8, pos: u
 /// `start0` at offset 0, `startL` just after a `\n` (a line start), else `startN`.
 fn runAnchored(program: *const Program, input: []const u8, s: usize, earliest: bool) ?usize {
     const nc = program.n_classes;
+    // Hoist the table/array bases to locals so the hot loop is pointer-chasing over
+    // registers, not re-loading `program.*` fields each byte (the other DFA loops —
+    // `runUnanchoredOnePass`/`findEndForwardEager` — already do this; this one didn't).
+    const trans = program.trans;
+    const map = &program.classes.map;
+    const accept = program.accept;
+
     var state = if (s == 0)
         program.start0
     else if (program.has_line_anchor and input[s - 1] == '\n')
         program.startL
+    else if (program.has_word_boundary and byte.isAsciiWordByte(input[s - 1]))
+        program.startNW // preceding byte is a word byte (the left context a leading `\b`/`\B` needs)
     else
         program.startN;
     var match_end: ?usize = if (accepts(program, state, input, s)) s else null;
     if (match_end != null and earliest) return match_end;
 
     var pos = s;
+    // `(?m)` line programs and `\b`/`\B` programs need the position-aware accept (a one-byte
+    // `\n` / word-ness lookahead), so they keep the full `accepts` call.
+    if (program.has_line_anchor or program.has_word_boundary) {
+        while (pos < input.len) {
+            const class = map[input[pos]];
+            state = trans[state * nc + class];
+            if (state == DEAD) break;
+            pos += 1;
+            if (accepts(program, state, input, pos)) {
+                match_end = pos;
+                if (earliest) break;
+            }
+        }
+        return match_end;
+    }
+
+    // Common case (no line anchor): mid-input acceptance is exactly `accept[state]`;
+    // end-of-input acceptance (`$`/`\z`) differs only at `pos == input.len`, so it is
+    // checked once there instead of branching on every accepting position.
+    const accept_eoi = program.accept_eoi;
     while (pos < input.len) {
-        const class = program.classes.map[input[pos]];
-        state = program.trans[state * nc + class];
+        const class = map[input[pos]];
+        state = trans[state * nc + class];
         if (state == DEAD) break;
         pos += 1;
-        if (accepts(program, state, input, pos)) {
+        if (accept[state]) {
             match_end = pos;
             if (earliest) break;
+        } else if (pos == input.len and accept_eoi[state]) {
+            match_end = pos; // trailing `$`/`\z` satisfied at end-of-input
         }
     }
     return match_end;
@@ -2256,6 +2640,122 @@ test "differential vs Pike VM: trailing `$` corpus (spans must agree)" {
         "a@b",           "foo",        "bar",          "αβγδ end",
     };
     for (patterns) |p| try agreesWithPikeVM(testing.allocator, p, &inputs);
+}
+
+test "differential vs Pike VM: \\b/\\B corpus (ASCII; spans must agree)" {
+    // The byte DFA evaluates `\b`/`\B` as ASCII word boundaries, so the differential corpus is
+    // ASCII (where ASCII and Unicode word boundaries coincide). Every span must equal the Pike VM's.
+    const patterns = [_][]const u8{
+        "\\bcat\\b",   "\\bcat",       "cat\\b",      "\\Bcat\\B",  "\\Bcat",
+        "cat\\B",      "\\b\\w+\\b",   "\\w+\\b",     "\\b\\w+",    "\\b\\d+\\b",
+        "s\\b",        "\\bs",         "\\b[a-z]+\\b", "\\bword\\b", "a\\bb",
+        "a\\Bb",       "\\b.\\b",      "\\B.\\B",      "(\\w+)\\b",  "\\bfoo\\b|\\bbar\\b",
+        "\\d+\\b",     "\\b\\d+",      "[A-Z]\\w*\\b", "\\w\\b",     "\\B\\w\\B",
+    };
+    const inputs = [_][]const u8{
+        "",             "cat",            "a cat!",        "category",
+        "scattered",    "the cat sat",    "locator",       "concatenate",
+        "  hello, world  ", "x",          "s",             "cats dogs",
+        "a b c",        "word",           "a word.",       "foo bar baz",
+        "123 456",      "_under_score_",  "CamelCase ok",  "ab",
+        "a-b",          "one two_three",  "  spaced  ",    "!!!",
+    };
+    for (patterns) |p| try agreesWithPikeVM(testing.allocator, p, &inputs);
+}
+
+test "eager DFA \\b/\\B: direct spans (leading/trailing/mid, start/end of input)" {
+    try expectFind("\\bcat\\b", "the cat sat", "cat");
+    try expectNoMatch("\\bcat\\b", "category"); // no trailing boundary
+    try expectNoMatch("\\bcat\\b", "scat"); // no leading boundary
+    try expectFind("\\bcat", "scat cat", "cat"); // leading boundary at the 2nd
+    try expectFind("cat\\b", "cat catalog", "cat"); // trailing boundary at the 1st
+    try expectFind("\\b\\w+\\b", "  hello, world", "hello");
+    try expectFind("\\w+\\b", "hello!", "hello");
+    try expectFind("s\\b", "cats dogs", "s"); // word→non-word edge
+    try expectFind("\\bx", "x", "x"); // \b at start of input
+    try expectFind("x\\b", "x", "x"); // \b at end of input
+    try expectFind("\\Bcat\\B", "locator", "cat"); // \B between word bytes
+    try expectNoMatch("\\Bcat\\B", "a cat b"); // 'cat' is bounded → \B fails
+    try expectFind("a\\Bb", "ab", "ab"); // \B between two word bytes holds
+    try expectNoMatch("a\\bb", "ab"); // \b between two word bytes never holds
+    try expectFind("\\bword\\b", "a word.", "word"); // punctuation is a boundary
+}
+
+test "eager DFA routes \\b to anchored restart (no reverse DFA), non-prone" {
+    const gpa = testing.allocator;
+    inline for (.{ "\\bcat\\b", "\\b\\w+\\b", "s\\b", "\\bword\\b" }) |pat| {
+        var prog = try buildFrom(gpa, pat);
+        defer freeProgram(gpa, &prog);
+        try testing.expect(prog.has_word_boundary);
+        try testing.expect(!prog.prone); // the word lookahead keeps these non-prone
+        try testing.expect(!prog.rev_built); // \b never builds the reverse DFA
+    }
+}
+
+test "eager DFA declines \\b combined with $ / (?m) (→ Pike VM, always correct)" {
+    // `\b`/`\B` combined with `$` (text_end) or `(?m)` line anchors is declined by `supports`
+    // (the lookahead interactions are deferred) — `auto` routes those to the linear Pike VM. The
+    // combo decline is what keeps the eager-DFA `\b` machinery isolated; chained `\b\b` (rare /
+    // simplified away) is guarded at build by `hasChainedBoundary` and exercised by the differential
+    // corpus (`\b\B`/`\B\b` either decline or match exactly the Pike VM — both handled there).
+    const gpa = testing.allocator;
+    // Genuine combos: `\b` + text_end (`$`), and `\b` + a `(?m)` line anchor (which needs an actual
+    // `^`/`$` under `(?m)` to exist as a node — `(?m)` alone is a no-op).
+    inline for (.{ "\\bword\\b$", "\\bword$", "(?m)^\\bword", "(?m)\\bword$" }) |pat| {
+        var diag: compile.Diagnostic = .{};
+        const ast = try compile.parse(gpa, pat, &diag);
+        defer ast.deinit(gpa);
+        const h = try hir.buildAlloc(gpa, ast, .{});
+        defer hir.deinitHir(gpa, h);
+        try testing.expect(!supports(h)); // declined → `auto` uses the Pike VM (Unicode-correct)
+    }
+}
+
+test "\\b/\\B count is linear (non-prone anchored restart, no Θ(n²))" {
+    const gpa = testing.allocator;
+    // `\b\w+\b` over a long all-word input: each match-start scans only its word (bounded), so the
+    // whole count is O(input). A quadratic regression makes this visibly hang. ASCII keeps it on
+    // the eager DFA (the gate would route non-ASCII to the Pike VM).
+    const N = 1 << 17; // 131072
+    const buf = try gpa.alloc(u8, N);
+    defer gpa.free(buf);
+    @memset(buf, 'a');
+    var i: usize = 7;
+    while (i < N) : (i += 8) buf[i] = ' '; // words of length 7 separated by spaces
+    var re = try Compiled.init("\\b\\w+\\b");
+    defer re.deinit();
+    const c = E.count(&re.program, &re.scratch, buf, .{});
+    try testing.expect(c > 0);
+}
+
+test "\\b matches at COMPTIME via the eager DFA (ro_data, ASCII word context)" {
+    const got = comptime blk: {
+        @setEvalBranchQuota(20_000_000);
+        const a = compile.compile("\\b[a-z]+\\b");
+        const h = switch (hir.buildComptime(a, .{})) {
+            .ok => |x| x,
+            .fail => @compileError("hir"),
+        };
+        const program = buildComptime(h, .{});
+        var sc = Scratch{};
+        const input = "  the cat  ";
+        const m = E.find(&program, &sc, input, .{}) orelse @compileError("no \\b match at comptime");
+        break :blk m.slice(input);
+    };
+    try testing.expectEqualStrings("the", got);
+}
+
+test "REGRESSION: \\b\\w+\\b exact spans + count (reverting the determinizer breaks this)" {
+    var re = try Compiled.init("\\b\\w+\\b");
+    defer re.deinit();
+    const input = "ab, cd_e! 12three";
+    // words: "ab" [0,2), "cd_e" [4,8), "12three" [10,17)
+    var it = E.findAll(&re.program, &re.scratch, input, .{});
+    try testing.expectEqualStrings("ab", it.next().?.slice(input));
+    try testing.expectEqualStrings("cd_e", it.next().?.slice(input));
+    try testing.expectEqualStrings("12three", it.next().?.slice(input));
+    try testing.expect(it.next() == null);
+    try testing.expectEqual(@as(usize, 3), E.count(&re.program, &re.scratch, input, .{}));
 }
 
 test "trailing `$` is linear, not Θ(n²) (ReDoS immunity)" {

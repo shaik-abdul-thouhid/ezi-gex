@@ -230,20 +230,43 @@ pub const Program = struct {
     slot_count: u32,
 };
 
-/// A `\b`/`\B` word boundary needs the adjacent *code point*'s word-ness, not just a
-/// byte, so it is **not** byte-lowerable here (it routes to the code-point engines).
-/// Every other assertion is a byte-level test.
+/// Every zero-width assertion is byte-evaluable. `text_*`/`line_*` are position tests;
+/// `\b`/`\B` are evaluated as **ASCII** word boundaries (`isAsciiWordByte` on the adjacent
+/// bytes — see `assertionHolds`). A *Unicode* word boundary near a non-ASCII byte needs the
+/// adjacent code point, which a byte cannot give — so the dispatcher (`auto`) routes a
+/// `\b` program's **non-ASCII** input to the code-point Pike VM, and the byte substrate /
+/// byte DFAs serve only its ASCII input (where ASCII and Unicode word boundaries coincide).
 fn lowerableAssertion(kind: hir.AnchorKind) bool {
     return switch (kind) {
-        .word_boundary, .not_word_boundary => false,
+        .word_boundary, .not_word_boundary => true, // ASCII word boundary (byte-evaluable)
         .text_start, .text_end, .line_start, .line_end => true,
     };
 }
 
+/// Whether `b` is an **ASCII** word byte (`[0-9A-Za-z_]`, Perl `\w` restricted to ASCII).
+/// The byte substrate evaluates `\b`/`\B` as ASCII word boundaries; for ASCII input this is
+/// exactly the Unicode word boundary, and the dispatcher keeps non-ASCII `\b` input on the
+/// code-point engines (see `lowerableAssertion`). A byte ≥ 0x80 is reported non-word here —
+/// correct for ASCII input (the only input a byte `\b` program is fed).
+///
+/// @stable-since: v0.4.0
+pub fn isAsciiWordByte(b: u8) bool {
+    return (b >= '0' and b <= '9') or (b >= 'A' and b <= 'Z') or b == '_' or (b >= 'a' and b <= 'z');
+}
+
+/// Word-ness of the byte just **before** `sp` (false at the start of input).
+inline fn wordBefore(input: []const u8, sp: usize) bool {
+    return sp > 0 and isAsciiWordByte(input[sp - 1]);
+}
+/// Word-ness of the byte **at** `sp` (false at end of input).
+inline fn wordAfter(input: []const u8, sp: usize) bool {
+    return sp < input.len and isAsciiWordByte(input[sp]);
+}
+
 /// Whether a zero-width assertion holds at byte offset `sp`. Byte programs only ever
 /// carry byte-evaluable kinds (see `lowerableAssertion`), so this needs no decode —
-/// it is the byte VM's analogue of `nfa.assertionHolds`. `\b`/`\B` are `unreachable`
-/// (they are never byte-lowered).
+/// it is the byte VM's analogue of `nfa.assertionHolds`. `\b`/`\B` are evaluated as
+/// **ASCII** word boundaries (the dispatcher keeps non-ASCII `\b` input off the byte path).
 ///
 /// @stable-since: v0.2.0
 pub fn assertionHolds(kind: hir.AnchorKind, input: []const u8, sp: usize) bool {
@@ -252,7 +275,8 @@ pub fn assertionHolds(kind: hir.AnchorKind, input: []const u8, sp: usize) bool {
         .text_end => sp == input.len,
         .line_start => sp == 0 or input[sp - 1] == '\n',
         .line_end => sp == input.len or input[sp] == '\n',
-        .word_boundary, .not_word_boundary => unreachable, // never byte-lowered
+        .word_boundary => wordBefore(input, sp) != wordAfter(input, sp),
+        .not_word_boundary => wordBefore(input, sp) == wordAfter(input, sp),
     };
 }
 
@@ -628,9 +652,10 @@ fn build(h: hir.Hir, insts: []Inst, patch: []u32, entries: []u32) error{Unsuppor
     return .{ .insts = insts[0..b.inst_len], .slot_count = 2 * (h.capture_count + 1) };
 }
 
-/// Whether this HIR can be lowered to a **byte** program. False for `\X` (grapheme)
-/// and for `\b`/`\B` (word boundary needs the adjacent code point, not a byte).
-/// The dispatcher falls back to the code-point engines otherwise.
+/// Whether this HIR can be lowered to a **byte** program. False only for `\X` (grapheme).
+/// `\b`/`\B` ARE byte-lowerable (lowered to a byte `assertion` evaluated as an **ASCII** word
+/// boundary — see `lowerableAssertion`/`assertionHolds`); the dispatcher keeps non-ASCII `\b`
+/// input on the code-point engines. The dispatcher falls back to the code-point engines for `\X`.
 ///
 /// @stable-since: v0.2.0
 pub fn byteLowerable(h: hir.Hir) bool {
@@ -653,7 +678,7 @@ pub fn byteLowerable(h: hir.Hir) bool {
 pub const max_byte_insts: u32 = 100_000;
 
 /// Whether lowering this HIR to a **byte** program is worth it: byte-lowerable
-/// (`byteLowerable` — no `\X`/`\b`) **and** small enough that the resulting automaton
+/// (`byteLowerable` — no `\X`; `\b`/`\B` lower as ASCII boundaries) **and** small enough that the resulting automaton
 /// stays at or under `max_byte_insts`. The `auto` dispatcher consults this (alongside
 /// `dfa.supports`) before building the byte lazy-DFA arm — a pattern that is
 /// byte-lowerable but whose byte automaton would be pathologically large (a big
@@ -666,12 +691,12 @@ pub const max_byte_insts: u32 = 100_000;
 ///
 /// @stable-since: v0.3.0
 pub fn byteWorthLowering(h: hir.Hir) bool {
-    const sizes = measure(h) catch return false; // not byte-lowerable (\X / \b)
+    const sizes = measure(h) catch return false; // not byte-lowerable (\X grapheme)
     return sizes.insts <= max_byte_insts;
 }
 
 /// The exact byte-program instruction count for `h`, or null if `h` is not byte-lowerable
-/// (`\X`/`\b`). A cheap size probe — it runs only the `.count` pass, no emit — for a caller
+/// (`\X` grapheme). A cheap size probe — it runs only the `.count` pass, no emit — for a caller
 /// choosing whether to pay for an eager determinization (e.g. `auto` gating its comptime
 /// CTRE-lane DFA on size, so a big Unicode class is not determinized at compile time).
 ///
@@ -711,7 +736,7 @@ pub fn buildComptime(comptime h: hir.Hir) Program {
     // common, small comptime patterns; a caller may always raise it further.)
     const rsq: u64 = @as(u64, h.ranges.len) * h.ranges.len;
     @setEvalBranchQuota(@intCast(@min(50_000 + work * 200 + rsq * 40, std.math.maxInt(u32))));
-    const sizes = comptime (measure(h) catch @compileError("byte: HIR is not byte-lowerable (\\X grapheme or \\b word boundary)"));
+    const sizes = comptime (measure(h) catch @compileError("byte: HIR is not byte-lowerable (\\X grapheme)"));
     comptime var insts: [sizes.insts]Inst = undefined;
     comptime var patch: [sizes.insts]u32 = undefined;
     comptime var entries: [sizes.insts]u32 = undefined;
@@ -763,6 +788,7 @@ pub fn byteClasses(prog: *const Program) ByteClasses {
     // `boundary[b]` ⇒ a class boundary falls between byte `b` and `b + 1`.
     var boundary: [256]bool = @splat(false);
     var has_line = false;
+    var has_word = false;
     for (prog.insts) |inst| {
         switch (inst) {
             .byte_range => |r| {
@@ -773,9 +799,13 @@ pub fn byteClasses(prog: *const Program) ByteClasses {
             // A `(?m)` line anchor (`line_start`/`line_end`) is position-dependent on `\n`, so
             // the DFA determinizer must be able to tell a `\n` edge from any other byte. Force
             // `\n` (0x0A) into its own equivalence class by splitting the boundaries around it.
-            // Only triggered for line-anchor programs, so non-line patterns' classes are unchanged.
-            .assertion => |k| if (k == .line_start or k == .line_end) {
-                has_line = true;
+            // A `\b`/`\B` word boundary is position-dependent on byte word-ness, so the DFA must
+            // tell a word-byte edge from a non-word one — force the ASCII word set into its own
+            // classes (below). Both only fire for the relevant programs, so others are unchanged.
+            .assertion => |k| switch (k) {
+                .line_start, .line_end => has_line = true,
+                .word_boundary, .not_word_boundary => has_word = true,
+                else => {},
             },
             else => {},
         }
@@ -783,6 +813,19 @@ pub fn byteClasses(prog: *const Program) ByteClasses {
     if (has_line) {
         boundary[0x0A] = true; // boundary between '\n' and the next byte
         boundary[0x09] = true; // boundary between the previous byte and '\n'
+    }
+    if (has_word) {
+        // Isolate the ASCII word set `[0-9A-Za-z_]` so every class is word-homogeneous
+        // (all bytes in a class agree on `isAsciiWordByte`), which is what lets the DFA carry
+        // word-boundary context per class. A boundary just below and at each word-run edge:
+        boundary['0' - 1] = true; // '/'(0x2F) | '0'
+        boundary['9'] = true; // '9' | ':'
+        boundary['A' - 1] = true; // '@'(0x40) | 'A'
+        boundary['Z'] = true; // 'Z' | '['
+        boundary['_' - 1] = true; // '^'(0x5E) | '_'
+        boundary['_'] = true; // '_' | '`'
+        boundary['a' - 1] = true; // '`'(0x60) | 'a'
+        boundary['z'] = true; // 'z' | '{'
     }
     var classes = ByteClasses{ .map = undefined, .count = 0 };
     var id: u16 = 0;
@@ -965,18 +1008,43 @@ test "byte lowering: multi-byte UTF-8 literals and classes" {
     try expectByteMatch("[α-ω]+", "ΑΒΓαβγ", "αβγ"); // Greek lowercase only
 }
 
-test "byte lowering refuses \\X and \\b" {
+test "byte lowering refuses \\X (grapheme) but now lowers \\b (ASCII word boundary)" {
     const gpa = testing.allocator;
-    inline for (.{ "a\\Xb", "\\bcat\\b" }) |pat| {
-        var diag = @import("../core/root.zig").errors.Diagnostic{};
-        const core = @import("../core/root.zig");
-        const ast = try core.compile.parse(gpa, pat, &diag);
+    const core = @import("../core/root.zig");
+    // `\X` (grapheme) is still not byte-lowerable.
+    {
+        var diag = core.errors.Diagnostic{};
+        const ast = try core.compile.parse(gpa, "a\\Xb", &diag);
         defer ast.deinit(gpa);
         const h = try hir.buildAlloc(gpa, ast, .{});
         defer hir.deinitHir(gpa, h);
         try testing.expect(!byteLowerable(h));
         try testing.expectError(error.Unsupported, buildAlloc(gpa, h));
     }
+    // `\b`/`\B` ARE now byte-lowerable (evaluated as ASCII word boundaries).
+    inline for (.{ "\\bcat\\b", "foo\\Bbar", "\\w+\\b" }) |pat| {
+        var diag = core.errors.Diagnostic{};
+        const ast = try core.compile.parse(gpa, pat, &diag);
+        defer ast.deinit(gpa);
+        const h = try hir.buildAlloc(gpa, ast, .{});
+        defer hir.deinitHir(gpa, h);
+        try testing.expect(byteLowerable(h));
+        var prog = try buildAlloc(gpa, h);
+        freeProgram(gpa, &prog);
+    }
+}
+
+test "byte Acceptor evaluates ASCII \\b/\\B correctly" {
+    // The reference Acceptor evaluates `assertion` via `assertionHolds`, so these pin the
+    // ASCII word-boundary semantics the byte substrate (and bytepike) rely on.
+    try expectByteMatch("\\bcat\\b", "the cat sat", "cat");
+    try expectByteMatch("\\bcat\\b", "scattered", null); // no boundary around 'cat'
+    try expectByteMatch("\\bword\\b", "a word.", "word"); // punctuation is a boundary
+    try expectByteMatch("\\b\\w+\\b", "  hello, world", "hello");
+    try expectByteMatch("foo\\Bbar", "foobar", "foobar"); // \B holds between two word bytes
+    try expectByteMatch("foo\\bbar", "foobar", null); // no boundary mid-word
+    try expectByteMatch("\\bcat", "cat", "cat"); // \b at start of input
+    try expectByteMatch("cat\\b", "cat", "cat"); // \b at end of input
 }
 
 test "byte classes are sound and contiguous" {

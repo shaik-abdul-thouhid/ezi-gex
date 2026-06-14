@@ -34,8 +34,8 @@ const byte = @import("byte.zig");
 const hir = @import("../core/hir.zig");
 const ccompile = @import("../core/compile.zig");
 
-/// Whether `pattern` can be lowered to a byte program (false for `\X`/`\b` — those
-/// route to the code-point engines, so the byte Pike VM is not expected to run them).
+/// Whether `pattern` can be lowered to a byte program (false for `\X` grapheme; **`\b`/`\B`
+/// now lower** — they are evaluated as ASCII word boundaries by the byte engines).
 fn byteLowerablePattern(pattern: []const u8) bool {
     const gpa = testing.allocator;
     var diag: regex.Diagnostic = .{};
@@ -44,6 +44,33 @@ fn byteLowerablePattern(pattern: []const u8) bool {
     const h = hir.buildAlloc(gpa, ast, .{}) catch return false;
     defer hir.deinitHir(gpa, h);
     return byte.byteLowerable(h);
+}
+
+/// Whether `pattern` carries a `\b`/`\B` word boundary (via the HIR analysis flag).
+fn patternHasWordBoundary(pattern: []const u8) bool {
+    const gpa = testing.allocator;
+    var diag: regex.Diagnostic = .{};
+    const ast = ccompile.parse(gpa, pattern, &diag) catch return false;
+    defer ast.deinit(gpa);
+    const h = hir.buildAlloc(gpa, ast, .{}) catch return false;
+    defer hir.deinitHir(gpa, h);
+    return h.analysis.has_word_boundary;
+}
+
+fn isAsciiStr(s: []const u8) bool {
+    for (s) |b| if (b >= 0x80) return false;
+    return true;
+}
+
+/// CONVENTION: the byte engines (`bytepike`, lazy `dfa`, eager `edfa`) evaluate `\b`/`\B` as
+/// **ASCII** word boundaries — exact for ASCII input (where ASCII and Unicode word boundaries
+/// coincide). For a `\b` pattern on **non-ASCII** input the dispatcher (`auto`) routes to the
+/// code-point engines instead, so the byte engines are only contracted on ASCII input. This
+/// harness honours that contract: a `\b`-bearing case with a non-ASCII byte in its input is
+/// skipped when cross-checking a byte engine (the code-point engines still run every case).
+fn byteEngineCanRunCase(pattern: []const u8, input: []const u8) bool {
+    if (isAsciiStr(input)) return true;
+    return !patternHasWordBoundary(pattern);
 }
 
 /// Small ASCII-only cases for the byte engine's *comptime* parity. Kept separate
@@ -294,11 +321,13 @@ test "byte Pike VM agrees on the byte-lowerable subset (the lowering is correct)
     var ran: usize = 0;
     for (general_cases) |c| {
         if (!byteLowerablePattern(c.pat)) continue;
+        if (!byteEngineCanRunCase(c.pat, c.input)) continue; // ASCII-\b contract
         try checkRuntime(bytepike, c);
         ran += 1;
     }
     for (literal_cases) |c| {
         if (!byteLowerablePattern(c.pat)) continue;
+        if (!byteEngineCanRunCase(c.pat, c.input)) continue;
         try checkRuntime(bytepike, c);
         ran += 1;
     }
@@ -307,9 +336,9 @@ test "byte Pike VM agrees on the byte-lowerable subset (the lowering is correct)
 
 // ── lazy DFA span conformance ─────────────────────────────────────────────────────
 
-/// Whether `pattern` can run on the lazy DFA (byte-lowerable AND no zero-width
-/// anchors — the v1 DFA declines `^ $ \b \X` and line anchors). A narrower gate than
-/// `byteLowerablePattern`, so it gets its own predicate.
+/// Whether `pattern` can run on the lazy DFA (`dfa.supports`): byte-lowerable, with `\A`/`^`,
+/// anchored-end `$`, and **isolated `\b`/`\B`** (Unicode, via the decode-hybrid) allowed; mixed `$`,
+/// `(?m)` line anchors, `\X`, and `\b`+`$` declined. A narrower gate than `byteLowerablePattern`.
 fn dfaRoutablePattern(pattern: []const u8) bool {
     const gpa = testing.allocator;
     var diag: regex.Diagnostic = .{};
@@ -327,6 +356,8 @@ test "lazy DFA agrees with the code-point engines on its eligible subset (span-o
     var ran: usize = 0;
     for (general_cases) |c| {
         if (!dfaRoutablePattern(c.pat)) continue;
+        // NOTE: no ASCII-\b guard here — the LAZY DFA evaluates Unicode `\b`/`\B` (decode-hybrid),
+        // so it must agree with the code-point engines on non-ASCII `\b` input too.
         try checkRuntime(dfa, c);
         ran += 1;
     }
@@ -360,11 +391,13 @@ test "eager DFA agrees with the code-point engines on its eligible subset (span-
     var ran: usize = 0;
     for (general_cases) |c| {
         if (!edfaBuildable(c.pat)) continue;
+        if (!byteEngineCanRunCase(c.pat, c.input)) continue; // ASCII-\b contract
         try checkRuntime(edfa, c);
         ran += 1;
     }
     for (literal_cases) |c| {
         if (!edfaBuildable(c.pat)) continue;
+        if (!byteEngineCanRunCase(c.pat, c.input)) continue;
         try checkRuntime(edfa, c);
         ran += 1;
     }

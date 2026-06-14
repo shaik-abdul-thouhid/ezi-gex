@@ -631,8 +631,10 @@ Three design choices follow from the contract:
   prefilter (length gate, `^`/`\A` short-circuit, leading-literal `memchr`,
   rarest-required-byte fast-reject). A pattern with an *interior* `text_start` (rare, not
   fully `anchored_start`) keeps anchored restart so the cached reverse transitions stay
-  position-independent. It supports `\A` / non-multiline `^`, and declines `\b`/`\X` and
-  the other zero-width anchors (those route to the code-point engines).
+  position-independent. It supports `\A` / non-multiline `^`, anchored-end `$`, and **isolated
+  `\b`/`\B`** (Unicode word boundaries via the **decode-hybrid** — consumption stays the cached
+  byte walk, boundary positions decode the adjacent code points), and declines `\X`, `(?m)` line
+  anchors, and `\b`+`$` (those route to the code-point engines).
 
 The **byte DFA is on by default** (`Options.strategy.byte_engine = .auto`, which means *build
 and use the byte DFA* on an eligible pattern; `.disabled` opts back to the compact NFA-only
@@ -691,9 +693,10 @@ Three properties are specific to determinizing *eagerly*:
   edge — finds the leftmost start in one backward scan, no anchored restart, no Θ(n²). A
   **mixed** `$` (text_end in only some branches, e.g. `a$|b`) has no pinned end and is
   **declined** (it routes to the linear Pike VM). So `edfa.supports` accepts `text_start`
-  (`\A`/`^`) and `anchored_end` `text_end` (`$`/`\z`) — broader than `dfa.supports` (the lazy
-  DFA declines `$` outright). `(?m)` line anchors and `\b`/`\X` are
-  still declined and route to the code-point engines.
+  (`\A`/`^`), `anchored_end` `text_end` (`$`/`\z`), and **isolated `\b`/`\B`** (as **ASCII** word
+  boundaries — the lazy `dfa` complements it with the *Unicode* boundary on non-ASCII input). `\X`,
+  `(?m)` line anchors, a mixed `$`, and `\b` combined with `$`/`(?m)` are declined and route to the
+  code-point engines.
 - **It builds only the tables it will use.** `utrans` and the reverse table are built **only
   for prone patterns**; a non-prone `\w+` now stores just its forward `trans` table (~141 KB)
   instead of `trans` + `utrans` + reverse (~1 MB). (Full Hopcroft minimization + a sparse

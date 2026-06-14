@@ -270,6 +270,16 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, opts: Options) BuildError!
     if (opts.byte_engine != .disabled and edfa.supports(h) and byte.byteWorthLowering(h)) {
         if (edfa.buildAlloc(gpa, h, .{})) |ep| {
             program.edfa_prog = ep;
+            // A `\b`/`\B` program's EAGER DFA does only the ASCII boundary; build the LAZY DFA too
+            // as the **non-ASCII** arm — it evaluates Unicode word boundaries via the decode-hybrid.
+            // `auto` then routes a `\b` program's non-ASCII input here instead of the Pike VM
+            // (`edfaArm` returns null on non-ASCII, and the lazy arm below picks it up). Built only
+            // when the eager built (a non-prone, bounded `\b`); a heap `Scratch` gets its `dfa_sc`.
+            if (h.analysis.has_word_boundary and dfa.supports(h)) {
+                // Optional accelerator arm — any build failure (incl. OOM) just degrades non-ASCII
+                // `\b` to the Pike VM (correct), so swallow it rather than leak the eager program.
+                program.dfa_prog = dfa.buildAlloc(gpa, h, .{}) catch null;
+            }
         } else |e| switch (e) {
             error.OutOfMemory => return e,
             else => { // eager DFA declined (exceeded its fixed bounds) — fall back to the lazy
@@ -387,6 +397,19 @@ pub const Scratch = struct {
     /// @stable-since: v0.3.1
     confirm_probes: u64 = 0,
 
+    /// Cached ASCII-ness of the current input, for `\b`/`\B` (word-boundary) programs. The byte DFA
+    /// evaluates `\b` as an **ASCII** word boundary (exact for ASCII text); for **non-ASCII** input
+    /// `auto` must instead use the code-point Pike VM (correct **Unicode** word boundaries). Scanning
+    /// the input for non-ASCII bytes is O(n), so it is cached here keyed on the input slice
+    /// (`ptr`+`len`) — a `count`/`findAll` over one input pays the scan **once**, not per match.
+    /// `reset` clears it; a caller reusing one `Scratch` across DIFFERENT inputs must `reset` between
+    /// them (the conventional contract). Dormant (never consulted) for non-`\b` programs.
+    ///
+    /// @stable-since: v0.4.0
+    wb_input_ptr: ?[*]const u8 = null,
+    wb_input_len: usize = 0,
+    wb_all_ascii: bool = false,
+
     /// @stable-since: v0.1.0
     pub fn bufferLen(program: *const Program) usize {
         return switch (program.inner) {
@@ -441,6 +464,7 @@ pub const Scratch = struct {
     pub fn reset(self: *Scratch) void {
         if (self.dfa_sc) |*d| d.reset();
         self.confirm_probes = 0; // the ReDoS observable is per-reuse
+        self.wb_input_ptr = null; // invalidate the input-ASCII cache (a new search may use a new input)
         switch (self.inner) {
             .literal => |*s| s.reset(),
             .nfa => |*s| {
@@ -671,6 +695,38 @@ fn runEdfa(ep: *const edfa.Program, filter: Filter, input: []const u8, opts: Sea
     return edfa.search(ep, &es, input, o);
 }
 
+// ── Word-boundary ASCII gate: keep non-ASCII `\b` input on the code-point Pike VM ──────
+
+/// Whether `s` is wholly ASCII (no byte ≥ 0x80). Used by the `\b` gate; cached per input.
+fn isAsciiSlice(s: []const u8) bool {
+    for (s) |b| if (b >= 0x80) return false;
+    return true;
+}
+
+/// Whether `input` is wholly ASCII — cached on `scratch` keyed by the input slice so a
+/// `count`/`findAll` over one input scans once (see `Scratch.wb_*`).
+fn inputAllAscii(scratch: *Scratch, input: []const u8) bool {
+    if (scratch.wb_input_ptr == input.ptr and scratch.wb_input_len == input.len) return scratch.wb_all_ascii;
+    const a = isAsciiSlice(input);
+    scratch.wb_input_ptr = input.ptr;
+    scratch.wb_input_len = input.len;
+    scratch.wb_all_ascii = a;
+    return a;
+}
+
+/// The eager-DFA span arm to use for this search, or `null` to fall through to the lazy DFA / NFA
+/// arm. The eager DFA evaluates `\b`/`\B` as **ASCII** word boundaries, so a `\b` program's eager
+/// DFA is used **only on ASCII input**; non-ASCII input falls through to the code-point Pike VM,
+/// which evaluates correct **Unicode** word boundaries. (For a non-`\b` program this is just
+/// `program.edfa_prog`.) This is what keeps `auto` correct for **every** input.
+fn edfaArm(program: *const Program, scratch: *Scratch, input: []const u8) ?*const edfa.Program {
+    if (program.edfa_prog) |*ep| {
+        if (ep.has_word_boundary and !inputAllAscii(scratch, input)) return null; // Unicode \b → Pike VM
+        return ep;
+    }
+    return null;
+}
+
 // ── Contract: matching entry points ──────────────────────────────────────────────
 
 /// @stable-since: v0.1.0
@@ -678,9 +734,10 @@ pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, op
     switch (program.inner) {
         .literal => |*p| return literal.isMatch(p, &scratch.inner.literal, input, opts),
         .nfa => |*p| {
-            // Eager DFA span scan (prefiltered, stateless) when built — the fastest arm,
-            // same result the NFA arm gives.
-            if (program.edfa_prog) |*ep| return runEdfa(ep, program.filter, input, opts, true, &scratch.confirm_probes) != null;
+            // Eager DFA span scan (prefiltered, stateless) when built and usable — the fastest arm,
+            // same result the NFA arm gives. A `\b` program's eager DFA is used only on ASCII input
+            // (`edfaArm`); non-ASCII `\b` input falls through to the Pike VM (Unicode boundaries).
+            if (edfaArm(program, scratch, input)) |ep| return runEdfa(ep, program.filter, input, opts, true, &scratch.confirm_probes) != null;
             // Lazy DFA fallback (prefiltered) when built and not disabled.
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
@@ -699,7 +756,7 @@ pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opt
     switch (program.inner) {
         .literal => |*p| return literal.search(p, &scratch.inner.literal, input, opts),
         .nfa => |*p| {
-            if (program.edfa_prog) |*ep| return runEdfa(ep, program.filter, input, opts, false, &scratch.confirm_probes);
+            if (edfaArm(program, scratch, input)) |ep| return runEdfa(ep, program.filter, input, opts, false, &scratch.confirm_probes);
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
                     const r = runByteDfa(dp, program.filter, d, input, opts, false);
@@ -726,7 +783,9 @@ pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const
             // without re-scanning to locate it. On a sparse match in a long input this turns
             // an O(input) capture search into an O(match) one.
             // Eager DFA span → anchored capture fill (one-pass table when built, else Pike VM).
-            if (program.edfa_prog) |*ep| {
+            // A `\b` program's eager DFA is used only on ASCII input (`edfaArm`); otherwise the whole
+            // capture search runs on the Pike VM (Unicode boundaries), via the NFA arm below.
+            if (edfaArm(program, scratch, input)) |ep| {
                 const m = runEdfa(ep, program.filter, input, opts, false, &scratch.confirm_probes) orelse return null;
                 return fillCapturesAnchored(program, &scratch.inner.nfa, p, input, slots, m, opts);
             }

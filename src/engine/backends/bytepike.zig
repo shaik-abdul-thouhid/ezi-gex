@@ -15,8 +15,10 @@
 //! `Scratch` design (one `[]Cell` buffer, generation-stamped reset, iterative
 //! epsilon closure) carries over verbatim, so it runs at comptime and runtime.
 //!
-//! Not byte-lowerable (so refused at build, `error.Unsupported`): `\X` (grapheme)
-//! and `\b`/`\B` (word boundary needs the adjacent code point, not a byte).
+//! Not byte-lowerable (so refused at build, `error.Unsupported`): `\X` (grapheme).
+//! `\b`/`\B` **are** lowered and evaluated as **ASCII** word boundaries (`byte.assertionHolds`)
+//! — exact for ASCII input; the dispatcher (`auto`) keeps non-ASCII `\b` input on the
+//! code-point engines, so this byte engine only ever sees ASCII for a `\b` pattern.
 //! **Invalid UTF-8** needs no special handling: the lowering only accepts well-formed
 //! sequences, so a malformed byte matches nothing and the unanchored scan resyncs to
 //! the next start position — dead-on-invalid by construction.
@@ -48,7 +50,8 @@ pub const Inst = byte.Inst;
 pub const Program = byte.Program;
 
 /// Compile a HIR into a heap-allocated byte `Program` (free with `freeProgram`).
-/// `\X`/`\b` patterns are refused with `error.Unsupported` by the byte compiler.
+/// `\X` (grapheme) is refused with `error.Unsupported`; `\b`/`\B` lower to byte
+/// assertions (evaluated as ASCII word boundaries — see the module header).
 ///
 /// @stable-since: v0.2.0
 pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Program {
@@ -510,16 +513,29 @@ test "scratch reuse without stale state" {
     try testing.expectEqualStrings("a", c3.groupSlice(1).?);
 }
 
-test "refuses \\X and \\b (not byte-lowerable)" {
+test "refuses \\X (grapheme, not byte-lowerable)" {
     const gpa = testing.allocator;
-    inline for (.{ "\\X", "\\bcat\\b" }) |pat| {
-        var diag: compile.Diagnostic = .{};
-        const ast = try compile.parse(gpa, pat, &diag);
-        defer ast.deinit(gpa);
-        const h = try hir.buildAlloc(gpa, ast, .{});
-        defer hir.deinitHir(gpa, h);
-        try testing.expectError(error.Unsupported, buildAlloc(gpa, h, .{}));
-    }
+    var diag: compile.Diagnostic = .{};
+    const ast = try compile.parse(gpa, "\\X", &diag);
+    defer ast.deinit(gpa);
+    const h = try hir.buildAlloc(gpa, ast, .{});
+    defer hir.deinitHir(gpa, h);
+    try testing.expectError(error.Unsupported, buildAlloc(gpa, h, .{}));
+}
+
+test "ASCII \\b/\\B: the byte Pike VM evaluates word boundaries (via assertionHolds)" {
+    // `\b`/`\B` now lower to a byte `assertion`; the byte Pike VM evaluates them as ASCII word
+    // boundaries (exact for ASCII input — the only input the dispatcher routes to a byte engine).
+    try expectFind("\\bcat\\b", "the cat sat", "cat");
+    try expectNoMatch("\\bcat\\b", "category"); // 'cat' here has no trailing boundary
+    try expectNoMatch("\\bcat\\b", "scat"); // no leading boundary
+    try expectFind("\\b\\w+\\b", "  hello, world", "hello");
+    try expectFind("\\Bcat\\B", "locator", "cat"); // \B holds between word bytes
+    try expectFind("s\\b", "cats dogs", "s"); // \b at a word→non-word edge
+    try expectFind("\\bword\\b", "a word.", "word"); // punctuation is a boundary
+    try expectFind("\\bx", "x", "x"); // \b at start of input
+    try expectFind("x\\b", "x", "x"); // \b at end of input
+    try expectNoMatch("foo\\bbar", "foobar"); // no boundary mid-word
 }
 
 test "full match pipeline runs at COMPTIME via a buffer scratch" {

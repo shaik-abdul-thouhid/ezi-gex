@@ -10,7 +10,7 @@ time). `auto` is the default.
 | `literal` | substring / literal-alternation byte scan (`indexOf` / SIMD `indexOfAny`) | none (stateless) | whole-match only | pure-literal pattern (`abc`, `cat\|dog`) |
 | `pikevm` | breadth-first NFA (thread set, one code point/step) | O(program), input-independent | ✅ | NFA pattern, large input — and it fills captures for the DFA span arm |
 | `backtrack` | depth-first NFA + `(pc,sp)` memo | O(program × input) | ✅ | NFA pattern, small input that fits (≤ 4096 B) |
-| `bytepike` | breadth-first **byte** NFA (`../byte.zig`), one *byte*/step, zero-decode | O(program); larger for Unicode classes | ✅ | **never** — the byte-lowering reference VM / DFA substrate; refuses `\X`/`\b` |
+| `bytepike` | breadth-first **byte** NFA (`../byte.zig`), one *byte*/step, zero-decode | O(program); larger for Unicode classes | ✅ | **never** — the byte-lowering reference VM / DFA substrate; refuses `\X`; evaluates `\b`/`\B` as **ASCII** word boundaries |
 | `edfa` | **eager DFA**: fully determinizes the byte NFA at build into a frozen `states × byte_classes` table — a bare table walk, zero decode | the frozen table (`ro_data` at comptime / heap at runtime); **empty `Scratch`** | **span-only** (`caps.captures = false`) | **the default span arm** (`isMatch`/`find`); captures come from the Pike VM |
 | `dfa` | **lazy DFA**: determinizes the byte NFA on the fly, one DFA *state*/byte via a cached `(state, class)` table | the transition cache in `Scratch` (heap; runtime-only) | **span-only** (`caps.captures = false`) | **the fallback** when the eager DFA overflows its `max_states` bound |
 | `auto` | dispatcher over the others | per sub-backend | ✅ | the default |
@@ -37,10 +37,17 @@ properties fall out for all three:
   closure) keeps the NFA states in **priority order** and **cuts on match** — exactly the
   Pike VM's leftmost-first rule, lifted into a DFA state.
 
-The substrate gate is `byteLowerable(hir)`: **no `\X`, no `\b`/`\B`** (a word boundary needs
-the adjacent *code point*, not a byte). `byteWorthLowering(hir)` adds a cost gate — a
-pathologically large byte automaton (a big Unicode class repeated dozens of times,
-`\p{L}{60}`) declines the byte path and stays on the compact code-point engine.
+The substrate gate is `byteLowerable(hir)`: **no `\X`** (a grapheme cluster is variable-width).
+`\b`/`\B` **do** lower — they become a byte `assertion` evaluated as an **ASCII** word boundary
+(`isAsciiWordByte` on the adjacent bytes). A byte cannot classify a *code point's* word-ness (a
+continuation byte is part of a word char after one lead and a non-word char after another), so:
+the **eager DFA** bakes the ASCII boundary into byte classes (fast, frozen), the **lazy DFA**
+evaluates the full **Unicode** boundary by decoding the adjacent code points at match time
+(`decode-hybrid`), and the dispatcher (`auto`) routes a `\b` program's **ASCII** input to the eager
+DFA, its **non-ASCII** input to the lazy DFA, and anything either declines to the Pike VM (which
+also evaluates Unicode `\b`). `byteWorthLowering(hir)` adds a cost gate — a pathologically large
+byte automaton (a big Unicode class repeated dozens of times, `\p{L}{60}`) declines the byte path
+and stays on the compact code-point engine.
 
 ## How `auto` dispatches
 
@@ -74,9 +81,12 @@ sound one-sided bounds (hold for *every* match), so a skip never drops a real ma
 `Options.strategy.byte_engine` defaults to `.auto` (≡ `.enabled`), so the byte DFA is built
 **by default** — building it is a strict throughput win (~5–10× the code-point engine on a
 class scan, never slower; class scans are now at Rust-`regex` parity). `auto` **prefers the
-eager DFA** and falls back to the **lazy DFA** only when the eager one declines a pattern
-because its full state space overflows `edfa.max_states` (4096), then to the NFA. `.disabled`
-opts back to the compact NFA-only program.
+eager DFA** and falls back to the **lazy DFA** when the eager one declines a pattern because its
+full state space overflows `edfa.max_states` (4096), then to the NFA. For a **`\b`/`\B` program**
+the lazy DFA is *also* built alongside the eager one as the **non-ASCII arm**: `auto` runs the
+eager DFA (ASCII boundary) on ASCII input and the lazy DFA (Unicode boundary, decode-hybrid) on
+non-ASCII input — the latter chosen per search by a cached input-ASCII check (so a `count`/`findAll`
+over one input pays the scan once). `.disabled` opts back to the compact NFA-only program.
 
 - **Eager (`edfa`) — preferred, comptime + runtime.** Fully determinizes the byte NFA at
   build into a frozen `states × byte_classes` table, so its `Scratch` is **empty**
@@ -86,21 +96,32 @@ opts back to the compact NFA-only program.
   `\d+`, `[A-Za-z]+`) uses one greedy **anchored restart**; a *prone* pattern (`\w+@\w+`'s
   pre-`@` word run, `[ab]*c`) uses the **reverse-DFA two-pass** (a forward pass locates the
   match end, a frozen reverse DFA the start) — no Θ(n²). `edfa.supports` accepts `\A`/`^`
-  (`text_start`) **and `$`/`\z`** (`text_end`). It builds **only the tables it uses** — a
-  non-prone `\w+` keeps just its forward table (~141 KB), not forward + `.*?`-prefix + reverse.
+  (`text_start`), **`$`/`\z`** (`text_end`), and **isolated `\b`/`\B`** (`text_start`/`$`/`(?m)`
+  combos and chained `\b\b` excepted). A `\b` program runs on **anchored restart with ASCII word
+  context**: the ASCII word set is isolated into byte classes, the start state is chosen by the
+  preceding byte's word-ness, and acceptance uses a one-byte word-lookahead (the mirror of `(?m)$`'s
+  `\n`-lookahead) — an **ASCII** boundary, frozen into the table with zero match-time decode. It
+  builds **only the tables it uses** — a non-prone `\w+` keeps just its forward table (~141 KB), not
+  forward + `.*?`-prefix + reverse.
 - **Lazy (`dfa`) — the fallback, runtime-only.** Determinizes on the fly, caching
   `(state, class)` edges in the caller-owned `Scratch` (bounded by
   `ScratchOptions{ max_bytes, on_full }`), so it materializes only the states an input
   actually visits (a handful over ordinary text) — the right tool when the eager table is too
-  large. It is **runtime-only** (the cache mutates while matching, which const-eval cannot do)
-  and **narrower** than the eager DFA: `dfa.supports` declines `$`/`\z`, so a `$` pattern
-  routes to the eager DFA, or to the NFA if that overflows. Its `find` is also O(input) (a
-  forward end-pass + a reverse DFA for the start).
+  large. It is **runtime-only** (the cache mutates while matching, which const-eval cannot do).
+  It also carries the **Unicode `\b`/`\B`** the eager DFA can't: a `\b` program runs the
+  **decode-hybrid** — consumption stays the cached byte-DFA walk, but a state holding a pending
+  boundary decodes the adjacent code points at match time (`nfa.assertionHolds`, the Pike VM's own
+  routine — Unicode-correct), so only sparse boundary positions pay a decode. `auto` routes a `\b`
+  program's **non-ASCII** input here (its ASCII input goes to the faster eager DFA). Its plain
+  `find` is also O(input) (a forward end-pass + a reverse DFA for the start; a `\b` program uses
+  anchored restart, as a decoded boundary can't be reversed).
 
-Both DFAs are span-only; the Pike VM fills captures and evaluates `\b`. The DFA span *is* the
-leftmost-first match, so the switch is results-invariant — `conformance.zig` pins every DFA
-span (and the handed-off captures) to the Pike VM, runtime and comptime, and fuzzes the
-`byte_engine`/`prefilter` knobs on↔off.
+Both DFAs are span-only; the Pike VM fills captures (it also remains the fallback for anything the
+DFAs decline — a `\b` combined with `$`/`(?m)`, a chained `\b\b`, a prone `\b`, `\X`). The eager DFA
+evaluates **ASCII** `\b`, the lazy DFA **Unicode** `\b`, the Pike VM **Unicode** `\b` — all agree.
+The DFA span *is* the leftmost-first match, so every switch is results-invariant: `conformance.zig`
+pins every DFA span (and the handed-off captures) to the Pike VM, runtime and comptime — including
+`\b`/`\B` over non-ASCII input for the lazy DFA — and fuzzes the `byte_engine`/`prefilter` knobs on↔off.
 
 ## Notes
 
