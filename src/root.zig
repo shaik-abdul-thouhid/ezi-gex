@@ -63,6 +63,7 @@ pub const SearchOptions = engine.SearchOptions;
 /// | `bytepike`  | no       | yes      | byte-lowerable (no `\X`/`\b`); reference executor      |
 /// | `dfa`       | no       | **no**   | byte-lowerable + `\A`/`^` + **anchored-end** `$`/`\z`  |
 /// | `edfa`      | no       | yes      | as `dfa`, frozen tables; bounded determinized state    |
+/// | `onepass`   | yes      | yes      | provably one-pass, assertion-free patterns; anchored   |
 ///
 /// **Universal limits (true of every backend, by design — routing decisions, not missing
 /// features):**
@@ -80,7 +81,10 @@ pub const SearchOptions = engine.SearchOptions;
 ///
 /// **Span-only** backends (`literal`/`bytepike`/`dfa`/`edfa`) locate `[start, end)` but do not
 /// fill captures; asking one for captures is a `@compileError`. **`dfa` is runtime-only** (its
-/// cache mutates while matching) — use `edfa`/`pikevm`/`auto` for comptime matching. Each
+/// cache mutates while matching) — use `edfa`/`pikevm`/`auto` for comptime matching. **`onepass`**
+/// is the *capture* fast path: a single deterministic thread fills the slots in O(input) (no
+/// thread set) for a provably one-pass pattern — `auto` uses it for the anchored capture fill
+/// after a DFA arm locates the span, and declines (→ Pike VM) anything not one-pass. Each
 /// backend's module doc spells out precisely what it accepts and declines.
 pub const backends = engine.backends;
 /// Front-door pipeline options (`case_fold`, …), comptime-known on both paths.

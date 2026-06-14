@@ -11,6 +11,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **One-pass NFA capture fast path** (new `backends.onepass`). A linear-time, single-thread
+  capture engine for **provably one-pass** patterns — the common structured shapes
+  `(\d{4})-(\d{2})-(\d{2})`, `(\w+)@(\w+)`, `(\d+):(\d+)`, `(\w)+`, `(a|b)*` — where at every
+  step exactly one transition can fire and the capture writes to it are unique. It determinizes
+  the shared NFA into a **frozen one-pass table** (comptime *and* runtime, like `edfa`; `Scratch`
+  is empty/stateless) and fills the whole `slots` array with one deterministic thread: no thread
+  set, no per-thread slot copies, no per-step epsilon closure. `auto` builds it for any
+  capture-bearing one-pass pattern and uses it for the **anchored capture fill** after a DFA arm
+  locates the span (replacing the Pike VM there). Measured on `(\w+)` capture extraction over the
+  256 KiB corpus: **ASCII 64 → 206 MiB/s (~3.2×)**, Multilingual ~1.6×, Pathological ~2.7× vs the
+  Pike-VM capture fill. **Sound by construction:** the one-pass decision is conservative — any
+  ambiguity (two firable transitions on one symbol, a capture mask reached two ways, or a
+  matching state that could consume into a non-matching one, i.e. an abandonable match) declines
+  the pattern (`error.Unsupported`, a `@compileError` at comptime), and `auto` keeps it on the
+  Pike VM — so the result never changes, only the capture cost. Assertion-bearing (`^ $ \A \z
+  \b \B`, `(?m)`), `\X`, and >31-group patterns are declined by design. Pinned by a wide
+  **differential test against the Pike VM** (byte-identical slots on every accepted pattern) plus
+  a revert-failing regression and the cross-backend conformance suite. All decls `@stable-since
+  v0.4.0`.
+
 - **`(?m)` line anchors (`line_start`/`line_end`) on the eager DFA** (`backends.edfa`). `(?m)^`
   and `(?m)$` previously routed to the code-point Pike VM (`(?m)^\w+` ≈ 187 MiB/s); a **non-prone**
   line pattern (`(?m)^\w+`, `(?m)^foo`, `(?m)foo$`, `(?m)^abc$`, `(?m)^$`) now runs on the eager DFA

@@ -40,6 +40,12 @@ pub const backends = struct {
     /// Bounded — a pattern whose full DFA exceeds `edfa.max_states` is declined (use
     /// `dfa` at runtime). Same capability gate as `dfa` (`supports`).
     pub const edfa = @import("backends/edfa.zig");
+    /// One-pass NFA — a linear-time **capture** fast path for unambiguous patterns
+    /// (`(\d{4})-(\d{2})-(\d{2})`, `(\w+)@(\w+)`): a single deterministic thread fills the
+    /// slots, no thread set. Captures-capable and **stateless** (a frozen table), so it runs
+    /// at **comptime** too. Declines (→ Pike VM) any pattern that is not provably one-pass, or
+    /// that carries an assertion / `\X`. `auto` uses it for the anchored capture handoff.
+    pub const onepass = @import("backends/onepass.zig");
     /// The default dispatcher — composes the above, switching on analysis + input.
     pub const auto = @import("backends/auto.zig");
 };

@@ -45,6 +45,7 @@ const pikevm = @import("pikevm.zig");
 const backtrack = @import("backtrack.zig");
 const dfa = @import("dfa.zig");
 const edfa = @import("edfa.zig");
+const onepass = @import("onepass.zig");
 const byte = @import("../byte.zig");
 
 const utils = @import("utils");
@@ -232,6 +233,17 @@ pub const Program = struct {
     ///
     /// @stable-since: v0.3.0
     dfa_prog: ?dfa.Program = null,
+    /// The **one-pass** capture table — a linear-time, single-thread capture fast path,
+    /// built (at runtime) for a capture-bearing pattern that is provably one-pass
+    /// (`(\d{4})-(\d{2})-(\d{2})`, `(\w+)@(\w+)`). Non-null ⇒ `searchCaptures` fills the
+    /// slots with it (anchored at the span a DFA arm located) instead of the Pike VM — same
+    /// slots, no thread set. Null for a non-one-pass pattern, a capture-less pattern, or the
+    /// comptime path (comptime captures stay on the Pike VM); such patterns fall back to the
+    /// Pike VM capture fill, so this is purely an accelerator. Results-invariant
+    /// (`conformance.zig` pins its slots to the Pike VM's).
+    ///
+    /// @stable-since: v0.4.0
+    onepass_prog: ?onepass.Program = null,
 };
 
 /// @stable-since: v0.1.0
@@ -274,6 +286,19 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, opts: Options) BuildError!
             },
         }
     }
+    // One-pass capture accelerator: for a capture-bearing pattern that is provably one-pass,
+    // build the single-thread capture table. `searchCaptures` then fills slots with it
+    // (anchored at the DFA-located span) instead of the Pike VM — same slots, no thread set.
+    // A non-one-pass / assertion-bearing pattern is declined here (left null) and keeps using
+    // the Pike VM capture fill, so this never changes a result, only the capture cost.
+    if (h.capture_count > 0) {
+        if (onepass.buildAlloc(gpa, h, .{})) |op| {
+            program.onepass_prog = op;
+        } else |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => {}, // not one-pass → Pike VM fills captures (no change in result)
+        }
+    }
     return program;
 }
 
@@ -309,6 +334,7 @@ pub fn buildComptime(comptime h: hir.Hir, comptime opts: Options) Program {
 pub fn freeProgram(gpa: std.mem.Allocator, program: *Program) void {
     if (program.edfa_prog) |*e| edfa.freeProgram(gpa, e);
     if (program.dfa_prog) |*d| dfa.freeProgram(gpa, d);
+    if (program.onepass_prog) |*op| onepass.freeProgram(gpa, op);
     switch (program.inner) {
         .literal => |*p| literal.freeProgram(gpa, p),
         .nfa => |*p| nfa.freeProgram(gpa, p),
@@ -454,6 +480,22 @@ fn confirmAt(p: *const nfa.Program, s: *Scratch.NfaScratch, input: []const u8, a
     const o = SearchOptions{ .start = at, .anchored = true };
     if (slots) |sl| return pikevm.searchCaptures(p, &s.pike, input, sl, o);
     return pikevm.search(p, &s.pike, input, o);
+}
+
+/// Fill `slots` for the match whose span a DFA arm already located, anchored at its start.
+/// Prefers the **one-pass** table (a single deterministic thread — no thread set) when the
+/// pattern built one; otherwise the Pike VM. Both are anchored at the same span start and
+/// are leftmost-first, so they fill identical slots (`conformance.zig` pins it) — this only
+/// changes the capture cost, never the result.
+fn fillCapturesAnchored(program: *const Program, s: *Scratch.NfaScratch, p: *const nfa.Program, input: []const u8, slots: []?usize, m: Match, opts: SearchOptions) ?Match {
+    var o = opts;
+    o.start = m.start;
+    o.anchored = true;
+    if (program.onepass_prog) |*op| {
+        var os = onepass.Scratch{};
+        return onepass.searchCaptures(op, &os, input, slots, o);
+    }
+    return pikevm.searchCaptures(p, &s.pike, input, slots, o);
 }
 
 /// Ordinary per-input dispatch over the whole (unfiltered) range: backtrack for a
@@ -676,20 +718,17 @@ pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const
         .literal => |*p| return literal.searchCaptures(p, &scratch.inner.literal, input, slots, opts),
         .nfa => |*p| {
             // Capture handoff: when the byte DFA arm is available, locate the **span**
-            // cheaply with the DFA, then run the Pike VM **anchored at the span start**
-            // to fill captures — bounded to the match — instead of an unanchored Pike VM
-            // scan over the whole input. The DFA span *is* the leftmost-first match
-            // (`conformance.zig` pins it), so the anchored Pike VM finds the same match
-            // and the same groups, just without re-scanning to locate it. On a sparse
-            // match in a long input this turns an O(input) capture search into an
-            // O(match) one.
-            // Eager DFA span → anchored Pike VM for groups (the fastest handoff).
+            // cheaply with the DFA, then fill captures **anchored at the span start**
+            // (`fillCapturesAnchored`: the one-pass table when the pattern built one, else
+            // the Pike VM) — bounded to the match — instead of an unanchored scan over the
+            // whole input. The DFA span *is* the leftmost-first match (`conformance.zig`
+            // pins it), so the anchored fill finds the same match and the same groups, just
+            // without re-scanning to locate it. On a sparse match in a long input this turns
+            // an O(input) capture search into an O(match) one.
+            // Eager DFA span → anchored capture fill (one-pass table when built, else Pike VM).
             if (program.edfa_prog) |*ep| {
                 const m = runEdfa(ep, program.filter, input, opts, false, &scratch.confirm_probes) orelse return null;
-                var o = opts;
-                o.start = m.start;
-                o.anchored = true;
-                return pikevm.searchCaptures(p, &scratch.inner.nfa.pike, input, slots, o);
+                return fillCapturesAnchored(program, &scratch.inner.nfa, p, input, slots, m, opts);
             }
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
@@ -698,10 +737,7 @@ pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const
                         scratch.dfa_disabled = true; // cache thrashed → fall through to the NFA arm
                     } else {
                         const m = span orelse return null; // DFA is exact: no span ⇒ no match
-                        var o = opts;
-                        o.start = m.start;
-                        o.anchored = true;
-                        return pikevm.searchCaptures(p, &scratch.inner.nfa.pike, input, slots, o);
+                        return fillCapturesAnchored(program, &scratch.inner.nfa, p, input, slots, m, opts);
                     }
                 };
             }

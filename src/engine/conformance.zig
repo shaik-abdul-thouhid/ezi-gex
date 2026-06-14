@@ -27,6 +27,7 @@ const literal = @import("backends/literal.zig");
 const bytepike = @import("backends/bytepike.zig");
 const dfa = @import("backends/dfa.zig");
 const edfa = @import("backends/edfa.zig");
+const onepass = @import("backends/onepass.zig");
 const auto = @import("backends/auto.zig");
 
 const byte = @import("byte.zig");
@@ -660,6 +661,44 @@ test "capture slot arrays agree across pikevm / backtrack / auto" {
             }
         }
     }
+}
+
+test "one-pass capture path agrees with the Pike VM wherever it applies (front door)" {
+    // The one-pass backend fills the SAME slots as the Pike VM on every pattern it accepts;
+    // a non-one-pass pattern (e.g. `((a)(b))+`) is declined (`error.Unsupported`) and skipped
+    // — soundly handled by the Pike VM. This pins both the one-pass *decision* and its
+    // single-thread *executor* against the oracle through the public front door.
+    const gpa = testing.allocator;
+    const inputs = [_][]const u8{ "2026-06-07", "alice@example.com", "abc", "aaabb", "2026-06", "abab", "user@host.org" };
+    for (capture_cases) |pat| {
+        for (inputs) |in| {
+            var a: [16]?usize = undefined;
+            var b: [16]?usize = undefined;
+            const ra = try captureSlots(pikevm, gpa, pat, in, &a);
+            const rb = captureSlots(onepass, gpa, pat, in, &b) catch |e| switch (e) {
+                error.Unsupported => continue, // not one-pass → the Pike VM covers it
+                else => return e,
+            };
+            try testing.expectEqual(ra, rb);
+            if (ra) try testing.expectEqualSlices(?usize, &a, &b);
+        }
+    }
+}
+
+test "auto fills one-pass captures through its DFA→one-pass handoff" {
+    const gpa = testing.allocator;
+    var diag: regex.Diagnostic = .{};
+    var re = try regex.compileRuntimeWith(auto, gpa, "(\\d{4})-(\\d{2})-(\\d{2})", &diag, .{});
+    defer re.deinit();
+    try testing.expect(re.program.onepass_prog != null); // a one-pass capture table was built
+    var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+    defer sc.deinit(gpa);
+    var slots: [8]?usize = undefined;
+    const c = re.captures(&sc, &slots, "on 2026-06-14 ok").?;
+    try testing.expectEqualStrings("2026-06-14", c.match().slice("on 2026-06-14 ok"));
+    try testing.expectEqualStrings("2026", c.groupSlice(1).?);
+    try testing.expectEqualStrings("06", c.groupSlice(2).?);
+    try testing.expectEqualStrings("14", c.groupSlice(3).?);
 }
 
 // ── auto's internal input-size switch is transparent ──────────────────────────────
