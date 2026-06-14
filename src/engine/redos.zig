@@ -206,6 +206,11 @@ test "default-engine prefilter: prone/end_anchored => 0 confirms; fast-confirm =
         .{ .pat = "(a+)+$", .fill = 'a', .tail = '!' }, // end_anchored, prefix 'a'
         .{ .pat = "(x+x+)+y", .fill = 'x', .tail = '!' }, // prone, prefix 'x' -- the canonical bomb
         .{ .pat = "a{4,}b", .fill = 'a', .tail = '!' }, // prone (UNBOUNDED tail) -- cf. a{4}b in (B)
+        // Bounded-LARGE prefix: no cycle, but a 100-long non-accepting prefix exceeds
+        // RESTART_SCAN_LIMIT (64), so it is `prone` too -- the per-occurrence confirm would be
+        // Θ(n·100). Reverting the bounded-prefix branch of `computeProne` makes this fail
+        // (a{100}b would be classified non-prone → ~N confirms each re-scanning the 100-a prefix).
+        .{ .pat = "a{100}b", .fill = 'a', .tail = '!' },
     };
     for (gated) |c| {
         const input = try worstCase(gpa, N, c.fill, c.tail);
@@ -250,6 +255,74 @@ test "default-engine prefilter: prone/end_anchored => 0 confirms; fast-confirm =
         defer sc.deinit(gpa);
         _ = re.find(&sc, "fx fo food foo9 bar"); // several 'f's; the loop probes each candidate
         try testing.expect(sc.confirm_probes > 0);
+    }
+}
+
+test "prefilter: bounded-prefix proneness threshold (a{64}b on edfa vs a{65}b off it)" {
+    // RESTART_SCAN_LIMIT = 64 (edfa.zig) is the longest non-accepting prefix that keeps a pattern
+    // on the eager DFA's per-occurrence confirm loop. With the two-phase build (non-prone patterns
+    // skip the unanchored `utrans` table), a{64}b's prefix is exactly 64 (≤ limit) → non-prone →
+    // it fits the eager DFA and KEEPS the memchr-jump loop bounded to ≤64 bytes/confirm
+    // (probes > 0). a{65}b's is 65 (> limit) → prone → its `utrans` overflows the eager pool → it
+    // falls to the lazy DFA, whose `find` is a single-skip + O(input) reverse pass (probes == 0).
+    //
+    // The pair pins the EXACT boundary and is revert-failing for BOTH fixes:
+    //   * revert the bounded-prefix branch of `computeProne` → a{65}b stays non-prone → eager DFA
+    //     fast-confirm → probes > 0 (boundary breaks);
+    //   * revert the two-phase (non-prone skips utrans) → a{64}b's unused utrans overflows the eager
+    //     pool → it falls to the lazy DFA → probes == 0 (a{64}b's positive control breaks).
+    const gpa = testing.allocator;
+    const N: usize = 4096;
+    const input = try worstCase(gpa, N, 'a', '!'); // dense 'a', no 'b' → no match
+    defer gpa.free(input);
+
+    const Case = struct { pat: []const u8, want_probes_zero: bool };
+    for ([_]Case{
+        .{ .pat = "a{64}b", .want_probes_zero = false }, // 64 == limit → eager DFA fast-confirm (loop kept, ≤64/confirm)
+        .{ .pat = "a{65}b", .want_probes_zero = true }, // 65 > limit → prone → lazy DFA (no per-occurrence confirm)
+    }) |c| {
+        var diag: regex.Diagnostic = .{};
+        var re = try regex.compileRuntimeWith(auto, gpa, c.pat, &diag, .{});
+        defer re.deinit();
+        var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+        defer sc.deinit(gpa);
+        try testing.expect(re.find(&sc, input) == null); // correct no-match either way
+        if (c.want_probes_zero) {
+            if (sc.confirm_probes != 0) {
+                std.debug.print("/{s}/: {d} per-occurrence confirms (expected 0) — bounded-prefix gate regression\n", .{ c.pat, sc.confirm_probes });
+                return error.BoundedPrefixQuadratic;
+            }
+        } else {
+            try testing.expect(sc.confirm_probes > 0); // positive control: the loop is live & bounded
+        }
+    }
+}
+
+test "bounded-large-prefix a{N}b is linear (not Θ(n·k)) at scale" {
+    // a{N}b on dense 'a' with no 'b': the prefilter used to confirm-scan the whole N-long prefix at
+    // every position → Θ(n·N) (the bounded-large-prefix ReDoS). Now any N > RESTART_SCAN_LIMIT is
+    // `prone` → the eager DFA's O(input) reverse find, or the lazy DFA's O(input) reverse find when
+    // the (utrans-inflated) eager bound overflows. 64 KiB completing near-instantly with the correct
+    // no-match is the signal; the Θ(n·N) regression would not finish in any reasonable time.
+    const gpa = testing.allocator;
+    const N_input: usize = 1 << 16;
+    const no_b = try worstCase(gpa, N_input, 'a', '!'); // dense 'a', no 'b' → no match
+    defer gpa.free(no_b);
+    for ([_]usize{ 100, 1000, 4000 }) |k| {
+        const pat = try std.fmt.allocPrint(gpa, "a{{{d}}}b", .{k});
+        defer gpa.free(pat);
+        var diag: regex.Diagnostic = .{};
+        var re = try regex.compileRuntimeWith(auto, gpa, pat, &diag, .{});
+        defer re.deinit();
+        var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+        defer sc.deinit(gpa);
+        try testing.expect(re.find(&sc, no_b) == null);
+        // And a genuine match still works (k a's then b), proving the fast path didn't break it.
+        const yes = try gpa.alloc(u8, k + 1);
+        defer gpa.free(yes);
+        @memset(yes[0..k], 'a');
+        yes[k] = 'b';
+        try testing.expect(re.find(&sc, yes) != null);
     }
 }
 

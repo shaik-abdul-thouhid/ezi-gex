@@ -10,18 +10,35 @@
 //! a handful of states / a few hundred bytes of `ro_data` (`abc` is 5 states, `[a-z]+`
 //! is 3), and the matcher is a pure `state = trans[state][class]` loop with zero decode.
 //! A big *Unicode* class is a few hundred states with a correspondingly large **dense**
-//! table (`\w+` ≈ 323 states / ~141 KB) — minimization and a sparse encoding are the
-//! obvious follow-ups; such patterns are usually better left to the runtime lazy DFA.
+//! table (`\w+` ≈ 322 states / ~140 KB); such patterns are usually better left to the runtime
+//! lazy DFA. The frozen tables are **Hopcroft/Moore-minimized** at build (results-invariant),
+//! which mostly helps the larger reverse tables (a prone `\w+@\w+`'s reverse DFA ≈ 3251 → ≈ 1047
+//! states); the layout is kept **dense** (one `trans[state*nc + class]` load — the hot loop), so
+//! minimization drops the state *count* without slowing matching. A sparse transition encoding
+//! was deliberately *not* adopted: it would trade that single-load hot loop for smaller tables.
 //!
 //! ## Status
 //!
 //! `auto`'s **default span engine** (since 0.3.0). `find`/`isMatch` are **O(input) on every
 //! supported pattern** — quadratic-immune, including `$`/`\z` (matched by a reverse-DFA-from-end
 //! pass; covers `anchored_end` patterns and all-branch-`$` alternations like `foo$|bar$`).
-//! **Known, intentional gaps**, each declined to the code-point engines (correct + linear, just
-//! not DFA-accelerated): *mixed* `$` (`a$|b`), `(?m)` line anchors, and `\b`/`\B`. **Build-time:**
-//! determinization is hash-interned (~O(states)), so even big Unicode-class builds stay fast — a
-//! one-time cost, match time is O(input). All detailed below.
+//! **`(?m)` line anchors** (`line_start`/`line_end`) run here too, via **anchored restart with line
+//! context** (`\n` isolated into its own byte class; the start state chosen by the preceding byte;
+//! a one-byte `\n`-lookahead for `line_end`) — but only when **non-prone** (`(?m)^\w+`, `(?m)foo$`);
+//! a *prone* `(?m)` (an unbounded run before the anchor, `(?m)\w+$`) is declined (anchored restart
+//! would be Θ(n²) and the reverse fix can't carry line context). **Known, intentional gaps**, each
+//! declined to the code-point engines (correct + linear, just not DFA-accelerated): *mixed* `$`
+//! (`a$|b`), *prone* `(?m)`, and `\b`/`\B`/`\X` (the last three are *codepoint* properties a byte
+//! DFA cannot evaluate — a permanent design choice, not a missing feature). **Build-time:**
+//! determinization is hash-interned (~O(states)), so even big
+//! Unicode-class builds stay fast — a one-time cost, match time is O(input). All detailed below.
+//!
+//! **Invariant:** every pattern `supports` accepts matches in **O(input)** (a hard contract — the
+//! eager DFA never takes a super-linear path) and **leftmost-first** (byte-identical spans to the
+//! Pike VM, `conformance.zig`). If you pin `edfa` directly, a declined or too-large pattern is
+//! `error.Unsupported` at build (a `@compileError` at comptime) — there is no silent fallback.
+//! Through `auto` the decline is invisible: it routes to a capable backend, so `auto` is correct
+//! by construction for every pattern.
 //!
 //! ## What it is (and is not)
 //!
@@ -73,7 +90,7 @@
 //! restart, `supports` **declines** it (`has_text_end and !anchored_end`) and `auto` routes it
 //! to the **Pike VM** — correct and linear, just not DFA-accelerated. A two-seed reverse DFA
 //! could keep it on the DFA, but the shape is rare and already linear, so it is intentionally
-//! deferred (see `DESIGN.md` §7).
+//! deferred.
 //!
 //! ## Build-time cost — determinization is ~O(states) (hash-interned)
 //!
@@ -176,25 +193,47 @@ pub const Program = struct {
     /// (reachable without an end assertion)?
     accept: []const bool,
     /// `accept_eoi[state]` — is this state accepting **at end of input**: `accept[state]`
-    /// OR it holds a pending `text_end` (`$`/`\z`) assertion whose continuation reaches
-    /// `match`. The matcher checks this once, when the scan reaches `input.len`. Equal to
-    /// `accept` for a pattern with no `$`/`\z` (so the check is a no-op there).
+    /// OR it holds a pending end-of-input assertion (`text_end` `$`/`\z`, or `line_end` `(?m)$`)
+    /// whose continuation reaches `match`. The matcher checks this once, when the scan reaches
+    /// `input.len`. Equal to `accept` for a pattern with no `$` (so the check is a no-op there).
     ///
     /// @stable-since: v0.3.0
     accept_eoi: []const bool,
-    /// Start state with `text_start` TRUE (used at offset 0).
+    /// `accept_before_nl[state]` — is this state accepting **just before a `\n`**: it holds a
+    /// pending `line_end` (`(?m)$`) whose continuation reaches `match`. The matcher checks it at a
+    /// position whose next byte is `\n`. Equal to `accept` for a non-`(?m)$` program (the matcher
+    /// only consults it for `has_line_anchor` programs).
+    ///
+    /// @stable-since: v0.4.0
+    accept_before_nl: []const bool,
+    /// Start state with `text_start` + `line_start` TRUE (used at offset 0).
     start0: u32,
-    /// Start state with `text_start` FALSE (offset > 0). Equals `start0` for a pattern
-    /// with no `\A`/`^`.
+    /// Start state with `text_start` + `line_start` FALSE (offset > 0, not just after a `\n`).
+    /// Equals `start0` for a pattern with no `\A`/`^`/`(?m)^`.
     startN: u32,
+    /// Start state with `line_start` TRUE, `text_start` FALSE — the entry for an unanchored
+    /// match beginning **just after a `\n`** (a `(?m)^` line start at offset > 0). Equals
+    /// `startN` for a program with no `(?m)^`. Only consulted for `has_line_anchor` programs.
+    ///
+    /// @stable-since: v0.4.0
+    startL: u32,
+    /// True when the program carries a `(?m)` line anchor (`line_start`/`line_end`). Such a
+    /// program runs on **anchored restart** with line context: the start state is chosen per
+    /// position by the preceding byte (`start0`/`startL`/`startN`), and `line_end` is matched via
+    /// `accept_before_nl` with a one-byte `\n` lookahead. Quadratic-immune because `supports`
+    /// declines a *prone* line pattern (an unbounded run before the anchor) to the Pike VM.
+    ///
+    /// @stable-since: v0.4.0
+    has_line_anchor: bool,
     /// True when every match must begin at offset 0 (a leading `\A` / non-multiline `^`).
     /// The search then tries only `s == 0`.
     anchored_start: bool,
-    /// True when anchored restart is **Θ(n²)-prone**: the anchored DFA has a non-accepting
-    /// cycle reachable from a start (it can consume an unbounded run without ever accepting,
-    /// e.g. `\w+@\w+`'s pre-`@` word run), so re-scanning it from every start is quadratic.
-    /// Such a program takes the O(input) reverse-DFA `find`; a non-prone one (`\w+`, `\d+`)
-    /// keeps the faster anchored restart. Computed once at build (`computeProne`).
+    /// True when anchored restart is unsafe — some start can scan a long non-accepting run before
+    /// accepting/dying. Two shapes: a **non-accepting cycle** reachable from a start (an *unbounded*
+    /// run, Θ(n²) — `\w+@\w+`'s pre-`@` word run), or a **long bounded** non-accepting prefix
+    /// (`a{4000}b`, longest non-accepting path > `RESTART_SCAN_LIMIT`, Θ(n·k)). Both take the
+    /// O(input) reverse-DFA `find` (and gate `auto`'s per-occurrence prefilter confirm); a non-prone
+    /// one (`\w+`, `\d+`, `a{4}b`) keeps the faster anchored restart. Computed once (`computeProne`).
     ///
     /// @stable-since: v0.3.0
     prone: bool,
@@ -245,34 +284,36 @@ pub const Program = struct {
 };
 
 /// Whether this HIR can run on the eager DFA: byte-lowerable (no `\X`/`\b`) **and** whose
-/// only zero-width assertions are `text_start` (`\A`/`^`, evaluated at offset 0 via two
-/// start closures) and `text_end` (`$`/`\z`) — the latter only when **every match ends at
-/// input end** (`anchored_end`), where the reverse-DFA-from-end path matches it in O(input).
-/// Still **broader than `dfa.supports`** (the lazy DFA declines `text_end` outright). A
-/// **mixed** `$` (text_end in only some branches, e.g. `a$|b`, `[ab]*c$|x`) has no pinned
-/// end, so anchored restart on it would be Θ(n²) — it is **declined** here and `auto` routes
-/// it to the linear Pike VM. `(?m)` line anchors and `\b`/`\X` likewise stay on the
-/// code-point engines. (Whether the determinized DFA *fits* the fixed bounds is a separate
-/// build-time check; this is the capability gate.)
+/// zero-width assertions are a supported subset:
+///   * `text_start` (`\A`/`^`) — evaluated at offset 0 via the start closures.
+///   * `text_end` (`$`/`\z`) — only when **every match ends at input end** (`anchored_end`),
+///     matched O(input) by the reverse-DFA-from-end path. A **mixed** `$` (text_end in only some
+///     branches, `a$|b`) has no pinned end → would be Θ(n²) → declined to the Pike VM.
+///   * `line_start`/`line_end` (`(?m)^`/`(?m)$`) — matched by **anchored restart** with line
+///     context (`\n` isolated into its own byte class; the start state is chosen per position).
+///     This is O(input) only when the pattern is **non-prone** (no unbounded run before the
+///     anchor); a *prone* line pattern (`(?m)\w+$`, `(?m).*^x`) is declined at **build** time
+///     (`buildAlloc`) and routed to the linear Pike VM, since the reverse-DFA fix does not carry
+///     line context. So `supports` admits line anchors here; the proneness gate is in the build.
+/// `\b`/`\X` stay on the code-point engines. (Whether the determinized DFA *fits* the fixed
+/// bounds is a separate build-time check; this is the capability gate.)
 ///
 /// @stable-since: v0.3.0
 pub fn supports(h: hir.Hir) bool {
     if (!byte.byteLowerable(h)) return false; // excludes \X and \b/\B
     var has_text_end = false;
     for (h.nodes) |n| {
-        // `text_start` (`\A`/`^`) is evaluated at offset 0 via two start closures; `text_end`
-        // (`$`/`\z`) at end of input. Line anchors (`(?m)^`/`$`) are position-dependent on the
-        // previous/next byte and route to the code-point engines, like `\b`.
         if (n.tag == .anchor) switch (n.data.anchor.kind) {
-            .text_start => {},
+            .text_start, .line_start, .line_end => {}, // text_start at offset 0; line anchors via anchored restart
             .text_end => has_text_end = true,
-            else => return false,
+            else => return false, // \b/\B
         };
     }
     // Quadratic immunity is a hard contract — the eager DFA never takes a super-linear path.
     // A `text_end` pattern is linear only when its end is pinned to input end (`anchored_end`),
     // matched by the reverse-DFA-from-end pass. A mixed `$` (not `anchored_end`) would fall to
-    // the Θ(n²) anchored restart, so decline it; `auto` then uses the linear Pike VM.
+    // the Θ(n²) anchored restart, so decline it; `auto` then uses the linear Pike VM. (Line
+    // anchors' analogous proneness gate is in `buildAlloc`, which knows the determinized DFA.)
     if (has_text_end and !h.analysis.anchored_end) return false;
     return true;
 }
@@ -316,16 +357,30 @@ const Det = struct {
     classes: *const byte.ByteClasses,
     class_rep: *const [256]u8,
     n_classes: u32,
-    /// `reaches_end[pc]` — does `pc` reach `match` following only epsilon edges with
-    /// `text_end` **passable** (the at-end-of-input view)? Used to compute `accept_eoi`
-    /// when the closure records a pending `text_end` pc. All-false for a `$`-free program.
+    /// `reaches_end[pc]` — does `pc` reach `match` following only epsilon edges with the
+    /// end-of-input assertions (`text_end` **and** `line_end`, both true at `input.len`)
+    /// passable? Used to compute `accept_eoi` when the closure parks a pending `$` pc.
+    /// All-false for a program with no `$`/`(?m)$`.
     reaches_end: []const bool,
+    /// `reaches_nl[pc]` — does `pc` reach `match` with **`line_end` passable but `text_end`
+    /// not** (the before-a-`\n` view: at a non-final `\n`, `line_end` holds, `text_end` does
+    /// not)? Drives `accept_before_nl`. All-false unless the program has a `(?m)$` line anchor.
+    reaches_nl: []const bool,
+    /// The byte class of `\n` (0x0A), or `maxInt` for a non-line program (so `c == nl_class`
+    /// is never true and the line-context fork is dormant). `byteClasses` isolates `\n` into
+    /// its own class exactly when the program has a `(?m)` line anchor.
+    nl_class: u32 = std.math.maxInt(u32),
+    /// Skip building the unanchored `utrans` rows. Line-anchor programs run on **anchored
+    /// restart** only (the `.*?`-prefix unanchored automaton can't carry line-start context),
+    /// so their `utrans` would be unused dead weight that also inflates the state count.
+    skip_utrans: bool = false,
 
     // ── frozen-DFA outputs (caller buffers) ──
     state_off: []u32, // state id → start of its pc list in `pc_pool`
     state_len: []u32, // state id → length of its pc list
     accept: []bool, // state id → accepting mid-input?
-    accept_eoi: []bool, // state id → accepting at end of input (accept ∨ a pending `text_end`)?
+    accept_eoi: []bool, // state id → accepting at end of input (accept ∨ a pending `$`)?
+    accept_before_nl: []bool, // state id → accepting just before a `\n` (a pending `(?m)$` line_end)?
     trans: []u32, // n_states × n_classes (anchored)
     utrans: []u32, // n_states × n_classes (unanchored: ∪ a fresh start each edge)
     pc_pool: []u32, // concatenated, priority-ordered pc lists
@@ -341,26 +396,30 @@ const Det = struct {
     work: []u32, // closure result (the pc list being built)
     work_len: u32 = 0,
     work_match: bool = false,
-    work_match_eoi: bool = false, // a pending `text_end` in this closure reaches match at end
+    work_match_eoi: bool = false, // a pending end-of-input assertion in this closure reaches match
+    work_match_nl: bool = false, // a pending `(?m)$` (line_end) in this closure reaches match before a `\n`
     seeds: []u32, // successor pcs feeding a closure
 
-    start0: u32 = DEAD,
-    startN: u32 = DEAD,
+    start0: u32 = DEAD, // text_start + line_start true (offset 0)
+    startN: u32 = DEAD, // text_start + line_start false (offset > 0, not after `\n`)
+    startL: u32 = DEAD, // line_start true, text_start false (offset > 0, just after a `\n`); == startN if no line_start
 
     /// Epsilon-closure of `seeds` into `work` (priority order, deduplicated, cut on
     /// match) — the byte analogue of the Pike VM's thread closure, minus capture slots,
-    /// identical to the lazy DFA's. `at_start` is whether the search position is offset 0
-    /// (the only thing `text_start` depends on). A `text_end` (`$`/`\z`) is recorded as a
-    /// pending **member** of the state (it consumes no byte, so the thread parks until end
-    /// of input) and sets `work_match_eoi` when its continuation reaches `match` — that is
-    /// how the state knows it is accepting *at end of input*. Writes
-    /// `work`/`work_len`/`work_match`/`work_match_eoi`.
-    fn closure(self: *Det, seeds: []const u32, at_start: bool) void {
+    /// identical to the lazy DFA's. `at_start` is whether the position is offset 0 (what
+    /// `text_start` depends on); `at_line_start` is whether the position is a line start —
+    /// offset 0, or just after a `\n` (what `(?m)^` `line_start` depends on). A `text_end`
+    /// (`$`/`\z`) or `line_end` (`(?m)$`) is recorded as a pending **member** (it consumes no
+    /// byte, so the thread parks): `work_match_eoi` is set when it reaches `match` at end of
+    /// input, and `work_match_nl` when a `line_end` reaches `match` before a `\n`. Writes
+    /// `work`/`work_len`/`work_match`/`work_match_eoi`/`work_match_nl`.
+    fn closure(self: *Det, seeds: []const u32, at_start: bool, at_line_start: bool) void {
         self.seen_gen +%= 1;
         const gen = self.seen_gen;
         self.work_len = 0;
         self.work_match = false;
         self.work_match_eoi = false;
+        self.work_match_nl = false;
 
         seeds_loop: for (seeds) |seed| {
             var top: usize = 0;
@@ -386,15 +445,29 @@ const Det = struct {
                                 if (!at_start) break :follow;
                                 pc += 1;
                             },
-                            // `text_end` parks here (consumes no byte): record it as a member,
-                            // and mark the state accepting-at-end if it reaches `match`.
+                            // `(?m)^` line_start holds iff at a line start (offset 0 or after a `\n`).
+                            .line_start => {
+                                if (!at_line_start) break :follow;
+                                pc += 1;
+                            },
+                            // `text_end` parks here (consumes no byte): a member, accepting at end
+                            // of input if its continuation reaches `match`.
                             .text_end => {
                                 self.work[self.work_len] = pc;
                                 self.work_len += 1;
                                 if (self.reaches_end[pc]) self.work_match_eoi = true;
                                 break :follow;
                             },
-                            else => break :follow, // line anchors etc. — gated out by supports()
+                            // `(?m)$` line_end parks too: accepting at end of input AND just before
+                            // a `\n` (the two positions where line_end holds).
+                            .line_end => {
+                                self.work[self.work_len] = pc;
+                                self.work_len += 1;
+                                if (self.reaches_end[pc]) self.work_match_eoi = true;
+                                if (self.reaches_nl[pc]) self.work_match_nl = true;
+                                break :follow;
+                            },
+                            else => break :follow, // \b/\B — gated out by supports()
                         },
                         .byte_range => {
                             self.work[self.work_len] = pc;
@@ -405,7 +478,8 @@ const Det = struct {
                             self.work[self.work_len] = pc;
                             self.work_len += 1;
                             self.work_match = true;
-                            self.work_match_eoi = true; // a mid-input match also accepts at end
+                            self.work_match_eoi = true; // a mid-input match also accepts at end…
+                            self.work_match_nl = true; // …and before a `\n`
                             // Cut: every lower-priority thread (on the stack or in later
                             // seeds) is discarded — the Pike VM's match cut.
                             break :seeds_loop;
@@ -440,6 +514,7 @@ const Det = struct {
         self.state_len[id] = @intCast(key.len);
         self.accept[id] = self.work_match;
         self.accept_eoi[id] = self.work_match_eoi;
+        self.accept_before_nl[id] = self.work_match_nl;
         self.pool_len += @intCast(key.len);
         self.n_states += 1;
         self.state_hash[slot] = id + 1;
@@ -459,16 +534,16 @@ const Det = struct {
                 ns += 1;
             },
             .match => {}, // terminal: no outgoing edge
-            .assertion => {}, // a pending `text_end` member: no byte transition (end-only)
-            else => unreachable, // a canonical state holds only byte_range / match / text_end pcs
+            .assertion => {}, // a pending end-assertion member ($/\z or (?m)$): no byte transition
+            else => unreachable, // a canonical state holds only byte_range / match / end-assertion pcs
         };
         return ns - base;
     }
 
-    /// Determinize fully. Reserve DEAD = the empty set (state 0), intern the two start
-    /// states, then breadth-first compute every `(state, class)` edge. The worklist is
-    /// the growing `0..n_states` range — `intern` appends new states, the loop reaches
-    /// them. Returns nothing; fills `state_*`, `accept`, `trans`, `start0`, `startN`.
+    /// Determinize fully. Reserve DEAD = the empty set (state 0), intern the start states,
+    /// then breadth-first compute every `(state, class)` edge. The worklist is the growing
+    /// `0..n_states` range — `intern` appends new states, the loop reaches them. Fills
+    /// `state_*`, `accept`, `trans` (and `utrans` unless `skip_utrans`), `start0/startN/startL`.
     fn run(self: *Det) DetError!void {
         @memset(self.seen, 0);
         @memset(self.state_hash, 0); // empty index (0 = empty slot)
@@ -477,33 +552,43 @@ const Det = struct {
         self.work_len = 0;
         self.work_match = false;
         self.work_match_eoi = false;
+        self.work_match_nl = false;
         std.debug.assert((try self.intern()) == DEAD);
 
-        // Start states: closure of pc 0 with text_start true (offset 0) and false.
-        self.closure(&[_]u32{0}, true);
+        // Start states: closure of pc 0 in the three position contexts. `startL` (line start,
+        // not text start) equals `startN` when the program has no `line_start`, so it costs
+        // nothing there; a line program uses it after a `\n`.
+        self.closure(&[_]u32{0}, true, true); // offset 0: text_start ✓, line_start ✓
         self.start0 = try self.intern();
-        self.closure(&[_]u32{0}, false);
+        self.closure(&[_]u32{0}, false, false); // offset > 0, not after `\n`
         self.startN = try self.intern();
+        self.closure(&[_]u32{0}, false, true); // offset > 0, just after a `\n` (line start)
+        self.startL = try self.intern();
 
-        // Worklist = the growing `0..n_states` range (intern appends, the loop reaches
-        // them). DEAD (the empty set) is NOT special-cased: `collectSeeds(DEAD)` yields
-        // nothing, so its anchored row closes to the empty set (DEAD again), while its
-        // unanchored row still re-seeds the start — exactly the lazy DFA's `ustep` rule.
+        // Worklist = the growing `0..n_states` range (intern appends, the loop reaches them).
+        // DEAD (the empty set) is NOT special-cased: `collectSeeds(DEAD)` yields nothing.
         var sid: u32 = 0;
         while (sid < self.n_states) : (sid += 1) {
             var c: u32 = 0;
             while (c < self.n_classes) : (c += 1) {
                 const rep = self.class_rep[c];
+                // The destination is a **line start** iff the byte just consumed was `\n` — that
+                // is how the anchored DFA carries `(?m)^` context forward (`nl_class` is `maxInt`
+                // for a non-line program, so this is always false there).
+                const at_line_start = (c == self.nl_class);
                 // Anchored row: successors of this state only.
                 const na = self.collectSeeds(sid, rep, 0);
-                self.closure(self.seeds[0..na], false); // a transition is always at sp > 0
+                self.closure(self.seeds[0..na], false, at_line_start); // a transition is always at sp > 0
                 self.trans[sid * self.n_classes + c] = try self.intern();
-                // Unanchored row: this state's successors ∪ a fresh start (`startN`) —
-                // the implicit `(?s:.)*?` prefix. Same interned id space as `trans`.
-                var nu = self.collectSeeds(sid, rep, 0);
-                nu += self.collectSeeds(self.startN, rep, nu);
-                self.closure(self.seeds[0..nu], false);
-                self.utrans[sid * self.n_classes + c] = try self.intern();
+                // Unanchored row: this state's successors ∪ a fresh start (`startN`) — the
+                // implicit `(?s:.)*?` prefix. Skipped for line programs (they run on anchored
+                // restart, and the position-independent re-seed can't carry line-start context).
+                if (!self.skip_utrans) {
+                    var nu = self.collectSeeds(sid, rep, 0);
+                    nu += self.collectSeeds(self.startN, rep, nu);
+                    self.closure(self.seeds[0..nu], false, false);
+                    self.utrans[sid * self.n_classes + c] = try self.intern();
+                }
             }
         }
     }
@@ -856,22 +941,64 @@ fn reverseAlloc(gpa: std.mem.Allocator, insts: []const byte.Inst, class_rep: *co
     };
     rdet.run() catch return error.Unsupported;
 
-    const rtrans = try gpa.dupe(u32, rdet.rtrans[0 .. rdet.n_rstates * nc]);
+    // Minimize the reverse DFA in place (Moore; single table `rtrans`, colour = `raccept`; no
+    // secondary table). Reverse states are plain sets, so this is the biggest win — a prone
+    // `\w+@\w+`'s reverse DFA is ~3251 states. `r_state_hash` is reused as the signature index.
+    var rn = rdet.n_rstates;
+    {
+        const blk = try gpa.alloc(u32, rn);
+        defer gpa.free(blk);
+        const nblk = try gpa.alloc(u32, rn);
+        defer gpa.free(nblk);
+        const rrep = try gpa.alloc(u32, rn);
+        defer gpa.free(rrep);
+        var i: u32 = 0;
+        while (i < rn) : (i += 1) blk[i] = @intFromBool(rdet.raccept[i]);
+        const n_new = minimizeDfa(rdet.rtrans, &.{}, false, rn, nc, blk, nblk, rrep, r_state_hash, r_ht - 1);
+        var b: u32 = 0;
+        while (b < n_new) : (b += 1) { // rrep[b] >= b ⇒ in-place compaction is safe
+            const r = rrep[b];
+            rdet.raccept[b] = rdet.raccept[r];
+            var c: u32 = 0;
+            while (c < nc) : (c += 1) rdet.rtrans[b * nc + c] = blk[rdet.rtrans[r * nc + c]];
+        }
+        rdet.rstart = blk[rdet.rstart];
+        rn = n_new;
+    }
+
+    const rtrans = try gpa.dupe(u32, rdet.rtrans[0 .. rn * nc]);
     errdefer gpa.free(rtrans);
-    const raccept = try gpa.dupe(bool, rdet.raccept[0..rdet.n_rstates]);
+    const raccept = try gpa.dupe(bool, rdet.raccept[0..rn]);
     return .{ .rtrans = rtrans, .raccept = raccept, .rstart = rdet.rstart };
 }
 
-// ── Θ(n²)-proneness: is there a non-accepting cycle reachable from a start? ──────────
+// ── Anchored-restart safety: a non-accepting cycle, OR a long bounded prefix ─────────
 
-/// Whether anchored restart is Θ(n²)-prone on the frozen anchored DFA: can the automaton, from
-/// a start state, consume an **unbounded run staying entirely in non-accepting states** — a
-/// non-accepting cycle reachable from a start? If so, anchored restart re-scans that run from
-/// every start position (`\w+@\w+` on a `@`-free word run), so `find` uses the reverse DFA
-/// instead. If not (every consuming cycle passes an accepting state, e.g. `\w+`/`\d+`),
-/// anchored restart is O(input) and far faster. A back-edge in a 3-colour DFS over the
-/// non-accepting, non-dead subgraph proves a cycle. `color`/`stack`/`iter` are caller buffers
-/// sized to the state count (so the identical code runs at comptime and runtime).
+/// Longest **bounded** non-accepting prefix tolerated on anchored restart before a pattern is
+/// treated like a prone one. Anchored restart (and the prefilter's per-occurrence confirm) scans
+/// up to the longest non-accepting path from a start before it accepts or dies, so the per-restart
+/// cost is O(this). A non-accepting *cycle* makes that path unbounded (Θ(n²)); a long *bounded*
+/// prefix (`a{4000}b`) makes it Θ(n·k) with a large k — still a ReDoS-shaped blowup. Capping it
+/// here routes such patterns to the O(input) reverse two-pass instead. Common patterns sit far
+/// below this (`\w+` ≈ 3, `a{4}b` = 4, `foo\d+` ≈ 3), so they keep the fast anchored restart.
+///
+/// @stable-since: v0.4.0
+const RESTART_SCAN_LIMIT: u32 = 64;
+
+/// Whether anchored restart is unsafe on the frozen anchored DFA — i.e. some start can consume a
+/// **long run staying entirely in non-accepting states** before it accepts or dies. Two shapes
+/// qualify, both routed to the O(input) reverse-DFA find instead of the Θ(per-restart-length)
+/// anchored restart:
+///   * a **non-accepting cycle** reachable from a start (`\w+@\w+`'s `@`-free run) — the run is
+///     *unbounded*, so anchored restart is Θ(n²); a back-edge in the DFS proves it.
+///   * a **long bounded** non-accepting prefix (`a{4000}b`) — no cycle, but the longest
+///     non-accepting path exceeds `RESTART_SCAN_LIMIT`, so anchored restart is Θ(n·k) with a large
+///     k (and the prefilter's per-occurrence confirm re-scans the whole prefix at every dense hit).
+/// Non-prone patterns (`\w+`/`\d+` — their consuming loop is accepting; short literals) keep the
+/// faster anchored restart. A 3-colour DFS over the non-accepting, non-dead subgraph detects the
+/// cycle; `longest[s]` (the longest non-accepting path from `s`, filled post-order — valid since
+/// the subgraph is a DAG once cycles are excluded) detects the long bounded prefix.
+/// `color`/`stack`/`iter`/`longest` are caller buffers sized to the state count (comptime + runtime).
 fn computeProne(
     trans: []const u32,
     accept: []const bool,
@@ -879,9 +1006,11 @@ fn computeProne(
     nc: u32,
     start0: u32,
     startN: u32,
+    startL: u32,
     color: []u8,
     stack: []u32,
     iter: []u32,
+    longest: []u32,
 ) bool {
     const WHITE: u8 = 0;
     const GRAY: u8 = 1;
@@ -889,7 +1018,9 @@ fn computeProne(
     var i: u32 = 0;
     while (i < n_states) : (i += 1) color[i] = WHITE;
 
-    for ([_]u32{ start0, startN }) |start| {
+    // All entry states a search can begin from — including the line-start start (`startL`,
+    // which equals `startN` for a non-line program, so the visited check dedups it).
+    for ([_]u32{ start0, startN, startL }) |start| {
         if (start == DEAD or accept[start] or color[start] != WHITE) continue;
         var top: u32 = 0;
         stack[0] = start;
@@ -911,6 +1042,18 @@ fn computeProne(
                     top += 1;
                 }
             } else {
+                // Finish `s` (post-order): every non-accepting, non-dead successor is now BLACK
+                // (no cycle ⇒ none is still GRAY), so `longest` is settled for them. The longest
+                // non-accepting path from `s` is 1 + the deepest such successor's.
+                var best: u32 = 0;
+                var cc: u32 = 0;
+                while (cc < nc) : (cc += 1) {
+                    const nx = trans[@as(usize, s) * nc + cc];
+                    if (nx == DEAD or accept[nx]) continue;
+                    if (longest[nx] + 1 > best) best = longest[nx] + 1;
+                }
+                longest[s] = best;
+                if (best > RESTART_SCAN_LIMIT) return true; // long bounded non-accepting prefix
                 color[s] = BLACK;
                 top -= 1;
             }
@@ -919,13 +1062,14 @@ fn computeProne(
     return false;
 }
 
-/// `out[pc]` ← does `pc` reach `match` via epsilon edges only, with `text_end` (`$`/`\z`)
-/// **passable** (the end-of-input view)? Drives `accept_eoi`: a closure that parks on a
-/// `text_end` pc whose `reaches_end` is true makes its state accepting at end of input.
-/// `text_start` is treated as *not* passable here (it needs offset 0, which the at-end view
-/// lacks in general — the empty-input `^…$` case is covered by the start closures). A monotone
-/// backward fixpoint; all-false for a `$`-free program. `out` is a caller buffer sized to the
-/// instruction count, so the identical code runs at comptime and runtime.
+/// `out[pc]` ← does `pc` reach `match` via epsilon edges only, with the **end-of-input**
+/// assertions (`text_end` `$`/`\z` **and** `line_end` `(?m)$`, both true at `input.len`)
+/// passable? Drives `accept_eoi`: a closure that parks a pending `$`/`(?m)$` pc whose
+/// `reaches_end` is true makes its state accepting at end of input. `text_start`/`line_start`
+/// are *not* passable here (they need offset 0 / a preceding `\n`, which the at-end view lacks
+/// in general — the empty-input `^…$` case is covered by the start closures). A monotone
+/// backward fixpoint; all-false for a program with no `$`. `out` is a caller buffer sized to
+/// the instruction count, so the identical code runs at comptime and runtime.
 fn computeEndReaches(insts: []const byte.Inst, out: []bool) void {
     const n = insts.len;
     for (out[0..n]) |*v| v.* = false;
@@ -941,7 +1085,7 @@ fn computeEndReaches(insts: []const byte.Inst, out: []bool) void {
                 .jmp => |t| out[t],
                 .split => |s| out[s.a] or out[s.b],
                 .save => out[i + 1], // captures are epsilons
-                .assertion => |k| k == .text_end and out[i + 1], // text_start: not passable at end
+                .assertion => |k| (k == .text_end or k == .line_end) and out[i + 1], // both hold at end
                 .byte_range => false, // consumes a byte — no input left at end
             };
             if (r) {
@@ -950,6 +1094,141 @@ fn computeEndReaches(insts: []const byte.Inst, out: []bool) void {
             }
         }
     }
+}
+
+/// `out[pc]` ← does `pc` reach `match` with **`line_end` `(?m)$` passable but `text_end` NOT**?
+/// This is the view at a *non-final* `\n`, where `(?m)$` holds (the next byte is `\n`) but `$`/`\z`
+/// does not (it is not end-of-input). Drives `accept_before_nl`: a closure that parks a pending
+/// `(?m)$` whose `reaches_nl` is true makes its state accepting just before a `\n`. All-false
+/// unless the program has a `(?m)$`. Caller buffer, comptime + runtime.
+fn computeNlReaches(insts: []const byte.Inst, out: []bool) void {
+    const n = insts.len;
+    for (out[0..n]) |*v| v.* = false;
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var i: usize = n;
+        while (i > 0) {
+            i -= 1;
+            if (out[i]) continue;
+            const r = switch (insts[i]) {
+                .match => true,
+                .jmp => |t| out[t],
+                .split => |s| out[s.a] or out[s.b],
+                .save => out[i + 1],
+                .assertion => |k| k == .line_end and out[i + 1], // only (?m)$ holds before a non-final \n
+                .byte_range => false,
+            };
+            if (r) {
+                out[i] = true;
+                changed = true;
+            }
+        }
+    }
+}
+
+// ── DFA minimization (Moore partition-refinement, dense; comptime + runtime) ─────────
+//
+// After determinization the frozen tables are correct but **not minimal** — distinct DFA states
+// can be language-equivalent (e.g. a Unicode class fans its multi-byte continuations into many
+// states that behave identically once past the lead byte). Moore's algorithm partitions the
+// states by their accept signature, then refines by successor-block signature to a fixpoint;
+// each resulting block is one state of the minimal DFA. It is **results-invariant** (the minimal
+// DFA accepts exactly the same language) and shrinks `ro_data`/heap and the working set. Kept
+// dense (one `trans[state*nc + class]` load in the hot loop — the eager DFA's headline) — only
+// the state *count* drops; the row layout is unchanged. Pure integer ops over caller buffers, so
+// the identical code runs at comptime and runtime, like the determinizers.
+
+/// FNV-1a over a state's equivalence signature: its current block plus the blocks of its `t1`
+/// (and, when `has_t2`, `t2`) successors per class. Two states with different signatures are
+/// provably inequivalent; equal hashes are confirmed by `sigEq`.
+fn sigHashOf(t1: []const u32, t2: []const u32, has_t2: bool, blk: []const u32, s: u32, nc: u32) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    h ^= blk[s];
+    h *%= 0x100000001b3;
+    var c: u32 = 0;
+    while (c < nc) : (c += 1) {
+        h ^= blk[t1[s * nc + c]];
+        h *%= 0x100000001b3;
+    }
+    if (has_t2) {
+        c = 0;
+        while (c < nc) : (c += 1) {
+            h ^= blk[t2[s * nc + c]];
+            h *%= 0x100000001b3;
+        }
+    }
+    return h;
+}
+
+/// Exact equality of two states' equivalence signatures (same block, same successor blocks for
+/// every class in `t1` and — when `has_t2` — `t2`). The collision check behind `sigHashOf`.
+fn sigEqOf(t1: []const u32, t2: []const u32, has_t2: bool, blk: []const u32, r: u32, s: u32, nc: u32) bool {
+    if (blk[r] != blk[s]) return false;
+    var c: u32 = 0;
+    while (c < nc) : (c += 1) if (blk[t1[r * nc + c]] != blk[t1[s * nc + c]]) return false;
+    if (has_t2) {
+        c = 0;
+        while (c < nc) : (c += 1) if (blk[t2[r * nc + c]] != blk[t2[s * nc + c]]) return false;
+    }
+    return true;
+}
+
+/// Moore partition-refinement minimization of a complete dense DFA over caller buffers. `t1` is
+/// the primary transition table (`n_states × nc`); `t2` is an optional secondary table folded into
+/// the signature (the forward DFA's `utrans` for a prone program — `has_t2 = false` ignores it).
+/// `blk` holds the **initial colour** per state on entry (a small dense key combining the accept
+/// flags) and the **final block id** (`remap[old] = new`) on return. States merge iff
+/// indistinguishable under their colour AND every successor block, to a fixpoint, so the minimised
+/// DFA accepts the same language. DEAD (old 0) maps to new 0 (state 0 is scanned first every
+/// round, so it always lands in block 0). `rep[new]` is filled with the lowest old state of each
+/// block (so `rep[b] >= b`, which makes the caller's in-place compaction safe). Returns the
+/// minimised state count. `sig_hash` is an open-addressing index (length a power of two ≥ 2·states,
+/// so the load factor stays ≤ 0.5); `htmask = sig_hash.len - 1`. O(rounds × n_states × nc) with
+/// `rounds` the partition depth (small in practice).
+fn minimizeDfa(
+    t1: []const u32,
+    t2: []const u32,
+    has_t2: bool,
+    n_states: u32,
+    nc: u32,
+    blk: []u32,
+    nblk: []u32,
+    rep: []u32,
+    sig_hash: []u32,
+    htmask: u32,
+) u32 {
+    var cur: u32 = 0;
+    while (true) {
+        for (sig_hash) |*v| v.* = 0; // empty index (0 = empty slot)
+        var next_count: u32 = 0;
+        var s: u32 = 0;
+        while (s < n_states) : (s += 1) {
+            const h = sigHashOf(t1, t2, has_t2, blk, s, nc);
+            var slot: u32 = @as(u32, @truncate(h)) & htmask;
+            while (sig_hash[slot] != 0) : (slot = (slot + 1) & htmask) {
+                const r = sig_hash[slot] - 1;
+                if (sigEqOf(t1, t2, has_t2, blk, r, s, nc)) {
+                    nblk[s] = nblk[r]; // same group as an earlier state this round
+                    break;
+                }
+            } else {
+                sig_hash[slot] = s + 1; // new group: this state is its representative
+                nblk[s] = next_count;
+                next_count += 1;
+            }
+        }
+        @memcpy(blk[0..n_states], nblk[0..n_states]);
+        if (next_count == cur) break; // count stopped growing ⇒ partition is stable
+        cur = next_count;
+    }
+    var b: u32 = 0;
+    while (b < cur) : (b += 1) rep[b] = n_states; // sentinel
+    var s2: u32 = 0;
+    while (s2 < n_states) : (s2 += 1) {
+        if (rep[blk[s2]] == n_states) rep[blk[s2]] = s2;
+    }
+    return cur;
 }
 
 // ── Build (comptime + runtime share one determinizer) ──────────────────────────────
@@ -972,6 +1251,23 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
         while (b < 256) : (b += 1) class_rep[classes.map[b]] = @intCast(b);
     }
 
+    // Which zero-width assertions the program carries (one scan; independent of DFA states).
+    // `text_end`/`text_start` choose the reverse-from-end / anchored-restart paths; a `(?m)` line
+    // anchor switches on anchored restart with line context (`\n` isolated into `nl_class`).
+    var has_text_start = false;
+    var has_text_end = false;
+    var has_line = false;
+    for (bp.insts) |inst| switch (inst) {
+        .assertion => |k| switch (k) {
+            .text_start => has_text_start = true,
+            .text_end => has_text_end = true,
+            .line_start, .line_end => has_line = true,
+            else => {},
+        },
+        else => {},
+    };
+    const nl_class: u32 = if (has_line) classes.map['\n'] else std.math.maxInt(u32);
+
     const ic: u32 = @intCast(bp.insts.len);
     const state_cap = @min(ic + 256, max_states); // pattern-proportional, capped
     const pool_sz = ic *| pool_factor;
@@ -985,9 +1281,14 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     defer gpa.free(accept_buf);
     const accept_eoi_buf = try gpa.alloc(bool, state_cap);
     defer gpa.free(accept_eoi_buf);
+    const accept_before_nl_buf = try gpa.alloc(bool, state_cap);
+    defer gpa.free(accept_before_nl_buf);
     const reaches_end = try gpa.alloc(bool, ic);
     defer gpa.free(reaches_end);
     computeEndReaches(bp.insts, reaches_end);
+    const reaches_nl = try gpa.alloc(bool, ic);
+    defer gpa.free(reaches_nl);
+    if (has_line) computeNlReaches(bp.insts, reaches_nl) else @memset(reaches_nl, false);
     const trans_buf = try gpa.alloc(u32, @as(usize, state_cap) * nc);
     defer gpa.free(trans_buf);
     const utrans_buf = try gpa.alloc(u32, @as(usize, state_cap) * nc);
@@ -1012,10 +1313,14 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
         .class_rep = &class_rep,
         .n_classes = nc,
         .reaches_end = reaches_end,
+        .reaches_nl = reaches_nl,
+        .nl_class = nl_class,
+        .skip_utrans = true, // phase 1: trans only (utrans is built in phase 2, prone-only — below)
         .state_off = state_off,
         .state_len = state_len,
         .accept = accept_buf,
         .accept_eoi = accept_eoi_buf,
+        .accept_before_nl = accept_before_nl_buf,
         .trans = trans_buf,
         .utrans = utrans_buf,
         .pc_pool = pc_pool,
@@ -1026,36 +1331,90 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
         .state_hash = state_hash,
         .htmask = ht - 1,
     };
-    det.run() catch return error.Unsupported;
+    det.run() catch return error.Unsupported; // phase 1: anchored `trans` only
 
-    // Keep only the used prefix of the anchored table + accept flags (right-sized heap copies).
-    const n = det.n_states;
+    // Anchored-restart safety on the **unminimized** trans-only DFA: a non-accepting cycle, OR a
+    // long bounded non-accepting prefix (`computeProne`). It is a language property (preserved by
+    // minimization and unaffected by the utrans phase), so computing it on the trans-only DFA is
+    // valid. `\w+@\w+`'s pre-`@` run is prone; `\w+`/`a{4}b` are not.
+    const prone = blk: {
+        const pc = det.n_states;
+        const pcolor = try gpa.alloc(u8, pc);
+        defer gpa.free(pcolor);
+        const pstack = try gpa.alloc(u32, pc);
+        defer gpa.free(pstack);
+        const piter = try gpa.alloc(u32, pc);
+        defer gpa.free(piter);
+        const plong = try gpa.alloc(u32, pc);
+        defer gpa.free(plong);
+        break :blk computeProne(det.trans[0 .. pc * nc], det.accept, pc, nc, det.start0, det.startN, det.startL, pcolor, pstack, piter, plong);
+    };
+
+    // Quadratic-immunity gate for line anchors: a *prone* `(?m)` pattern (an unbounded/long run
+    // before the anchor, e.g. `(?m)\w+$`, `(?m).*^x`) can't run linearly on anchored restart, and
+    // the reverse fix can't carry line context — so decline it to the linear Pike VM. Non-prone
+    // line patterns (`(?m)^\w+`, `(?m)foo$`) stay on anchored restart, O(input).
+    if (has_line and prone) return error.Unsupported;
+
+    // **Phase 2 (prone, non-line only): re-determinize with the unanchored `utrans` table** for the
+    // O(input) reverse two-pass. A NON-prone pattern runs entirely on anchored restart (`trans`),
+    // so it never needs `utrans` — skipping it keeps the build smaller/faster (the `.*?`-prefix
+    // `utrans` states are the bulk for many patterns) AND lets medium counted reps (`a{64}b`) fit
+    // the eager DFA instead of overflowing on unused `utrans` states. A prone pattern whose
+    // `utrans` overflows the fixed bounds declines here and falls to the (unbounded) lazy DFA.
+    if (prone) { // ⟹ !has_line (declined above)
+        det.skip_utrans = false;
+        det.n_states = 0;
+        det.pool_len = 0;
+        det.run() catch return error.Unsupported;
+    }
+
+    // Minimize the forward DFA in place (Moore partition-refinement; results-invariant — the
+    // minimal DFA accepts the same language). Only the state *count* drops; the dense row layout
+    // (one `trans[s*nc + c]` load, the hot loop) is untouched. `has_t2 = prone` so `utrans` is in
+    // the signature iff it was built/consulted. `state_hash` is reused as the signature index.
+    const n0 = det.n_states;
+    var n = n0;
+    {
+        const blk = try gpa.alloc(u32, n0);
+        defer gpa.free(blk);
+        const nblk = try gpa.alloc(u32, n0);
+        defer gpa.free(nblk);
+        const rep = try gpa.alloc(u32, n0);
+        defer gpa.free(rep);
+        var i: u32 = 0;
+        while (i < n0) : (i += 1)
+            blk[i] = @as(u32, @intFromBool(det.accept[i])) |
+                (@as(u32, @intFromBool(det.accept_eoi[i])) << 1) |
+                (@as(u32, @intFromBool(det.accept_before_nl[i])) << 2);
+        const n_new = minimizeDfa(det.trans, det.utrans, prone, n0, nc, blk, nblk, rep, state_hash, ht - 1);
+        var b: u32 = 0;
+        while (b < n_new) : (b += 1) { // rep[b] >= b ⇒ writing row b while reading row rep[b] is in-place safe
+            const r = rep[b];
+            det.accept[b] = det.accept[r];
+            det.accept_eoi[b] = det.accept_eoi[r];
+            det.accept_before_nl[b] = det.accept_before_nl[r];
+            var c: u32 = 0;
+            while (c < nc) : (c += 1) {
+                det.trans[b * nc + c] = blk[det.trans[r * nc + c]];
+                if (prone) det.utrans[b * nc + c] = blk[det.utrans[r * nc + c]];
+            }
+        }
+        det.start0 = blk[det.start0];
+        det.startN = blk[det.startN];
+        det.startL = blk[det.startL];
+        n = n_new;
+    }
+
+    // Keep only the used prefix of the (now minimized) tables + accept flags (right-sized copies).
     const trans = try gpa.dupe(u32, det.trans[0 .. n * nc]);
     errdefer gpa.free(trans);
     const accept = try gpa.dupe(bool, det.accept[0..n]);
     errdefer gpa.free(accept);
     const accept_eoi = try gpa.dupe(bool, det.accept_eoi[0..n]);
     errdefer gpa.free(accept_eoi);
-
-    // Θ(n²)-proneness of anchored restart — decides which auxiliary tables are built. `prone`
-    // (a non-accepting cycle reachable from a start) gets the forward+reverse two-pass; a
-    // `text_end` (`$`/`\z`) program — whose match end is pinned at `input.len` — gets the
-    // reverse-DFA-from-end pass (`end_anchored`, below). Both are O(input), neither uses
-    // anchored restart, so a trailing `$` is no longer the Θ(n²) hazard it once was.
-    var has_text_end = false;
-    for (bp.insts) |inst| switch (inst) {
-        .assertion => |k| if (k == .text_end) {
-            has_text_end = true;
-        },
-        else => {},
-    };
-    const pcolor = try gpa.alloc(u8, n);
-    defer gpa.free(pcolor);
-    const pstack = try gpa.alloc(u32, n);
-    defer gpa.free(pstack);
-    const piter = try gpa.alloc(u32, n);
-    defer gpa.free(piter);
-    const prone = !has_text_end and computeProne(trans, accept, n, nc, det.start0, det.startN, pcolor, pstack, piter);
+    const accept_before_nl = try gpa.dupe(bool, det.accept_before_nl[0..n]);
+    errdefer gpa.free(accept_before_nl);
 
     // The unanchored `utrans` table and the reverse DFA are consulted **only** on the prone
     // arm (one-pass `isMatch` + reverse-DFA `find`). A non-prone pattern runs entirely on
@@ -1063,13 +1422,6 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     // DFA's memory on the common case (`\w+` skips ~850 KB of utrans + reverse). A `text_start`
     // program additionally has no reverse table (its reverse transitions are position-dependent),
     // so a prone `text_start` pattern keeps anchored restart.
-    var has_text_start = false;
-    for (bp.insts) |inst| switch (inst) {
-        .assertion => |k| if (k == .text_start) {
-            has_text_start = true;
-        },
-        else => {},
-    };
     const utrans: []const u32 = if (prone) try gpa.dupe(u32, det.utrans[0 .. n * nc]) else &.{};
     errdefer if (prone) gpa.free(utrans);
     // A trailing-`$` pattern (every match ends at input end — `supports` declined mixed `$`,
@@ -1093,8 +1445,11 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
         .utrans = utrans,
         .accept = accept,
         .accept_eoi = accept_eoi,
+        .accept_before_nl = accept_before_nl,
         .start0 = det.start0,
         .startN = det.startN,
+        .startL = det.startL,
+        .has_line_anchor = has_line,
         .anchored_start = h.analysis.anchored_start,
         .prone = prone,
         .has_text_start = has_text_start,
@@ -1115,7 +1470,20 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
 ///
 /// @stable-since: v0.3.0
 pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
-    if (!comptime supports(h)) @compileError("edfa: HIR is not byte/DFA-lowerable (\\X, \\b/\\B, or a non-text_start anchor)");
+    if (!comptime supports(h)) @compileError("edfa: HIR is not byte/DFA-lowerable (\\X, \\b/\\B, or a mixed `$`)");
+    // Comptime-size guard (DX): determinizing a big Unicode class (`\w`, `\p{L}`) or `.` (the whole
+    // scalar space) at compile time exhausts the const-eval allocator — an opaque `OutOfMemory` —
+    // long before `max_states`. Refuse those up front with a clear message instead. `auto` never
+    // trips this: its `tinyForComptimeEdfa` gate keeps such patterns on the NFA at comptime and uses
+    // the eager DFA for them only at *runtime* (`buildAlloc`), where there is no such limit. This
+    // only guards a direct `compileComptimeWith(backends.edfa, …)`. Thresholds are generous, so
+    // moderate ASCII patterns (the CTRE-lane sweet spot) still bake fine.
+    comptime {
+        if (h.ranges.len > 32 or h.nodes.len > 96 or h.literals.len > 64)
+            @compileError("edfa.buildComptime: pattern too large for comptime determinization (big Unicode class) — use buildAlloc at runtime, or backends.dfa");
+        for (h.nodes) |n| if (n.tag == .any)
+            @compileError("edfa.buildComptime: `.` lowers to the whole-scalar-space automaton, too large at comptime — use buildAlloc at runtime, or backends.dfa");
+    }
     const bp = comptime byte.buildComptime(h);
     const classes = comptime byte.byteClasses(&bp);
     const nc = classes.count;
@@ -1125,20 +1493,42 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
         while (b < 256) : (b += 1) class_rep[classes.map[b]] = @intCast(b);
     }
 
+    // Which zero-width assertions the program carries (see `buildAlloc`).
+    comptime var has_text_start = false;
+    comptime var has_text_end = false;
+    comptime var has_line = false;
+    comptime {
+        for (bp.insts) |inst| switch (inst) {
+            .assertion => |k| switch (k) {
+                .text_start => has_text_start = true,
+                .text_end => has_text_end = true,
+                .line_start, .line_end => has_line = true,
+                else => {},
+            },
+            else => {},
+        };
+    }
+    const nl_class: u32 = if (has_line) classes.map['\n'] else std.math.maxInt(u32);
+
     const ic: u32 = bp.insts.len;
-    // Determinization closure work is ~states × classes × (split-tree traversal), and the
-    // reverse determinization adds a comparable pass; size the quota for both. Large Unicode
-    // classes are slow to determinize at comptime but produce a tiny table — the CTRE-lane
-    // trade (compile-time cost, small `ro_data`).
-    @setEvalBranchQuota(@intCast(@min(400_000 + @as(u64, ic) * 800, std.math.maxInt(u32))));
+    // Determinization closure work is ~states × classes × (split-tree traversal); a prone pattern
+    // determinizes twice (trans-only, then again with `utrans`) and the reverse determinization
+    // adds a comparable pass — size the quota for all of them. Large Unicode classes are slow to
+    // determinize at comptime but produce a tiny table — the CTRE-lane trade.
+    @setEvalBranchQuota(@intCast(@min(600_000 + @as(u64, ic) * 1600, std.math.maxInt(u32))));
 
     const state_cap = @min(ic + 256, max_states); // pattern-proportional, capped
     comptime var state_off: [state_cap]u32 = undefined;
     comptime var state_len: [state_cap]u32 = undefined;
     comptime var accept_buf: [state_cap]bool = undefined;
     comptime var accept_eoi_buf: [state_cap]bool = undefined;
+    comptime var accept_before_nl_buf: [state_cap]bool = undefined;
     comptime var reaches_end: [ic]bool = undefined;
     comptime computeEndReaches(bp.insts, &reaches_end);
+    comptime var reaches_nl: [ic]bool = undefined;
+    comptime {
+        if (has_line) computeNlReaches(bp.insts, &reaches_nl) else @memset(&reaches_nl, false);
+    }
     comptime var trans_buf: [state_cap * @as(usize, nc)]u32 = undefined;
     comptime var utrans_buf: [state_cap * @as(usize, nc)]u32 = undefined;
     comptime var pc_pool: [ic * pool_factor]u32 = undefined;
@@ -1155,10 +1545,14 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
         .class_rep = &class_rep,
         .n_classes = nc,
         .reaches_end = &reaches_end,
+        .reaches_nl = &reaches_nl,
+        .nl_class = nl_class,
+        .skip_utrans = true, // phase 1: trans only (utrans built in phase 2, prone-only — below)
         .state_off = &state_off,
         .state_len = &state_len,
         .accept = &accept_buf,
         .accept_eoi = &accept_eoi_buf,
+        .accept_before_nl = &accept_before_nl_buf,
         .trans = &trans_buf,
         .utrans = &utrans_buf,
         .pc_pool = &pc_pool,
@@ -1169,44 +1563,76 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
         .state_hash = &state_hash,
         .htmask = ht - 1,
     };
-    det.run() catch @compileError("edfa: pattern's DFA exceeds max_states; use the runtime lazy DFA (backends.dfa) instead");
+    det.run() catch @compileError("edfa: pattern's DFA exceeds max_states; use the runtime lazy DFA (backends.dfa) instead"); // phase 1: anchored `trans` only
 
-    const n = det.n_states;
-    const final_trans = trans_buf[0 .. n * nc].*;
-    const final_accept = accept_buf[0..n].*;
-    const final_accept_eoi = accept_eoi_buf[0..n].*;
-
-    // Θ(n²)-proneness of anchored restart — decides which auxiliary tables are built (the
-    // unanchored `utrans` and the reverse DFA are consulted only on the prone / `end_anchored`
-    // arms, so a plain non-prone pattern bakes neither: only `trans` reaches `ro_data`). A
-    // `text_end` program takes the O(input) reverse-DFA-from-end pass (`end_anchored`), not
-    // anchored restart.
-    comptime var has_text_end = false;
-    comptime {
-        for (bp.insts) |inst| switch (inst) {
-            .assertion => |k| if (k == .text_end) {
-                has_text_end = true;
-            },
-            else => {},
-        };
-    }
+    // Anchored-restart safety on the trans-only DFA (a non-accepting cycle or a long bounded
+    // prefix; a language property — see `buildAlloc`). Decides whether `utrans` is needed.
     comptime var pcolor: [state_cap]u8 = undefined;
     comptime var pstack: [state_cap]u32 = undefined;
     comptime var piter: [state_cap]u32 = undefined;
-    const prone = !has_text_end and computeProne(&final_trans, &final_accept, n, nc, det.start0, det.startN, &pcolor, &pstack, &piter);
+    comptime var plong: [state_cap]u32 = undefined;
+    const prone = computeProne(trans_buf[0 .. det.n_states * nc], accept_buf[0..det.n_states], det.n_states, nc, det.start0, det.startN, det.startL, &pcolor, &pstack, &piter, &plong);
+    // A prone `(?m)` line pattern can't run linearly on anchored restart and the reverse fix can't
+    // carry line context — decline it (a `@compileError`; `auto` only calls `buildComptime` for
+    // tiny patterns that never reach this).
+    if (has_line and prone) @compileError("edfa: prone (?m) line pattern; route to the Pike VM (use compileComptime, not edfa directly)");
+
+    // Phase 2 (prone, non-line only): re-determinize WITH the unanchored `utrans` table for the
+    // O(input) reverse two-pass. A non-prone pattern runs on anchored restart (`trans` only), so it
+    // skips this — keeping the comptime table small AND matching the runtime build. **At comptime
+    // there is no lazy-DFA handoff** (the lazy DFA is runtime-only), so a prone pattern whose
+    // `utrans` exceeds the fixed bound is a `@compileError`. `auto` never trips this: its
+    // `tinyForComptimeEdfa` gate only calls `buildComptime` for patterns that provably fit both
+    // phases; this fires only for a *direct* `compileComptimeWith(backends.edfa, …)` on a too-large
+    // pattern, telling the user to use the runtime path.
+    if (prone) { // ⟹ !has_line (declined above)
+        det.skip_utrans = false;
+        det.n_states = 0;
+        det.pool_len = 0;
+        det.run() catch @compileError("edfa: pattern's DFA (with the unanchored table) exceeds max_states at comptime — there is no lazy-DFA handoff at comptime (it is runtime-only); use buildAlloc at runtime, or backends.dfa");
+    }
+    const n0 = det.n_states;
+
+    // Minimize the forward DFA in place (Moore partition-refinement; results-invariant; the dense
+    // row layout is untouched, only the state count drops). `has_t2 = prone` so `utrans` joins the
+    // signature iff it will be consulted. `state_hash` is reused as the signature index.
+    comptime var blk: [state_cap]u32 = undefined;
+    comptime var nblk: [state_cap]u32 = undefined;
+    comptime var rep: [state_cap]u32 = undefined;
+    const n = comptime min_fwd: {
+        var i: u32 = 0;
+        while (i < n0) : (i += 1)
+            blk[i] = @as(u32, @intFromBool(accept_buf[i])) |
+                (@as(u32, @intFromBool(accept_eoi_buf[i])) << 1) |
+                (@as(u32, @intFromBool(accept_before_nl_buf[i])) << 2);
+        const n_new = minimizeDfa(&trans_buf, &utrans_buf, prone, n0, nc, &blk, &nblk, &rep, &state_hash, ht - 1);
+        var b: u32 = 0;
+        while (b < n_new) : (b += 1) { // rep[b] >= b ⇒ in-place compaction is safe
+            const r = rep[b];
+            accept_buf[b] = accept_buf[r];
+            accept_eoi_buf[b] = accept_eoi_buf[r];
+            accept_before_nl_buf[b] = accept_before_nl_buf[r];
+            var c: u32 = 0;
+            while (c < nc) : (c += 1) {
+                trans_buf[b * nc + c] = blk[trans_buf[r * nc + c]];
+                if (prone) utrans_buf[b * nc + c] = blk[utrans_buf[r * nc + c]];
+            }
+        }
+        det.start0 = blk[det.start0];
+        det.startN = blk[det.startN];
+        det.startL = blk[det.startL];
+        break :min_fwd n_new;
+    };
+
+    const final_trans = trans_buf[0 .. n * nc].*;
+    const final_accept = accept_buf[0..n].*;
+    const final_accept_eoi = accept_eoi_buf[0..n].*;
+    const final_accept_before_nl = accept_before_nl_buf[0..n].*;
     const final_utrans = if (prone) utrans_buf[0 .. n * nc].* else [_]u32{};
 
-    // Reverse frozen DFA — only for a prone, assertion-free program (a `text_start` keeps
-    // `find` on anchored restart). Determinized into ro_data at comptime via the same `RDet`.
-    comptime var has_text_start = false;
-    comptime {
-        for (bp.insts) |inst| switch (inst) {
-            .assertion => |k| if (k == .text_start) {
-                has_text_start = true;
-            },
-            else => {},
-        };
-    }
+    // Reverse frozen DFA — only for a prone, assertion-free program or a trailing-`$`
+    // (`end_anchored`) program (a `text_start` keeps `find` on anchored restart). Determinized
+    // into ro_data at comptime via the same `RDet`.
     const end_anchored = has_text_end and h.analysis.anchored_end and !has_text_start;
     const rev_built = (prone or end_anchored) and !has_text_start;
     const r_state_cap = @min(ic + 256, max_states);
@@ -1254,7 +1680,27 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
         .r_htmask = r_ht - 1,
     };
     if (rev_built) rdet.run() catch @compileError("edfa: reverse DFA exceeds bounds; use the runtime lazy DFA (backends.dfa) instead");
-    const rn = rdet.n_rstates;
+
+    // Minimize the reverse DFA in place (Moore; colour = `raccept`, no secondary table) — the
+    // biggest table, so the biggest `ro_data` saving. `r_state_hash` is reused as the index.
+    comptime var rblk: [r_state_cap]u32 = undefined;
+    comptime var rnblk: [r_state_cap]u32 = undefined;
+    comptime var rrep: [r_state_cap]u32 = undefined;
+    const rn: u32 = if (rev_built) comptime min_rev: {
+        const rn0 = rdet.n_rstates;
+        var i: u32 = 0;
+        while (i < rn0) : (i += 1) rblk[i] = @intFromBool(raccept_buf[i]);
+        const n_new = minimizeDfa(&rtrans_buf, &.{}, false, rn0, nc, &rblk, &rnblk, &rrep, &r_state_hash, r_ht - 1);
+        var b: u32 = 0;
+        while (b < n_new) : (b += 1) { // rrep[b] >= b ⇒ in-place compaction is safe
+            const r = rrep[b];
+            raccept_buf[b] = raccept_buf[r];
+            var c: u32 = 0;
+            while (c < nc) : (c += 1) rtrans_buf[b * nc + c] = rblk[rtrans_buf[r * nc + c]];
+        }
+        rdet.rstart = rblk[rdet.rstart];
+        break :min_rev n_new;
+    } else 0;
     const final_rtrans = if (rev_built) rtrans_buf[0 .. rn * nc].* else [_]u32{};
     const final_raccept = if (rev_built) raccept_buf[0..rn].* else [_]bool{};
 
@@ -1265,8 +1711,11 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
         .utrans = &final_utrans,
         .accept = &final_accept,
         .accept_eoi = &final_accept_eoi,
+        .accept_before_nl = &final_accept_before_nl,
         .start0 = det.start0,
         .startN = det.startN,
+        .startL = det.startL,
+        .has_line_anchor = has_line,
         .anchored_start = h.analysis.anchored_start,
         .prone = prone,
         .has_text_start = has_text_start,
@@ -1284,6 +1733,7 @@ pub fn freeProgram(gpa: std.mem.Allocator, program: *Program) void {
     if (program.prone) gpa.free(program.utrans); // empty (never allocated) for non-prone
     gpa.free(program.accept);
     gpa.free(program.accept_eoi);
+    gpa.free(program.accept_before_nl);
     if (program.rev_built) {
         gpa.free(program.rtrans);
         gpa.free(program.raccept);
@@ -1322,16 +1772,33 @@ pub const Scratch = struct {
 
 // ── Matching (a bare table walk) ────────────────────────────────────────────────────
 
+/// Is `state` accepting at position `pos`? Mid-input via a `match` pc (`accept`); at
+/// end-of-input via a pending `$`/`(?m)$` (`accept_eoi`); or, for a `(?m)$` line program, just
+/// before a `\n` via a pending `line_end` (`accept_before_nl`, a one-byte lookahead). For a
+/// `$`-free program `accept_eoi == accept` and `has_line_anchor` is false, so only `accept` matters.
+inline fn accepts(program: *const Program, state: u32, input: []const u8, pos: usize) bool {
+    if (program.accept[state]) return true;
+    if (pos == input.len) return program.accept_eoi[state];
+    if (program.has_line_anchor and input[pos] == '\n') return program.accept_before_nl[state];
+    return false;
+}
+
 /// Run the DFA anchored at `s`: the leftmost-first match end reached from `s`, or null
 /// if no match begins exactly at `s`. With `earliest`, returns as soon as any accepting
 /// state is entered; otherwise it scans on, keeping the last accepting position — which,
-/// thanks to the priority/cut determinization, is the leftmost-first end. A state counts as
-/// accepting **at `input.len`** when `accept_eoi` holds (a pending `text_end` `$`/`\z`); for a
-/// `$`-free program `accept_eoi == accept`, so that extra term is a no-op.
+/// thanks to the priority/cut determinization, is the leftmost-first end. Acceptance is
+/// position-aware (`accepts`): end-of-input (`$`/`\z`/`(?m)$`) and before-a-`\n` (`(?m)$`)
+/// count too. For a `(?m)^` line program the **start state** is chosen by the preceding byte:
+/// `start0` at offset 0, `startL` just after a `\n` (a line start), else `startN`.
 fn runAnchored(program: *const Program, input: []const u8, s: usize, earliest: bool) ?usize {
     const nc = program.n_classes;
-    var state = if (s == 0) program.start0 else program.startN;
-    var match_end: ?usize = if (program.accept[state] or (s == input.len and program.accept_eoi[state])) s else null;
+    var state = if (s == 0)
+        program.start0
+    else if (program.has_line_anchor and input[s - 1] == '\n')
+        program.startL
+    else
+        program.startN;
+    var match_end: ?usize = if (accepts(program, state, input, s)) s else null;
     if (match_end != null and earliest) return match_end;
 
     var pos = s;
@@ -1340,7 +1807,7 @@ fn runAnchored(program: *const Program, input: []const u8, s: usize, earliest: b
         state = program.trans[state * nc + class];
         if (state == DEAD) break;
         pos += 1;
-        if (program.accept[state] or (pos == input.len and program.accept_eoi[state])) {
+        if (accepts(program, state, input, pos)) {
             match_end = pos;
             if (earliest) break;
         }
@@ -1894,6 +2361,163 @@ test "end_anchored / anchored_start flags route `$` patterns correctly" {
         try testing.expectEqual(c.anchored_start, prog.anchored_start);
         if (prog.end_anchored) try testing.expect(prog.rev_built); // end_anchored ⟹ reverse table built
     }
+}
+
+// ── Minimization (Moore): the built DFA is minimal; reverting leaves mergeable states ──
+
+/// Re-run partition refinement on a built `Program` and return the block count. If the program
+/// is minimal this equals its state count; if minimization were reverted, a pattern with
+/// determinization redundancy would have mergeable states and this returns fewer.
+fn forwardBlocks(gpa: std.mem.Allocator, prog: *const Program) !u32 {
+    const n: u32 = @intCast(prog.accept.len);
+    const nc = prog.n_classes;
+    const blk = try gpa.alloc(u32, n);
+    defer gpa.free(blk);
+    const nblk = try gpa.alloc(u32, n);
+    defer gpa.free(nblk);
+    const rep = try gpa.alloc(u32, n);
+    defer gpa.free(rep);
+    const ht = htCap(n);
+    const sig = try gpa.alloc(u32, ht);
+    defer gpa.free(sig);
+    const has_t2 = prog.utrans.len > 0; // utrans is built (and consulted) only for prone programs
+    var i: u32 = 0;
+    while (i < n) : (i += 1)
+        blk[i] = @as(u32, @intFromBool(prog.accept[i])) | (@as(u32, @intFromBool(prog.accept_eoi[i])) << 1);
+    return minimizeDfa(prog.trans, prog.utrans, has_t2, n, nc, blk, nblk, rep, sig, ht - 1);
+}
+
+fn reverseBlocks(gpa: std.mem.Allocator, prog: *const Program) !u32 {
+    const n: u32 = @intCast(prog.raccept.len);
+    const nc = prog.n_classes;
+    const blk = try gpa.alloc(u32, n);
+    defer gpa.free(blk);
+    const nblk = try gpa.alloc(u32, n);
+    defer gpa.free(nblk);
+    const rep = try gpa.alloc(u32, n);
+    defer gpa.free(rep);
+    const ht = htCap(n);
+    const sig = try gpa.alloc(u32, ht);
+    defer gpa.free(sig);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) blk[i] = @intFromBool(prog.raccept[i]);
+    return minimizeDfa(prog.rtrans, &.{}, false, n, nc, blk, nblk, rep, sig, ht - 1);
+}
+
+test "built eager DFA is minimal (Moore); a redundant pattern is genuinely reduced (revert-failing)" {
+    const gpa = testing.allocator;
+    // Post-condition of minimization: re-refining a built Program finds no mergeable states, so
+    // the block count equals the state count. A pattern with determinization redundancy (`abc|dbc`
+    // keeps the 'a'- and 'd'-tails distinct by pc-list even though they are language-equivalent)
+    // would, if minimization were reverted, have mergeable states → fewer blocks than states →
+    // these assertions fail. Covers plain, prone (utrans in the signature), and end_anchored
+    // (reverse table) shapes, at the forward and reverse DFAs.
+    const patterns = [_][]const u8{
+        "abc|dbc",  "a(?:bc|dc)", "foo|boo|zoo", "\\w+",    "\\d+",
+        "[a-z]+",   "\\p{L}+",    "\\w+@\\w+",   "[a-z]+$", "\\w+@\\w+$",
+    };
+    for (patterns) |p| {
+        var prog = buildFrom(gpa, p) catch |e| switch (e) {
+            error.Unsupported => continue,
+            else => return e,
+        };
+        defer freeProgram(gpa, &prog);
+        try testing.expectEqual(@as(u32, @intCast(prog.accept.len)), try forwardBlocks(gpa, &prog));
+        if (prog.rev_built)
+            try testing.expectEqual(@as(u32, @intCast(prog.raccept.len)), try reverseBlocks(gpa, &prog));
+    }
+
+    // `abc|dbc` is genuinely non-minimal before minimization (the determinizer interns by pc-list,
+    // so the 'a'-tail and 'd'-tail stay separate): its minimal anchored DFA is 5 states
+    // (start, {a|d}, {b}, accept, DEAD). This exact count is what makes the property test above
+    // revert-failing — without minimization the build would keep the extra tail states.
+    var prog = try buildFrom(gpa, "abc|dbc");
+    defer freeProgram(gpa, &prog);
+    try testing.expectEqual(@as(usize, 5), prog.accept.len);
+}
+
+// ── Line anchors (?m)^ / (?m)$ — anchored restart with line context ─────────────────
+
+test "line anchors: (?m)^ / (?m)$ spans (anchored restart, \\n-isolated class)" {
+    try expectFind("(?m)^foo", "x\nfoo", "foo"); // line start after a \n
+    try expectNoMatch("(?m)^foo", "xfoo"); // not a line start
+    try expectFind("(?m)^foo", "foo", "foo"); // line start at offset 0
+    try expectFind("(?m)^\\w+", "  \nbar baz", "bar"); // first word on a line
+    try expectFind("(?m)bar$", "bar\nx", "bar"); // line end just before a \n
+    try expectFind("(?m)bar$", "x bar", "bar"); // line end at input end
+    try expectNoMatch("(?m)bar$", "barx"); // neither before \n nor at end
+    try expectFind("(?m)^abc$", "x\nabc\ny", "abc"); // a whole line
+    try expectFind("(?m)^abc$", "abc", "abc");
+    try expectNoMatch("(?m)^abc$", "abcd");
+    try expectFind("(?m)^$", "a\n\nb", ""); // an empty line (between the two \n)
+    try expectFind("(?m)^\\w+", "αβ\nγδ", "αβ"); // multibyte, byte-stepped
+}
+
+test "differential vs Pike VM: (?m) line-anchor corpus (spans must agree)" {
+    const patterns = [_][]const u8{
+        "(?m)^foo", "(?m)^\\w+", "(?m)^\\d+",       "(?m)^abc$", "(?m)foo$",
+        "(?m)\\w$", "(?m)^.",    "(?m).$",          "(?m)^$",    "(?m)^[a-z]+",
+        "(?m)^x$",  "(?m)^α",    "(?m)β$",          "(?m)^(foo|bar)", "\\A(?m)^x",
+    };
+    const inputs = [_][]const u8{
+        "",           "abc",            "x\nfoo",   "foo\nbar\nbaz",
+        "\nabc",      "abc\n",          "\n\n\n",   "a\n\nb",
+        "hello\nfoo", "line1\nline2\n", "  \n  ",   "αβ\nγ",
+        "foo",        "bar\n",          "x\ny\nz",  "no newlines here",
+    };
+    for (patterns) |p| try agreesWithPikeVM(testing.allocator, p, &inputs);
+}
+
+test "prone (?m) line patterns are declined (Unsupported) → auto routes them to the Pike VM" {
+    const gpa = testing.allocator;
+    // An unbounded run before the line anchor makes anchored restart Θ(n²); since the reverse-DFA
+    // fix can't carry line context, the eager DFA declines these (and `auto` falls to the Pike VM).
+    for ([_][]const u8{ "(?m)\\w+$", "(?m)[a-z]+$", "(?m).*^x" }) |pat| {
+        var diag: compile.Diagnostic = .{};
+        const ast = try compile.parse(gpa, pat, &diag);
+        defer ast.deinit(gpa);
+        const hh = try hir.buildAlloc(gpa, ast, .{});
+        defer hir.deinitHir(gpa, hh);
+        try testing.expect(supports(hh)); // the capability gate admits it…
+        try testing.expectError(error.Unsupported, buildAlloc(gpa, hh, .{})); // …but the build declines (prone)
+    }
+}
+
+test "non-prone (?m) line patterns are linear at scale (no Θ(n²))" {
+    const gpa = testing.allocator;
+    const N = 1 << 18; // 262144
+    const buf = try gpa.alloc(u8, N);
+    defer gpa.free(buf);
+    for ([_][]const u8{ "(?m)^\\w+", "(?m)^foo", "(?m)foo$" }) |pat| {
+        var re = try Compiled.init(pat);
+        defer re.deinit();
+        @memset(buf, 'a'); // one logical line, no \n
+        _ = re.find(buf);
+        _ = E.isMatch(&re.program, &re.scratch, buf, .{});
+        var i: usize = 0; // many short lines: lots of line starts, still O(n) total
+        while (i < N) : (i += 1) buf[i] = if (i % 8 == 7) '\n' else 'a';
+        _ = re.find(buf);
+        _ = E.isMatch(&re.program, &re.scratch, buf, .{});
+    }
+}
+
+test "line anchors match at COMPTIME (anchored restart with line context in const-eval)" {
+    // A small ASCII line pattern (a big Unicode class like `\w` would exhaust the comptime
+    // allocator — the CTRE lane is for small, eager-friendly patterns).
+    const got = comptime blk: {
+        @setEvalBranchQuota(20_000_000);
+        const a = compile.compile("(?m)^[a-z]+");
+        const hh = switch (hir.buildComptime(a, .{})) {
+            .ok => |x| x,
+            .fail => @compileError("hir"),
+        };
+        const program = buildComptime(hh, .{});
+        var sc = Scratch{};
+        const input = "  \nabc def"; // line start at offset 3 (after the \n); offset 0 is a space
+        const m = E.find(&program, &sc, input, .{}) orelse @compileError("no (?m)^ match at comptime");
+        break :blk m.slice(input);
+    };
+    try testing.expectEqualStrings("abc", got);
 }
 
 test {

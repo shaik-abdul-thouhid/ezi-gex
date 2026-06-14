@@ -762,6 +762,7 @@ pub const ByteClasses = struct {
 pub fn byteClasses(prog: *const Program) ByteClasses {
     // `boundary[b]` ⇒ a class boundary falls between byte `b` and `b + 1`.
     var boundary: [256]bool = @splat(false);
+    var has_line = false;
     for (prog.insts) |inst| {
         switch (inst) {
             .byte_range => |r| {
@@ -769,8 +770,19 @@ pub fn byteClasses(prog: *const Program) ByteClasses {
                 boundary[r.range.hi] = true;
                 if (r.range.lo > 0) boundary[r.range.lo - 1] = true;
             },
+            // A `(?m)` line anchor (`line_start`/`line_end`) is position-dependent on `\n`, so
+            // the DFA determinizer must be able to tell a `\n` edge from any other byte. Force
+            // `\n` (0x0A) into its own equivalence class by splitting the boundaries around it.
+            // Only triggered for line-anchor programs, so non-line patterns' classes are unchanged.
+            .assertion => |k| if (k == .line_start or k == .line_end) {
+                has_line = true;
+            },
             else => {},
         }
+    }
+    if (has_line) {
+        boundary[0x0A] = true; // boundary between '\n' and the next byte
+        boundary[0x09] = true; // boundary between the previous byte and '\n'
     }
     var classes = ByteClasses{ .map = undefined, .count = 0 };
     var id: u16 = 0;

@@ -370,6 +370,109 @@ test "eager DFA agrees with the code-point engines on its eligible subset (span-
     try testing.expect(ran > 0);
 }
 
+// ── Line anchors (?m): exact spans + cross-engine agreement ─────────────────────────
+
+const LineCase = struct { pat: []const u8, input: []const u8, spans: []const [2]usize };
+
+/// Every non-overlapping match span the `(?m)` line anchors must produce, hand-computed against
+/// the reference semantics. There is **no `.crlf` mode** — the line terminator is `\n` only, so
+/// `\r` is ordinary content (verified by the CRLF cases). Covers line-start placement off-by-ones,
+/// offset-0 ↔ text-start aliasing, `(?m)$` (line_end), empty-line / zero-width placement,
+/// empty-match advancement, and CRLF.
+const line_cases = [_]LineCase{
+    // line-start placement (the core off-by-ones)
+    .{ .pat = "(?m)^\\w+", .input = "abc\ndef", .spans = &.{ .{ 0, 3 }, .{ 4, 7 } } }, // 2nd starts at 4 (after \n), not 3/5
+    .{ .pat = "(?m)^\\w+", .input = "\nabc", .spans = &.{.{ 1, 4 }} }, // leading \n: ^ fires at 0 (empty; \w+ fails) and 1
+    .{ .pat = "(?m)^\\w+", .input = "abc\n", .spans = &.{.{ 0, 3 }} }, // trailing \n: no spurious match past it
+    .{ .pat = "(?m)^\\w+", .input = "abc\n\ndef", .spans = &.{ .{ 0, 3 }, .{ 5, 8 } } }, // empty line → no phantom; def at 5
+    .{ .pat = "(?m)^", .input = "a\nb\nc", .spans = &.{ .{ 0, 0 }, .{ 2, 2 }, .{ 4, 4 } } }, // bare anchor: empty at each line start
+    // offset-0 vs text-start aliasing
+    .{ .pat = "(?m)^abc", .input = "abc", .spans = &.{.{ 0, 3 }} }, // line start == text start: no double-count
+    .{ .pat = "(?m)^abc", .input = "xabc", .spans = &.{} }, // mid-line, no preceding \n → no match
+    .{ .pat = "(?m)^abc", .input = "x\nabc", .spans = &.{.{ 2, 5 }} }, // post-newline start at byte 2
+    // (?m)$ line_end (prone on the byte DFA → declined to the Pike VM; cross-checked vs backtrack)
+    .{ .pat = "(?m)\\w+$", .input = "abc\ndef", .spans = &.{ .{ 0, 3 }, .{ 4, 7 } } }, // 1st ends at 3 (before \n), not 4
+    .{ .pat = "(?m)^\\w+$", .input = "ab\ncd\nef", .spans = &.{ .{ 0, 2 }, .{ 3, 5 }, .{ 6, 8 } } }, // every line, both ends
+    .{ .pat = "(?m)^$", .input = "a\n\nb", .spans = &.{.{ 2, 2 }} }, // empty line: ^ and $ coincide on the blank line
+    // empty-match advancement
+    .{ .pat = "(?m)^", .input = "a\nb", .spans = &.{ .{ 0, 0 }, .{ 2, 2 } } }, // advance by one; no double-emit at offset 0
+    // CRLF — no `.crlf` mode, so \r is content: the line start is after \n (byte 5), not split by \r
+    .{ .pat = "(?m)^\\w+", .input = "abc\r\ndef", .spans = &.{ .{ 0, 3 }, .{ 5, 8 } } }, // \w+ stops at \r; def at 5
+    .{ .pat = "(?m)\\w+$", .input = "abc\r\ndef", .spans = &.{.{ 5, 8 }} }, // $ sits before \n: \r blocks line 1's match
+};
+
+/// Collect every non-overlapping match's `[start, end)` for backend `B` over `input`, or null when
+/// `B` declines the pattern (so the table can include shapes a given backend doesn't run). Uses the
+/// agnostic `findAll` iterator, which advances past empty matches by one position.
+fn collectSpans(comptime B: type, gpa: std.mem.Allocator, pat: []const u8, input: []const u8, out: *[16][2]usize) !?usize {
+    var diag: regex.Diagnostic = .{};
+    var re = regex.compileRuntimeWith(B, gpa, pat, &diag, .{}) catch return null; // declined → skip
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+    defer sc.deinit(gpa);
+    var n: usize = 0;
+    var it = re.findAll(&sc, input);
+    while (it.next()) |m| {
+        if (n >= out.len) return error.TooManySpans;
+        out[n] = .{ m.start, m.end };
+        n += 1;
+    }
+    return n;
+}
+
+test "line anchors (?m): exact spans (vs hand-computed) + cross-engine agreement" {
+    const gpa = testing.allocator;
+    for (line_cases) |c| {
+        // Oracle = the Pike VM: it must produce EXACTLY the hand-computed spans (this catches a
+        // bug all engines might share — the line semantics / placement themselves).
+        var ov: [16][2]usize = undefined;
+        const on = (try collectSpans(pikevm, gpa, c.pat, c.input, &ov)).?;
+        testing.expectEqual(c.spans.len, on) catch {
+            std.debug.print("/{s}/ on \"{s}\": Pike VM found {d} spans, expected {d}\n", .{ c.pat, c.input, on, c.spans.len });
+            return error.Mismatch;
+        };
+        for (c.spans, 0..) |sp, i| {
+            try testing.expectEqual(sp[0], ov[i][0]);
+            try testing.expectEqual(sp[1], ov[i][1]);
+        }
+        // Every other backend must agree span-for-span, or decline → skip. `backtrack` is an
+        // INDEPENDENT code-point engine (it cross-checks the prone `(?m)$` cases the byte DFAs
+        // decline); `edfa` covers the non-prone cases on the byte DFA; `dfa` declines line anchors.
+        inline for (.{ backtrack, auto, edfa, dfa }) |B| {
+            var bv: [16][2]usize = undefined;
+            if (try collectSpans(B, gpa, c.pat, c.input, &bv)) |bn| {
+                testing.expectEqual(on, bn) catch {
+                    std.debug.print("/{s}/ on \"{s}\": {s} found {d} spans, Pike VM {d}\n", .{ c.pat, c.input, @typeName(B), bn, on });
+                    return error.Mismatch;
+                };
+                for (0..on) |i| {
+                    try testing.expectEqual(ov[i][0], bv[i][0]);
+                    try testing.expectEqual(ov[i][1], bv[i][1]);
+                }
+            }
+        }
+    }
+}
+
+test "auto never @compileErrors at comptime — big/prone patterns route to the Pike VM" {
+    // The eager DFA is bounded (fixed comptime tables) and at comptime there is NO runtime lazy-DFA
+    // handoff, so pinning it on a too-large pattern (`compileComptimeWith(backends.edfa, …)`) is a
+    // `@compileError`. `auto` never hits that: its `tinyForComptimeEdfa` gate keeps non-tiny
+    // patterns on the NFA/Pike VM at comptime, so `compileComptime*(auto, …)` ALWAYS compiles. Each
+    // pattern here would `@compileError` on a pinned comptime edfa (big Unicode class / prone); the
+    // fact this file compiles AND they match proves auto routed them to the Pike VM instead.
+    const ok = comptime blk: {
+        @setEvalBranchQuota(50_000_000);
+        const R1 = regex.compileComptimeWith(auto, "\\w+@\\w+", .{}); // big Unicode + prone
+        const R2 = regex.compileComptimeWith(auto, "\\p{L}+", .{}); // big Unicode class
+        const R3 = regex.compileComptimeWith(auto, "(?m)\\w+$", .{}); // prone line anchor
+        break :blk (R1.findComptime("see a@b") != null) and
+            (R2.findComptime("héllo") != null) and
+            (R3.findComptime("x\ny") != null);
+    };
+    try testing.expect(ok);
+}
+
 /// `find` a backend's span for `(pat, input)`, or `.skip` when the pattern does not
 /// compile for it (an unsupported `\p{…}` name, or a backend declining the shape) — so
 /// the differential corpus tolerates patterns outside a given backend's domain without
@@ -451,7 +554,7 @@ test "prefilter on/off and byte_engine on/off are results-invariant on the wide 
 }
 
 test "auto's byte_engine=.enabled is results-invariant (DFA span == NFA span) and routes to dfa" {
-    // Flipping the strategy knob must not change a single match (DESIGN §3). For every
+    // Flipping the strategy knob must not change a single match (results-invariance). For every
     // DFA-eligible case, the .enabled build and the default build must return
     // byte-identical spans. With .enabled an eligible pattern routes to the DFA span
     // arm ("dfa") unless it is a pure literal (then "literal", already optimal); it is

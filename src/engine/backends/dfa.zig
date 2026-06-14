@@ -60,6 +60,12 @@
 //!     still tries only offset 0; a pattern with an *interior* `text_start` (rare, not
 //!     fully `anchored_start`) keeps anchored restart so the reverse transitions stay
 //!     position-independent.
+//!   * **Trailing `$` (`end_anchored`) is O(input) via one reverse pass.** When every match
+//!     ends at input end the end is pinned, so `find`/`isMatch` skip the forward scan and run
+//!     a single reverse-DFA pass from `input.len` (`revFindEnd`) — the same quadratic-immune
+//!     shape the eager DFA uses for begin-but-don't-complete `$` inputs. (`isMatch` also uses
+//!     this pass: a `$` program has no *mid-input* accepting state for the one-pass `utrans`
+//!     scan to hit.)
 //!
 //! ## Prefilter (only via `auto`, and only for *leading*-literal patterns)
 //!
@@ -81,14 +87,34 @@
 //! `isMatch`'s unanchored scan re-seeds the start each byte), so a match never spans a
 //! bad byte. No validity check in the hot loop, no decode.
 //!
-//! ## Feature gate
+//! ## Capabilities & invariants (read this before opting directly into `backends.dfa`)
 //!
-//! `supports(hir)` accepts a pattern iff it is byte-lowerable (`byte.byteLowerable`,
-//! i.e. no `\X`/`\b`) **and** its only zero-width assertion (if any) is `text_start`
-//! (`\A`, non-multiline `^`). `text_start` depends only on the search position, so two
-//! start closures (true at offset 0, false past it) handle it with no position-dependent
-//! transition state. Other assertions — `$`/`\z` (`text_end`) and `(?m)` line anchors —
-//! are declined and stay on the code-point engines, exactly as `\b`/`\X` do.
+//! `supports(hir)` is the capability gate. A pattern runs here iff it is byte-lowerable
+//! (`byte.byteLowerable` — **no `\X`, no `\b`/`\B`**) and its zero-width assertions are a
+//! supported subset:
+//!
+//!   * **`text_start`** (`\A`, non-multiline `^`) — depends only on the search position, so
+//!     two start closures (true at offset 0, false past it) handle it with no
+//!     position-dependent transition state.
+//!   * **`text_end`** (`$`/`\z`) **when `anchored_end`** (every match ends at input end) —
+//!     matched in O(input) by the reverse-DFA-from-end pass (`@stable-since v0.4.0`).
+//!
+//! **Declined** (→ code-point engines, where they are correct **and linear**, so this is a
+//! routing decision, not a limitation of the library):
+//!
+//!   * `\b`/`\B` and `\X` — *codepoint* properties a byte DFA cannot evaluate; a **permanent**
+//!     design choice, never built into the DFA.
+//!   * a **mixed** `$` (a `text_end` in only some alternation branches, e.g. `a$|b`) — the end
+//!     is not pinned, so anchored restart would be Θ(n²); declined to stay quadratic-immune.
+//!   * `(?m)` line anchors (`line_start`/`line_end`) — position-dependent on the adjacent byte.
+//!
+//! **Invariants this backend upholds for every pattern `supports` accepts:** matching is
+//! **O(input)** (no quadratic path — a hard contract), **leftmost-first** (byte-identical
+//! spans to the Pike VM, proven in `conformance.zig`), **span-only** (no captures), and
+//! **dead-on-invalid** UTF-8. If you opt directly into `backends.dfa`, a pattern it declines
+//! is `error.Unsupported` at build — there is no silent fallback. Through **`auto`** the
+//! decline is invisible: `auto` routes the pattern to a backend that handles it, so `auto`
+//! is correct by construction for every pattern.
 
 const std = @import("std");
 
@@ -172,33 +198,85 @@ pub const Program = struct {
     /// Reverse adjacency of the byte automaton, driving the reverse-DFA `find` (forward
     /// scan locates the leftmost match **end** in one pass; the reverse DFA, anchored at
     /// that end, locates the leftmost **start** — replacing the Θ(n²) anchored restart).
-    /// `built == false` (and the slices empty) for `has_text_start` programs.
+    /// `built == false` (and the slices empty) for `has_text_start` programs. For a
+    /// `text_end` (`$`/`\z`) program the trailing `$` is woven in as a **passable reverse
+    /// epsilon** (`buildReverse`), so the reverse start represents "at end-of-input, `$`
+    /// satisfied" and one backward pass from `input.len` (`revFindEnd`) finds the leftmost
+    /// start in O(input).
     ///
     /// @stable-since: v0.3.0
     rev: ReverseAdj,
+    /// True when the byte program carries a `text_end` (`$`/`\z`) assertion. Such a program
+    /// is always `anchored_end` (`supports` declines a mixed `$`), so the match end is pinned
+    /// at `input.len`. Used to route `find`/`isMatch` to the reverse-DFA-from-end pass.
+    ///
+    /// @stable-since: v0.4.0
+    has_text_end: bool,
+    /// True when every match must end at end-of-input (a trailing `$`/`\z`, `anchored_end`)
+    /// and the pattern is not `anchored_start` (`^…$` tries only offset 0 instead). The match
+    /// end is then pinned to `input.len`, so a single reverse-DFA pass from there
+    /// (`revFindEnd`) is the whole search — O(input), the same fix the eager DFA uses for
+    /// begin-but-don't-complete `$` shapes (`[ab]*c$`, `\w+@\w+$`). Implies `rev.built`.
+    ///
+    /// @stable-since: v0.4.0
+    end_anchored: bool,
+    /// `reaches_end[pc]` — does `pc` reach `match` via epsilon edges only, with `text_end`
+    /// (`$`/`\z`) **passable** (the at-end-of-input view)? Drives `accept_eoi`: a closure that
+    /// parks on a `text_end` pc whose `reaches_end` is true makes its DFA state accepting *at
+    /// end of input*. Empty (`&.{}`) for a `$`-free program (the closure never indexes it).
+    ///
+    /// @stable-since: v0.4.0
+    reaches_end: []const bool,
 };
 
-/// Whether this HIR can run on the lazy DFA: byte-lowerable (no `\X`/`\b`) **and**
-/// carrying no zero-width assertions other than `text_start`. `\A` and non-multiline
-/// `^` both lower to a `text_start` assertion, which is evaluable purely from the
-/// search position (true only at offset 0) — handled by two start closures, no
-/// position-dependent transition state. The rest (`$` / `\z` `text_end`, `(?m)` line
-/// anchors) stay on the code-point engines. `auto` consults this to route.
+/// Whether this HIR can run on the lazy DFA. The capability gate (read this if you opt
+/// directly into `backends.dfa` rather than `auto`):
+///
+///   * **Required:** byte-lowerable — no `\X` (grapheme) and no `\b`/`\B` (word boundary).
+///     Those are *codepoint* properties the byte DFA cannot evaluate and **always** stay on
+///     the code-point engines (Pike VM / backtracker). This is a deliberate, permanent design
+///     choice, not a missing feature.
+///   * **Allowed assertions:** `text_start` (`\A`, non-multiline `^`) — evaluable purely from
+///     the search position (true only at offset 0), handled by two start closures with no
+///     position-dependent transition state; and **`text_end` (`$`/`\z`) when the pattern is
+///     `anchored_end`** (every match ends at input end), matched in O(input) by the
+///     reverse-DFA-from-end pass (`@stable-since v0.4.0`).
+///   * **Declined (→ code-point engines, correct + linear there):** a **mixed** `$` (a
+///     `text_end` in only some alternation branches, e.g. `a$|b`) — its end is not pinned, so
+///     anchored restart would be Θ(n²); and `(?m)` line anchors (`line_start`/`line_end`),
+///     which are position-dependent on the adjacent byte.
+///
+/// **Invariant:** every pattern this returns `true` for matches in **O(input)** (no
+/// quadratic path) and **leftmost-first** (identical spans to every other backend). A pattern
+/// it declines is not wrong — it runs on another engine. `auto` consults this to route, so
+/// through `auto` the decline is invisible.
 ///
 /// @stable-since: v0.3.0
 pub fn supports(h: hir.Hir) bool {
-    if (!byte.byteLowerable(h)) return false; // excludes \X and \b/\B
+    if (!byte.byteLowerable(h)) return false; // excludes \X and \b/\B (codepoint properties)
+    var has_text_end = false;
     for (h.nodes) |n| {
-        if (n.tag == .anchor and n.data.anchor.kind != .text_start) return false;
+        if (n.tag == .anchor) switch (n.data.anchor.kind) {
+            .text_start => {},
+            .text_end => has_text_end = true,
+            else => return false, // (?m) line anchors → code-point engines
+        };
     }
+    // `text_end` is linear here only when the match end is pinned to input end
+    // (`anchored_end`), matched by the reverse-DFA-from-end pass. A mixed `$` would fall to the
+    // Θ(n²) anchored restart, so decline it; `auto` then routes it to the linear Pike VM.
+    if (has_text_end and !h.analysis.anchored_end) return false;
     return true;
 }
 
 /// Reverse adjacency of the byte automaton: the predecessors of each pc, in CSR form, so
 /// the reverse DFA can walk the automaton **backward** from a match end to the match
-/// start. Built only for assertion-free programs (the reverse-DFA `find` path), where
-/// every epsilon edge is a plain `split`/`jmp`/`save` — no position-dependent `text_start`
-/// to evaluate — which is what keeps the reverse transitions cacheable.
+/// start. Built for `!has_text_start` programs (the reverse-DFA `find` path): the
+/// assertion-free case (every epsilon edge a plain `split`/`jmp`/`save`) and the
+/// **`text_end`** case, where a trailing `$`/`\z` is recorded as a passable reverse epsilon
+/// (its forward edge `i → i+1` becomes a reverse predecessor). A position-dependent
+/// `text_start` is *not* reverse-cacheable, so `has_text_start` programs keep anchored
+/// restart and build no reverse adjacency.
 ///
 /// @stable-since: v0.3.0
 pub const ReverseAdj = struct {
@@ -243,8 +321,12 @@ fn prefixSum(arr: []u32) void {
     }
 }
 
-/// Build the reverse adjacency from an assertion-free byte program (two passes: count
-/// in-edges per pc, prefix-sum to offsets, fill).
+/// Build the reverse adjacency from a `!has_text_start` byte program (two passes: count
+/// in-edges per pc, prefix-sum to offsets, fill). A trailing `text_end` (`$`/`\z`) is a
+/// passable forward epsilon (`i → i+1`), so it gets a reverse predecessor exactly like a
+/// `jmp` — that is what lets `revClosure(match)` walk back through the `$` into the pre-`$`
+/// states. No other assertion kind reaches here (`text_start` programs build no reverse
+/// adjacency; `\b`/line anchors are declined by `supports`).
 fn buildReverse(gpa: std.mem.Allocator, bp: byte.Program) Err!ReverseAdj {
     const n: u32 = @intCast(bp.insts.len);
     const eps_off = try gpa.alloc(u32, n + 1);
@@ -269,7 +351,12 @@ fn buildReverse(gpa: std.mem.Allocator, bp: byte.Program) Err!ReverseAdj {
         },
         .jmp => |t| eps_off[t] += 1,
         .save => eps_off[i + 1] += 1,
-        .assertion => unreachable, // buildReverse is only called for assertion-free programs
+        // `text_end` ($/\z) is a passable epsilon (forward edge i → i+1): record its reverse
+        // predecessor so `revClosure(match)` walks back through it. Only `text_end` reaches
+        // here (text_start programs build no reverse; \b/line anchors are declined).
+        .assertion => |k| if (k == .text_end) {
+            eps_off[i + 1] += 1;
+        },
         .match => n_match += 1,
     };
     prefixSum(eps_off);
@@ -318,7 +405,10 @@ fn buildReverse(gpa: std.mem.Allocator, bp: byte.Program) Err!ReverseAdj {
                 eps[ec[i + 1]] = pc;
                 ec[i + 1] += 1;
             },
-            .assertion => unreachable,
+            .assertion => |k| if (k == .text_end) { // passable epsilon — see the count pass
+                eps[ec[i + 1]] = pc;
+                ec[i + 1] += 1;
+            },
             .match => {
                 match_seed[mi] = pc;
                 mi += 1;
@@ -350,6 +440,46 @@ fn freeReverse(gpa: std.mem.Allocator, rev: *ReverseAdj) void {
     gpa.free(rev.match_seed);
 }
 
+/// `out[pc]` ← does `pc` reach `match` via epsilon edges only, with `text_end` (`$`/`\z`)
+/// **passable** (the end-of-input view)? Drives `accept_eoi`: a closure that parks on a
+/// `text_end` pc whose `reaches_end` is true makes its DFA state accepting at end of input.
+/// `text_start` is *not* passable here (it needs offset 0, which the at-end view lacks; the
+/// empty-input `^…$` case is covered by the start closures). A monotone backward fixpoint;
+/// all-false for a `$`-free program. Mirrors `edfa.computeEndReaches` (kept local to avoid a
+/// `dfa`↔`edfa` import cycle).
+fn computeEndReaches(insts: []const byte.Inst, out: []bool) void {
+    const n = insts.len;
+    for (out[0..n]) |*v| v.* = false;
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var i: usize = n;
+        while (i > 0) {
+            i -= 1;
+            if (out[i]) continue;
+            const r = switch (insts[i]) {
+                .match => true,
+                .jmp => |t| out[t],
+                .split => |s| out[s.a] or out[s.b],
+                .save => out[i + 1], // captures are epsilons
+                .assertion => |k| k == .text_end and out[i + 1], // text_start: not passable at end
+                .byte_range => false, // consumes a byte — no input left at end
+            };
+            if (r) {
+                out[i] = true;
+                changed = true;
+            }
+        }
+    }
+}
+
+/// Allocate + compute `reaches_end` for a `text_end` program (caller owns the result).
+fn buildEndReaches(gpa: std.mem.Allocator, bp: byte.Program) Err![]bool {
+    const out = try gpa.alloc(bool, bp.insts.len);
+    computeEndReaches(bp.insts, out);
+    return out;
+}
+
 /// Compile a HIR into a heap-allocated DFA `Program` (free with `freeProgram`).
 /// A pattern this backend cannot run (`\X`/`\b`/`$`/line anchors) is rejected with
 /// `error.Unsupported`; `auto` then keeps it on the code-point engines.
@@ -359,14 +489,17 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     if (!supports(h)) return error.Unsupported;
     var bp = try byte.buildAlloc(gpa, h);
     errdefer byte.freeProgram(gpa, &bp);
-    // Defensive: only `text_start` assertions are DFA-evaluable here (at offset 0);
-    // `supports` already excludes the rest, but double-check the lowered program — and
-    // note whether any `text_start` is present (it forces the anchored-restart `find`).
+    // Defensive: only `text_start` (offset 0) and `text_end` (end of input) assertions are
+    // DFA-evaluable here; `supports` already excludes the rest, but double-check the lowered
+    // program and note which are present — `text_start` forces anchored restart; `text_end`
+    // takes the reverse-from-end path (and `supports` guarantees it is `anchored_end`).
     var has_text_start = false;
+    var has_text_end = false;
     for (bp.insts) |inst| switch (inst) {
-        .assertion => |k| {
-            if (k != .text_start) return error.Unsupported;
-            has_text_start = true;
+        .assertion => |k| switch (k) {
+            .text_start => has_text_start = true,
+            .text_end => has_text_end = true,
+            else => return error.Unsupported,
         },
         else => {},
     };
@@ -374,10 +507,21 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     var class_rep: [256]u8 = @splat(0);
     var b: u16 = 0;
     while (b < 256) : (b += 1) class_rep[classes.map[b]] = @intCast(b);
-    // Reverse adjacency for the O(n) reverse-DFA `find` — only for assertion-free
-    // programs (the common case); `has_text_start` patterns keep anchored restart.
+    // Reverse adjacency for the O(n) reverse-DFA `find` — built for `!has_text_start`
+    // programs: the assertion-free case (forward-end + reverse-start two-pass) and the
+    // `text_end` case (reverse-from-end, trailing `$` woven in as a passable reverse epsilon).
+    // `has_text_start` patterns keep anchored restart (reverse transitions must stay
+    // position-independent).
     var rev = if (has_text_start) empty_rev else try buildReverse(gpa, bp);
     errdefer freeReverse(gpa, &rev);
+    // `reaches_end` drives `accept_eoi`; only a `text_end` program needs it (empty otherwise,
+    // and the closure never indexes it for a `$`-free program).
+    const reaches_end: []const bool = if (has_text_end) try buildEndReaches(gpa, bp) else &.{};
+    errdefer if (has_text_end) gpa.free(reaches_end);
+    // A `text_end` program is `anchored_end` (mixed `$` was declined by `supports`); with no
+    // leading anchor (`!has_text_start`) the end is pinned at `input.len`, so `find`/`isMatch`
+    // take the single-pass reverse-from-end path.
+    const end_anchored = has_text_end and h.analysis.anchored_end and !has_text_start;
     return .{
         .byte_prog = bp,
         .classes = classes,
@@ -385,6 +529,9 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
         .anchored_start = h.analysis.anchored_start,
         .has_text_start = has_text_start,
         .rev = rev,
+        .has_text_end = has_text_end,
+        .end_anchored = end_anchored,
+        .reaches_end = reaches_end,
     };
 }
 
@@ -393,6 +540,7 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
 /// @stable-since: v0.3.0
 pub fn freeProgram(gpa: std.mem.Allocator, program: *Program) void {
     freeReverse(gpa, &program.rev);
+    if (program.has_text_end) gpa.free(program.reaches_end);
     byte.freeProgram(gpa, &program.byte_prog);
 }
 
@@ -439,6 +587,13 @@ pub const Scratch = struct {
     states: std.ArrayListUnmanaged([]const u32) = .empty,
     /// `state_match.items[id]` — does state `id` contain the `match` pc (accepting)?
     state_match: std.ArrayListUnmanaged(bool) = .empty,
+    /// `state_match_eoi.items[id]` — is state `id` accepting **at end of input**
+    /// (`accept_eoi`): `state_match` OR it parks on a pending `text_end` (`$`/`\z`) whose
+    /// continuation reaches `match`. Equal to `state_match` for a `$`-free program, so the
+    /// extra end-of-input check `runAnchored` does is a no-op there.
+    ///
+    /// @stable-since: v0.4.0
+    state_match_eoi: std.ArrayListUnmanaged(bool) = .empty,
     /// Flat `id * nclass + class` **anchored** transition table; `UNKNOWN` until first
     /// computed. Used by `search` (anchored restart from each start).
     trans: std.ArrayListUnmanaged(u32) = .empty,
@@ -469,6 +624,7 @@ pub const Scratch = struct {
     work: []u32, // the closure result (canonical pc list being built)
     work_len: usize = 0,
     work_match: bool = false,
+    work_match_eoi: bool = false, // a pending `text_end` in this closure reaches match at end
     seeds: []u32, // successor pcs feeding the next closure
 
     // ── reverse-DFA cache (the O(n) reverse `find`; set-based, no priority/cut) ──
@@ -530,12 +686,13 @@ pub const Scratch = struct {
             sc.states.deinit(gpa);
         }
         errdefer sc.state_match.deinit(gpa);
+        errdefer sc.state_match_eoi.deinit(gpa);
         errdefer sc.trans.deinit(gpa);
         errdefer sc.utrans.deinit(gpa);
 
         // Intern the empty set as the DEAD sink (state id 0).
         sc.work_len = 0;
-        _ = try sc.internState(false);
+        _ = try sc.internState(false, false);
         return sc;
     }
 
@@ -544,6 +701,7 @@ pub const Scratch = struct {
         for (self.states.items) |o| gpa.free(o);
         self.states.deinit(gpa);
         self.state_match.deinit(gpa);
+        self.state_match_eoi.deinit(gpa);
         self.trans.deinit(gpa);
         self.utrans.deinit(gpa);
         self.intern.deinit(gpa);
@@ -578,6 +736,8 @@ pub const Scratch = struct {
         self.states = .empty;
         self.state_match.deinit(self.gpa);
         self.state_match = .empty;
+        self.state_match_eoi.deinit(self.gpa);
+        self.state_match_eoi = .empty;
         self.trans.deinit(self.gpa);
         self.trans = .empty;
         self.utrans.deinit(self.gpa);
@@ -587,7 +747,7 @@ pub const Scratch = struct {
         self.cache_bytes = 0;
         self.start_ready = false;
         self.work_len = 0;
-        _ = self.internState(false) catch @panic(OOM_PANIC); // re-seed DEAD = state 0
+        _ = self.internState(false, false) catch @panic(OOM_PANIC); // re-seed DEAD = state 0
     }
 
     /// Evict the cache if it has outgrown its budget, at a search boundary (no live
@@ -608,20 +768,22 @@ pub const Scratch = struct {
         const plen = pcs.len;
         @memcpy(self.work[0..plen], pcs); // stage across the clear (clearCache spares `work`)
         const is_match = self.state_match.items[state_id];
+        const is_match_eoi = self.state_match_eoi.items[state_id];
         self.clearCache();
         self.work_len = plen;
-        const new_id = try self.internState(is_match);
+        const new_id = try self.internState(is_match, is_match_eoi);
         try self.ensureStart(program); // start0/startN are invalid after the clear
         flushes.* += 1;
         if (self.opts.on_full == .give_up and flushes.* >= MAX_FLUSHES) self.gave_up = true;
         return new_id;
     }
 
-    /// Intern the state currently in `work[0..work_len]` (with accepting flag
-    /// `is_match`) to a dense id, allocating it on first sight. On a fresh state it
-    /// owns a copy of the pc list, appends an all-`UNKNOWN` transition row, and bumps
-    /// the footprint estimate.
-    fn internState(self: *Scratch, is_match: bool) Err!u32 {
+    /// Intern the state currently in `work[0..work_len]` (accepting flag `is_match`,
+    /// end-of-input accepting flag `is_match_eoi`) to a dense id, allocating it on first
+    /// sight. On a fresh state it owns a copy of the pc list, appends an all-`UNKNOWN`
+    /// transition row, and bumps the footprint estimate. For a `$`-free program
+    /// `is_match_eoi == is_match` at every call.
+    fn internState(self: *Scratch, is_match: bool, is_match_eoi: bool) Err!u32 {
         const key = self.work[0..self.work_len];
         const gop = try self.intern.getOrPut(self.gpa, key);
         if (gop.found_existing) return gop.value_ptr.*;
@@ -634,25 +796,29 @@ pub const Scratch = struct {
         gop.value_ptr.* = id;
         try self.states.append(self.gpa, owned);
         try self.state_match.append(self.gpa, is_match);
+        try self.state_match_eoi.append(self.gpa, is_match_eoi);
         try self.trans.appendNTimes(self.gpa, UNKNOWN, self.nclass);
         try self.utrans.appendNTimes(self.gpa, UNKNOWN, self.nclass);
 
-        self.cache_bytes += owned.len * @sizeOf(u32) + 2 * @as(usize, self.nclass) * @sizeOf(u32) + 48;
+        self.cache_bytes += owned.len * @sizeOf(u32) + 2 * @as(usize, self.nclass) * @sizeOf(u32) + 49;
         return id;
     }
 
     /// Epsilon-closure of `seeds` into `work` (priority order, deduplicated, cut on
     /// match). The byte analogue of the Pike VM's thread closure, minus capture slots.
-    /// `at_start` is whether the search position is offset 0 — the only thing a
-    /// `text_start` assertion (the sole assertion that survives `buildAlloc`) depends
-    /// on. Writes `work`/`work_len` and sets `work_match`. Allocation-free (all buffers
-    /// pre-sized to the program).
+    /// `at_start` is whether the search position is offset 0 — what a `text_start` assertion
+    /// depends on. A `text_end` (`$`/`\z`) is recorded as a pending **member** (it consumes no
+    /// byte, so the thread parks until end of input) and sets `work_match_eoi` when its
+    /// continuation reaches `match` — that is how a state knows it is accepting *at end of
+    /// input*. Writes `work`/`work_len` and sets `work_match`/`work_match_eoi`. Allocation-free
+    /// (all buffers pre-sized to the program).
     fn closure(self: *Scratch, program: *const Program, seeds: []const u32, at_start: bool) void {
         const insts = program.byte_prog.insts;
         self.seen_gen +%= 1;
         const gen = self.seen_gen;
         self.work_len = 0;
         self.work_match = false;
+        self.work_match_eoi = false;
 
         seeds_loop: for (seeds) |seed| {
             var top: usize = 0;
@@ -673,11 +839,22 @@ pub const Scratch = struct {
                             pc = s.a;
                         },
                         .save => pc += 1, // captures are epsilons to the DFA
-                        .assertion => {
-                            // Only `text_start` reaches here (buildAlloc rejects the
-                            // rest); it holds iff we are at offset 0.
-                            if (!at_start) break :follow;
-                            pc += 1;
+                        .assertion => |k| switch (k) {
+                            // `text_start` holds iff at offset 0 (a build-time fork).
+                            .text_start => {
+                                if (!at_start) break :follow;
+                                pc += 1;
+                            },
+                            // `text_end` parks here (consumes no byte): record it as a member,
+                            // and mark the state accepting-at-end if its continuation reaches
+                            // `match` (`reaches_end`). buildAlloc rejects every other kind.
+                            .text_end => {
+                                self.work[self.work_len] = pc;
+                                self.work_len += 1;
+                                if (program.reaches_end[pc]) self.work_match_eoi = true;
+                                break :follow;
+                            },
+                            else => break :follow, // line anchors etc. — gated out by supports()
                         },
                         .byte_range => {
                             self.work[self.work_len] = pc;
@@ -688,6 +865,7 @@ pub const Scratch = struct {
                             self.work[self.work_len] = pc;
                             self.work_len += 1;
                             self.work_match = true;
+                            self.work_match_eoi = true; // a mid-input match also accepts at end
                             // Cut: every lower-priority thread (still on the stack or in
                             // later seeds) is discarded — the Pike VM's match cut.
                             break :seeds_loop;
@@ -712,7 +890,7 @@ pub const Scratch = struct {
         var ns: usize = 0;
         self.collectSeeds(program, state_id, rep, &ns);
         self.closure(program, self.seeds[0..ns], false); // sp > 0 during a transition
-        const next = try self.internState(self.work_match);
+        const next = try self.internState(self.work_match, self.work_match_eoi);
         // `internState` may have grown `trans` (realloc) — re-index to write the edge.
         self.trans.items[@as(usize, state_id) * self.nclass + class] = next;
         return next;
@@ -732,7 +910,7 @@ pub const Scratch = struct {
         self.collectSeeds(program, state_id, rep, &ns); // successors of the live state
         self.collectSeeds(program, self.startN, rep, &ns); // ∪ a fresh start at this byte
         self.closure(program, self.seeds[0..ns], false);
-        const next = try self.internState(self.work_match);
+        const next = try self.internState(self.work_match, self.work_match_eoi);
         self.utrans.items[@as(usize, state_id) * self.nclass + class] = next;
         return next;
     }
@@ -746,16 +924,17 @@ pub const Scratch = struct {
                 ns.* += 1;
             },
             .match => {}, // terminal: no outgoing edge
-            else => unreachable, // a canonical state holds only byte_range / match
+            .assertion => {}, // a pending `text_end` member: no byte transition (end-only)
+            else => unreachable, // a canonical state holds only byte_range / match / text_end
         };
     }
 
     fn ensureStart(self: *Scratch, program: *const Program) Err!void {
         if (self.start_ready) return;
         self.closure(program, &[_]u32{0}, true); // text_start holds at offset 0
-        self.start0 = try self.internState(self.work_match);
+        self.start0 = try self.internState(self.work_match, self.work_match_eoi);
         self.closure(program, &[_]u32{0}, false); // ...and not past it
-        self.startN = try self.internState(self.work_match);
+        self.startN = try self.internState(self.work_match, self.work_match_eoi);
         self.start_ready = true;
     }
 
@@ -765,10 +944,17 @@ pub const Scratch = struct {
     /// accepting position — which, thanks to the priority/cut closure, is the
     /// leftmost-first end. The caller must have run `ensureStart`. (No dead check on the
     /// start: the closure of pc 0 always interns at least one `byte_range`/`match` pc,
-    /// so the start is never the empty set.)
+    /// so the start is never the empty set.) A state also counts as accepting **at
+    /// `input.len`** when its `accept_eoi` holds (a pending `text_end` `$`/`\z`); for a
+    /// `$`-free program `accept_eoi == accept`, so that extra term is a no-op. (Used for
+    /// `$` patterns reached via the pinned/`anchored_start` paths, e.g. `^abc$`; a plain
+    /// trailing `$` takes the reverse-from-end path instead.)
     fn runAnchored(self: *Scratch, program: *const Program, input: []const u8, s: usize, earliest: bool, flushes: *u32) Err!?usize {
         var state = if (s == 0) self.start0 else self.startN; // text_start holds only at 0
-        var match_end: ?usize = if (self.state_match.items[state]) s else null;
+        // A state accepts at `s` if it holds a `match`, or — only when `s` is end-of-input — a
+        // pending `text_end` (`accept_eoi`). For a `$`-free program `accept_eoi == accept`.
+        var match_end: ?usize = if (self.state_match.items[state] or
+            (s == input.len and self.state_match_eoi.items[state])) s else null;
         if (match_end != null and earliest) return match_end;
 
         // ── Warm-path pointer cache ──
@@ -785,6 +971,7 @@ pub const Scratch = struct {
         // touched on the warm path, which cannot grow the tables).
         var trans: [*]const u32 = self.trans.items.ptr;
         var accept: [*]const bool = self.state_match.items.ptr;
+        var accept_eoi: [*]const bool = self.state_match_eoi.items.ptr;
         const map: *const [256]u8 = &program.classes.map;
         const nclass: usize = self.nclass;
 
@@ -798,7 +985,7 @@ pub const Scratch = struct {
                 state = next;
                 if (state == DEAD) break;
                 pos += 1;
-                if (accept[state]) {
+                if (accept[state] or (pos == input.len and accept_eoi[state])) {
                     match_end = pos;
                     if (earliest) break;
                 }
@@ -810,9 +997,10 @@ pub const Scratch = struct {
             state = try self.step(program, state, class);
             trans = self.trans.items.ptr;
             accept = self.state_match.items.ptr;
+            accept_eoi = self.state_match_eoi.items.ptr;
             if (state == DEAD) break;
             pos += 1;
-            if (accept[state]) {
+            if (accept[state] or (pos == input.len and accept_eoi[state])) {
                 match_end = pos;
                 if (earliest) break;
             }
@@ -822,6 +1010,7 @@ pub const Scratch = struct {
                 state = try self.flushPreserving(program, state, flushes);
                 trans = self.trans.items.ptr;
                 accept = self.state_match.items.ptr;
+                accept_eoi = self.state_match_eoi.items.ptr;
             }
         }
         return match_end;
@@ -1101,6 +1290,53 @@ pub const Scratch = struct {
         }
         return found orelse end; // the forward guaranteed a match, so non-null in practice
     }
+
+    /// Leftmost match START for an `end_anchored` (trailing-`$`) program, where every match
+    /// ends at `input.len`. One reverse-DFA pass from `input.len` down to `lo` (`opts.start`);
+    /// the smallest position whose reverse state accepts (forward pc 0 reachable ⇒
+    /// `[pos, input.len)` is a full match) is the leftmost-first start, or null if no suffix
+    /// `[·, input.len)` matches. Because `$`/`\z` pins the end at end-of-input, no forward
+    /// end-find is needed — this single O(input) backward pass is the whole search (the eager
+    /// DFA's `revFindEnd`, lazily cached). The trailing `$` is woven into the reverse start as
+    /// a passable epsilon (`buildReverse`), so `r_start` already represents "at end-of-input,
+    /// `$` satisfied". The fix for the Θ(n²) anchored restart on begin-but-don't-complete `$`
+    /// shapes (`[ab]*c$`, `\w+@\w+$`, `\w+$`).
+    ///
+    /// @stable-since: v0.4.0
+    fn revFindEnd(self: *Scratch, program: *const Program, input: []const u8, lo: usize) Err!?usize {
+        try self.ensureRevStart(program);
+        var state = self.r_start;
+        var found: ?usize = if (self.r_accept.items[state]) input.len else null; // empty match at end (`a*$` on "")
+
+        // Warm-path pointer cache over the *reverse* tables (see `revFind`): the reverse cache
+        // is never flushed, so the sole invalidation is a cold `revStep` realloc — re-fetch
+        // both bases after every cold step.
+        var r_trans: [*]const u32 = self.r_trans.items.ptr;
+        var r_accept: [*]const bool = self.r_accept.items.ptr;
+        const map: *const [256]u8 = &program.classes.map;
+        const nclass: usize = self.nclass;
+
+        var pos = input.len;
+        while (pos > lo) {
+            pos -= 1;
+            const class = map[input[pos]];
+            const next = r_trans[@as(usize, state) * nclass + class];
+            if (next != UNKNOWN) {
+                // Warm path: memoized reverse edge, no growth.
+                state = next;
+                if (r_accept[state]) found = pos;
+                if (state == DEAD) break;
+                continue;
+            }
+            // Cold path: compute + cache the reverse edge (may realloc → re-fetch bases).
+            state = try self.revStep(program, state, class);
+            r_trans = self.r_trans.items.ptr;
+            r_accept = self.r_accept.items.ptr;
+            if (r_accept[state]) found = pos;
+            if (state == DEAD) break;
+        }
+        return found;
+    }
 };
 
 // ── Search core ───────────────────────────────────────────────────────────────────
@@ -1128,6 +1364,15 @@ fn searchImpl(program: *const Program, scratch: *Scratch, input: []const u8, opt
         if (try scratch.runAnchored(program, input, opts.start, earliest, &flushes)) |end|
             return Match{ .start = opts.start, .end = end };
         return null;
+    }
+
+    // Trailing `$` (every match ends at input.len): one reverse pass from the end finds the
+    // leftmost start in O(input). The end is pinned, so no forward scan — and crucially no
+    // anchored restart, which is Θ(n²) on `[ab]*c$`-style begin-but-don't-complete shapes.
+    // (`^…$` is `anchored_start`, handled above; this is a plain trailing `$`.)
+    if (program.end_anchored) {
+        const st = (try scratch.revFindEnd(program, input, opts.start)) orelse return null;
+        return Match{ .start = st, .end = input.len };
     }
 
     // Unanchored find. The reverse-DFA path is **O(input)**: one forward pass (`ustep`
@@ -1165,6 +1410,11 @@ fn isMatchImpl(program: *const Program, scratch: *Scratch, input: []const u8, op
         if (opts.start != 0) return false;
         return (try scratch.runAnchored(program, input, 0, true, &flushes)) != null;
     }
+    // Trailing `$`: a single reverse pass from input.len — any start position reaching the
+    // forward start ⇒ a match. O(input). (A `$` program has no mid-input `match`, so the
+    // one-pass `runUnanchored` over `utrans` would wrongly never accept — route to the
+    // reverse pass instead.)
+    if (program.end_anchored) return (try scratch.revFindEnd(program, input, opts.start)) != null;
     return scratch.runUnanchored(program, input, opts.start, &flushes);
 }
 
@@ -1325,11 +1575,21 @@ test "invalid UTF-8 input is dead-on-invalid (a match never spans a bad byte)" {
     try expectNoMatch("\\w+", "\xFF\xFE");
 }
 
-test "supports(): accepts byte-class + \\A/^; declines $/(?m)/\\b/\\X" {
+test "supports(): accepts byte-class + \\A/^ + anchored-end $; declines mixed-$/(?m)/\\b/\\X" {
     const gpa = testing.allocator;
-    // \A and non-multiline ^ lower to a text_start assertion the DFA can evaluate.
-    const accepts = [_][]const u8{ "[a-z]+", "\\w+\\d*", "cat|dog", "héllo", "a.*c", "\\p{L}+", "^abc", "\\Aword", "^\\d+" };
-    const declines = [_][]const u8{ "abc$", "\\bcat\\b", "\\Bx", "a\\Xb", "(?m)^line", "^abc$", "x\\z" };
+    // \A and non-multiline ^ lower to a text_start assertion; an `anchored_end` $/\z lowers to
+    // a text_end assertion matched by the reverse-from-end pass — both DFA-evaluable.
+    const accepts = [_][]const u8{
+        "[a-z]+",  "\\w+\\d*", "cat|dog",         "héllo", "a.*c",
+        "\\p{L}+", "^abc",     "\\Aword",         "^\\d+",
+        // text_end, anchored_end (every match ends at input end):
+        "abc$",    "\\w+$",    "[a-z]+@[a-z]+$",  "^abc$", "x\\z",  "foo$|bar$",
+    };
+    // \b/\B/\X are codepoint properties; (?m) line anchors are position-dependent; a *mixed* $
+    // (text_end in only some branches) is not anchored_end → would be Θ(n²), so declined.
+    const declines = [_][]const u8{
+        "\\bcat\\b", "\\Bx", "a\\Xb", "(?m)^line", "(?m)$", "a$|b", "(foo$|bar)",
+    };
     inline for (accepts) |pat| {
         var diag: compile.Diagnostic = .{};
         const ast = try compile.parse(gpa, pat, &diag);
@@ -1578,6 +1838,95 @@ test "reverse-DFA find agrees with anchored restart (has_text_start) across a co
             try testing.expectEqual(m.end, am.?.end);
             if (p.exp) |e| try testing.expectEqualStrings(e, m.slice(p.in));
         }
+    }
+}
+
+// ── text_end ($/\z): the reverse-from-end path (anchored_end only) ──────────────────
+
+test "text_end ($ / \\z): leftmost-first spans on the reverse-from-end path" {
+    try expectFind("\\w+$", "  hello world", "world");
+    try expectFind("[a-z]+$", "ABCdef", "def");
+    try expectNoMatch("[a-z]+$", "abc!"); // no [a-z] at the very end
+    try expectFind("abc$", "xxabcabc", "abc");
+    try expectNoMatch("abc$", "abcx");
+    try expectFind("\\d+$", "a1b234", "234");
+    try expectFind("x\\z", "axx", "x");
+    try expectFind("[a-z]+@[a-z]+$", "see alice@host", "alice@host");
+    try expectNoMatch("[a-z]+@[a-z]+$", "alice@host!");
+    try expectFind("foo$|bar$", "a foo a bar", "bar"); // every branch ends $ → anchored_end
+    try expectFind("a*$", "", ""); // empty match at end of empty input
+    try expectSpan("a*$", "baaa", 1, 4); // greedy run ending at input end (leftmost start)
+    try expectFind("[α-ω]+$", "ΑΒΓαβγ", "αβγ"); // multi-byte, byte-stepped
+}
+
+test "text_end with ^ / \\A uses the anchored-start path (accept_eoi at end)" {
+    try expectFind("^abc$", "abc", "abc");
+    try expectNoMatch("^abc$", "abcd");
+    try expectNoMatch("^abc$", "xabc");
+    try expectFind("\\A\\d+$", "12345", "12345");
+    try expectNoMatch("\\A\\d+$", "12345x");
+    try expectFind("^[a-z]*$", "", ""); // empty input, ^…$ holds
+    try expectSpan("^\\w+$", "héllo", 0, 6); // byte offsets
+}
+
+test "end_anchored / has_text_end flags route $ patterns correctly" {
+    const gpa = testing.allocator;
+    const Case = struct { pat: []const u8, has_text_end: bool, end_anchored: bool, anchored_start: bool };
+    for ([_]Case{
+        .{ .pat = "[a-z]+$", .has_text_end = true, .end_anchored = true, .anchored_start = false }, // reverse-from-end
+        .{ .pat = "\\w+@\\w+$", .has_text_end = true, .end_anchored = true, .anchored_start = false },
+        .{ .pat = "foo$|bar$", .has_text_end = true, .end_anchored = true, .anchored_start = false },
+        .{ .pat = "^abc$", .has_text_end = true, .end_anchored = false, .anchored_start = true }, // anchored-start path
+        .{ .pat = "\\A\\d+$", .has_text_end = true, .end_anchored = false, .anchored_start = true },
+        .{ .pat = "[a-z]+", .has_text_end = false, .end_anchored = false, .anchored_start = false }, // no $
+    }) |c| {
+        var prog = try buildFrom(gpa, c.pat);
+        defer freeProgram(gpa, &prog);
+        try testing.expectEqual(c.has_text_end, prog.has_text_end);
+        try testing.expectEqual(c.end_anchored, prog.end_anchored);
+        try testing.expectEqual(c.anchored_start, prog.anchored_start);
+        if (prog.end_anchored) try testing.expect(prog.rev.built); // end_anchored ⟹ reverse built
+    }
+}
+
+test "differential vs Pike VM: trailing-$ corpus (spans must agree)" {
+    const patterns = [_][]const u8{
+        "[a-z]+$",  "[a-z]+@[a-z]+$",   "[ab]*c$",  "a+$",      "\\d+$",
+        "\\d{3}$",  "[0-9]+\\.[0-9]+$", ".*$",      ".*foo$",   "[a-z]+\\s*$",
+        "x*$",      "(foo|bar)$",       "abc$",     "[α-ω]+$",  "é+$",
+        "(?i)end$", "^abc$",            "\\A\\d+$", "^[a-z]*$", "foo$|bar$",
+    };
+    const inputs = [_][]const u8{
+        "",              "abc",        "trailing 42", "ends with foo",
+        "no terminal c", "abcc",       "12.34",       "  spaced   ",
+        "alice@host",    "ALICE@HOST", "αβγ",         "café",
+        "the end",       "END",        "aaaaaaaa!",   "ababababc",
+        "a@b",           "foo",        "bar",         "αβγδ end",
+    };
+    for (patterns) |p| {
+        for (inputs) |in| try expectAgreesWithPikeVM(p, in);
+    }
+}
+
+test "trailing $ is linear, not Θ(n²) (ReDoS immunity, reverse-from-end)" {
+    // A begin-but-don't-complete `$` shape on a long input with no completer: under anchored
+    // restart this is Θ(n²) (every start walks to end-of-input and fails). The reverse-from-end
+    // path makes it ONE O(input) backward pass, so this completing near-instantly is the signal;
+    // a quadratic regression makes it visibly hang. ASCII keeps determinization cheap.
+    const gpa = testing.allocator;
+    const N = 1 << 18; // 262144
+    const buf = try gpa.alloc(u8, N);
+    defer gpa.free(buf);
+    for ([_][]const u8{ "[a-z]+$", "[a-z]+@[a-z]+$", "[ab]*c$" }) |pat| {
+        var re = try Compiled.init(pat);
+        defer re.deinit();
+        @memset(buf, 'a');
+        buf[N - 1] = '!'; // no terminal [a-z]/@/c ⇒ no match — the worst case
+        try testing.expect(re.find(buf) == null);
+        try testing.expect(!re.isMatch(buf));
+        @memset(buf, 'a'); // all [a-z]: [a-z]+$ matches the whole string; @/c shapes do not
+        _ = re.find(buf);
+        _ = re.isMatch(buf);
     }
 }
 

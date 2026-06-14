@@ -7,7 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-`0.4.0-dev` on `main` — nothing yet.
+`0.4.0-dev` on `main`.
+
+### Added
+
+- **`(?m)` line anchors (`line_start`/`line_end`) on the eager DFA** (`backends.edfa`). `(?m)^`
+  and `(?m)$` previously routed to the code-point Pike VM (`(?m)^\w+` ≈ 187 MiB/s); a **non-prone**
+  line pattern (`(?m)^\w+`, `(?m)^foo`, `(?m)foo$`, `(?m)^abc$`, `(?m)^$`) now runs on the eager DFA
+  via **anchored restart with line context** — `\n` is forced into its own byte equivalence class,
+  the start state is chosen per position (`start0` at offset 0, `startL` just after a `\n`, else
+  `startN`), and `line_end` is matched with a one-byte `\n`-lookahead (`accept_before_nl`).
+  `(?m)^\w+` is now ~496 MiB/s (~2.6×). It is **O(input)** and quadratic-immune: a *prone* line
+  pattern (an unbounded/long run before the anchor — `(?m)\w+$`, `(?m).*^x`) is declined at build
+  and runs on the linear Pike VM (the reverse-DFA fix can't carry line context). Exhaustively tested
+  — exact spans vs the Pike VM oracle across line-start placement off-by-ones, empty-line / zero-width
+  placement, empty-match advancement, offset-0↔text-start aliasing, and `\r` (no `.crlf` mode → `\r`
+  is content). New `Program` fields `accept_before_nl`/`startL`/`has_line_anchor` are `@stable-since v0.4.0`.
+
+- **Hopcroft/Moore minimization of the eager DFA** (`backends.edfa`). The frozen transition
+  tables are now partition-refined to the minimal DFA at build time (comptime + runtime),
+  **results-invariant** (the minimal DFA accepts exactly the same language — pinned by the
+  cross-backend differential/conformance suites). The representation is kept **dense** (the hot
+  loop stays a single `trans[state*nc + class]` load — the eager DFA's headline throughput), so
+  only the state *count* drops. The win is largest on the bigger auxiliary tables: a prone
+  `\w+@\w+`'s reverse DFA shrinks ~3251 → ~1047 states (~3×); forward class loops like `\w+` are
+  already near-minimal (~322), so they barely change. The forward DFA folds `utrans` into the
+  equivalence signature exactly when it is consulted (prone programs); the reverse DFA is
+  minimized independently. A **sparse** transition encoding was deliberately *not* adopted — it
+  would trade the dense single-load hot loop for smaller tables, regressing throughput. Internal
+  transform only — no public API change. Revert-failing regression: a redundant pattern
+  (`abc|dbc`) is verified to minimize 7 → 5 states, and built programs are checked to be already
+  minimal (re-refinement finds no mergeable states).
+
+- **`text_end` (`$`/`\z`) on the lazy DFA** (`backends.dfa`). The lazy DFA previously declined
+  any `$`/`\z` and left such patterns to the code-point engines; it now matches an
+  **anchored-end** `$` (every match ends at input end — `\w+$`, `[ab]*c$`, `\w+@\w+$`,
+  `foo$|bar$`, `^abc$`) in **O(input)** via a reverse-DFA-from-end pass, the same
+  quadratic-immune strategy the eager DFA uses. This closes the one capability gap between the
+  eager and lazy DFAs, so a trailing-`$` pattern too large for the eager DFA's fixed bounds now
+  falls back to the lazy DFA (still on the fast span arm) instead of the NFA. A **mixed** `$` (a
+  `text_end` in only some alternation branches, `a$|b`) stays declined — its end is not pinned,
+  so it would be Θ(n²) — and runs on the linear Pike VM, as do `\b`/`\B`, `\X`, and `(?m)` line
+  anchors. Results-invariant (lazy-DFA spans stay byte-identical to the Pike VM, pinned by a new
+  trailing-`$` differential corpus) and quadratic-immune (a new reverse-from-end linearity
+  regression at 256 KiB). New `Program` fields `has_text_end`/`end_anchored`/`reaches_end`,
+  `Scratch.state_match_eoi`, and the `revFindEnd` path are `@stable-since v0.4.0`.
+
+### Changed / Fixed
+
+- **Eager DFA: build the unanchored `utrans` table only for prone patterns (two-phase build).** A
+  non-prone pattern runs entirely on anchored restart (`trans`), so it never consults `utrans` —
+  yet the determinizer used to compute it anyway. Now phase 1 determinizes `trans` only, proneness
+  is decided, and phase 2 re-determinizes with `utrans` **only when prone**. This (a) shrinks and
+  speeds the build for the common non-prone case (`\w+`, `[a-z]+`), and (b) puts medium counted
+  reps on the right arm: `a{8}b`..`a{64}b` now fit the (fast, dense) eager DFA instead of
+  overflowing on unused `utrans` states and falling to the lazy DFA. Results-invariant.
+- **Bounded-large-prefix anchored-restart hardening.** `computeProne` now flags not only a
+  non-accepting *cycle* (unbounded run, Θ(n²)) but also a **long bounded** non-accepting prefix
+  (longest non-accepting path > `RESTART_SCAN_LIMIT` = 64, e.g. `a{4000}b`), routing it off the
+  per-occurrence confirm loop to the O(input) reverse find. This bounds the eager-DFA prefilter's
+  confirm window to ≤64 bytes regardless of pattern. (A measurement confirmed `a{4000}b` itself is
+  already **O(input)** — it overflows the eager DFA and runs on the lazy DFA, ~25 ms flat as the
+  input grows 4 KiB→64 KiB; the 25 ms is the inherent Θ(k²) determinization of a k=4000 counted rep,
+  a pattern-size cost, not an input ReDoS.) New deterministic `redos` guards: the `a{64}b`↔`a{65}b`
+  proneness boundary and at-scale `a{N}b` linearity.
+
+### Docs
+
+- Hardened the backend module docs to state each backend's **capabilities, declines, and
+  invariants** explicitly — what runs where and why — so opting directly into a specific
+  backend is unambiguous (`auto` remains correct by construction for every pattern).
 
 ## [0.3.1] - 2026-06-14
 
@@ -303,7 +372,7 @@ signature or match-result changes.
   (a flat Thompson NFA has no subroutine/return), and the un-shared cross-class
   duplication of `\p{L}{3}`-style patterns is collapsed at match time by the lazy DFA
   (`\w+` → ~10 DFA states regardless of its ~3.9 k-instruction NFA). The eager comptime
-  DFA (the deferred CTRE-lane backend, `DESIGN.md §7`) is what would carry that collapse
+  DFA (the deferred CTRE-lane backend) is what would carry that collapse
   into `ro_data` for the comptime path.
 
 ## [0.2.0] - 2026-06-09

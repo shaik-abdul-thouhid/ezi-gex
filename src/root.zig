@@ -46,9 +46,42 @@ pub const Backend = engine.backend;
 pub const Match = engine.Match;
 pub const Captures = engine.Captures;
 pub const SearchOptions = engine.SearchOptions;
-/// Built-in, pluggable backends: `auto` (default), `pikevm`, `backtrack`, `literal`,
-/// `bytepike`, and `dfa` (the byte lazy DFA — span-only, runtime-only). Pass any to
-/// `compileRuntimeWith`/`compileComptimeWith`.
+/// ## Built-in backends & capability matrix
+///
+/// Pluggable backends, any of which can be passed to `compileRuntimeWith` /
+/// `compileComptimeWith`. **`auto` is the default and is correct by construction:** it inspects
+/// each pattern and routes it to a backend that supports it (and switches per search — bounded
+/// backtracker vs. Pike VM for captures, eager vs. lazy DFA for spans). So you only need the
+/// matrix below if you deliberately *pin* a non-`auto` backend; that is the contract you opt into:
+///
+/// | backend     | captures | comptime | accepts (beyond the universal limits below)            |
+/// |-------------|----------|----------|-------------------------------------------------------|
+/// | `auto`      | yes      | yes      | everything — routes to a capable backend internally   |
+/// | `pikevm`    | yes      | yes      | every feature **except `\X`**; always O(input)        |
+/// | `backtrack` | yes      | yes      | every feature **including `\X`**; **bounded input**   |
+/// | `literal`   | no       | yes      | pure literals / literal alternations only             |
+/// | `bytepike`  | no       | yes      | byte-lowerable (no `\X`/`\b`); reference executor      |
+/// | `dfa`       | no       | **no**   | byte-lowerable + `\A`/`^` + **anchored-end** `$`/`\z`  |
+/// | `edfa`      | no       | yes      | as `dfa`, frozen tables; bounded determinized state    |
+///
+/// **Universal limits (true of every backend, by design — routing decisions, not missing
+/// features):**
+///   * `\b`/`\B` (word boundary) and `\X` (grapheme) are *codepoint* properties: only the
+///     **code-point** engines evaluate them (`\b`/`\B` on `pikevm`/`backtrack`; `\X` on
+///     `backtrack` only). The byte DFAs (`dfa`/`edfa`/`bytepike`) **never** support them —
+///     `auto` keeps such patterns on the code-point engines.
+///   * A **mixed** `$` (a `text_end` in only some alternation branches, `a$|b`) runs on the Pike
+///     VM. `(?m)` line anchors run on the **eager** DFA when non-prone (`(?m)^\w+`, `(?m)foo$`);
+///     a *prone* `(?m)` (an unbounded run before the anchor, `(?m)\w+$`) and any `(?m)` on the
+///     lazy DFA fall to the Pike VM (correct + linear there).
+///   * Every backend is **leftmost-first** (byte-identical spans) and — except `backtrack` on
+///     oversized input — **linear-time** (no catastrophic backtracking), pinned by
+///     `engine/conformance.zig` and `engine/redos.zig`.
+///
+/// **Span-only** backends (`literal`/`bytepike`/`dfa`/`edfa`) locate `[start, end)` but do not
+/// fill captures; asking one for captures is a `@compileError`. **`dfa` is runtime-only** (its
+/// cache mutates while matching) — use `edfa`/`pikevm`/`auto` for comptime matching. Each
+/// backend's module doc spells out precisely what it accepts and declines.
 pub const backends = engine.backends;
 /// Front-door pipeline options (`case_fold`, …), comptime-known on both paths.
 pub const Options = engine.Options;

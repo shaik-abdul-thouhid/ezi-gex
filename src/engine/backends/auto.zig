@@ -261,8 +261,10 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, opts: Options) BuildError!
         } else |e| switch (e) {
             error.OutOfMemory => return e,
             else => { // eager DFA declined (exceeded its fixed bounds) — fall back to the lazy
-                // DFA when IT can run the pattern (the lazy DFA still declines `$`/`\z`, which
-                // the eager DFA supports, so a too-big `$` pattern lands on the NFA arm).
+                // DFA when IT can run the pattern. The lazy DFA covers anchored-end `$`/`\z`
+                // (reverse-from-end), so a too-big trailing-`$` pattern stays on the DFA arm; a
+                // mixed `$`, `\b`/`\X`, a *prone* `(?m)` line pattern, or a too-big `(?m)` (the
+                // lazy DFA declines line anchors) lands on the NFA arm.
                 if (dfa.supports(h)) {
                     program.dfa_prog = dfa.buildAlloc(gpa, h, .{}) catch |e2| switch (e2) {
                         error.OutOfMemory => return e2,
@@ -595,16 +597,16 @@ fn runEdfa(ep: *const edfa.Program, filter: Filter, input: []const u8, opts: Sea
     var o = opts;
     if (filter.prefix_byte) |fb| {
         // The leading-literal `memchr` start-skip confirms anchored at each prefix-byte
-        // occurrence. Each confirm is O(match-attempt); when a confirm can walk an unbounded
-        // run before failing — `prone` (a non-accepting cycle, `(x+x+)+y`) or `end_anchored`
-        // (`$`, the confirm runs to end, `(a+)+$`) — this loop is **Θ(n²)** on a dense-prefix
-        // begin-but-don't-complete input (`a+b`/`(a+)+$` on `aaaa…a!`: a leading-byte at every
-        // position, each confirm re-walking the whole run). For exactly those programs the eager
-        // DFA's *native* find is already O(input) (reverse two-pass / reverse-from-end), so skip
-        // to the first candidate once and hand off to it — no per-position confirm. The fast-
-        // confirm case (`foo\d+`: bounded literal, confirm fails within a few bytes) keeps the
-        // memchr-jump loop, its intended speedup. (Both are leftmost-first; no match begins
-        // before the first prefix byte.)
+        // occurrence. Each confirm is O(match-attempt); when a confirm can walk a long run before
+        // failing it blows up on a dense-prefix begin-but-don't-complete input (`aaaa…a!`: a
+        // leading byte at every position, each confirm re-walking the run). `ep.prone` flags both
+        // hazardous shapes — a non-accepting *cycle* (`(x+x+)+y`, unbounded ⇒ Θ(n²)) AND a long
+        // *bounded* prefix (`a{4000}b`, Θ(n·k) with large k) — and `end_anchored` (`$`) flags the
+        // run-to-end shape (`(a+)+$`). For all of those the eager DFA's *native* find is O(input)
+        // (reverse two-pass / reverse-from-end), so skip to the first candidate once and hand off —
+        // no per-position confirm. The fast-confirm case (`foo\d+`, `a{4}b`: the confirm fails
+        // within a few bytes) keeps the memchr-jump loop, its intended speedup. (Both leftmost-first;
+        // no match begins before the first prefix byte.)
         if (ep.prone or ep.end_anchored) {
             o.start = memchrFrom(input, o.start, fb) orelse return null;
             if (input.len - o.start < filter.min_bytes) return null;
@@ -788,7 +790,9 @@ test "auto routes literal patterns to the literal backend; DFA-eligible NFA patt
         .{ .pat = "(a)(b)", .route = "nfa+edfa" }, // captures don't block the DFA span arm
         .{ .pat = "\\d+", .route = "nfa+edfa" },
         .{ .pat = "^abc$", .route = "nfa+edfa" }, // `^`/`$` now both DFA-eligible (text_start + text_end)
-        .{ .pat = "(?m)^x", .route = "nfa" }, // line anchors stay DFA-ineligible → NFA only
+        .{ .pat = "(?m)^\\w+", .route = "nfa+edfa" }, // non-prone (?m)^ → eager DFA (anchored restart w/ line context)
+        .{ .pat = "(?m)foo$", .route = "nfa+edfa" }, // non-prone (?m)$ → eager DFA
+        .{ .pat = "(?m)\\w+$", .route = "nfa" }, // PRONE (?m)$ → declined to the Pike VM (quadratic-immune)
     };
     for (cases) |c| {
         var diag: compile.Diagnostic = .{};
