@@ -27,11 +27,14 @@ a **pluggable backend** architecture.
 
 ## Status
 
-**`0.4.0-dev` on `main`** — the active development branch. The latest *tagged* release is
-**`v0.3.1`**, but it predates most of the work below; for the current engine, track `main`
-(see [Installing](#installing)). Pre-1.0, so the API may still change, but everything in the
-public surface is annotated `@stable-since: vX.Y.Z` and is covered by SemVer. Tracks a recent
-Zig dev build (`0.17.0-dev`); it will not compile on stable 0.16.
+**Latest release: `v0.4.0`.** `main` is the active development branch (now `0.5.0-dev`); see
+[Installing](#installing) for pinning the tag vs. tracking `main`. Pre-1.0, so the API may still
+change, but everything in the public surface is annotated `@stable-since: vX.Y.Z` and is covered by
+SemVer. Tracks a recent Zig dev build (`0.17.0-dev`); it will not compile on stable 0.16.
+
+**Benchmarked** three ways against **Rust `regex`** and **Go `regexp`** on real
+[rebar](https://github.com/BurntSushi/rebar) haystacks — reproducible harness (clone + `./run.sh`):
+**[github.com/shaik-abdul-thouhid/regex-bench](https://github.com/shaik-abdul-thouhid/regex-bench)**.
 
 **What works is tested** — **400+ tests** pass (per-module behaviour; cross-backend
 conformance, a wide differential corpus where every backend must agree with the Pike VM,
