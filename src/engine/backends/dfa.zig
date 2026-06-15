@@ -140,10 +140,10 @@
 
 const std = @import("std");
 
-const backend = @import("../backend.zig");
-const hir = @import("../../core/hir.zig");
-const byte = @import("../byte.zig");
-const nfa = @import("../nfa.zig"); // for the Unicode-correct `\b`/`\B` decode at match time (assertionHolds)
+const backend = @import("engine_base").backend;
+const hir = @import("core").hir;
+const byte = @import("engine_base").byte;
+const nfa = @import("engine_base").nfa; // for the Unicode-correct `\b`/`\B` decode at match time (assertionHolds)
 
 const Match = backend.Match;
 const SearchOptions = backend.SearchOptions;
@@ -1757,8 +1757,8 @@ pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opt
 // ════════════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
-const compile = @import("../../core/compile.zig");
-const pikevm = @import("pikevm.zig");
+const compile = @import("core").compile;
+const pikevm = @import("pikevm");
 const E = backend.Engine(@This());
 
 fn buildFrom(gpa: std.mem.Allocator, pattern: []const u8) !Program {

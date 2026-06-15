@@ -59,9 +59,9 @@
 
 const std = @import("std");
 
-const backend = @import("../backend.zig");
-const hir = @import("../../core/hir.zig");
-const nfa = @import("../nfa.zig");
+const backend = @import("engine_base").backend;
+const hir = @import("core").hir;
+const nfa = @import("engine_base").nfa;
 
 const Match = backend.Match;
 const SearchOptions = backend.SearchOptions;
@@ -461,7 +461,7 @@ pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const
 // ════════════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
-const compile = @import("../../core/compile.zig");
+const compile = @import("core").compile;
 const E = backend.Engine(@This());
 
 const Compiled = struct {

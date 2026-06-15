@@ -21,7 +21,7 @@
 const std = @import("std");
 
 const backend = @import("backend.zig");
-const hir = @import("../core/hir.zig");
+const hir = @import("core").hir;
 
 const utils = @import("utils");
 const utf8 = utils.unicode.utf8;
@@ -961,7 +961,7 @@ fn findSpan(prog: *const Program, input: []const u8) ?[2]usize {
 }
 
 fn buildByteFromPattern(gpa: std.mem.Allocator, pattern: []const u8) !Program {
-    const core = @import("../core/root.zig");
+    const core = @import("core");
     var diag: core.errors.Diagnostic = .{};
     const ast = try core.compile.parse(gpa, pattern, &diag);
     defer ast.deinit(gpa);
@@ -1010,7 +1010,7 @@ test "byte lowering: multi-byte UTF-8 literals and classes" {
 
 test "byte lowering refuses \\X (grapheme) but now lowers \\b (ASCII word boundary)" {
     const gpa = testing.allocator;
-    const core = @import("../core/root.zig");
+    const core = @import("core");
     // `\X` (grapheme) is still not byte-lowerable.
     {
         var diag = core.errors.Diagnostic{};
@@ -1102,8 +1102,8 @@ test "byte classes: a single ASCII class collapses to three groups" {
 }
 
 test "byte program builds at comptime (ro_data)" {
-    const core = @import("../core/root.zig");
-    const h = comptime switch (core.hir.buildComptime(@import("../core/root.zig").compile.compile("[a-z]+\\d"), .{})) {
+    const core = @import("core");
+    const h = comptime switch (core.hir.buildComptime(@import("core").compile.compile("[a-z]+\\d"), .{})) {
         .ok => |x| x,
         .fail => @compileError("bad pattern"),
     };
@@ -1113,7 +1113,7 @@ test "byte program builds at comptime (ro_data)" {
 
 test "byteWorthLowering gates pathological patterns, keeps normal ones" {
     const gpa = testing.allocator;
-    const core = @import("../core/root.zig");
+    const core = @import("core");
     const Case = struct { pat: []const u8, worth: bool };
     const cases = [_]Case{
         .{ .pat = "[a-z]+", .worth = true },

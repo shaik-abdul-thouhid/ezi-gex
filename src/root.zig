@@ -1,7 +1,7 @@
 const std = @import("std");
 
 /// Internal building blocks: token, ast, errors, scanner, compile.
-pub const core = @import("core/root.zig");
+pub const core = @import("core");
 
 pub const ast = core.ast;
 pub const token = core.token;
@@ -11,7 +11,7 @@ pub const scanner = core.scanner;
 pub const hir = core.hir;
 
 /// The execution engine: backend contract + agnostic operations + backends.
-pub const engine = @import("engine/root.zig");
+pub const engine = @import("engine");
 
 // The comptime/runtime AST-building layer. Aliased privately to avoid clashing
 // with the `compile` *function* re-exported below.

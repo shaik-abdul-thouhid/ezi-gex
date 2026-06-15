@@ -134,7 +134,7 @@ A recurring worry is that resolving Unicode classes "pulls in huge tables." It d
 pull in tables, but the size is **bounded and constant**, not proportional to how many
 or how complex your patterns are:
 
-- **Class matching uses range tables; assertions use property tables (~380 KB total,
+- **Class matching uses range tables; assertions use property tables (~385 KB total,
   linked once).** Class *matching* is delegated to `ezi_code`'s *enumerable range tables*
   — `category_runs`, `derived_runs`, `script_runs` — which the HIR resolves every class
   from (matched by a range check, no per-character lookup). The Unicode **assertions** are
@@ -142,7 +142,7 @@ or how complex your patterns are:
   via `properties.isWord` (the **DerivedCoreProperties** table, ~161 KB — the single
   biggest contributor; see `engine/nfa.zig`), `\X` via the **grapheme-break** table, and
   full `(?i)` folding via the **case-fold** tables. Measured in the bundled demo (which
-  exercises `\p{L}`, scripts, classes, captures): **≈ 380 KB**, the same whether the
+  exercises `\p{L}`, scripts, classes, captures): **≈ 385 KB**, the same whether the
   program compiles one regex or ten thousand.
 - **It is a fixed cost, not a growing one** — and a program that uses *no* Unicode
   assertions and only ASCII classes pulls far less (`ezi_gex` still links none of
@@ -583,7 +583,7 @@ The contract is the seam that makes these drop-in:
 | 1 ✅ *(0.1.0)* | literal `eql` → `std.mem.indexOf`; `prefix_literal` first byte → `memchr` start-skip in `auto` (+ length/anchor gates); **0.3.0:** literal *alternation* skips with a single SIMD `indexOfAny` pass (was a Θ(n²) per-branch `indexOfPos`); **0.4.0:** the start-skip uses the **whole `prefix_literal` run** (`\bthe\b` jumps "the"→"the" not 't'→'t'), via the two-byte `memmem.Finder` (next row) | done | ~20× on memchr-friendly literals and prefixed NFA patterns; `foo\|bar\|baz\|qux` 7.5 → ~460 MiB/s (no longer quadratic) |
 | 1+ ✅ *(0.4.0)* | **Two-byte SIMD `memmem`** (`engine/memmem.zig`) — a portable single-substring search: probe the two **rarest** needle bytes, AND their `@Vector` equality masks across a 16/32-byte chunk, verify only where both coincide. **No arch asm** (SSE2 `pcmpeqb`/NEON via portable `@Vector`; `simd.zig` stays the only arch-specific file). Wired into both the `literal` backend's single-literal scan (`literal.Program.mem`) and `auto`'s ≥2-byte prefix start-skip (`auto.memmemFrom`); governed by `strategy.simd` | done | `Sherlock` 233.67 → 13.54 µs (**17×, 40.9 GiB/s — faster than Rust**); `the` 504.75 → 62.88 µs (8×); `\bthe\b` on logs 144.96 → 23.75 µs (6×); `the\s+\p{L}+` 837 → 670 µs |
 | 3a ✅ *(0.2.0, compacted 0.3.0)* | **byte-NFA lowering + `ByteMap`** (`engine/byte.zig`) — UTF-8 `utf8-ranges`, a `byte_range` Thompson NFA, byte equivalence classes; executed by the `bytepike` reference VM. **0.3.0:** UTF-8 suffix sharing (`(lo,hi,next)` cache) + single-copy `x+` shrink the NFA ~1.5–2.9×; `byteWorthLowering` cost-gate | done | the substrate for the DFAs below; smaller NFA ⇒ faster determinization |
-| 3c ✅ *(0.3.0)* — **the default span engine** | **eager DFA** (`backends/edfa.zig`) — fully determinizes the byte NFA into a frozen `states × byte_classes` table; **stateless** matcher (a bare table walk, zero decode), comptime *and* runtime, span-only. **`find` is O(input) on every pattern** via the build-time `program.prone` strategy: non-prone → anchored restart, prone → the reverse-DFA two-pass (`utrans` forward-end + a frozen reverse table for the start). Supports `text_start` **and `text_end`** (`$`/`\z`). **Builds only the tables it uses** (a non-prone `\w+` keeps just its `trans`, ~141 KB, not + `utrans` + reverse, ~1 MB) | done | class scans (`\w+`, `\d+`, `[A-Za-z]+`, `\p{L}+`) at **Rust parity** (~1.1–1.3×); the email `\w+@\w+` Θ(n²) stays fixed; tiny + bakeable for literal/ASCII (`abc` 5 states / 105 B) |
+| 3c ✅ *(0.3.0)* — **the default span engine** | **eager DFA** (`backends/edfa.zig`) — fully determinizes the byte NFA into a frozen `states × byte_classes` table; **stateless** matcher (a bare table walk, zero decode), comptime *and* runtime, span-only. **`find` is O(input) on every pattern** via the build-time `program.prone` strategy: non-prone → anchored restart, prone → the reverse-DFA two-pass (`utrans` forward-end + a frozen reverse table for the start). Supports `text_start` **and `text_end`** (`$`/`\z`). **Builds only the tables it uses** (a non-prone `\w+` keeps just its `trans`, ~141 KB, not + `utrans` + reverse — ~1 MB for a prone pattern like `\w+@\w+`) | done | class scans (`\w+`, `\d+`, `[A-Za-z]+`, `\p{L}+`) at **Rust parity** (~1.1–1.3×); the email `\w+@\w+` Θ(n²) stays fixed; tiny + bakeable for literal/ASCII (`abc` 5 states / 100 B) |
 | 3b ✅ *(0.3.0)* — **the fallback** | **lazy DFA** over the **byte** automaton (`engine/backends/dfa.zig`) — caches `(state, class)` transitions; span-only, runtime-only, leftmost-first via priority + cut-on-match determinization; with an **O(n) reverse-DFA `find`**. Now the fallback when the eager DFA overflows its `max_states` bound. **0.3.0 hot-loop pass:** cached raw table pointers refreshed only after a cold transition (`\w+` ~336 → ~517 MiB/s). **0.4.0:** also matches anchored-end `$`/`\z` (reverse-from-end) and carries **Unicode `\b`** (decode-hybrid) | done | one DFA state per byte (cached); serves patterns whose full eager table is too large |
 | line anchors `(?m)` & `\b`/`\B` in the DFA ✅ *(0.4.0)* | **eager** DFA bakes in **ASCII** `\b`/`\B` (word-context byte classes + one-byte word-lookahead) and non-prone `(?m)` line anchors (anchored restart with line context, `\n` isolated); the **lazy** DFA carries **Unicode** `\b` via the decode-hybrid; `auto` routes ASCII→eager, non-ASCII→lazy, declined→Pike VM | done | `\b\w+\b` 37 → 244 MiB/s (~6.6×, now ≈ plain `\w+`); `\bthe\b` 89 MiB/s → multi-GiB/s |
 | one-pass NFA capture path ✅ *(0.4.0)* | **`backends.onepass`** — a single deterministic thread fills `slots` in O(input) for provably one-pass patterns; `auto` uses it for the anchored capture fill after a DFA locates the span (else the Pike VM) | done | `(\w+)` capture extraction ASCII 64 → 206 MiB/s (~3.2×) |
@@ -768,7 +768,7 @@ Three properties are specific to determinizing *eagerly*:
   engines (correct + linear there).
 - **It builds only the tables it will use, and minimizes them.** `utrans` and the reverse
   table are built **only for prone patterns**; a non-prone `\w+` stores just its forward `trans`
-  table (~141 KB) instead of `trans` + `utrans` + reverse (~1 MB). The kept tables are then
+  table (~141 KB) instead of the full `trans` + `utrans` + reverse trio (which for a prone pattern like `\w+@\w+` totals ~1 MB). The kept tables are then
   **Hopcroft/Moore minimized** (since 0.4.0, results-invariant, dense layout preserved — a prone
   `\w+@\w+`'s reverse DFA shrinks ~3251 → ~1047 states). A **sparse** transition encoding remains
   a noted follow-up — tier 3c+ — for the tables that *are* kept.
@@ -777,9 +777,9 @@ Three properties are specific to determinizing *eagerly*:
   `max_states` is **declined**: `error.Unsupported` at runtime (`auto` falls back to the lazy
   DFA), a `@compileError` at comptime. The per-build buffers are sized to the pattern
   (`min(instruction_count + 256, max_states)`), so small patterns stay cheap. Size is honest:
-  `abc` is 5 states / 105 B, `[a-z]+` is 3 states, a `\d{4}-\d{2}-\d{2}` date ~200 states /
-  ~63 KB; a Unicode class is a few **hundred** states (`\w+` ~323 / ~141 KB **dense**,
-  `\w+@\w+` ~645) — larger than the byte NFA, since a dense `states × classes` table over a
+  `abc` is 5 states / 100 B, `[a-z]+` is 3 states, a `\d{4}-\d{2}-\d{2}` date ~200 states /
+  ~63 KB; a Unicode class is a few **hundred** states (`\w+` ~322 / ~141 KB **dense**,
+  `\w+@\w+` ~643) — larger than the byte NFA, since a dense `states × classes` table over a
   ~100-class alphabet is big and most transitions go to the dead state. The follow-up
   minimization (3c+) shrinks the kept tables; until then a class pattern too large for the
   eager bound is served by the runtime lazy DFA.

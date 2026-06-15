@@ -64,12 +64,12 @@
 
 const std = @import("std");
 
-const core = @import("../core/root.zig");
+const core = @import("core");
 const hir = core.hir;
 const parser = core.compile;
-const backend = @import("backend.zig");
-const auto = @import("backends/auto.zig");
-const simd = @import("simd.zig");
+const backend = @import("engine_base").backend;
+const auto = @import("auto");
+const simd = @import("engine_base").simd;
 
 /// Re-export: a parse-failure report — error code + byte span + message + caret renderer.
 pub const Diagnostic = parser.Diagnostic;

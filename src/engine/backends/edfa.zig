@@ -116,10 +116,10 @@
 
 const std = @import("std");
 
-const backend = @import("../backend.zig");
-const hir = @import("../../core/hir.zig");
-const byte = @import("../byte.zig");
-const dfa = @import("dfa.zig");
+const backend = @import("engine_base").backend;
+const hir = @import("core").hir;
+const byte = @import("engine_base").byte;
+const dfa = @import("dfa");
 
 const Match = backend.Match;
 const SearchOptions = backend.SearchOptions;
@@ -2448,8 +2448,8 @@ pub fn search(program: *const Program, _: *Scratch, input: []const u8, opts: Sea
 // ════════════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
-const compile = @import("../../core/compile.zig");
-const pikevm = @import("pikevm.zig");
+const compile = @import("core").compile;
+const pikevm = @import("pikevm");
 const E = backend.Engine(@This());
 
 fn buildFrom(gpa: std.mem.Allocator, pattern: []const u8) !Program {

@@ -53,21 +53,21 @@
 
 const std = @import("std");
 
-const backend = @import("../backend.zig");
-const hir = @import("../../core/hir.zig");
-const nfa = @import("../nfa.zig");
-const simd = @import("../simd.zig");
-const memmem = @import("../memmem.zig");
-const teddy = @import("../teddy.zig");
-const classscan = @import("../classscan.zig");
+const backend = @import("engine_base").backend;
+const hir = @import("core").hir;
+const nfa = @import("engine_base").nfa;
+const simd = @import("engine_base").simd;
+const memmem = @import("engine_base").memmem;
+const teddy = @import("engine_base").teddy;
+const classscan = @import("engine_base").classscan;
 
-const literal = @import("literal.zig");
-const pikevm = @import("pikevm.zig");
-const backtrack = @import("backtrack.zig");
-const dfa = @import("dfa.zig");
-const edfa = @import("edfa.zig");
-const onepass = @import("onepass.zig");
-const byte = @import("../byte.zig");
+const literal = @import("literal");
+const pikevm = @import("pikevm");
+const backtrack = @import("backtrack");
+const dfa = @import("dfa");
+const edfa = @import("edfa");
+const onepass = @import("onepass");
+const byte = @import("engine_base").byte;
 
 const utils = @import("utils");
 const encoding = utils.unicode.encoding;
@@ -1772,7 +1772,7 @@ pub fn route(program: *const Program) []const u8 {
 // ════════════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
-const compile = @import("../../core/compile.zig");
+const compile = @import("core").compile;
 const E = backend.Engine(@This());
 
 const Compiled = struct {

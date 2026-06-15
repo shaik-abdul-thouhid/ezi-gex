@@ -26,11 +26,11 @@
 
 const std = @import("std");
 
-const backend = @import("../backend.zig");
-const hir = @import("../../core/hir.zig");
-const simd = @import("../simd.zig");
-const teddy = @import("../teddy.zig");
-const memmem = @import("../memmem.zig");
+const backend = @import("engine_base").backend;
+const hir = @import("core").hir;
+const simd = @import("engine_base").simd;
+const teddy = @import("engine_base").teddy;
+const memmem = @import("engine_base").memmem;
 
 const utils = @import("utils");
 const utf8 = utils.unicode.utf8;
@@ -463,7 +463,7 @@ pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const
 // ════════════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
-const compile = @import("../../core/compile.zig");
+const compile = @import("core").compile;
 const E = backend.Engine(@This());
 
 const Compiled = struct {

@@ -18,7 +18,7 @@
 const std = @import("std");
 
 const backend = @import("backend.zig");
-const hir = @import("../core/hir.zig");
+const hir = @import("core").hir;
 
 const utils = @import("utils");
 const properties = utils.unicode.properties;

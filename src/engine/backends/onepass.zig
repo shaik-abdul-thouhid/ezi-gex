@@ -61,9 +61,9 @@
 
 const std = @import("std");
 
-const backend = @import("../backend.zig");
-const hir = @import("../../core/hir.zig");
-const nfa = @import("../nfa.zig");
+const backend = @import("engine_base").backend;
+const hir = @import("core").hir;
+const nfa = @import("engine_base").nfa;
 
 const utils = @import("utils");
 
@@ -670,8 +670,8 @@ pub fn searchCaptures(program: *const Program, _: *Scratch, input: []const u8, s
 // ════════════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
-const compile = @import("../../core/compile.zig");
-const pikevm = @import("pikevm.zig");
+const compile = @import("core").compile;
+const pikevm = @import("pikevm");
 const E = backend.Engine(@This());
 
 test "onepass satisfies the backend contract" {

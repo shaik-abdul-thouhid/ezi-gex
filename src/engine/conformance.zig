@@ -19,20 +19,20 @@
 const std = @import("std");
 const testing = std.testing;
 
-const regex = @import("regex.zig");
-const backend = @import("backend.zig");
-const pikevm = @import("backends/pikevm.zig");
-const backtrack = @import("backends/backtrack.zig");
-const literal = @import("backends/literal.zig");
-const bytepike = @import("backends/bytepike.zig");
-const dfa = @import("backends/dfa.zig");
-const edfa = @import("backends/edfa.zig");
-const onepass = @import("backends/onepass.zig");
-const auto = @import("backends/auto.zig");
+const regex = @import("regex");
+const backend = @import("engine_base").backend;
+const pikevm = @import("pikevm");
+const backtrack = @import("backtrack");
+const literal = @import("literal");
+const bytepike = @import("bytepike");
+const dfa = @import("dfa");
+const edfa = @import("edfa");
+const onepass = @import("onepass");
+const auto = @import("auto");
 
-const byte = @import("byte.zig");
-const hir = @import("../core/hir.zig");
-const ccompile = @import("../core/compile.zig");
+const byte = @import("engine_base").byte;
+const hir = @import("core").hir;
+const ccompile = @import("core").compile;
 
 /// Whether `pattern` can be lowered to a byte program (false for `\X` grapheme; **`\b`/`\B`
 /// now lower** — they are evaluated as ASCII word boundaries by the byte engines).

@@ -478,7 +478,7 @@ Use it when **all three** are true:
 That third one is the catch — though a much smaller one than it used to be. This engine
 resolves Unicode classes to sorted code-point ranges at HIR time, and a
 `compileComptime` program bakes its ranges into `ro_data`. One `\w` is ~6.3 KB
-(802 ranges × 8 B), `\p{L}` ~5.3 KB, `\d` ~0.5 KB, `\s` ~80 B. **Identical classes
+(802 ranges × 8 B), `\p{L}` ~5.3 KB (684 ranges), `\d` ~0.6 KB (72 ranges), `\s` ~80 B (10 ranges). **Identical classes
 inside a pattern are interned to a single range-block**, so a counted repeat like
 `\w{3,32}` costs *one* `\w` (~6.3 KB), not one per copy — repetition no longer
 multiplies the table. The remaining cost is one block per *distinct* class per
@@ -593,7 +593,8 @@ the end is pinned to `input.len`, so a single **reverse-DFA pass from the end** 
 leftmost start (no anchored restart, which would be Θ(n²) on these begin-but-don't-complete
 shapes). The eager DFA also **builds only the tables it will use**: `utrans` and the reverse
 table are built **only for prone or trailing-`$` patterns**, so a non-prone `\w+` stores just
-its forward `trans` table (~141 KB) instead of all three (~1 MB). Leftmost-first,
+its forward `trans` table (~141 KB), not the full forward + `.*?`-prefix + reverse trio
+(which for a prone pattern like `\w+@\w+` totals ~1 MB). Leftmost-first,
 conformance-pinned to the Pike VM.
 
 Since first writing this, most items here have **landed**: `\b`/`\B` and `(?m)` on the byte DFAs,
@@ -628,13 +629,13 @@ whether you compile 1 pattern or 10 000:
 
 | What | Cost | Grows with…? |
 |---|---|---|
-| `ezi_code` Unicode tables linked into the demo — class **ranges** (`category_runs`, `derived_runs`, `script_runs`) **plus** the assertion **tables** (DerivedCoreProperties for `\b`, grapheme-break for `\X`, case-fold for `(?i)`) | **≈ 380 KB, linked once** *(measured by symbol span; largest: DerivedCoreProperties ~161 KB, case-fold ~96 KB, category ranges ~49 KB, derived ranges ~40 KB)* | **nothing** — same for 1 pattern or 10 000 |
+| `ezi_code` Unicode tables linked into the demo — class **ranges** (`category_runs`, `derived_runs`, `script_runs`) **plus** the assertion **tables** (DerivedCoreProperties for `\b`, grapheme-break for `\X`, case-fold for `(?i)`) | **≈ 385 KB, linked once** *(measured by symbol span; largest: DerivedCoreProperties ~161 KB, case-fold ~95 KB, category ranges ~49 KB, derived ranges ~40 KB)* | **nothing** — same for 1 pattern or 10 000 |
 | a runtime-compiled regex (`compileRuntime`) | on the **heap**, not the binary | the pattern |
 | a comptime-compiled regex (`compileComptime`), per pattern | one program in `ro_data`; ~6.3 KB per *distinct* `\w`, ~5.3 KB per `\p{L}`, ≤0.5 KB for ASCII classes | the pattern's distinct classes |
 
 So once a program touches the regex engine at all, the Unicode tables are paid for **once** and
 never again — adding more patterns, longer patterns, or more Unicode classes cannot push that
-~380 KB any higher (and a program that uses *no* Unicode assertions and only ASCII classes pulls
+~385 KB any higher (and a program that uses *no* Unicode assertions and only ASCII classes pulls
 far less). The only size that scales with your code is `ro_data` for the `compileComptime`
 programs you choose to bake in, and even there **identical classes are interned** (a class used N
 times in one pattern is stored once; `\w{3,32}` costs one `\w`, not 35). `compileRuntime` adds
@@ -656,7 +657,7 @@ nothing to the binary beyond the shared tables.
 > CTRE/bake-it-in path: tiny for literal/ASCII patterns (`abc` is 5 states / ~100 B), a
 > few hundred states for a Unicode class. It now **builds only the tables it uses** (a
 > non-prone `\w+` keeps just its forward table, ~141 KB, not the forward + `.*?`-prefix +
-> reverse trio, ~1 MB). See [`docs/architecture.md`](docs/architecture.md) → *The byte
+> reverse trio — which for a prone pattern like `\w+@\w+` totals ~1 MB). See [`docs/architecture.md`](docs/architecture.md) → *The byte
 > substrate* / *The eager DFA*.
 >
 > **Build-time note — determinization is ~O(states) (hash-interned).** The forward and reverse
@@ -671,14 +672,14 @@ backends), built with Zig `0.17.0-dev` on macOS arm64:
 
 | Optimize mode | Demo binary |
 |---|---|
-| `Debug` | **~3.4 MB** (3,574,728 B) |
-| `ReleaseSafe` | **~1.27 MB** (1,329,416 B) |
-| `ReleaseFast` | **~1.14 MB** (1,191,160 B) |
-| `ReleaseSmall` | **~758 KB** (775,992 B) |
+| `Debug` | **~3.5 MB** (3,682,968 B) |
+| `ReleaseSafe` | **~1.30 MB** (1,362,504 B) |
+| `ReleaseFast` | **~1.17 MB** (1,226,408 B) |
+| `ReleaseSmall` | **~777 KB** (794,968 B) |
 
 The bulk of the `Debug` figure is the Zig `Debug` runtime (DWARF self-unwind, UBSan, the
-allocator), not regex data — `ReleaseSmall` strips that down to ~758 KB, of which the shared
-`ezi_code` Unicode tables (~380 KB, above) are the largest single contributor. Your own binary
+allocator), not regex data — `ReleaseSmall` strips that down to ~777 KB, of which the shared
+`ezi_code` Unicode tables (~385 KB, above) are the largest single contributor. Your own binary
 will be smaller still: it won't link the demo's spread of backends and Unicode features, and
 `compileRuntime` adds nothing beyond the shared tables.
 
@@ -696,6 +697,33 @@ will be smaller still: it won't link the demo's spread of backends and Unicode f
   backends, the front door, and a backend quickstart.
 - [`src/engine/backends/README.md`](src/engine/backends/README.md) — the built-in
   backends (incl. `bytepike`/`dfa`/`edfa`) and how `auto` chooses.
+
+## Building & testing
+
+```sh
+zig build                                   # build the demo exe (zig-out/bin/ezi_gex)
+zig build run                               # build + run it
+zig build bench                             # benchmarks (ReleaseFast by default)
+zig build test -Doptimize=ReleaseSafe       # full suite (ReleaseSafe is faster than Debug)
+```
+
+The test suite is split into **15 independently-cacheable units** — one named module per area, so a
+test binary only ever contains its own `test {}` blocks (Zig pulls a file's tests into every module
+that reaches it via a *relative* import, but never across a *named*-module boundary). Editing one
+file recompiles and re-runs only the unit(s) whose inputs changed; the rest stay cached. The units:
+`utils`, `core`, `engine_base`, the eight backends (`backtrack`, `pikevm`, `bytepike`, `dfa`, `edfa`,
+`onepass`, `literal`, `auto`), `regex`, `conformance`, `redos`, and `exe`.
+
+```sh
+zig build test-core                         # run ONE unit (cached; also test-auto, test-edfa, …)
+zig build test-conformance -Doptimize=ReleaseSafe
+zig build --help                            # lists every test-<unit> step
+# Gate the aggregate `test` step to a subset (REPEAT the flag — there is no comma form):
+zig build test -Dinclude-test=auto -Dinclude-test=conformance -Doptimize=ReleaseSafe
+```
+
+Use `test-<unit>` while iterating on one file; run the full `zig build test` before committing.
+`zig build test` prints nothing and exits `0` on success; a failure prints the failing test.
 
 ## License
 

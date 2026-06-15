@@ -42,6 +42,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the lazy DFA regardless. The lazy DFA computes the same states on demand, amortized over the input.
   Results-invariant — it only changes which span engine runs. The comptime CTRE-lane keeps its
   separate, tighter `tinyForComptimeEdfa` gate. New decl (`@stable-since v0.5.0`): `auto.EAGER_BYTE_INST_MAX`.
+- **Per-module test units — `zig build test` is now flag-selectable and caches per module.** The
+  engine was a single Zig module, so every `test {}` block compiled into one giant test binary;
+  editing any file recompiled and re-ran the whole engine. `build.zig` now splits the library into
+  named modules along an acyclic DAG (`utils` → `core` → `engine_base` → each backend → `regex` /
+  `conformance` / `redos` → the `ezi_gex` facade), giving **15 independently-cacheable test
+  binaries**. Editing one file re-runs only the unit(s) whose inputs changed; the rest stay cached
+  (e.g. touching `literal.zig` re-runs 6 of 15 units, the other 9 stay cached). New ergonomics:
+  `zig build test-<unit>` runs a single unit (`test-core`, `test-auto`, `test-pikevm`, …), and
+  `-Dinclude-test=<unit>` (repeat the flag for several) gates the aggregate `zig build test`. The
+  same 409 tests run, each exactly once; no source behavior change — the demo binary is byte-identical.
+  Modeled on `ezi_code`'s build.
 
 ### Performance
 
@@ -60,6 +71,18 @@ Measured on `regex-bench` (Apple M4, ReleaseFast; non-overlapping `count` over t
 All four are **results-invariant** — the cross-backend conformance suite pins every new path's spans
 and capture slots to the Pike VM (runtime and comptime), incl. non-ASCII `\b`, fixed-offset
 alignment, and line-skip cases.
+
+### Docs
+
+- Refreshed the empirical footprint numbers in `README.md` and `docs/architecture.md` against the
+  current byte substrate (ezi_code `v0.4.1` pin, Zig 0.17.0-dev, macOS arm64). Re-measured: demo
+  binary sizes (ReleaseSmall **794,968 B**, ReleaseSafe 1,362,504 B, ReleaseFast 1,226,408 B, Debug
+  3,682,968 B — all ~1–3 % larger than the previously documented values); the `ezi_code` Unicode
+  tables linked into the demo (**≈ 385 KB**); per-distinct-class baked ranges (`\w` 802, `\p{L}` 684,
+  `\d` 72, `\s` 10); and the `abc` eager DFA (5 states / **100 B**). Corrected the "~1 MB trio"
+  wording — that figure is the *prone* `\w+@\w+`, not a non-prone `\w+` (which only ever keeps its
+  ~141 KB forward table). Instruction counts, range-block sizes and the reverse-DFA minimization
+  ratio were re-checked and already current.
 
 ## [0.4.0] - 2026-06-15
 

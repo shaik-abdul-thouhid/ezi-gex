@@ -41,13 +41,13 @@
 const std = @import("std");
 const testing = std.testing;
 
-const regex = @import("regex.zig");
-const backend = @import("backend.zig");
-const pikevm = @import("backends/pikevm.zig");
-const backtrack = @import("backends/backtrack.zig");
-const auto = @import("backends/auto.zig");
-const edfa = @import("backends/edfa.zig");
-const dfa = @import("backends/dfa.zig");
+const regex = @import("regex");
+const backend = @import("engine_base").backend;
+const pikevm = @import("pikevm");
+const backtrack = @import("backtrack");
+const auto = @import("auto");
+const edfa = @import("edfa");
+const dfa = @import("dfa");
 
 /// A catastrophic pattern paired with the bytes that maximise its backtracking: a long
 /// run of `fill` (the unit the inner quantifier chews on) ending in `tail` (a byte that
