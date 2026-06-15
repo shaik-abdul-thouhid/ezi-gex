@@ -67,6 +67,17 @@ pub const Program = struct {
     ranges: []const Range,
     /// `2 * (capture_count + 1)` — slots needed by capture-aware search.
     slot_count: u32,
+    /// Every match begins at a **line start** via `(?m)^` (`line_start`), and the
+    /// pattern is not pinned to offset 0 (`!anchored_start`). Set from the HIR
+    /// analysis. The Pike VM uses this to **seed start threads only at line starts**
+    /// and to leap between them with a `\n` memchr when the thread set empties — a
+    /// single linear pass (no per-line confirm loop, so no Θ(n²)). `false` ⇒ the
+    /// ordinary every-position seeding. Purely an optimization; correctness is
+    /// identical either way (a non-line-start seed would die on the `line_start`
+    /// assertion anyway). The backtracker ignores it (it is already correct).
+    ///
+    /// @stable-since: v0.4.0
+    line_anchored: bool = false,
 };
 
 // ── Compiler: HIR → Program ──────────────────────────────────────────────────────
@@ -263,6 +274,7 @@ fn build(h: hir.Hir, insts: []Inst, ranges: []Range, patch: []u32, marks: []Mark
         .insts = insts[0..b.inst_len],
         .ranges = ranges[0..b.range_len],
         .slot_count = 2 * (h.capture_count + 1),
+        .line_anchored = h.analysis.line_anchored_start and !h.analysis.anchored_start,
     };
 }
 
@@ -317,7 +329,7 @@ pub fn buildComptime(comptime h: hir.Hir) Program {
     const prog = build(h, &insts, &ranges, &patch, &marks) catch unreachable; // measure already validated
     const final_insts = insts[0..prog.insts.len].*;
     const final_ranges = ranges[0..prog.ranges.len].*;
-    return .{ .insts = &final_insts, .ranges = &final_ranges, .slot_count = prog.slot_count };
+    return .{ .insts = &final_insts, .ranges = &final_ranges, .slot_count = prog.slot_count, .line_anchored = prog.line_anchored };
 }
 
 /// @stable-since: v0.1.0

@@ -16,16 +16,22 @@
 //!     choice is invisible: same match, same captures, every time.
 //!   * **By analysis, at search time (the prefilter).** Before touching the NFA on an
 //!     unanchored search `auto` consults the HIR `Analysis` baked into the program
-//!     (a tiny POD `Filter`): a `min_utf8_len` length gate rejects inputs too short
-//!     to hold any match; an `anchored_start` pattern (`^…`/`\A…`) only ever matches
-//!     at offset 0, so the leftward scan is skipped entirely; and when every match
-//!     must begin with a fixed literal, that whole literal run drives a portable **two-byte**
-//!     SIMD `memmem` skip (`memmem.Finder`, via `memmemFrom`: AND the equality masks of the
-//!     run's two rarest bytes, verify only where both coincide) that leaps straight to each
-//!     candidate start — literal-to-literal, not byte-to-byte (`\bthe\b` jumps "the"→"the") —
-//!     confirming there with an anchored NFA/DFA run. Every `Analysis`
-//!     fact is a sound one-sided bound, so the prefilter never drops a real match — it only
-//!     avoids running the engine where one provably cannot start.
+//!     (a tiny POD `Filter`) and picks **at most one** start-skip, in priority order:
+//!       - a `min_utf8_len` length gate (and an `anchored_start` `^…`/`\A…` short-circuit to
+//!         offset 0) always apply first;
+//!       - **single leading literal** → a portable two-byte SIMD `memmem` skip (`memmem.Finder`)
+//!         that leaps literal-to-literal (`\bthe\b` jumps "the"→"the");
+//!       - **multi-prefix set** — a top-level alternation's leading literals (`Holmes…|Watson…`)
+//!         OR a synthesised **case-variant set** for a small-class / `(?i)` lead (`(?i)the` →
+//!         `{THE…the}`, `(?i)что`) — → the **Teddy** SIMD multi-literal scan (`prefix_teddy`),
+//!         scalar `multiPrefixFrom` as the comptime/non-native fallback;
+//!       - **interior anchor** — a required literal after a leading variable class run
+//!         (`[\w.+-]+@…`) — → memchr to the anchor + a bounded reverse-scan;
+//!       - **leading-class scan** — a selective digit/number-class lead (`\d+`, `\p{N}+`) → a
+//!         SIMD scan to the next member of the class's first-byte set (`classscan.ClassFinder`);
+//!       - else the rarest unconditionally-required byte drives a presence fast-reject.
+//!     Every `Analysis` fact is a sound one-sided bound, so the prefilter never drops a real
+//!     match — it only avoids running the engine where one provably cannot start.
 //!
 //! This is the backend a casual user gets by default (`compileRuntime` /
 //! `compileComptime`); power users opt into a specific backend explicitly. It works
@@ -44,6 +50,8 @@ const hir = @import("../../core/hir.zig");
 const nfa = @import("../nfa.zig");
 const simd = @import("../simd.zig");
 const memmem = @import("../memmem.zig");
+const teddy = @import("../teddy.zig");
+const classscan = @import("../classscan.zig");
 
 const literal = @import("literal.zig");
 const pikevm = @import("pikevm.zig");
@@ -56,6 +64,7 @@ const byte = @import("../byte.zig");
 const utils = @import("utils");
 const encoding = utils.unicode.encoding;
 const utf8 = utils.unicode.utf8;
+const CodePoint = utils.unicode.CodePoint;
 
 const Match = backend.Match;
 const SearchOptions = backend.SearchOptions;
@@ -183,7 +192,112 @@ pub const Filter = struct {
     ///
     /// @stable-since: v0.4.0
     prefix_len: u8 = 0,
+
+    /// Multi-prefix set: the leading literal of every branch of a top-level alternation
+    /// (`Holmes…|Watson…`), each truncated to `MAX_PREFIX_LEN` bytes. `prefix_set[i][0..
+    /// prefix_set_len[i]]` is branch `i`'s needle. `prefix_set_n == 0` ⇒ unused. Because
+    /// every match begins with one of these, the **leftmost occurrence of any** of them is
+    /// a sound start-skip (`multiPrefixFrom`), exactly like the single `prefix` but for an
+    /// alternation that has no common leading literal. Only set when `prefix_len == 0`.
+    ///
+    /// @stable-since: v0.4.0
+    prefix_set: [hir.MAX_PREFIX_BRANCHES][MAX_PREFIX_LEN]u8 = @splat(@splat(0)),
+    /// Valid byte length of each `prefix_set` needle.
+    ///
+    /// @stable-since: v0.4.0
+    prefix_set_len: [hir.MAX_PREFIX_BRANCHES]u8 = @splat(0),
+    /// Number of needles in `prefix_set` (0 = unused; otherwise ≥ 2).
+    ///
+    /// @stable-since: v0.4.0
+    prefix_set_n: u8 = 0,
+    /// True when `prefix_set` is a **case-variant set** synthesised from a small-class-led
+    /// concat (`(?i)the` → {THE,…,the}, `(?i)что` → 8 Cyrillic variants) rather than the
+    /// leading literals of a top-level alternation. Both ride the same multi-prefix skip
+    /// machinery; this only documents/diagnoses the source (and pins the white-box test).
+    ///
+    /// @stable-since: v0.4.0
+    prefix_set_case_variant: bool = false,
+
+    /// Inner-anchor byte: the first byte of a required literal that immediately follows a
+    /// leading variable class run (`@` in `[\w.+-]+@…`), or null. Drives a sound *skip to
+    /// the anchor + bounded reverse-scan over `inner_lead`* start-skip (`innerSkipFrom`) for
+    /// a pattern with no leading literal — far better than the mere `rare_byte` presence
+    /// reject. Only set when there is no `prefix`/`prefix_set`, and only when the byte is
+    /// rare enough (`byteRarity`) that the skip pays off.
+    ///
+    /// @stable-since: v0.4.0
+    inner_byte: ?u8 = null,
+    /// The leading variable run's byte alphabet — what the inner-anchor reverse scan walks
+    /// back over to reach the earliest possible match start. Meaningful only when
+    /// `inner_byte != null`. (Bytes ≥ 0x80 are set conservatively; see `hir.InnerAnchor`.)
+    ///
+    /// @stable-since: v0.4.0
+    inner_lead: hir.ByteSet = .{},
+
+    /// The match has a **bounded** maximum length (`max_utf8_len ≤ CONFIRM_MAX`), so an
+    /// anchored confirm reads at most that many bytes. This makes a **per-occurrence**
+    /// multi-prefix confirm (anchored at every prefix hit, advancing past it) O(occurrences ×
+    /// max_len) = O(input) — no Θ(n²) — which is the real win for a sparse-but-DFA-heavy
+    /// pattern like `Holmes.{0,30}Watson|…` (a single skip + DFA find re-scans the whole gap;
+    /// per-occurrence confirms each fail within ~max_len). Unbounded patterns keep the single
+    /// skip + linear dispatch. Only consulted on the `prefix_set` arm.
+    ///
+    /// @stable-since: v0.4.0
+    bounded_confirm: bool = false,
+
+    /// Leading-class first-byte set: every match begins with one of these bytes (the
+    /// pattern's leading mandatory atom is a class with no fixed leading literal — `\d+`,
+    /// `\p{N}+`, `\d{4}-…`). Drives a SIMD scan to the next member (`classscan.ClassFinder`,
+    /// built into `Program.class_finder`) — the start-skip that lets the DFA run only on the
+    /// real class runs instead of crawling the gaps. Null unless the set is **selective**
+    /// (`classLeadSelective`): a set covering most of typical text (`\p{L}+`) would land on
+    /// almost every byte and isn't worth it. Set only when no `prefix`/`prefix_set`/
+    /// `inner_byte` skip applies.
+    ///
+    /// @stable-since: v0.4.0
+    class_lead: ?hir.ByteSet = null,
 };
+
+/// Max match length (UTF-8 bytes) under which the per-occurrence multi-prefix confirm is
+/// used (see `Filter.bounded_confirm`). Each confirm reads ≤ this many bytes, so the loop is
+/// linear with this as its constant; a bound keeps that constant modest.
+///
+/// @stable-since: v0.4.0
+const CONFIRM_MAX: u32 = 256;
+
+/// Inner-anchor rarity ceiling: only build the inner-literal skip when the anchor byte
+/// scores at or below this on `byteRarity` (punctuation / digits / uppercase). A common
+/// anchor (lowercase, space) occurs almost everywhere, so the skip would barely advance
+/// and isn't worth its memchr + reverse-scan — fall back to the plain scan there.
+///
+/// @stable-since: v0.4.0
+const INNER_RARITY_MAX: u8 = 50;
+
+/// Largest number of code points a single leading class may have for the **case-variant**
+/// expansion to enumerate it. A position with more choices than this aborts the expansion
+/// (`\d`'s 10 members → the class-scan lane instead, not a 10-way variant set). Two suffices
+/// for a folded ASCII letter (`[Tt]`); a few cover Greek `σ`/`ς`/`Σ` and friends.
+///
+/// @stable-since: v0.4.0
+const VARIANT_CLASS_MAX: usize = 4;
+
+/// Minimum needle length (UTF-8 bytes) for a case-variant set to be worth building. A
+/// 1-byte set (`[Tt]` alone) lands almost everywhere; ≥ 2 bytes makes the Teddy fingerprint
+/// selective. Soundness is independent of this — it gates speed only.
+///
+/// @stable-since: v0.4.0
+const VARIANT_MIN_LEN: u8 = 2;
+
+/// Ceiling on the number of **high** (≥ 0x80) UTF-8 lead bytes in a leading-class first-byte
+/// set for the class scan to apply. A digit / number class spans a few scripts' lead bytes
+/// (`\d` → 8, `\p{N}` → 11) and stays selective; a broad **letter** class (`\p{Lu}` → 21,
+/// `\p{L}` → 45) covers the lead bytes of whole scripts (Cyrillic `0xD0`/`0xD1`, CJK
+/// `0xE4`–`0xE9`), so on a non-Latin corpus it lands on nearly every character — the scan
+/// then only adds overhead. The compile-time analysis can't see the corpus, so this caps the
+/// breadth instead: ≤ 16 high lead bytes admits digits/numbers and excludes letter classes.
+///
+/// @stable-since: v0.4.0
+const CLASS_HIGH_LEAD_MAX: u32 = 16;
 
 /// A coarse "commonness" score for a byte: **higher = more common** in typical text, so
 /// the prefilter picks the lowest-scoring required byte as the most selective `memchr`
@@ -200,50 +314,276 @@ fn byteRarity(b: u8) u8 {
     };
 }
 
-/// Distil the sound prefilter facts from the HIR analysis.
+/// Encode the leading code points of literal run `run` into `out` as UTF-8, truncating
+/// at a code-point boundary to fit `MAX_PREFIX_LEN`. Returns the byte length (0 if none
+/// fit). A truncated run is still a sound necessary prefix of every match it leads.
+fn encodeRun(h: hir.Hir, run: hir.Node.Run, out: *[MAX_PREFIX_LEN]u8) u8 {
+    var n: usize = 0;
+    var k: u32 = 0;
+    while (k < run.len and n < MAX_PREFIX_LEN) : (k += 1) {
+        const cp = h.literals[run.start + k];
+        if (!encoding.isValidCodePoint(cp)) break;
+        var buf: [4]u8 = undefined;
+        const m = utf8.encodeCodePointUnchecked(cp, &buf);
+        if (m == 0 or n + m > MAX_PREFIX_LEN) break;
+        @memcpy(out[n .. n + m], buf[0..m]);
+        n += m;
+    }
+    return @intCast(n);
+}
+
+/// Distil the sound prefilter facts from the HIR analysis. Picks **at most one** start-skip
+/// in priority order — single leading literal, multi-prefix set, **case-variant set**,
+/// interior anchor, **leading-class scan** — falling back to the rarest-required-byte
+/// presence reject only when none applies. Every choice is a sound one-sided bound (see
+/// `Filter`); a search acting on it never drops a real match.
 fn filterFromAnalysis(h: hir.Hir) Filter {
     const an = h.analysis;
     var f = Filter{ .min_bytes = an.min_utf8_len, .anchored_start = an.anchored_start };
-    // A leading-byte memchr only helps an unanchored scan; for `anchored_start` the
-    // start short-circuit already pins the search to offset 0.
-    if (!an.anchored_start) {
-        if (an.prefix_literal) |run| {
-            // Encode as many leading code points as fit in `prefix` (truncate at a code-point
-            // boundary — a shorter run is still a sound necessary prefix). This is the SIMD
-            // `memmem` needle every match must begin with; `prefix_byte` mirrors its first byte.
-            var n: usize = 0;
-            var k: u32 = 0;
-            while (k < run.len and n < MAX_PREFIX_LEN) : (k += 1) {
-                const cp = h.literals[run.start + k];
-                if (!encoding.isValidCodePoint(cp)) break;
-                var buf: [4]u8 = undefined;
-                const m = utf8.encodeCodePointUnchecked(cp, &buf);
-                if (m == 0 or n + m > MAX_PREFIX_LEN) break;
-                @memcpy(f.prefix[n .. n + m], buf[0..m]);
-                n += m;
-            }
-            if (n > 0) {
-                f.prefix_len = @intCast(n);
-                f.prefix_byte = f.prefix[0];
-            }
-        }
-        // Rarest required byte for the fast-reject (only when there is no fixed prefix
-        // to memchr — with a prefix the start-skip already implies the byte is present).
-        if (f.prefix_byte == null and !an.required_bytes.isEmpty()) {
-            var best: ?u8 = null;
-            var best_score: u8 = 255;
-            var b: u16 = 0;
-            while (b < 256) : (b += 1) {
-                const by: u8 = @intCast(b);
-                if (an.required_bytes.has(by) and byteRarity(by) < best_score) {
-                    best = by;
-                    best_score = byteRarity(by);
-                }
-            }
-            f.rare_byte = best;
+    f.bounded_confirm = if (an.max_utf8_len) |mx| mx <= CONFIRM_MAX else false;
+    // A start-skip only helps an unanchored scan; for `anchored_start` the start
+    // short-circuit already pins the search to offset 0.
+    if (an.anchored_start) return f;
+
+    // 1. Single leading literal → two-byte SIMD `memmem` start-skip (`prefix_byte` mirrors
+    //    its first byte for the degenerate one-byte case).
+    if (an.prefix_literal) |run| {
+        const n = encodeRun(h, run, &f.prefix);
+        if (n > 0) {
+            f.prefix_len = n;
+            f.prefix_byte = f.prefix[0];
         }
     }
+
+    // 2. Multi-prefix set (top-level alternation, no common leading literal) → leftmost-of-
+    //    any-needle skip. Needs every branch's leading literal to encode to ≥ 1 byte, else
+    //    the set is not a sound necessary prefix and is dropped.
+    if (f.prefix_len == 0) {
+        if (an.prefix_set) |ps| set_blk: {
+            if (ps.len < 2) break :set_blk;
+            var i: usize = 0;
+            while (i < ps.len) : (i += 1) {
+                const n = encodeRun(h, ps.runs[i], &f.prefix_set[i]);
+                if (n == 0) break :set_blk; // a branch had no encodable prefix → drop the whole set
+                f.prefix_set_len[i] = n;
+            }
+            f.prefix_set_n = ps.len;
+        }
+    }
+
+    // 2b. Case-variant set: a small-class-led concat (`(?i)the` → {THE,…,the}) has no fixed
+    //     leading literal and no top-level alternation, so it reaches here. Enumerate the
+    //     leading positions' choices into a bounded byte-string set (every match begins with
+    //     one of them → sound), feeding the same multi-prefix skip — but via Teddy.
+    if (f.prefix_len == 0 and f.prefix_set_n == 0) {
+        const n = caseVariantSet(h, &f);
+        if (n >= 2) {
+            f.prefix_set_n = n;
+            f.prefix_set_case_variant = true;
+        }
+    }
+
+    // 3. Interior anchor (no leading literal at all) → skip-to-anchor + reverse-scan, when
+    //    the anchor byte is rare enough to pay off.
+    if (f.prefix_len == 0 and f.prefix_set_n == 0) {
+        if (an.inner_anchor) |ia| {
+            if (byteRarity(ia.byte) <= INNER_RARITY_MAX) {
+                f.inner_byte = ia.byte;
+                f.inner_lead = ia.lead_class;
+            }
+        }
+    }
+
+    // 4. Leading-class first-byte scan (`\d+`, `\p{N}+`, `\d{4}-…`): no literal / set / inner
+    //    anchor applies, but the match begins with a class byte — SIMD-scan to the next
+    //    member. Only when the set is selective (a near-universal set like `\p{L}+` is not).
+    if (f.prefix_len == 0 and f.prefix_set_n == 0 and f.inner_byte == null) {
+        if (an.leading_class_first) |bs| {
+            if (classLeadSelective(bs)) f.class_lead = bs;
+        }
+    }
+
+    // 5. Rarest required byte for a presence fast-reject — only when nothing above gives an
+    //    actual skip (with a skip the byte is already implied present).
+    if (f.prefix_byte == null and f.prefix_set_n == 0 and f.inner_byte == null and f.class_lead == null and !an.required_bytes.isEmpty()) {
+        var best: ?u8 = null;
+        var best_score: u8 = 255;
+        var b: u16 = 0;
+        while (b < 256) : (b += 1) {
+            const by: u8 = @intCast(b);
+            if (an.required_bytes.has(by) and byteRarity(by) < best_score) {
+                best = by;
+                best_score = byteRarity(by);
+            }
+        }
+        f.rare_byte = best;
+    }
     return f;
+}
+
+/// One leading position's choice set during case-variant expansion: the code points that may
+/// appear there (`[Tt]` → {T,t}; a literal char → a single cp).
+const Choice = struct {
+    cps: [VARIANT_CLASS_MAX]CodePoint = undefined,
+    len: u8 = 0,
+};
+
+/// Collect the leading mandatory single-code-point positions of the pattern into `out`,
+/// each as its choice set, stopping at the first non-enumerable atom (a class with more than
+/// `VARIANT_CLASS_MAX` members, `.`, an alternation, a repetition, an optional) or when `out`
+/// fills. Mirrors the `prefixLiteral`/`leadingClassFirst` spine walk (skip leading zero-width
+/// anchors; descend capture / `min≥1` repetition bodies). `*count` is advanced as positions
+/// are appended; `*stop` latches true once expansion must end. Every appended position is
+/// **mandatory** and **complete** (all of its choices), so the cartesian product over
+/// `out[0..count]` is a sound necessary prefix of every match.
+fn collectChoices(h: hir.Hir, idx: u32, out: []Choice, count: *usize, stop: *bool) void {
+    if (stop.*) return;
+    const node = h.nodes[idx];
+    switch (node.tag) {
+        .literal => {
+            const run = node.data.run;
+            var k: u32 = 0;
+            while (k < run.len) : (k += 1) {
+                if (count.* >= out.len) {
+                    stop.* = true;
+                    return;
+                }
+                out[count.*] = .{ .cps = undefined, .len = 1 };
+                out[count.*].cps[0] = h.literals[run.start + k];
+                count.* += 1;
+            }
+        },
+        .class => {
+            const c = node.data.class;
+            const rngs = h.ranges[c.start .. c.start + c.len];
+            // Count members; abort if empty (unmatchable) or larger than the per-position cap.
+            var total: usize = 0;
+            for (rngs) |r| total += @as(usize, r.hi - r.lo) + 1;
+            if (total == 0 or total > VARIANT_CLASS_MAX or count.* >= out.len) {
+                stop.* = true;
+                return;
+            }
+            var ch = Choice{ .cps = undefined, .len = 0 };
+            for (rngs) |r| {
+                var cp: CodePoint = r.lo;
+                while (cp <= r.hi) : (cp += 1) {
+                    ch.cps[ch.len] = cp;
+                    ch.len += 1;
+                }
+            }
+            out[count.*] = ch;
+            count.* += 1;
+        },
+        .concat => {
+            const d = node.data.children;
+            for (h.children[d.start .. d.start + d.len]) |ci| {
+                collectChoices(h, ci, out, count, stop);
+                if (stop.*) break;
+            }
+        },
+        .capture => collectChoices(h, node.data.capture.child, out, count, stop),
+        // A zero-width leading anchor/empty consumes no position; skip it (sound — it adds no
+        // bytes). Any other atom (`.`, repetition, alternation, grapheme) ends the prefix.
+        .anchor, .empty => {},
+        else => stop.* = true,
+    }
+}
+
+/// Expand the pattern's leading small-class / literal run into a bounded **case-variant
+/// prefix set** written to `f.prefix_set`/`f.prefix_set_len`, returning the needle count (0
+/// when not worth building). The cartesian product of `collectChoices`'s per-position choice
+/// sets, capped at `MAX_PREFIX_BRANCHES` needles and `MAX_PREFIX_LEN` bytes: a position whose
+/// inclusion would exceed either cap is dropped (the product of earlier positions is still a
+/// sound necessary prefix). Declines a 1-needle product (a pure literal — handled by
+/// `prefix_literal`) or one whose shortest needle is below `VARIANT_MIN_LEN` (not selective).
+fn caseVariantSet(h: hir.Hir, f: *Filter) u8 {
+    var choices: [MAX_PREFIX_LEN]Choice = undefined;
+    var nchoices: usize = 0;
+    var stop = false;
+    collectChoices(h, h.root, &choices, &nchoices, &stop);
+    if (nchoices == 0) return 0;
+
+    // Build the product into the filter's needle buffers, position by position.
+    var n: usize = 1; // current needle count (starts at one empty needle)
+    f.prefix_set[0] = @splat(0);
+    f.prefix_set_len[0] = 0;
+
+    for (choices[0..nchoices]) |ch| {
+        if (n * ch.len > hir.MAX_PREFIX_BRANCHES) break; // would exceed the needle cap — stop here
+
+        // Pre-encode this position's choices; bail (keep prior product) if any would overrun.
+        var enc: [VARIANT_CLASS_MAX][4]u8 = undefined;
+        var enc_len: [VARIANT_CLASS_MAX]u8 = undefined;
+        var fits = true;
+        for (0..ch.len) |ci| {
+            if (!encoding.isValidCodePoint(ch.cps[ci])) {
+                fits = false;
+                break;
+            }
+            const m = utf8.encodeCodePointUnchecked(ch.cps[ci], &enc[ci]);
+            if (m == 0) {
+                fits = false;
+                break;
+            }
+            enc_len[ci] = m;
+        }
+        if (!fits) break;
+        // If appending the longest choice to the longest existing needle would overrun, stop.
+        var max_add: u8 = 0;
+        for (0..ch.len) |ci| max_add = @max(max_add, enc_len[ci]);
+        var max_cur: u8 = 0;
+        for (0..n) |p| max_cur = @max(max_cur, f.prefix_set_len[p]);
+        if (@as(usize, max_cur) + max_add > MAX_PREFIX_LEN) break;
+
+        // Expand: each existing needle × each choice, written into a fresh buffer set.
+        var nb: [hir.MAX_PREFIX_BRANCHES][MAX_PREFIX_LEN]u8 = undefined;
+        var nl: [hir.MAX_PREFIX_BRANCHES]u8 = undefined;
+        var w: usize = 0;
+        for (0..n) |p| {
+            const plen = f.prefix_set_len[p];
+            for (0..ch.len) |ci| {
+                nb[w] = @splat(0);
+                @memcpy(nb[w][0..plen], f.prefix_set[p][0..plen]);
+                @memcpy(nb[w][plen .. plen + enc_len[ci]], enc[ci][0..enc_len[ci]]);
+                nl[w] = plen + enc_len[ci];
+                w += 1;
+            }
+        }
+        n = w;
+        for (0..n) |p| {
+            f.prefix_set[p] = nb[p];
+            f.prefix_set_len[p] = nl[p];
+        }
+    }
+
+    if (n < 2) return 0; // a pure literal (or single-choice run) — `prefix_literal` covers it
+    var min_len: u8 = 255;
+    for (0..n) |p| min_len = @min(min_len, f.prefix_set_len[p]);
+    if (min_len < VARIANT_MIN_LEN) return 0; // not selective enough to be worth a prefilter
+    return @intCast(n);
+}
+
+/// Whether a leading-class first-byte set is **selective** enough to drive the SIMD class
+/// scan. Three sound (corpus-independent) reasons to decline: the set includes whitespace
+/// (lands almost everywhere); it includes a swath of ASCII lowercase letters (`[A-Za-z]+`,
+/// `\w+`, `\p{L}+` — letter-dense on every corpus); or it spans too many **high** UTF-8 lead
+/// bytes (`CLASS_HIGH_LEAD_MAX`), the hallmark of a broad letter class (`\p{Lu}`, `\p{L}`)
+/// whose lead bytes blanket non-Latin text. Digit / number / punctuation classes (`\d+`,
+/// `\p{N}+`) pass — sparse in all the corpora, so the scan skips real gaps.
+fn classLeadSelective(bs: hir.ByteSet) bool {
+    if (bs.has(' ') or bs.has('\t') or bs.has('\n') or bs.has('\r')) return false;
+    var lower: u32 = 0;
+    var c: u8 = 'a';
+    while (c <= 'z') : (c += 1) if (bs.has(c)) {
+        lower += 1;
+    };
+    if (lower > 4) return false; // a few stray lowercase members are fine; a whole alphabet is not
+    var high: u32 = 0;
+    var b: u16 = 0x80;
+    while (b < 0x100) : (b += 1) if (bs.has(@intCast(b))) {
+        high += 1;
+    };
+    return high <= CLASS_HIGH_LEAD_MAX; // broad letter class (many script lead bytes) → decline
 }
 
 /// A compiled program: either a literal program or the shared NFA program, plus the
@@ -291,7 +631,42 @@ pub const Program = struct {
     ///
     /// @stable-since: v0.4.0
     onepass_prog: ?onepass.Program = null,
+    /// SIMD **multi-prefix** accelerator (Teddy) for `filter.prefix_set`: the leftmost
+    /// occurrence of any prefix needle in one vectorised pass, replacing the per-needle
+    /// `multiPrefixFrom` scan. Built (at runtime, native-shuffle target, `simd != .off`)
+    /// for any `prefix_set_n ≥ 2` — both a top-level alternation's leading literals
+    /// (`Holmes…|Watson…`) and a synthesised case-variant set (`(?i)the` → {THE,…,the}).
+    /// Null on the comptime path / non-native target / `.off` → the scalar `multiPrefixFrom`.
+    /// Results-invariant (same leftmost candidate; the engine confirms either way).
+    ///
+    /// @stable-since: v0.4.0
+    prefix_teddy: ?teddy.Teddy = null,
+    /// SIMD **leading-class** accelerator for `filter.class_lead`: scan to the next byte in
+    /// the leading class's first-byte set (`classscan.ClassFinder`). Built in BOTH
+    /// `buildAlloc` and `buildComptime` (POD, no `@Vector` in construction; `find` routes
+    /// comptime / non-native to its scalar scan), so the class-led start-skip works on every
+    /// path. Null when `filter.class_lead` is null. Results-invariant.
+    ///
+    /// @stable-since: v0.4.0
+    class_finder: ?classscan.ClassFinder = null,
 };
+
+/// Build the `prefix_teddy` accelerator for the program's `prefix_set`, or `.none`/null.
+/// Runtime only (the dynamic shuffle is asm; comptime keeps the scalar `multiPrefixFrom`).
+/// Declines when SIMD is off, the target has no native shuffle, or the set is empty. A
+/// slim 8-bucket Teddy suffices — `prefix_set_n ≤ MAX_PREFIX_BRANCHES (8)`.
+fn buildPrefixTeddy(gpa: std.mem.Allocator, f: *const Filter, opts: Options) BuildError!?teddy.Teddy {
+    if (opts.simd == .off) return null;
+    if (comptime !simd.has_native_shuffle16) return null;
+    if (f.prefix_set_n < 2) return null;
+    var slices: [hir.MAX_PREFIX_BRANCHES][]const u8 = undefined;
+    var k: usize = 0;
+    while (k < f.prefix_set_n) : (k += 1) {
+        if (f.prefix_set_len[k] == 0) return null; // an empty needle matches everywhere — decline
+        slices[k] = f.prefix_set[k][0..f.prefix_set_len[k]];
+    }
+    return try teddy.compileAlloc(gpa, slices[0..f.prefix_set_n]);
+}
 
 /// @stable-since: v0.1.0
 pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, opts: Options) BuildError!Program {
@@ -356,6 +731,12 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, opts: Options) BuildError!
             else => {}, // not one-pass → Pike VM fills captures (no change in result)
         }
     }
+    // SIMD prefilter accelerators distilled from the filter: a multi-prefix Teddy (alternation
+    // or case-variant set) and a leading-class scanner. Both are sound, results-invariant
+    // skips; declining either just keeps the scalar `multiPrefixFrom` / `class_lead` scan.
+    program.prefix_teddy = try buildPrefixTeddy(gpa, &program.filter, opts);
+    errdefer if (program.prefix_teddy) |*t| teddy.free(gpa, t);
+    if (program.filter.class_lead) |bs| program.class_finder = classscan.ClassFinder.init(bs.bits);
     return program;
 }
 
@@ -384,6 +765,10 @@ pub fn buildComptime(comptime h: hir.Hir, comptime opts: Options) Program {
     if (opts.byte_engine != .disabled and tinyForComptimeEdfa(h) and edfa.supports(h)) {
         program.edfa_prog = edfa.buildComptime(h, .{});
     }
+    // The leading-class scanner is POD (no `@Vector` to build) and `find` is comptime-safe, so
+    // it works on the comptime path; the multi-prefix Teddy is runtime-only (asm shuffle) and
+    // stays null here — the case-variant / alternation skip uses the scalar `multiPrefixFrom`.
+    if (program.filter.class_lead) |bs| program.class_finder = classscan.ClassFinder.init(bs.bits);
     return program;
 }
 
@@ -392,6 +777,7 @@ pub fn freeProgram(gpa: std.mem.Allocator, program: *Program) void {
     if (program.edfa_prog) |*e| edfa.freeProgram(gpa, e);
     if (program.dfa_prog) |*d| dfa.freeProgram(gpa, d);
     if (program.onepass_prog) |*op| onepass.freeProgram(gpa, op);
+    if (program.prefix_teddy) |*t| teddy.free(gpa, t);
     switch (program.inner) {
         .literal => |*p| literal.freeProgram(gpa, p),
         .nfa => |*p| nfa.freeProgram(gpa, p),
@@ -562,6 +948,46 @@ fn memmemFrom(input: []const u8, start: usize, needle: []const u8) ?usize {
     return f.find(input, start);
 }
 
+/// Leftmost offset `≥ start` at which **any** of the multi-prefix needles occurs, or null.
+/// The sound multi-prefix start-skip (`Holmes…|Watson…`): every match begins with one of the
+/// branches' leading literals, so no match can begin before the earliest occurrence of any of
+/// them. Each needle uses the two-byte SIMD `memmem` (or memchr for a one-byte needle); the
+/// minimum over needles is the leftmost. A handful of needles, scanned once per `find`.
+fn multiPrefixFrom(filter: *const Filter, input: []const u8, start: usize) ?usize {
+    var best: ?usize = null;
+    var i: usize = 0;
+    while (i < filter.prefix_set_n) : (i += 1) {
+        const needle = filter.prefix_set[i][0..filter.prefix_set_len[i]];
+        const at = memmemFrom(input, start, needle) orelse continue;
+        if (best == null or at < best.?) best = at;
+        if (best == start) break; // nothing can be earlier than the search start
+    }
+    return best;
+}
+
+/// Leftmost offset `≥ start` of any multi-prefix needle, via the SIMD Teddy when one was
+/// built (one vectorised pass over all needles), else the scalar `multiPrefixFrom` (per-needle
+/// `memmem`; the comptime / non-native / `.off` path). Same leftmost result either way.
+fn nextPrefixHit(filter: *const Filter, tdy: ?*const teddy.Teddy, input: []const u8, start: usize) ?usize {
+    if (tdy) |t| return if (t.find(input, start)) |m| m.start else null;
+    return multiPrefixFrom(filter, input, start);
+}
+
+/// Interior-anchor start-skip: leap to the next anchor byte `≥ start`, then walk **back**
+/// over the lead class to the earliest position a match could begin, and return that. Null
+/// when the anchor byte is absent (no match can exist). Sound: every match contains the
+/// anchor byte, and (because the byte sits right after a `lead_class+` run) no match begins
+/// before the reverse-scanned run start — so an unanchored scan from there finds the same
+/// leftmost match. Linear: the memchr leaps anchor-to-anchor, the reverse scan is bounded by
+/// the run it walks.
+fn innerSkipFrom(filter: *const Filter, input: []const u8, start: usize) ?usize {
+    const anchor = filter.inner_byte.?;
+    const p = memchrFrom(input, start, anchor) orelse return null;
+    var cs = p;
+    while (cs > start and filter.inner_lead.has(input[cs - 1])) cs -= 1;
+    return cs;
+}
+
 // ── NFA-arm execution: dispatch + analysis-driven prefilter ───────────────────────
 
 /// Confirm a match starting exactly at `at` (anchored). Uses the **Pike VM**: its
@@ -607,7 +1033,7 @@ fn dispatch(p: *const nfa.Program, s: *Scratch.NfaScratch, input: []const u8, op
 /// (`slots` non-null ⇒ capture). Applies the sound analysis prefilter, then either
 /// confirms at filtered positions or falls back to the plain dispatch. Returns the
 /// leftmost match (filling `slots` on success).
-fn runNfa(p: *const nfa.Program, filter: Filter, s: *Scratch.NfaScratch, input: []const u8, opts: SearchOptions, slots: ?[]?usize, has_grapheme: bool) ?Match {
+fn runNfa(p: *const nfa.Program, filter: *const Filter, tdy: ?*const teddy.Teddy, cf: ?*const classscan.ClassFinder, s: *Scratch.NfaScratch, input: []const u8, opts: SearchOptions, slots: ?[]?usize, has_grapheme: bool) ?Match {
     if (opts.start > input.len) return null;
     // Length gate: too few bytes left from here for even the shortest match.
     if (input.len - opts.start < filter.min_bytes) return null;
@@ -652,10 +1078,37 @@ fn runNfa(p: *const nfa.Program, filter: Filter, s: *Scratch.NfaScratch, input: 
     if (filter.prefix_len > 0) {
         o.start = memmemFrom(input, o.start, filter.prefix[0..filter.prefix_len]) orelse return null;
         if (input.len - o.start < filter.min_bytes) return null;
+    } else if (filter.prefix_set_n > 0) {
+        // Multi-prefix skip (`Holmes…|Watson…`). With a BOUNDED match length, confirm anchored
+        // at every prefix occurrence (each fails within ~max_len) — O(occurrences × max_len) =
+        // O(input), and it avoids re-scanning the sparse gaps. Otherwise one skip + a single
+        // linear unanchored dispatch (unbounded confirms could be Θ(n²)).
+        if (filter.bounded_confirm) {
+            var pos = o.start;
+            while (nextPrefixHit(filter, tdy, input, pos)) |hit| {
+                if (input.len - hit < filter.min_bytes) return null;
+                if (confirmAt(p, s, input, hit, slots)) |m| return m;
+                pos = hit + 1;
+            }
+            return null;
+        }
+        o.start = nextPrefixHit(filter, tdy, input, o.start) orelse return null;
+        if (input.len - o.start < filter.min_bytes) return null;
+    } else if (filter.inner_byte != null) {
+        // Interior-anchor skip (`[\w.+-]+@…`): leap to the next anchor byte, reverse-scan to
+        // the earliest run start, then one linear dispatch from there. Sound + O(input).
+        o.start = innerSkipFrom(filter, input, o.start) orelse return null;
+        if (input.len - o.start < filter.min_bytes) return null;
+    } else if (cf) |c| {
+        // Leading-class scan (`\d+`, `\p{N}+`): SIMD-skip to the next byte that could begin a
+        // match (a member of the leading class's first-byte set), then one linear dispatch. The
+        // skipped-to byte starts a class run, so the unanchored scan finds the leftmost match at
+        // or after it. Sound + O(input) (single skip, never a per-occurrence confirm loop).
+        o.start = c.find(input, o.start) orelse return null;
+        if (input.len - o.start < filter.min_bytes) return null;
     } else if (filter.rare_byte) |rb| {
         // Rarest-required-byte fast-reject: `rare_byte` appears in EVERY match, so if it is
-        // absent there is no match — return at once. Sound (one-sided). The big win for a
-        // prefix-less interior-literal pattern (`\w+@\w+` on text with no `@`).
+        // absent there is no match — return at once. Sound (one-sided).
         if (memchrFrom(input, o.start, rb) == null) return null;
     }
 
@@ -679,7 +1132,7 @@ fn dfaConfirmAt(dp: *const dfa.Program, d: *dfa.Scratch, input: []const u8, at: 
 /// is never slower than the default on prefix-literal / sparse-hit patterns. With no
 /// usable filter it runs one DFA pass (one-pass O(n) for `isMatch`, anchored-restart
 /// for `find`). Captures never come here — they always use the Pike VM (`runNfa`).
-fn runByteDfa(dp: *const dfa.Program, filter: Filter, d: *dfa.Scratch, input: []const u8, opts: SearchOptions, match_only: bool) ?Match {
+fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.Teddy, cf: ?*const classscan.ClassFinder, d: *dfa.Scratch, input: []const u8, opts: SearchOptions, match_only: bool) ?Match {
     if (opts.start > input.len) return null;
     if (input.len - opts.start < filter.min_bytes) return null; // length gate
     if (opts.anchored) return dfaConfirmAt(dp, d, input, opts.start, match_only);
@@ -695,6 +1148,27 @@ fn runByteDfa(dp: *const dfa.Program, filter: Filter, d: *dfa.Scratch, input: []
     var o = opts;
     if (filter.prefix_len > 0) {
         o.start = memmemFrom(input, o.start, filter.prefix[0..filter.prefix_len]) orelse return null;
+        if (input.len - o.start < filter.min_bytes) return null;
+    } else if (filter.prefix_set_n > 0) {
+        // Multi-prefix: per-occurrence anchored confirm when bounded (the real win), else one
+        // skip + a single native DFA find. See `runNfa` for the bound's soundness.
+        if (filter.bounded_confirm) {
+            var pos = opts.start;
+            while (nextPrefixHit(filter, tdy, input, pos)) |hit| {
+                if (input.len - hit < filter.min_bytes) return null;
+                if (dfaConfirmAt(dp, d, input, hit, match_only)) |m| return m;
+                pos = hit + 1;
+            }
+            return null;
+        }
+        o.start = nextPrefixHit(filter, tdy, input, o.start) orelse return null;
+        if (input.len - o.start < filter.min_bytes) return null;
+    } else if (filter.inner_byte != null) {
+        o.start = innerSkipFrom(filter, input, o.start) orelse return null;
+        if (input.len - o.start < filter.min_bytes) return null;
+    } else if (cf) |c| {
+        // Leading-class SIMD skip → one native DFA find from the first candidate (sound; see runNfa).
+        o.start = c.find(input, o.start) orelse return null;
         if (input.len - o.start < filter.min_bytes) return null;
     } else if (filter.rare_byte) |rb| {
         // Rarest-required-byte fast-reject (sound; see `runNfa`).
@@ -721,7 +1195,7 @@ fn edfaConfirmAt(ep: *const edfa.Program, input: []const u8, at: usize, match_on
 /// rarest-required-byte fast-reject) in front of the frozen-table walk. The eager DFA is
 /// stateless; the only state is `probes`, the ReDoS observable (`Scratch.confirm_probes`)
 /// incremented per per-occurrence confirm. Captures never come here — they always use the Pike VM.
-fn runEdfa(ep: *const edfa.Program, filter: Filter, input: []const u8, opts: SearchOptions, match_only: bool, probes: *u64) ?Match {
+fn runEdfa(ep: *const edfa.Program, filter: *const Filter, tdy: ?*const teddy.Teddy, cf: ?*const classscan.ClassFinder, input: []const u8, opts: SearchOptions, match_only: bool, probes: *u64) ?Match {
     if (opts.start > input.len) return null;
     if (input.len - opts.start < filter.min_bytes) return null; // length gate
     if (opts.anchored) return edfaConfirmAt(ep, input, opts.start, match_only);
@@ -757,6 +1231,31 @@ fn runEdfa(ep: *const edfa.Program, filter: Filter, input: []const u8, opts: Sea
             }
             return null;
         }
+    } else if (filter.prefix_set_n > 0) {
+        // Multi-prefix: per-occurrence anchored confirm when bounded AND not prone/end-anchored
+        // (the eager DFA's confirm is fast-failing then); else one skip + a native find.
+        if (filter.bounded_confirm and !ep.prone and !ep.end_anchored) {
+            var pos = o.start;
+            while (nextPrefixHit(filter, tdy, input, pos)) |hit| {
+                if (input.len - hit < filter.min_bytes) return null;
+                probes.* += 1; // ReDoS observable (bounded ⇒ stays linear)
+                if (edfaConfirmAt(ep, input, hit, match_only)) |m| return m;
+                pos = hit + 1;
+            }
+            return null;
+        }
+        o.start = nextPrefixHit(filter, tdy, input, o.start) orelse return null;
+        if (input.len - o.start < filter.min_bytes) return null;
+    } else if (filter.inner_byte != null) {
+        // Interior-anchor skip → one native eager-DFA find from the reverse-scanned start.
+        o.start = innerSkipFrom(filter, input, o.start) orelse return null;
+        if (input.len - o.start < filter.min_bytes) return null;
+    } else if (cf) |c| {
+        // Leading-class SIMD skip → one native eager-DFA find from the first candidate
+        // (sound; the skipped-to byte begins a class run, so the find lands on the leftmost
+        // match). Single skip, never a per-occurrence confirm loop — no ReDoS observable.
+        o.start = c.find(input, o.start) orelse return null;
+        if (input.len - o.start < filter.min_bytes) return null;
     } else if (filter.rare_byte) |rb| {
         if (memchrFrom(input, o.start, rb) == null) return null;
     }
@@ -805,6 +1304,18 @@ inline fn edfaArm(program: *const Program, scratch: *Scratch, input: []const u8)
 
 // ── Contract: matching entry points ──────────────────────────────────────────────
 
+/// Pointer to the program's multi-prefix Teddy accelerator (or null) — the SIMD finder the
+/// `run*` arms use for `prefix_set`. Pointer into the program, valid for the call.
+inline fn teddyPtr(program: *const Program) ?*const teddy.Teddy {
+    return if (program.prefix_teddy) |*t| t else null;
+}
+
+/// Pointer to the program's leading-class scanner (or null) — the SIMD finder the `run*`
+/// arms use for `class_lead`. Pointer into the program, valid for the call.
+inline fn classPtr(program: *const Program) ?*const classscan.ClassFinder {
+    return if (program.class_finder) |*c| c else null;
+}
+
 /// @stable-since: v0.1.0
 pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) bool {
     switch (program.inner) {
@@ -813,16 +1324,16 @@ pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, op
             // Eager DFA span scan (prefiltered, stateless) when built and usable — the fastest arm,
             // same result the NFA arm gives. A `\b` program's eager DFA is used only on ASCII input
             // (`edfaArm`); non-ASCII `\b` input falls through to the Pike VM (Unicode boundaries).
-            if (edfaArm(program, scratch, input)) |ep| return runEdfa(ep, program.filter, input, opts, true, &scratch.confirm_probes) != null;
+            if (edfaArm(program, scratch, input)) |ep| return runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, true, &scratch.confirm_probes) != null;
             // Lazy DFA fallback (prefiltered) when built and not disabled.
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
-                    const r = runByteDfa(dp, program.filter, d, input, opts, true);
+                    const r = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, true);
                     if (d.gave_up) scratch.dfa_disabled = true; // cache thrashed → stop using it
                     return r != null;
                 };
             }
-            return runNfa(p, program.filter, &scratch.inner.nfa, input, opts, null, program.has_grapheme) != null;
+            return runNfa(p, &program.filter, teddyPtr(program), classPtr(program), &scratch.inner.nfa, input, opts, null, program.has_grapheme) != null;
         },
     }
 }
@@ -832,15 +1343,15 @@ pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opt
     switch (program.inner) {
         .literal => |*p| return literal.search(p, &scratch.inner.literal, input, opts),
         .nfa => |*p| {
-            if (edfaArm(program, scratch, input)) |ep| return runEdfa(ep, program.filter, input, opts, false, &scratch.confirm_probes);
+            if (edfaArm(program, scratch, input)) |ep| return runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, false, &scratch.confirm_probes);
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
-                    const r = runByteDfa(dp, program.filter, d, input, opts, false);
+                    const r = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, false);
                     if (d.gave_up) scratch.dfa_disabled = true;
                     return r;
                 };
             }
-            return runNfa(p, program.filter, &scratch.inner.nfa, input, opts, null, program.has_grapheme);
+            return runNfa(p, &program.filter, teddyPtr(program), classPtr(program), &scratch.inner.nfa, input, opts, null, program.has_grapheme);
         },
     }
 }
@@ -862,12 +1373,12 @@ pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const
             // A `\b` program's eager DFA is used only on ASCII input (`edfaArm`); otherwise the whole
             // capture search runs on the Pike VM (Unicode boundaries), via the NFA arm below.
             if (edfaArm(program, scratch, input)) |ep| {
-                const m = runEdfa(ep, program.filter, input, opts, false, &scratch.confirm_probes) orelse return null;
+                const m = runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, false, &scratch.confirm_probes) orelse return null;
                 return fillCapturesAnchored(program, &scratch.inner.nfa, p, input, slots, m, opts);
             }
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
-                    const span = runByteDfa(dp, program.filter, d, input, opts, false);
+                    const span = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, false);
                     if (d.gave_up) {
                         scratch.dfa_disabled = true; // cache thrashed → fall through to the NFA arm
                     } else {
@@ -876,7 +1387,7 @@ pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const
                     }
                 };
             }
-            return runNfa(p, program.filter, &scratch.inner.nfa, input, opts, slots, program.has_grapheme);
+            return runNfa(p, &program.filter, teddyPtr(program), classPtr(program), &scratch.inner.nfa, input, opts, slots, program.has_grapheme);
         },
     }
 }
@@ -1172,6 +1683,142 @@ test "auto runs at comptime (both routes) via a buffer scratch" {
         break :blk m.slice(input);
     };
     try testing.expectEqualStrings("2026-06", cap);
+}
+
+// ── White-box tests for the v0.4.0 prefilters (case-variant Teddy + leading-class scan) ──
+
+/// Build a HIR for `pat` and return its distilled `Filter` (test helper).
+fn filterOf(gpa: std.mem.Allocator, pat: []const u8) !Filter {
+    var diag: compile.Diagnostic = .{};
+    const ast = try compile.parse(gpa, pat, &diag);
+    defer ast.deinit(gpa);
+    const h = try hir.buildAlloc(gpa, ast, .{});
+    defer hir.deinitHir(gpa, h);
+    return filterFromAnalysis(h);
+}
+
+test "auto: case-variant prefix set is synthesised for a small-class-led concat (revert-failing)" {
+    // `(?i)the` lowers to `[Tt][Hh][Ee]` — no fixed leading literal, no top-level alternation —
+    // so the case-variant expansion must produce the needle set. Reverting `caseVariantSet`
+    // collapses `prefix_set_n` to 0 here and fails. Pure literals must NOT come here.
+    const gpa = testing.allocator;
+    {
+        const f = try filterOf(gpa, "(?i)the");
+        try testing.expectEqual(@as(u8, 8), f.prefix_set_n); // {T,t}×{H,h}×{E,e}
+        try testing.expect(f.prefix_set_case_variant);
+        try testing.expectEqual(@as(u8, 0), f.prefix_len); // no single leading literal
+        // Every needle is the full 3-byte run and they are distinct (sound necessary prefixes).
+        var seen = std.AutoHashMap([3]u8, void).init(gpa);
+        defer seen.deinit();
+        var i: usize = 0;
+        while (i < f.prefix_set_n) : (i += 1) {
+            try testing.expectEqual(@as(u8, 3), f.prefix_set_len[i]);
+            try seen.put(f.prefix_set[i][0..3].*, {});
+        }
+        try testing.expectEqual(@as(usize, 8), seen.count()); // all 8 variants distinct
+    }
+    {
+        const f = try filterOf(gpa, "[Tt]he"); // only the first position is a class → 2 variants
+        try testing.expectEqual(@as(u8, 2), f.prefix_set_n);
+        try testing.expect(f.prefix_set_case_variant);
+    }
+    {
+        const f = try filterOf(gpa, "(?i)что"); // Cyrillic, each letter 2 bytes
+        try testing.expect(f.prefix_set_n >= 2);
+        try testing.expect(f.prefix_set_case_variant);
+        try testing.expect(f.prefix_set_len[0] >= VARIANT_MIN_LEN);
+    }
+    {
+        const f = try filterOf(gpa, "the"); // pure literal → prefix_literal, NOT a case-variant set
+        try testing.expect(f.prefix_len > 0);
+        try testing.expectEqual(@as(u8, 0), f.prefix_set_n);
+        try testing.expect(!f.prefix_set_case_variant);
+    }
+}
+
+test "auto: leading-class scan gate — digit/number classes yes, letter classes no (revert-failing)" {
+    // The selectivity gate must admit digit/number leading classes (sparse on all corpora) and
+    // decline letter classes (dense, or broad high-byte lead sets). Reverting `leadingClassFirst`
+    // or loosening `classLeadSelective` flips one of these.
+    const gpa = testing.allocator;
+    const Case = struct { pat: []const u8, want: bool };
+    const cases = [_]Case{
+        .{ .pat = "\\d+", .want = true },
+        .{ .pat = "\\p{N}+", .want = true },
+        .{ .pat = "[0-9]+", .want = true },
+        .{ .pat = "\\d{4}", .want = true }, // counted rep of a class still leads with the class
+        .{ .pat = "\\p{Lu}\\p{Ll}+", .want = false }, // broad uppercase letter class (high lead bytes)
+        .{ .pat = "[A-Za-z]+", .want = false }, // ASCII letters (lowercase present)
+        .{ .pat = "\\p{L}+", .want = false }, // all letters
+        .{ .pat = "\\w+", .want = false }, // word chars include a-z
+        .{ .pat = "foo\\d+", .want = false }, // a leading literal wins → no class scan
+    };
+    inline for (cases) |c| {
+        const f = try filterOf(gpa, c.pat);
+        try testing.expectEqual(c.want, f.class_lead != null);
+    }
+}
+
+test "auto: class_finder / prefix_teddy are built to back the filter facts" {
+    const gpa = testing.allocator;
+    // A class-led pattern builds the leading-class scanner (both build paths).
+    {
+        var diag: compile.Diagnostic = .{};
+        const ast = try compile.parse(gpa, "\\d+", &diag);
+        defer ast.deinit(gpa);
+        const h = try hir.buildAlloc(gpa, ast, .{});
+        defer hir.deinitHir(gpa, h);
+        var program = try buildAlloc(gpa, h, .{});
+        defer freeProgram(gpa, &program);
+        try testing.expect(program.filter.class_lead != null);
+        try testing.expect(program.class_finder != null);
+    }
+    // A letter-class pattern does not.
+    {
+        var diag: compile.Diagnostic = .{};
+        const ast = try compile.parse(gpa, "\\p{L}+", &diag);
+        defer ast.deinit(gpa);
+        const h = try hir.buildAlloc(gpa, ast, .{});
+        defer hir.deinitHir(gpa, h);
+        var program = try buildAlloc(gpa, h, .{});
+        defer freeProgram(gpa, &program);
+        try testing.expect(program.class_finder == null);
+    }
+    // The multi-prefix Teddy is built for a case-variant set and a top-level alternation set,
+    // but not for a lone leading literal — only on a native-shuffle target (else scalar path).
+    if (comptime simd.has_native_shuffle16) {
+        const Case = struct { pat: []const u8, want: bool };
+        const cases = [_]Case{
+            .{ .pat = "(?i)the", .want = true }, // case-variant set → Teddy
+            .{ .pat = "Holmes.{0,30}Watson|Watson.{0,30}Holmes", .want = true }, // alternation set
+            .{ .pat = "foo\\d+", .want = false }, // single leading literal → memmem, not Teddy
+            .{ .pat = "\\d+", .want = false }, // class scan, no prefix set
+        };
+        inline for (cases) |c| {
+            var diag: compile.Diagnostic = .{};
+            const ast = try compile.parse(gpa, c.pat, &diag);
+            defer ast.deinit(gpa);
+            const h = try hir.buildAlloc(gpa, ast, .{});
+            defer hir.deinitHir(gpa, h);
+            var program = try buildAlloc(gpa, h, .{});
+            defer freeProgram(gpa, &program);
+            try testing.expectEqual(c.want, program.prefix_teddy != null);
+        }
+    }
+}
+
+test "auto: case-variant + class-scan prefilters find/count correctly (functional)" {
+    // Smoke functional checks on the dispatcher's own harness (the heavy differential lives in
+    // conformance.zig). Leftmost-first, mixed case, multiple matches.
+    try expectFind("(?i)the", "oh THE end", "THE");
+    try expectFind("(?i)sherlock holmes", "she Sherlock Holmes!", "Sherlock Holmes");
+    try expectFind("\\d+", "no nums .... 4567 yes", "4567");
+    var re = try Compiled.init("(?i)the");
+    defer re.deinit();
+    try testing.expectEqual(@as(usize, 3), E.count(&re.program, &re.scratch, "the The tHe x", .{}));
+    var rn = try Compiled.init("\\d+");
+    defer rn.deinit();
+    try testing.expectEqual(@as(usize, 3), E.count(&rn.program, &rn.scratch, "1 .. 22 ... 333", .{}));
 }
 
 test {

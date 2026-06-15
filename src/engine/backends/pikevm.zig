@@ -289,11 +289,41 @@ fn addThread(program: *const Program, list: *ThreadList, pc0: u32, slots: []Cell
     }
 }
 
+// ── Line-anchored fast scan (`(?m)^` seed-gating) ─────────────────────────────────
+
+/// Whether byte offset `sp` is a **line start**: offset 0, or just after a `\n`. The
+/// position where `(?m)^` (`line_start`) holds, so the only place a `line_anchored`
+/// program can begin a match.
+inline fn atLineStart(input: []const u8, sp: usize) bool {
+    return sp == 0 or input[sp - 1] == '\n';
+}
+
+/// First `\n` at offset `≥ from`, or null. Runtime uses the SIMD `memchr`; comptime
+/// uses a plain scan (the project keeps `@Vector` out of const-eval). Drives the leap
+/// between line starts when a `line_anchored` search has no live threads.
+fn nextNewline(input: []const u8, from: usize) ?usize {
+    if (@inComptime()) {
+        var i = from;
+        while (i < input.len) : (i += 1) if (input[i] == '\n') return i;
+        return null;
+    }
+    return std.mem.indexOfScalarPos(u8, input, from, '\n');
+}
+
 // ── The VM ───────────────────────────────────────────────────────────────────────
 
-fn run(program: *const Program, sc: *Scratch, input: []const u8, opts: SearchOptions) ?[]const Cell {
+fn run(program: *const Program, sc: *Scratch, input: []const u8, opts: SearchOptions, span_only: bool) ?[]const Cell {
     var c_list = &sc.clist;
     var n_list = &sc.n_list;
+    // Span-only: `search`/`isMatch` need just the overall match bounds (slots 0,1), so track a
+    // 2-slot stride instead of `2*(groups+1)`. Inner `save`s are skipped (slot ≥ 2) and only
+    // two cells are copied per thread — a big cut on a many-group pattern's `count`/`find`
+    // (`(?m)^(\S+) … (\d+)`). The found match is identical (priority is by `pc`, not slots); only
+    // the unrecorded inner groups differ, which span ops never read. `searchCaptures` passes
+    // `false` to keep every slot.
+    const eff_sc: usize = if (span_only) @min(@as(usize, 2), sc.slot_count) else sc.slot_count;
+    c_list.sc = eff_sc;
+    n_list.sc = eff_sc;
     c_list.clear();
     n_list.clear();
     @memset(sc.entry_slots, .{ .slot = null });
@@ -301,9 +331,16 @@ fn run(program: *const Program, sc: *Scratch, input: []const u8, opts: SearchOpt
     var matched = false;
     var sp = opts.start;
 
+    // `(?m)^` seed-gating: a `line_anchored` program can only begin a match at a line
+    // start, so on an unanchored search we seed a start thread **only** at line starts
+    // and, when the thread set empties, leap to the next line start with a `\n` memchr
+    // (below). One linear pass, leftmost-first preserved — no per-line confirm loop, so
+    // no Θ(n²). Disabled for anchored searches (the seed is already pinned to `start`).
+    const line_gate = program.line_anchored and !opts.anchored;
+
     while (true) {
-        if (!matched and (!opts.anchored or sp == opts.start)) {
-            addThread(program, c_list, 0, sc.entry_slots, sp, input, sc.stack);
+        if (!matched and (!opts.anchored or sp == opts.start) and (!line_gate or atLineStart(input, sp))) {
+            addThread(program, c_list, 0, sc.entry_slots[0..eff_sc], sp, input, sc.stack);
         }
         const at_end = sp >= input.len;
         // Stop only when there are no live threads AND no way to spawn a new
@@ -312,6 +349,19 @@ fn run(program: *const Program, sc: *Scratch, input: []const u8, opts: SearchOpt
         // going even with an empty list — the next position seeds a fresh start
         // thread (crucial when a leading assertion like `^`/`\b` fails here).
         if (c_list.n == 0 and (matched or opts.anchored or at_end)) break;
+        // Line-anchored leap: no live threads here (so we are NOT at a line start — a
+        // line-start seed always yields ≥1 thread), so no match can begin before the
+        // next line start. Jump straight to it instead of stepping byte-by-byte; if
+        // there is no further `\n`, there is no later line start, so no match remains.
+        if (line_gate and !matched and c_list.n == 0) {
+            const nl = nextNewline(input, sp) orelse break;
+            // A dead seed at this position left generation stamps in `c_list`; bump the
+            // generation (the step/swap that normally does so is skipped by `continue`)
+            // so the next line start's seed is not deduped away as "already queued".
+            c_list.clear();
+            sp = nl + 1;
+            continue;
+        }
 
         var cp: CodePoint = 0;
         var cp_len: usize = 1;
@@ -344,7 +394,7 @@ fn run(program: *const Program, sc: *Scratch, input: []const u8, opts: SearchOpt
                 .any => |a| if (!at_end and valid and (a.dot_all or cp != '\n'))
                     addThread(program, n_list, t_pc + 1, t_slots, sp + cp_len, input, sc.stack),
                 .match => {
-                    @memcpy(sc.match_slots, t_slots);
+                    @memcpy(sc.match_slots[0..eff_sc], t_slots);
                     matched = true;
                     break; // cut lower-priority threads
                 },
@@ -358,25 +408,25 @@ fn run(program: *const Program, sc: *Scratch, input: []const u8, opts: SearchOpt
         if (at_end) break;
         sp += cp_len;
     }
-    return if (matched) sc.match_slots[0..sc.slot_count] else null;
+    return if (matched) sc.match_slots[0..eff_sc] else null;
 }
 
 // ── Contract: matching entry points ──────────────────────────────────────────────
 
 /// @stable-since: v0.1.0
 pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) bool {
-    return run(program, scratch, input, opts) != null;
+    return run(program, scratch, input, opts, true) != null; // span-only: bounds suffice
 }
 
 /// @stable-since: v0.1.0
 pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) ?Match {
-    const slots = run(program, scratch, input, opts) orelse return null;
+    const slots = run(program, scratch, input, opts, true) orelse return null; // span-only
     return .{ .start = slots[0].slot.?, .end = slots[1].slot.? };
 }
 
 /// @stable-since: v0.1.0
 pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const u8, slots_out: []?usize, opts: SearchOptions) ?Match {
-    const slots = run(program, scratch, input, opts) orelse return null;
+    const slots = run(program, scratch, input, opts, false) orelse return null; // need every group
     const k = @min(slots_out.len, slots.len);
     var i: usize = 0;
     while (i < k) : (i += 1) slots_out[i] = slots[i].slot;

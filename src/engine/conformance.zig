@@ -160,6 +160,17 @@ const wide_cases = [_]Case{
     .{ .pat = "(?i)k", .input = "\u{212A}", .expect = "\u{212A}" },
     .{ .pat = "(?i)\u{017F}", .input = "S", .expect = "S" },
     .{ .pat = "(?i)\u{00C5}", .input = "\u{212B}", .expect = "\u{212B}" },
+    // case-variant prefilter (small-class-led concat → multi-prefix Teddy start-skip): the
+    // synthesised needle set + per-occurrence confirm must find the same leftmost span as the
+    // Pike VM, incl. mixed-case hits and dense near-misses ("she" before "Sherlock Holmes").
+    .{ .pat = "(?i)the", .input = "----- THE end", .expect = "THE" },
+    .{ .pat = "(?i)the", .input = "a tHe b", .expect = "tHe" },
+    .{ .pat = "(?i)что", .input = "—там ЧТО здесь", .expect = "ЧТО" },
+    .{ .pat = "(?i)sherlock holmes", .input = "she said: Sherlock Holmes!", .expect = "Sherlock Holmes" },
+    .{ .pat = "[Tt]he", .input = "xxxxThe end", .expect = "The" },
+    // leading-class SIMD scan (`\d+`, `\p{N}+`): the start-skip must land on the leftmost
+    // class run across a long non-class gap.
+    .{ .pat = "\\p{N}+", .input = "................................ 4567 z", .expect = "4567" },
     // ^/$ with and without (?m)
     .{ .pat = "(?m)^line2", .input = "line1\nline2\nline3", .expect = "line2" },
     .{ .pat = "(?m)line2$", .input = "line2\nline3", .expect = "line2" },
@@ -433,6 +444,18 @@ const line_cases = [_]LineCase{
     // CRLF — no `.crlf` mode, so \r is content: the line start is after \n (byte 5), not split by \r
     .{ .pat = "(?m)^\\w+", .input = "abc\r\ndef", .spans = &.{ .{ 0, 3 }, .{ 5, 8 } } }, // \w+ stops at \r; def at 5
     .{ .pat = "(?m)\\w+$", .input = "abc\r\ndef", .spans = &.{.{ 5, 8 }} }, // $ sits before \n: \r blocks line 1's match
+    // leading (?m)^ on the LAZY DFA: the eager DFA declines the prone / many-state shapes below
+    // (a `\S+`/`[^…]` run before more pattern), so these exercise the lazy DFA's line-gated
+    // forward re-seed + reverse line-accept directly (the log_line fix). Spans hand-computed.
+    .{ .pat = "(?m)^\\S+ \\S+", .input = "aa bb\ncc dd\nee", .spans = &.{ .{ 0, 5 }, .{ 6, 11 } } }, // 3rd line has no 2nd field
+    .{ .pat = "(?m)^\\S+ \\S+", .input = "x yy zz\nq w", .spans = &.{ .{ 0, 4 }, .{ 8, 11 } } }, // greedy \S+ stops at first space; line 2 at 8
+    // a class that CROSSES newlines ([^z] matches \n) — the match may legitimately span lines;
+    // the leftmost still begins at a line start. (Prone shape: this is exactly why log_line is
+    // declined by the eager DFA and the Pike VM; the lazy DFA does it in one O(n) pass.)
+    .{ .pat = "(?m)^a[^z]*z", .input = "qq\nab\ncz", .spans = &.{.{ 3, 8 }} }, // starts at line-2 'a' (3), [^z]* eats "b\nc", ends at z(7)→8
+    .{ .pat = "(?m)^a[^z]*z", .input = "az\nayz", .spans = &.{ .{ 0, 2 }, .{ 3, 6 } } }, // two line-anchored matches
+    // log_line-shaped: bracket/quote fields with newline-crossing complements, multiple lines.
+    .{ .pat = "(?m)^(\\S+) \\[([^\\]]+)\\] \"([^\"]*)\"", .input = "GET [ok] \"hi\"\nPUT [no] \"bye\"", .spans = &.{ .{ 0, 13 }, .{ 14, 28 } } },
 };
 
 /// Collect every non-overlapping match's `[start, end)` for backend `B` over `input`, or null when
@@ -484,6 +507,40 @@ test "line anchors (?m): exact spans (vs hand-computed) + cross-engine agreement
                     try testing.expectEqual(ov[i][1], bv[i][1]);
                 }
             }
+        }
+    }
+}
+
+test "new prefilters (case-variant Teddy / leading-class scan): findAll agrees with the Pike VM" {
+    // The wide corpus pins the leftmost *single* match; this pins **every** non-overlapping match
+    // over multi-hit inputs, so the per-occurrence confirm loop (case-variant / bounded multi-prefix)
+    // and the repeated leading-class skip can't drop, duplicate, or misplace a match. `auto` (with the
+    // new SIMD prefilters) must produce span-for-span what the Pike VM (no prefilter) does.
+    const gpa = testing.allocator;
+    const cases = [_]Case{
+        // case-variant prefilter, dense + mixed case + near-misses
+        .{ .pat = "(?i)the", .input = "The theme: tHe THE then THEATRE, oTHEr the", .expect = null },
+        .{ .pat = "(?i)что", .input = "Что? что-то ЧТО! не что иначе, чТо.", .expect = null },
+        .{ .pat = "(?i)cat", .input = "car CAT cab Cat caT category scatter", .expect = null },
+        .{ .pat = "(?i)sherlock", .input = "she SHERlock sher Sherlock ashes sHeRlOcK", .expect = null },
+        .{ .pat = "[Tt]he", .input = "the The tHe THE then", .expect = null },
+        // leading-class SIMD scan, sparse and dense digit/number runs across gaps
+        .{ .pat = "\\d+", .input = "a1 .... 23 ..... 456 . 7 ...... 89012 z", .expect = null },
+        .{ .pat = "\\p{N}+", .input = "no nums then 12, ٤٥٦, 789, ١٢ end", .expect = null },
+        .{ .pat = "\\d+", .input = "...................................... 42 ......................", .expect = null },
+    };
+    for (cases) |c| {
+        var ov: [16][2]usize = undefined;
+        const on = (try collectSpans(pikevm, gpa, c.pat, c.input, &ov)).?;
+        var av: [16][2]usize = undefined;
+        const an = (try collectSpans(auto, gpa, c.pat, c.input, &av)).?;
+        testing.expectEqual(on, an) catch {
+            std.debug.print("/{s}/ on \"{s}\": auto found {d} spans, Pike VM {d}\n", .{ c.pat, c.input, an, on });
+            return error.Mismatch;
+        };
+        for (0..on) |i| {
+            try testing.expectEqual(ov[i][0], av[i][0]);
+            try testing.expectEqual(ov[i][1], av[i][1]);
         }
     }
 }

@@ -414,6 +414,47 @@ pub const ByteSet = struct {
     }
 };
 
+/// Largest number of top-level alternation branches the multi-prefix prefilter
+/// tracks (see `PrefixSet`). A pattern with more branches than this declines the
+/// set (the prefilter just isn't built; matching is unaffected).
+///
+/// @stable-since: v0.4.0
+pub const MAX_PREFIX_BRANCHES = 8;
+
+/// One leading literal run per branch of a top-level alternation in which **every**
+/// branch begins with a fixed literal (`Holmes…|Watson…` → {"Holmes","Watson"}).
+/// Because every match begins with one of these runs, the leftmost occurrence of
+/// ANY of them is a **sound** lower bound on where a match can start — a multi-needle
+/// generalisation of `prefix_literal`. Null when some branch lacks a fixed leading
+/// literal (then no sound multi-prefix bound exists).
+///
+/// @stable-since: v0.4.0
+pub const PrefixSet = struct {
+    /// `runs[0..len]` — each a leading literal run (index pair into `Hir.literals`).
+    runs: [MAX_PREFIX_BRANCHES]Node.Run,
+    /// Number of valid runs (always ≥ 2 — a single prefix uses `prefix_literal`).
+    len: u8,
+};
+
+/// An interior required literal that immediately follows a leading **variable-length
+/// class run**, e.g. the `@` in `[\w.+-]+@…` or `(\w+)@(\w+)`. For a pattern with no
+/// fixed leading literal this drives a sound *skip-to-anchor + bounded reverse-scan*
+/// prefilter: jump to the next `byte`, walk back over `lead_class` to the earliest
+/// possible run start, then scan from there — far better than the mere presence
+/// fast-reject `required_bytes` gives. Null when the pattern has no such shape.
+///
+/// @stable-since: v0.4.0
+pub const InnerAnchor = struct {
+    /// First UTF-8 byte of the required literal right after the lead run (the memchr
+    /// target). A necessary byte of every match; a false hit only costs a verify.
+    byte: u8,
+    /// Bytes that may appear in the leading variable atom's class — the alphabet the
+    /// reverse scan walks back over to find the run start. Bytes ≥ 0x80 are set
+    /// **conservatively** (all of them) when the class has any non-ASCII member, so
+    /// the scan never stops short of a real start (sound: a superset only over-scans).
+    lead_class: ByteSet,
+};
+
 /// Cheap, precomputed facts a dispatcher/backend can consult without rewalking the
 /// tree. Everything here is a *sound* property of the HIR: bounds are true bounds
 /// and the "required"/"anchored" facts hold for *every* match, so a prefilter or
@@ -465,6 +506,37 @@ pub const Analysis = struct {
     /// rarest). Empty when nothing is unconditionally required (e.g. a top-level
     /// alternation, or a leading optional).
     required_bytes: ByteSet,
+    /// Every match begins at a **line start** (offset 0 or just after a `\n`): the
+    /// pattern's leading mandatory atom is a `line_start` (`(?m)^`) or `text_start`
+    /// (`^`/`\A`) anchor. Lets a matcher seed only at line starts (and skip between
+    /// them with a `\n` memchr) instead of trying every position — the win for a
+    /// `(?m)^…` pattern that no DFA can hold. `text_start` implies this too, but that
+    /// case is already covered more tightly by `anchored_start`.
+    ///
+    /// @stable-since: v0.4.0
+    line_anchored_start: bool,
+    /// Leading literal of every branch of a top-level alternation, or null (see
+    /// `PrefixSet`). Drives the multi-prefix start-skip for `cat…|dog…|fish…`.
+    ///
+    /// @stable-since: v0.4.0
+    prefix_set: ?PrefixSet,
+    /// An interior required literal after a leading variable class run, or null (see
+    /// `InnerAnchor`). Drives the inner-literal skip for `[\w.+-]+@…`-shaped patterns.
+    ///
+    /// @stable-since: v0.4.0
+    inner_anchor: ?InnerAnchor,
+    /// The possible **first UTF-8 bytes** of a match whose leading mandatory atom is a
+    /// **class** with no fixed leading literal (`\d+`, `\d{4}-…`, `\p{N}+`, `\p{Lu}\p{Ll}+`),
+    /// or null. Every match begins with a byte in this set, so a SIMD scan for the next
+    /// member is a sound start-skip (`engine/classscan.zig`) — the leading-class lane the
+    /// dispatcher uses when no literal / multi-prefix / inner-anchor skip applies. Null when
+    /// the leading atom is a literal (covered by `prefix_literal`), `.`, an alternation, an
+    /// optional, or a grapheme. The dispatcher additionally gates it on *selectivity* (a set
+    /// covering most of typical text — `\p{L}+` — would scan to almost every byte and isn't
+    /// worth it).
+    ///
+    /// @stable-since: v0.4.0
+    leading_class_first: ?ByteSet,
 };
 
 /// The resolved program shape. All slices are sub-slices of caller storage
@@ -1277,6 +1349,10 @@ fn analyze(
         .prefix_literal = prefixLiteral(nodes, children, root),
         .required_literal = req.best,
         .required_bytes = req.bytes,
+        .line_anchored_start = startsLineAnchored(nodes, children, root),
+        .prefix_set = prefixSet(nodes, children, root),
+        .inner_anchor = innerAnchor(nodes, children, ranges, literals, root),
+        .leading_class_first = leadingClassFirst(nodes, children, ranges, root),
     };
 }
 
@@ -1435,6 +1511,200 @@ fn prefixLiteral(nodes: []const Node, children: []const u32, idx: u32) ?Node.Run
             null,
         else => null,
     };
+}
+
+/// Mirror of `startsAnchored`, widened to **line** starts: true when every match
+/// begins at offset 0 or just after a `\n`. The leading mandatory anchor must be
+/// `line_start` (`(?m)^`) or `text_start` (`^`/`\A`); an alternation qualifies only
+/// when every branch does. Sound one-sided fact (a branch that can start anywhere
+/// keeps the whole pattern un-line-anchored).
+fn startsLineAnchored(nodes: []const Node, children: []const u32, idx: u32) bool {
+    const node = nodes[idx];
+    return switch (node.tag) {
+        .anchor => switch (node.data.anchor.kind) {
+            .line_start, .text_start => true,
+            else => false,
+        },
+        .concat => blk: {
+            const d = node.data.children;
+            if (d.len == 0) break :blk false;
+            break :blk startsLineAnchored(nodes, children, children[d.start]);
+        },
+        .alternation => blk: {
+            const d = node.data.children;
+            if (d.len == 0) break :blk false;
+            for (children[d.start .. d.start + d.len]) |ci| {
+                if (!startsLineAnchored(nodes, children, ci)) break :blk false;
+            }
+            break :blk true;
+        },
+        .capture => startsLineAnchored(nodes, children, node.data.capture.child),
+        else => false,
+    };
+}
+
+/// The leading-literal set of a top-level alternation in which every branch begins
+/// with a fixed literal (see `PrefixSet`), or null. Descends a capture wrapping the
+/// alternation. Declines when the branch count is outside `[2, MAX_PREFIX_BRANCHES]`
+/// or any branch lacks a leading literal — in which case no sound multi-prefix bound
+/// exists and the dispatcher falls back to an unfiltered scan.
+fn prefixSet(nodes: []const Node, children: []const u32, idx: u32) ?PrefixSet {
+    const node = nodes[idx];
+    switch (node.tag) {
+        .capture => return prefixSet(nodes, children, node.data.capture.child),
+        .alternation => {
+            const d = node.data.children;
+            if (d.len < 2 or d.len > MAX_PREFIX_BRANCHES) return null;
+            var set = PrefixSet{ .runs = undefined, .len = 0 };
+            for (children[d.start .. d.start + d.len]) |ci| {
+                const pl = prefixLiteral(nodes, children, ci) orelse return null;
+                set.runs[set.len] = pl;
+                set.len += 1;
+            }
+            return set;
+        },
+        else => return null,
+    }
+}
+
+/// The interior required-literal anchor of a `[\w.+-]+@…`-shaped pattern (see
+/// `InnerAnchor`), or null. Recognizes: an optional capture wrapping a concat whose
+/// first mandatory atom is a variable **class** run (a class, or a repetition of one)
+/// and whose next mandatory atom is a **literal**. The literal's first byte is the
+/// memchr target; the class's byte alphabet is the reverse-scan set.
+fn innerAnchor(nodes: []const Node, children: []const u32, ranges: []const Range, literals: []const CodePoint, idx: u32) ?InnerAnchor {
+    var root_idx = idx;
+    if (nodes[root_idx].tag == .capture) root_idx = nodes[root_idx].data.capture.child;
+    if (nodes[root_idx].tag != .concat) return null;
+    const d = nodes[root_idx].data.children;
+    if (d.len < 2) return null;
+    const lead = leadClassBytes(nodes, children, ranges, children[d.start]) orelse return null;
+    const cp = firstLiteralCp(nodes, children, literals, children[d.start + 1]) orelse return null;
+    if (!encoding.isValidCodePoint(cp)) return null;
+    var buf: [4]u8 = undefined;
+    const n = utf8.encodeCodePointUnchecked(cp, &buf);
+    if (n == 0) return null;
+    return .{ .byte = buf[0], .lead_class = lead };
+}
+
+/// The byte alphabet of a leading variable **class** atom (`[\w.+-]+`, `\S+`, `[a-z]*`,
+/// a bare class), or null when `idx` is not such an atom. Descends a capture / a
+/// repetition wrapping the class. ASCII members are set exactly; if the class has any
+/// code point ≥ 0x80, **all** high bytes are set (a sound superset for the reverse scan).
+fn leadClassBytes(nodes: []const Node, children: []const u32, ranges: []const Range, idx: u32) ?ByteSet {
+    const node = nodes[idx];
+    return switch (node.tag) {
+        .class => classBytes(ranges[node.data.class.start .. node.data.class.start + node.data.class.len]),
+        .capture => leadClassBytes(nodes, children, ranges, node.data.capture.child),
+        .repetition => leadClassBytes(nodes, children, ranges, node.data.repetition.child),
+        else => null,
+    };
+}
+
+/// Build a `ByteSet` from a class's resolved (sorted, positive) ranges, with the
+/// non-ASCII conservatism described on `leadClassBytes`.
+fn classBytes(rngs: []const Range) ByteSet {
+    var bs = ByteSet{};
+    var any_high = false;
+    for (rngs) |r| {
+        if (r.lo <= 0x7F) {
+            var b: CodePoint = r.lo;
+            const hi: CodePoint = @min(r.hi, 0x7F);
+            while (b <= hi) : (b += 1) bs.set(@intCast(b));
+        }
+        if (r.hi >= 0x80) any_high = true;
+    }
+    if (any_high) {
+        var b: u16 = 0x80;
+        while (b < 0x100) : (b += 1) bs.set(@intCast(b));
+    }
+    return bs;
+}
+
+/// First code point of a leading literal atom (descending a capture / `min≥1`
+/// repetition), or null when `idx` is not a literal-bearing mandatory atom.
+fn firstLiteralCp(nodes: []const Node, children: []const u32, literals: []const CodePoint, idx: u32) ?CodePoint {
+    const node = nodes[idx];
+    return switch (node.tag) {
+        .literal => literals[node.data.run.start],
+        .capture => firstLiteralCp(nodes, children, literals, node.data.capture.child),
+        .repetition => if (node.data.repetition.min >= 1)
+            firstLiteralCp(nodes, children, literals, node.data.repetition.child)
+        else
+            null,
+        else => null,
+    };
+}
+
+/// First-UTF-8-byte set of the leading mandatory **class** atom, or null. Mirrors
+/// `prefixLiteral`'s spine walk (skip leading zero-width anchors in a concat; descend
+/// capture / `min≥1` repetition bodies), but stops at a `class` — returning its possible
+/// leading bytes (`classFirstByteSet`) — and returns null when the leading atom is a
+/// literal (covered by `prefixLiteral`), `.`, an alternation, an optional, or a grapheme.
+/// Sound: every match's first code point is in the class, so its first byte is in the set.
+fn leadingClassFirst(nodes: []const Node, children: []const u32, ranges: []const Range, idx: u32) ?ByteSet {
+    const node = nodes[idx];
+    return switch (node.tag) {
+        .class => classFirstByteSet(ranges[node.data.class.start .. node.data.class.start + node.data.class.len]),
+        .concat => blk: {
+            const d = node.data.children;
+            var i = d.start;
+            while (i < d.start + d.len) : (i += 1) {
+                const ci = children[i];
+                switch (nodes[ci].tag) {
+                    .anchor, .empty => continue, // zero-width: the match begins after it
+                    else => break :blk leadingClassFirst(nodes, children, ranges, ci),
+                }
+            }
+            break :blk null;
+        },
+        .capture => leadingClassFirst(nodes, children, ranges, node.data.capture.child),
+        .repetition => if (node.data.repetition.min >= 1)
+            leadingClassFirst(nodes, children, ranges, node.data.repetition.child)
+        else
+            null,
+        else => null,
+    };
+}
+
+/// The set of possible **first UTF-8 bytes** of any code point in a class's resolved
+/// (sorted, positive) ranges. ASCII members contribute themselves; a multi-byte member
+/// contributes the lead byte of its UTF-8 encoding. Computed per tier (1/2/3/4-byte) so a
+/// huge range never iterates code points: within a tier the lead byte is monotic in the
+/// code point, so `leadByte(lo)..leadByte(hi)` is the exact contiguous lead-byte span.
+fn classFirstByteSet(rngs: []const Range) ByteSet {
+    var bs = ByteSet{};
+    for (rngs) |r| addFirstBytes(&bs, r.lo, @min(r.hi, MAX_CP));
+    return bs;
+}
+
+/// Add to `bs` the UTF-8 lead bytes for code points in `[lo, hi]`, split by UTF-8 length
+/// tier (the lead byte is monotonic in the code point within each tier, so each tier
+/// contributes one contiguous byte range).
+fn addFirstBytes(bs: *ByteSet, lo: CodePoint, hi: CodePoint) void {
+    const tiers = [_]struct { lo: CodePoint, hi: CodePoint }{
+        .{ .lo = 0, .hi = 0x7F },
+        .{ .lo = 0x80, .hi = 0x7FF },
+        .{ .lo = 0x800, .hi = 0xFFFF },
+        .{ .lo = 0x10000, .hi = MAX_CP },
+    };
+    for (tiers) |t| {
+        const a = @max(lo, t.lo);
+        const b = @min(hi, t.hi);
+        if (a > b) continue;
+        var byte = leadByte(a);
+        const last = leadByte(b);
+        while (byte <= last) : (byte += 1) bs.set(byte);
+    }
+}
+
+/// First UTF-8 byte of `cp` (its encoding's lead byte), computed arithmetically so it works
+/// over a whole tier without encoding. Surrogates never reach here (HIR ranges are scalars).
+fn leadByte(cp: CodePoint) u8 {
+    if (cp <= 0x7F) return @intCast(cp);
+    if (cp <= 0x7FF) return @intCast(0xC0 | (cp >> 6));
+    if (cp <= 0xFFFF) return @intCast(0xE0 | (cp >> 12));
+    return @intCast(0xF0 | (cp >> 18));
 }
 
 /// Accumulator for `collectRequired`: the longest required literal run found
@@ -2022,6 +2292,59 @@ test "analysis: prefilter + feasibility facts" {
         try testing.expectEqual(@as(?u32, null), h.analysis.max_len);
         try testing.expectEqual(@as(?u32, null), h.analysis.max_utf8_len);
         try testing.expectEqual(@as(u32, 1), h.analysis.min_utf8_len); // just the leading 'a'
+    }
+}
+
+test "analysis: leading_class_first only for class-led patterns" {
+    var diag: compile.Diagnostic = .{};
+    // A class-led pattern exposes the first-byte set; the digit set has 0-9 and excludes letters.
+    {
+        const a = try compile.parse(testing.allocator, "\\d{4}-\\d{2}", &diag);
+        defer a.deinit(testing.allocator);
+        const h = try buildAlloc(testing.allocator, a, .{});
+        defer deinitHir(testing.allocator, h);
+        const bs = h.analysis.leading_class_first.?;
+        for ("0123456789") |b| try testing.expect(bs.has(b));
+        try testing.expect(!bs.has('a'));
+        try testing.expect(!bs.has(' '));
+    }
+    // A literal-led pattern has none (prefix_literal covers it).
+    {
+        const a = try compile.parse(testing.allocator, "foo\\d+", &diag);
+        defer a.deinit(testing.allocator);
+        const h = try buildAlloc(testing.allocator, a, .{});
+        defer deinitHir(testing.allocator, h);
+        try testing.expect(h.analysis.leading_class_first == null);
+    }
+}
+
+test "classFirstByteSet: tier-split lead bytes match a brute-force encode" {
+    // The per-tier lead-byte arithmetic (`addFirstBytes`/`leadByte`) must equal encoding every
+    // code point and taking its first UTF-8 byte. Cover ASCII, the 2/3-byte tier boundaries,
+    // and a 4-byte range — at the exact boundary code points where an off-by-one would show.
+    const ranges = [_]Range{
+        .{ .lo = '0', .hi = '9' }, // ASCII
+        .{ .lo = 0x7E, .hi = 0x81 }, // crosses the 1↔2-byte boundary (0x7F→0x80)
+        .{ .lo = 0x7F0, .hi = 0x810 }, // crosses the 2↔3-byte boundary (0x7FF→0x800)
+        .{ .lo = 0x0400, .hi = 0x04FF }, // Cyrillic (lead 0xD0/0xD1)
+        .{ .lo = 0xFFF0, .hi = 0x10010 }, // crosses the 3↔4-byte boundary (0xFFFF→0x10000)
+    };
+    for (ranges) |r| {
+        const got = classFirstByteSet(&.{r});
+        // Brute-force oracle: encode each scalar, record its first byte.
+        var want = ByteSet{};
+        var cp: CodePoint = r.lo;
+        while (cp <= r.hi) : (cp += 1) {
+            if (!encoding.isValidCodePoint(cp)) continue; // skip surrogates
+            var buf: [4]u8 = undefined;
+            const n = utf8.encodeCodePointUnchecked(cp, &buf);
+            if (n > 0) want.set(buf[0]);
+        }
+        var b: u16 = 0;
+        while (b < 256) : (b += 1) {
+            const by: u8 = @intCast(b);
+            try testing.expectEqual(want.has(by), got.has(by));
+        }
     }
 }
 

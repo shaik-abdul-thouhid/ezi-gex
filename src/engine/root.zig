@@ -26,6 +26,11 @@ pub const teddy = @import("teddy.zig");
 /// the single-literal accelerator for the `literal` backend (Teddy's single-needle peer).
 pub const memmem = @import("memmem.zig");
 
+/// classscan — a portable SIMD "next byte in a set" scan (built on `simd`'s dynamic shuffle,
+/// scalar fallback + comptime path). Not a backend; the leading-class start-skip accelerator
+/// `auto` uses for class-led patterns (`\d+`, `\p{N}+`) with no fixed leading literal.
+pub const classscan = @import("classscan.zig");
+
 /// Built-in backends. Each is independently pluggable; `auto` is the default
 /// dispatcher that composes them. Third-party backends implementing the contract
 /// (see `backend.verifyBackend`) drop in the same way.

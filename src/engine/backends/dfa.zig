@@ -74,9 +74,12 @@
 //! DFA arm too: a `min_utf8_len` length gate, an `anchored_start` short-circuit, and a
 //! **leading-literal** `memchr` start-skip (jump to each candidate byte, confirm with an
 //! anchored DFA run). So opting the DFA in is never *slower* than the default on patterns
-//! with a fixed leading literal. Patterns with **no** leading literal (a leading class,
-//! e.g. `\w+@\w+`) get *no* prefilter benefit and keep the quadratic `find` worst case
-//! above — the interior required-byte prefilter that would help them is not built yet.
+//! with a fixed leading literal. A leading-class pattern with **no** fixed literal is also
+//! covered now: `auto` adds an **interior-anchor** skip (`[\w.+-]+@…` — jump to the rare `@`,
+//! reverse-scan the lead class) and, for a digit/number-class lead (`\d+`, `\p{N}+`), a
+//! **leading-class SIMD scan** (`classscan`); a small-class / `(?i)` lead (`(?i)the`) drives the
+//! **case-variant Teddy** multi-prefix skip. The O(input) reverse-DFA `find` keeps the remaining
+//! no-prefilter cases linear regardless.
 //!
 //! ## Invalid UTF-8 — dead-on-invalid, for free
 //!
@@ -98,6 +101,14 @@
 //!     position-dependent transition state.
 //!   * **`text_end`** (`$`/`\z`) **when `anchored_end`** (every match ends at input end) —
 //!     matched in O(input) by the reverse-DFA-from-end pass (`@stable-since v0.4.0`).
+//!   * a single **leading `(?m)^`** (`line_start`) — matched in O(input) with no anchored
+//!     restart: the forward scan re-seeds the pattern start ONLY at line starts (offset 0 or
+//!     just after a `\n`, keyed on the `\n` byte class — `ustep`/`startL`), and the reverse
+//!     `find` accepts a start only where the position is a line start (`revFind`, gated on
+//!     `atLineStart`). A newline-crossing complement class (`[^"]*` spanning lines) is handled
+//!     in a single pass — quadratic-immune, unlike the eager DFA's anchored-restart line
+//!     support (which declines such *prone* patterns; `log_line` is the motivating case).
+//!     `@stable-since v0.4.0`.
 //!
 //! **`\b`/`\B` word boundaries (Unicode)** run here too, via the **decode-hybrid**: consumption is
 //! the cached byte-DFA walk, but at a state holding a pending boundary the position is resolved by
@@ -115,7 +126,8 @@
 //!   * `\X` — a grapheme cluster is variable-width, not a byte (or single-code-point) property.
 //!   * a **mixed** `$` (a `text_end` in only some alternation branches, e.g. `a$|b`) — the end
 //!     is not pinned, so anchored restart would be Θ(n²); declined to stay quadratic-immune.
-//!   * `(?m)` line anchors (`line_start`/`line_end`) — position-dependent on the adjacent byte.
+//!   * `(?m)$` (`line_end`) — position-dependent on the byte *ahead*, and an interior or repeated
+//!     `(?m)^`, or `(?m)^…$` — only a single leading `(?m)^` (above) is admitted.
 //!   * `\b` **combined with** `$` — the boundary-vs-reverse-end interaction is deferred to the Pike VM.
 //!
 //! **Invariants this backend upholds for every pattern `supports` accepts:** matching is
@@ -248,6 +260,22 @@ pub const Program = struct {
     ///
     /// @stable-since: v0.4.0
     has_word_boundary: bool,
+    /// True when the byte program's sole special anchor is a single **leading** `(?m)^`
+    /// (`line_start`). `supports` admits exactly this shape (no `$`/`\A`/`\b`/`line_end`,
+    /// `line_anchored_start`). It runs in **O(input)**, no anchored restart: the forward scan
+    /// re-seeds the pattern start **only at line starts** (after a `\n`, or offset 0 — see
+    /// `ustep`/`startL`), and the reverse `find` accepts a start only where the position is a
+    /// line start (`revFind`, gated on `atLineStart`). Position-dependence is confined to the
+    /// re-seed point and the reverse accept; the cached transitions stay position-independent.
+    ///
+    /// @stable-since: v0.4.0
+    has_line_start: bool = false,
+    /// Byte class of `\n` (the line separator), valid only when `has_line_start`. `byte.byteClasses`
+    /// isolates `\n` into its own class when line anchors are present, so a transition consuming it
+    /// (`class == nl_class`) is exactly "the next position is a line start" — the re-seed trigger.
+    ///
+    /// @stable-since: v0.4.0
+    nl_class: u32 = 0,
 };
 
 /// Whether this HIR can run on the lazy DFA. The capability gate (read this if you opt
@@ -275,15 +303,28 @@ pub const Program = struct {
 /// @stable-since: v0.3.0
 pub fn supports(h: hir.Hir) bool {
     if (!byte.byteLowerable(h)) return false; // excludes \X (grapheme)
+    var has_text_start = false;
     var has_text_end = false;
     var has_word = false;
+    var line_start_count: u32 = 0;
+    var has_line_end = false;
     for (h.nodes) |n| {
         if (n.tag == .anchor) switch (n.data.anchor.kind) {
-            .text_start => {},
+            .text_start => has_text_start = true,
             .text_end => has_text_end = true,
             .word_boundary, .not_word_boundary => has_word = true, // Unicode \b/\B (decode-hybrid, below)
-            .line_start, .line_end => return false, // (?m) line anchors → code-point engines
+            .line_start => line_start_count += 1,
+            .line_end => has_line_end = true, // (?m)$ → code-point engines (position-dependent end)
         };
+    }
+    // `(?m)^` (`line_start`): admitted ONLY as a single LEADING anchor (`line_anchored_start`)
+    // with nothing else special. Handled in O(input) by line-gated forward re-seeding +
+    // a reverse line-start accept check (no anchored restart, so quadratic-immune even for a
+    // `[^"]*`-across-newlines pattern like `log_line`). Any other shape — `(?m)$`, an interior
+    // or repeated `^`, or a mix with `\A`/`$`/`\b` — stays on the code-point engines.
+    if (line_start_count > 0 or has_line_end) {
+        return line_start_count == 1 and !has_line_end and !has_word and
+            !has_text_end and !has_text_start and h.analysis.line_anchored_start;
     }
     // `text_end` is linear here only when the match end is pinned to input end
     // (`anchored_end`), matched by the reverse-DFA-from-end pass. A mixed `$` would fall to the
@@ -382,10 +423,11 @@ fn buildReverse(gpa: std.mem.Allocator, bp: byte.Program) Err!ReverseAdj {
         },
         .jmp => |t| eps_off[t] += 1,
         .save => eps_off[i + 1] += 1,
-        // `text_end` ($/\z) is a passable epsilon (forward edge i → i+1): record its reverse
-        // predecessor so `revClosure(match)` walks back through it. Only `text_end` reaches
-        // here (text_start programs build no reverse; \b/line anchors are declined).
-        .assertion => |k| if (k == .text_end) {
+        // `text_end` ($/\z) and a leading `line_start` ((?m)^) are passable epsilons (forward edge
+        // i → i+1): record the reverse predecessor so `revClosure(match)` walks back through them.
+        // `line_start` additionally gates the reverse ACCEPT on the position being a line start
+        // (handled in `revClosure`/`revFind`); only these two assertion kinds reach here.
+        .assertion => |k| if (k == .text_end or k == .line_start) {
             eps_off[i + 1] += 1;
         },
         .match => n_match += 1,
@@ -436,7 +478,7 @@ fn buildReverse(gpa: std.mem.Allocator, bp: byte.Program) Err!ReverseAdj {
                 eps[ec[i + 1]] = pc;
                 ec[i + 1] += 1;
             },
-            .assertion => |k| if (k == .text_end) { // passable epsilon — see the count pass
+            .assertion => |k| if (k == .text_end or k == .line_start) { // passable epsilon — see the count pass
                 eps[ec[i + 1]] = pc;
                 ec[i + 1] += 1;
             },
@@ -527,12 +569,14 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     var has_text_start = false;
     var has_text_end = false;
     var has_word = false;
+    var has_line_start = false;
     for (bp.insts) |inst| switch (inst) {
         .assertion => |k| switch (k) {
             .text_start => has_text_start = true,
             .text_end => has_text_end = true,
             .word_boundary, .not_word_boundary => has_word = true, // Unicode \b/\B (decode-hybrid)
-            else => return error.Unsupported, // line anchors (declined by supports)
+            .line_start => has_line_start = true, // (?m)^ leading anchor (line-gated re-seed)
+            else => return error.Unsupported, // line_end (declined by supports)
         },
         else => {},
     };
@@ -547,6 +591,9 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     // program likewise keeps anchored restart (a decoded boundary cannot be woven into the reverse
     // automaton — `find`/`isMatch` run the decode-hybrid `runAnchoredWb`).
     var rev = if (has_text_start or has_word) empty_rev else try buildReverse(gpa, bp);
+    // Byte class of `\n` — the re-seed trigger for the `(?m)^` line-gated forward scan. `\n` is
+    // isolated into its own class by `byteClasses` whenever a line anchor is present.
+    const nl_class: u32 = if (has_line_start) classes.map['\n'] else 0;
     errdefer freeReverse(gpa, &rev);
     // `reaches_end` drives `accept_eoi`; only a `text_end` program needs it (empty otherwise,
     // and the closure never indexes it for a `$`-free program).
@@ -567,6 +614,8 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
         .end_anchored = end_anchored,
         .reaches_end = reaches_end,
         .has_word_boundary = has_word,
+        .has_line_start = has_line_start,
+        .nl_class = nl_class,
     };
 }
 
@@ -598,6 +647,13 @@ const InternMap = std.HashMapUnmanaged([]const u32, u32, StateCtx, std.hash_map.
 /// How many mid-search cache flushes are tolerated before `on_full = .give_up` raises
 /// the `gave_up` flag (a routing hint for `auto`; results stay correct regardless).
 const MAX_FLUSHES: u32 = 4;
+
+/// Whether byte offset `sp` is a **line start**: offset 0, or immediately after a `\n`. The
+/// position predicate `(?m)^` (`line_start`) tests; used to gate the forward re-seed's start
+/// state and the reverse `find` accept.
+inline fn atLineStart(input: []const u8, sp: usize) bool {
+    return sp == 0 or input[sp - 1] == '\n';
+}
 
 // ── Scratch: the caller-owned lazy transition cache ──────────────────────────────
 
@@ -658,6 +714,12 @@ pub const Scratch = struct {
     /// Start closure with `text_start` FALSE (used at offset > 0, and as the
     /// unanchored re-seed). Equals `start0` for patterns with no `\A`/`^`.
     startN: u32 = DEAD,
+    /// Start closure with `line_start` TRUE (`text_start` false) — the re-seed at a line start
+    /// for a `(?m)^` program (offset 0 uses `start0`, which is also at a line start; positions
+    /// just after a `\n` use this). `DEAD` for a non-line program.
+    ///
+    /// @stable-since: v0.4.0
+    startL: u32 = DEAD,
     start_ready: bool = false,
     /// Approximate live cache footprint in bytes (drives `ScratchOptions` eviction).
     cache_bytes: usize = 0,
@@ -678,6 +740,7 @@ pub const Scratch = struct {
     work_match: bool = false,
     work_match_eoi: bool = false, // a pending `text_end` in this closure reaches match at end
     work_has_wb: bool = false, // this closure parked a `\b`/`\B` member (resolved at match time by decode)
+    work_match_line: bool = false, // revClosure reached pc 0 of a `(?m)^` program → accept IF at a line start
     seeds: []u32, // successor pcs feeding the next closure
 
     // ── reverse-DFA cache (the O(n) reverse `find`; set-based, no priority/cut) ──
@@ -688,6 +751,7 @@ pub const Scratch = struct {
     r_intern: InternMap = .empty,
     r_states: std.ArrayListUnmanaged([]const u32) = .empty,
     r_accept: std.ArrayListUnmanaged(bool) = .empty, // does the state contain pc 0 (reverse accept)?
+    r_accept_line: std.ArrayListUnmanaged(bool) = .empty, // (?m)^: accepts ONLY where the position is a line start
     r_trans: std.ArrayListUnmanaged(u32) = .empty, // r_state × nclass, UNKNOWN until computed
     r_start: u32 = DEAD,
     r_start_ready: bool = false,
@@ -765,6 +829,7 @@ pub const Scratch = struct {
         for (self.r_states.items) |o| gpa.free(o);
         self.r_states.deinit(gpa);
         self.r_accept.deinit(gpa);
+        self.r_accept_line.deinit(gpa);
         self.r_trans.deinit(gpa);
         self.r_intern.deinit(gpa);
         gpa.free(self.seen);
@@ -877,7 +942,7 @@ pub const Scratch = struct {
     /// continuation reaches `match` — that is how a state knows it is accepting *at end of
     /// input*. Writes `work`/`work_len` and sets `work_match`/`work_match_eoi`. Allocation-free
     /// (all buffers pre-sized to the program).
-    fn closure(self: *Scratch, program: *const Program, seeds: []const u32, at_start: bool) void {
+    fn closure(self: *Scratch, program: *const Program, seeds: []const u32, at_start: bool, at_line_start: bool) void {
         const insts = program.byte_prog.insts;
         self.seen_gen +%= 1;
         const gen = self.seen_gen;
@@ -929,7 +994,15 @@ pub const Scratch = struct {
                                 self.work_has_wb = true;
                                 break :follow;
                             },
-                            else => break :follow, // line anchors — gated out by supports()
+                            // `(?m)^` holds iff the position is a line start — a build-time fork
+                            // (`at_line_start`), exactly like `text_start`/`at_start`. The forward
+                            // scan supplies `at_line_start` only at line starts (offset 0 / after a
+                            // `\n`), so a non-line-start re-seed dies here.
+                            .line_start => {
+                                if (!at_line_start) break :follow;
+                                pc += 1;
+                            },
+                            else => break :follow, // line_end — gated out by supports()
                         },
                         .byte_range => {
                             self.work[self.work_len] = pc;
@@ -964,7 +1037,7 @@ pub const Scratch = struct {
         const rep = program.class_rep[class];
         var ns: usize = 0;
         self.collectSeeds(program, state_id, rep, &ns);
-        self.closure(program, self.seeds[0..ns], false); // sp > 0 during a transition
+        self.closure(program, self.seeds[0..ns], false, false); // sp > 0; body has no leading anchor
         const next = try self.internState(self.work_match, self.work_match_eoi);
         // `internState` may have grown `trans` (realloc) — re-index to write the edge.
         self.trans.items[@as(usize, state_id) * self.nclass + class] = next;
@@ -983,8 +1056,23 @@ pub const Scratch = struct {
         const rep = program.class_rep[class];
         var ns: usize = 0;
         self.collectSeeds(program, state_id, rep, &ns); // successors of the live state
-        self.collectSeeds(program, self.startN, rep, &ns); // ∪ a fresh start at this byte
-        self.closure(program, self.seeds[0..ns], false);
+        if (program.has_line_start) {
+            // `(?m)^`: a new match may begin only at a line start. The destination of THIS
+            // transition is at a line start iff the byte consumed is `\n` (`class == nl_class`);
+            // there, re-seed the pattern start (pc 0) — closed with `at_line_start = true`, so
+            // its `line_start` passes — appended AFTER the carried successors (lower priority,
+            // the `.*?` semantics). On a non-`\n` byte nothing is re-seeded, so between line
+            // starts the scan only carries live threads (and stays alive through an empty state).
+            const at_ls = class == program.nl_class;
+            if (at_ls) {
+                self.seeds[ns] = 0;
+                ns += 1;
+            }
+            self.closure(program, self.seeds[0..ns], false, at_ls);
+        } else {
+            self.collectSeeds(program, self.startN, rep, &ns); // ∪ a fresh start at this byte
+            self.closure(program, self.seeds[0..ns], false, false);
+        }
         const next = try self.internState(self.work_match, self.work_match_eoi);
         self.utrans.items[@as(usize, state_id) * self.nclass + class] = next;
         return next;
@@ -1006,11 +1094,32 @@ pub const Scratch = struct {
 
     fn ensureStart(self: *Scratch, program: *const Program) Err!void {
         if (self.start_ready) return;
-        self.closure(program, &[_]u32{0}, true); // text_start holds at offset 0
+        self.closure(program, &[_]u32{0}, true, true); // offset 0: text_start AND line_start hold
         self.start0 = try self.internState(self.work_match, self.work_match_eoi);
-        self.closure(program, &[_]u32{0}, false); // ...and not past it
+        self.closure(program, &[_]u32{0}, false, false); // mid-input, not at a line start
         self.startN = try self.internState(self.work_match, self.work_match_eoi);
+        // Line-start re-seed (`(?m)^` after a `\n`): line_start holds, text_start does not.
+        if (program.has_line_start) {
+            self.closure(program, &[_]u32{0}, false, true);
+            self.startL = try self.internState(self.work_match, self.work_match_eoi);
+        } else self.startL = self.startN;
         self.start_ready = true;
+    }
+
+    /// The start state to begin a forward scan at position `s`: `start0` at offset 0 (text +
+    /// line start), `startL` at a `(?m)^` line start mid-input (just after a `\n`), else
+    /// `startN`. For a non-line program `startL == startN`, so this is just the `s == 0` fork.
+    inline fn startFor(self: *const Scratch, program: *const Program, input: []const u8, s: usize) u32 {
+        if (s == 0) return self.start0;
+        if (program.has_line_start and atLineStart(input, s)) return self.startL;
+        return self.startN;
+    }
+
+    /// Whether reverse state `state` accepts a match START at position `pos`: an unconditional
+    /// reverse accept (pc 0 reached), or — for a `(?m)^` program (`ls`) — a line-conditional one
+    /// that also requires `pos` be a line start.
+    inline fn revAccepts(self: *const Scratch, state: u32, ls: bool, input: []const u8, pos: usize) bool {
+        return self.r_accept.items[state] or (ls and self.r_accept_line.items[state] and atLineStart(input, pos));
     }
 
     /// Run the DFA anchored at `s`: returns the leftmost-first match end reached from
@@ -1025,7 +1134,7 @@ pub const Scratch = struct {
     /// `$` patterns reached via the pinned/`anchored_start` paths, e.g. `^abc$`; a plain
     /// trailing `$` takes the reverse-from-end path instead.)
     fn runAnchored(self: *Scratch, program: *const Program, input: []const u8, s: usize, earliest: bool, flushes: *u32) Err!?usize {
-        var state = if (s == 0) self.start0 else self.startN; // text_start holds only at 0
+        var state = self.startFor(program, input, s); // text_start@0; (?m)^ line start; else startN
         // A state accepts at `s` if it holds a `match`, or — only when `s` is end-of-input — a
         // pending `text_end` (`accept_eoi`). For a `$`-free program `accept_eoi == accept`.
         var match_end: ?usize = if (self.state_match.items[state] or
@@ -1140,7 +1249,7 @@ pub const Scratch = struct {
                 ns += 1;
             },
         };
-        self.closure(program, self.seeds[0..ns], at_start);
+        self.closure(program, self.seeds[0..ns], at_start, false); // `\b` programs never carry `(?m)^` (supports excludes the combo)
         const eff = try self.internState(self.work_match, self.work_match_eoi);
         // `internState` may have grown `wb_cache` (realloc) — index through `.items` after it.
         if (!at_start) self.wb_cache.items[@as(usize, state) * 2 + @intFromBool(b)] = eff;
@@ -1187,7 +1296,7 @@ pub const Scratch = struct {
     /// accepting. O(input), no per-position restart — the fix for the Θ(n²) `[ab]*c`
     /// class of patterns. Caller must have run `ensureStart`.
     fn runUnanchored(self: *Scratch, program: *const Program, input: []const u8, start: usize, flushes: *u32) Err!bool {
-        var state = if (start == 0) self.start0 else self.startN;
+        var state = self.startFor(program, input, start);
         if (self.state_match.items[state]) return true;
 
         // Warm-path pointer cache — same rationale as `runAnchored`, over the *unanchored*
@@ -1237,7 +1346,7 @@ pub const Scratch = struct {
     /// before it dies is the leftmost-first end. (Assertion-free programs only —
     /// `searchImpl` routes `text_start` patterns to anchored restart.)
     fn findEndForward(self: *Scratch, program: *const Program, input: []const u8, start: usize, flushes: *u32) Err!?usize {
-        var state = if (start == 0) self.start0 else self.startN;
+        var state = self.startFor(program, input, start);
         var matched = self.state_match.items[state];
         var end: ?usize = if (matched) start else null;
 
@@ -1329,6 +1438,7 @@ pub const Scratch = struct {
         const gen = self.seen_gen;
         self.work_len = 0;
         self.work_match = false;
+        self.work_match_line = false;
         for (seeds) |seed| {
             var top: usize = 0;
             self.stack[top] = seed;
@@ -1338,7 +1448,12 @@ pub const Scratch = struct {
                 const pc = self.stack[top];
                 if (self.seen[pc] == gen) continue;
                 self.seen[pc] = gen;
-                if (pc == 0) self.work_match = true; // forward start reachable = reverse accept
+                // pc 0 = the forward start = reverse accept. For `(?m)^` pc 0 is the leading
+                // `line_start` assertion, so the accept is CONDITIONAL on the current reverse
+                // position being a line start — recorded separately and checked in `revFind`.
+                if (pc == 0) {
+                    if (program.has_line_start) self.work_match_line = true else self.work_match = true;
+                }
                 // Collect byte_target pcs (have reverse-byte out-edges) AND pc 0 (the
                 // accept). Including pc 0 as a member is what keeps an "accepting but no
                 // byte edges" state's key (`[0]`) distinct from the DEAD empty set (`[]`)
@@ -1374,6 +1489,7 @@ pub const Scratch = struct {
         gop.value_ptr.* = id;
         try self.r_states.append(self.gpa, owned);
         try self.r_accept.append(self.gpa, self.work_match);
+        try self.r_accept_line.append(self.gpa, self.work_match_line);
         try self.r_trans.appendNTimes(self.gpa, UNKNOWN, self.nclass);
         return id;
     }
@@ -1423,15 +1539,17 @@ pub const Scratch = struct {
     /// leftmost match's end, so no earlier start ≥ `lo` matches `[·, end)`.)
     fn revFind(self: *Scratch, program: *const Program, input: []const u8, end: usize, lo: usize) Err!usize {
         try self.ensureRevStart(program);
+        const ls = program.has_line_start; // (?m)^: accept a start only where it's a line start
         var state = self.r_start;
-        var found: ?usize = if (self.r_accept.items[state]) end else null; // empty match at `end`?
+        var found: ?usize = if (self.revAccepts(state, ls, input, end)) end else null; // empty match at `end`?
 
-        // Warm-path pointer cache over the *reverse* tables `r_trans`/`r_accept`. The
+        // Warm-path pointer cache over the *reverse* tables `r_trans`/`r_accept`(`_line`). The
         // reverse cache is never flushed (it grows unbounded; only the forward cache is
         // budgeted), so the sole invalidation is a cold `revStep` realloc'ing the reverse
-        // tables on a new-state row append — re-fetch both bases after every cold step.
+        // tables on a new-state row append — re-fetch all bases after every cold step.
         var r_trans: [*]const u32 = self.r_trans.items.ptr;
         var r_accept: [*]const bool = self.r_accept.items.ptr;
+        var r_accept_line: [*]const bool = self.r_accept_line.items.ptr;
         const map: *const [256]u8 = &program.classes.map;
         const nclass: usize = self.nclass;
 
@@ -1443,7 +1561,7 @@ pub const Scratch = struct {
             if (next != UNKNOWN) {
                 // Warm path: memoized reverse edge, no growth.
                 state = next;
-                if (r_accept[state]) found = pos;
+                if (r_accept[state] or (ls and r_accept_line[state] and atLineStart(input, pos))) found = pos;
                 if (state == DEAD) break;
                 continue;
             }
@@ -1451,7 +1569,8 @@ pub const Scratch = struct {
             state = try self.revStep(program, state, class);
             r_trans = self.r_trans.items.ptr;
             r_accept = self.r_accept.items.ptr;
-            if (r_accept[state]) found = pos;
+            r_accept_line = self.r_accept_line.items.ptr;
+            if (r_accept[state] or (ls and r_accept_line[state] and atLineStart(input, pos))) found = pos;
             if (state == DEAD) break;
         }
         return found orelse end; // the forward guaranteed a match, so non-null in practice
@@ -1771,11 +1890,13 @@ test "invalid UTF-8 input is dead-on-invalid (a match never spans a bad byte)" {
     try expectNoMatch("\\w+", "\xFF\xFE");
 }
 
-test "supports(): accepts byte-class + \\A/^ + anchored-end $ + isolated \\b/\\B; declines mixed-$/(?m)/\\X/\\b-combos" {
+test "supports(): accepts byte-class + \\A/^ + anchored-end $ + isolated \\b/\\B + leading (?m)^; declines mixed-$/(?m)$/\\X/\\b-combos" {
     const gpa = testing.allocator;
     // \A and non-multiline ^ lower to a text_start assertion; an `anchored_end` $/\z lowers to
     // a text_end assertion matched by the reverse-from-end pass — both DFA-evaluable. `\b`/`\B`
-    // (Unicode word boundaries) are accepted in isolation and run on the decode-hybrid path.
+    // (Unicode word boundaries) are accepted in isolation and run on the decode-hybrid path. A
+    // single LEADING `(?m)^` (line_start) is accepted — line-gated forward re-seed + reverse
+    // line-accept, O(input).
     const accepts = [_][]const u8{
         "[a-z]+",  "\\w+\\d*", "cat|dog",         "héllo", "a.*c",
         "\\p{L}+", "^abc",     "\\Aword",         "^\\d+",
@@ -1783,12 +1904,15 @@ test "supports(): accepts byte-class + \\A/^ + anchored-end $ + isolated \\b/\\B
         "abc$",    "\\w+$",    "[a-z]+@[a-z]+$",  "^abc$", "x\\z",  "foo$|bar$",
         // isolated word boundaries (decode-hybrid):
         "\\bcat\\b", "\\Bx",   "\\b\\w+\\b",      "s\\b",  "\\bword\\b",
+        // leading (?m)^ (line_start) — the only line anchor the lazy DFA now runs:
+        "(?m)^line", "(?m)^\\w+", "(?m)^\\S+ \\S+",
     };
-    // \X is a grapheme (variable-width); (?m) line anchors are position-dependent; a *mixed* $
-    // (text_end in only some branches) is not anchored_end → Θ(n²); a `\b` COMBINED with `$` is
-    // deferred — all declined to the code-point engines.
+    // \X is a grapheme (variable-width); `(?m)$` (line_end) is position-dependent on the byte
+    // AHEAD (not supported); an INTERIOR/repeated `(?m)^` is not a single leading anchor; a
+    // `(?m)^…$` mixes line_start with text_end; a *mixed* $ is not anchored_end → Θ(n²); a `\b`
+    // COMBINED with `$` is deferred — all declined to the code-point engines.
     const declines = [_][]const u8{
-        "a\\Xb", "(?m)^line", "(?m)$", "a$|b", "(foo$|bar)", "\\bword$", "\\bword\\b$",
+        "a\\Xb", "(?m)$", "(?m)\\w+$", "a(?m)^b", "(?m)^a$", "a$|b", "(foo$|bar)", "\\bword$", "\\bword\\b$",
     };
     inline for (accepts) |pat| {
         var diag: compile.Diagnostic = .{};
