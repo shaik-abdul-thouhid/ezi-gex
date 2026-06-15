@@ -106,31 +106,30 @@ dead-on-invalid UTF-8, and the **byte-NFA lowering + `ByteMap` equivalence class
 
 ## Installing
 
-The latest **tagged** release is `v0.3.1`. It predates the `0.4.0-dev` work above
-(`\b`/`(?m)` on the DFAs, the one-pass capture path, DFA minimization, the whole-run
-prefilter) — for those, **track `main`** (below). Via git ref (resolves the tag at fetch time):
+The latest **tagged** release is **`v0.4.0`** — the recommended choice for reproducible
+builds. Via git ref (resolves the tag and pins its content hash in `build.zig.zon`):
 
 ```sh
-zig fetch --save git+https://github.com/shaik-abdul-thouhid/ezi-gex.git#v0.3.1
+zig fetch --save git+https://github.com/shaik-abdul-thouhid/ezi-gex.git#v0.4.0
 ```
 
-Or via plain HTTP tarball (pins the content hash in `build.zig.zon`):
+Or via plain HTTP tarball (also pins the content hash):
 
 ```sh
-zig fetch --save https://github.com/shaik-abdul-thouhid/ezi-gex/archive/refs/tags/v0.3.1.tar.gz
+zig fetch --save https://github.com/shaik-abdul-thouhid/ezi-gex/archive/refs/tags/v0.4.0.tar.gz
 ```
 
-**Tracking `main` (unreleased `0.4.0-dev`)** — if you want the latest, in-development
-surface before it's tagged, fetch the branch instead of a tag. This resolves `main`'s
-current commit and pins its hash in `build.zig.zon`; re-run it to move up:
+**Tracking `main` (unreleased `0.5.0-dev`)** — if you want the latest in-development surface
+before it's tagged, fetch the branch instead of a tag. This resolves `main`'s current commit
+and pins its hash in `build.zig.zon`; re-run it to move up:
 
 ```sh
 zig fetch --save git+https://github.com/shaik-abdul-thouhid/ezi-gex.git#main
 ```
 
-`main` is the development branch: it builds and is tested, but APIs there are not yet
-covered by a tag, so they can still change before `0.4.0`. For reproducible builds,
-prefer a tagged release; reach for `main` only when you specifically need unreleased work.
+`main` is the development branch: it builds and is tested, but APIs there are not yet covered
+by a tag, so they can still change before `0.5.0`. For reproducible builds prefer the `v0.4.0`
+tag; reach for `main` only when you specifically need unreleased work.
 
 Then in `build.zig` (the `ezi_code` dependency is resolved transitively — you only
 add `ezi_gex`):
