@@ -453,6 +453,17 @@ pub const InnerAnchor = struct {
     /// **conservatively** (all of them) when the class has any non-ASCII member, so
     /// the scan never stops short of a real start (sound: a superset only over-scans).
     lead_class: ByteSet,
+    /// Code-point length of the leading run when it is **fixed** (`\d{4}-…` → 4, a bare
+    /// class `\d-…` → 1), or null when the run is variable (`[\w.+-]+@…` → null). When
+    /// non-null **and the input is all-ASCII**, every leading code point is one byte, so
+    /// the anchor sits exactly this many *bytes* into every match: a hit at byte `q` pins
+    /// the match start to `q - lead_fixed_cps`, and a single bounded anchored confirm
+    /// there replaces the reverse-scan + native find — turning a dash-dense, linearly
+    /// scanned pattern (`\d{4}-\d{2}-\d{2}` over nginx logs) into one bounded confirm per
+    /// anchor occurrence. Null / non-ASCII keeps the sound reverse-scan + native-find path.
+    ///
+    /// @stable-since: v0.5.0
+    lead_fixed_cps: ?u32 = null,
 };
 
 /// Cheap, precomputed facts a dispatcher/backend can consult without rewalking the
@@ -1584,7 +1595,28 @@ fn innerAnchor(nodes: []const Node, children: []const u32, ranges: []const Range
     var buf: [4]u8 = undefined;
     const n = utf8.encodeCodePointUnchecked(cp, &buf);
     if (n == 0) return null;
-    return .{ .byte = buf[0], .lead_class = lead };
+    return .{ .byte = buf[0], .lead_class = lead, .lead_fixed_cps = leadFixedCps(nodes, children[d.start]) };
+}
+
+/// Code-point length of a leading run when it is **fixed**, else null (see
+/// `InnerAnchor.lead_fixed_cps`). A bare class is one code point; a counted repetition of a
+/// fixed-length body (`\d{4}`) is `min × body` when `min == max`; a capture descends to its
+/// child. A variable repetition (`+`, `*`, `{m,}`, `{m,n}` with `m≠n`), or a body that is
+/// not itself fixed, yields null. The reverse-scan path covers those.
+fn leadFixedCps(nodes: []const Node, idx: u32) ?u32 {
+    const node = nodes[idx];
+    return switch (node.tag) {
+        .class => 1,
+        .capture => leadFixedCps(nodes, node.data.capture.child),
+        .repetition => blk: {
+            const r = node.data.repetition;
+            const mx = r.max orelse break :blk null; // unbounded → variable
+            if (mx != r.min) break :blk null; // {m,n}, m≠n → variable
+            const body = leadFixedCps(nodes, r.child) orelse break :blk null;
+            break :blk r.min * body;
+        },
+        else => null,
+    };
 }
 
 /// The byte alphabet of a leading variable **class** atom (`[\w.+-]+`, `\S+`, `[a-z]*`,

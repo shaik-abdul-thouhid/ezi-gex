@@ -478,6 +478,21 @@ match, so a prefilter or length gate built on them never yields a false negative
 > `required_literal` (longest *interior* required run) and `is_one_pass` remain unconsumed *as
 > Analysis fields* — any backend is free to read them today. Toggle the whole prefilter with
 > `strategy.prefilter`.
+>
+> **Since 0.5.0 three more facts are consumed** (all results-invariant, pinned to the Pike VM):
+> (1) when the whole pattern is a literal in word-boundary assertions (`\bthe\b`, `the\b`), a
+> `memmem` hit is confirmed by an **O(1) word-boundary check** rather than a per-occurrence anchored
+> automaton walk (`Filter.lit_wb_confirm`; ASCII boundary on the eager arm, Unicode
+> `nfa.assertionHolds` on the lazy arm); (2) when the leading run before an `inner_anchor` is
+> **fixed-length** (`InnerAnchor.lead_fixed_cps`, `\d{4}-…` → 4) and the input is ASCII, the skip
+> jumps anchor-to-anchor and **bounded-confirms at the pinned start `anchor − off`**
+> (`Filter.inner_fixed_off`) — one confirm per occurrence on a dash-dense haystack; and (3) a
+> `(?m)^…` pattern with no eager DFA (`line_anchored_start`) **attempts the match anchored at each
+> line start** for span *and* captures (`Filter.line_anchored`), skipping the lazy DFA's reverse and
+> capture-fill passes. Separately, `auto` now gates the **eager-DFA build attempt** on byte-NFA size
+> (`EAGER_BYTE_INST_MAX`) so a big Unicode-class join (`\w+@\w+`, email) goes straight to the lazy
+> DFA instead of a multi-hundred-ms determinization that often only declines (email compile
+> ~0.88 s → ~6 ms).
 
 ---
 
@@ -580,6 +595,10 @@ The contract is the seam that makes these drop-in:
 | ✅ *(0.4.0)* + ongoing | **Unicode-class throughput** — a **leading-class SIMD scan** (`engine/classscan.zig`) skips the inter-match gaps for a selective digit/number lead (`\d+`, `\p{N}+`). The raw determinized table walk on dense Unicode classes still lags Rust (`\p{L}+`, `\d{4}-\d{2}-\d{2}`) — a faster inner loop / structural prefilter is the next step | partial | `\d+`/`\p{N}+` on sparse corpora ~33–37× (now **faster than Rust**); `date_iso`/dense letter cells still behind |
 | ✅ *(0.4.0)* | **Teddy on the NFA/DFA arm** — the multi-prefix Teddy (`Program.prefix_teddy`) now serves any `prefix_set` ≥ 2 needles: a top-level alternation's leading literals (`near`'s `Holmes…\|Watson…`) AND the synthesised case-variant set above | done | `near` ~1.6× (3.4 → 5.4 GiB/s) |
 | ✅ *(0.4.0)* | **`(?m)^` line anchors on the lazy DFA** — a single leading `(?m)^` runs O(input) on the lazy DFA (line-gated forward re-seed + reverse line-accept), no anchored restart, so a *prone* / newline-crossing line pattern (`log_line`) is no longer stuck on the Pike VM | done | `log_line` ~1.3× (a 7-capture, complement-class, 2-pass-`find` pattern — the DFA per-byte win is largely offset by the forward+reverse passes; still ~6× behind Rust) |
+| ✅ *(0.5.0)* | **`\b`-wrapped pure-literal O(1) confirm** (`Filter.lit_wb_confirm`) — when the whole pattern is a literal in word-boundary assertions (`\bthe\b`, `the\b`), a `memmem` hit is confirmed by two O(1) boundary checks, not a per-occurrence anchored DFA walk (ASCII boundary on the eager arm; Unicode `nfa.assertionHolds` on the lazy arm, so accented prose is fast). The `memmem.Finder` is also hoisted out of the per-occurrence loop (it was rebuilt per "the" substring) | done | `\bthe\b` over prose ~490 MiB/s → **~3.7 GiB/s (≈8×)** |
+| ✅ *(0.5.0)* | **Fixed-offset interior anchor** (`Filter.inner_fixed_off`, `InnerAnchor.lead_fixed_cps`) — when the leading run before the anchor is fixed-length (`\d{4}-…` → 4) and the input is ASCII, jump anchor-to-anchor and **bounded-confirm at `q − off`** (one confirm per occurrence) instead of a reverse-scan + native find that crawls a dash-dense haystack (nginx `- -`). Non-ASCII / variable-run keeps the reverse-scan path | done | `date_iso` ~610 MiB/s → **~9.8 GiB/s (≈16×)** |
+| ✅ *(0.5.0)* | **Line-anchored capture/span dispatch** (`Filter.line_anchored`) — a `(?m)^…` pattern with no eager DFA attempts the match anchored at each line start (`memchr` the next `\n`) for **both** span (`count`/`find`) and captures, dropping the lazy DFA's reverse pass and the separate capture-fill pass | done | `log_line` span ~230 MiB/s → **~1.1 GiB/s (≈4.7×)** |
+| ✅ *(0.5.0)* | **Eager-DFA determinization budget** (`auto.EAGER_BYTE_INST_MAX`) — `auto` only attempts the eager DFA when the byte NFA is small enough to determinize cheaply; a big Unicode-class join (`\w+@\w+`, `[\w.+-]+@…`) goes straight to the lazy DFA. The email pattern's eager DFA overflowed `max_states` and declined anyway after burning ~0.9 s | done | **email compile ~0.88 s → ~6 ms (≈140×)**, runtime unchanged (already lazy) |
 
 ### The byte substrate (tier 3a, landed)
 

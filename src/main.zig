@@ -336,16 +336,18 @@ test "usage: lazy DFA finds spans (span-only, runtime-only, leftmost-first)" {
 test "usage: auto opts into the DFA span arm (byte_engine=.enabled); captures still work" {
     const gpa = std.testing.allocator;
     var diag: ezi_gex.Diagnostic = .{};
-    var re = try ezi_gex.compileRuntimeWith(ezi_gex.backends.auto, gpa, "(\\w+)@(\\w+)", &diag, .{ .strategy = .{ .byte_engine = .enabled } });
+    // A small-class capture pattern keeps the EAGER DFA span arm (a big-class join like `\w+@\w+`
+    // exceeds the eager-determinization budget and uses the lazy DFA instead — see `auto`).
+    var re = try ezi_gex.compileRuntimeWith(ezi_gex.backends.auto, gpa, "(\\d{4})-(\\d{2})", &diag, .{ .strategy = .{ .byte_engine = .enabled } });
     defer re.deinit();
     var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
     defer sc.deinit(gpa);
     try std.testing.expectEqualStrings("nfa+edfa", ezi_gex.backends.auto.route(&re.program)); // eager DFA span arm built
     const slots = try gpa.alloc(?usize, re.slotCount());
     defer gpa.free(slots);
-    const c = re.captures(&sc, slots, "bob@example").?; // captures via the Pike VM
-    try std.testing.expectEqualStrings("bob", c.groupSlice(1).?);
-    try std.testing.expectEqualStrings("example", c.groupSlice(2).?);
+    const c = re.captures(&sc, slots, "on 2026-06 ok").?; // captures via the one-pass / Pike VM
+    try std.testing.expectEqualStrings("2026", c.groupSlice(1).?);
+    try std.testing.expectEqualStrings("06", c.groupSlice(2).?);
 }
 
 test "usage: bad pattern yields a precise diagnostic" {

@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 `0.5.0-dev` on `main`.
 
+### Added
+
+- **`\b`-wrapped pure-literal O(1) boundary confirm** (`auto`, `Filter.lit_wb_confirm`). When the
+  whole pattern is a literal wrapped in leading/trailing word-boundary assertions (`\bthe\b`,
+  `the\b`, `\bfoo`, `\Bx\B`), a `memmem` prefix hit already confirms the literal, so the match is
+  exactly `[hit, hit+len]` iff two **O(1)** word-boundary checks hold — no anchored automaton walk
+  per occurrence. The eager arm uses an ASCII boundary check (`asciiWbAt`, the eager `\b` arm runs
+  only on ASCII input); the lazy arm uses a Unicode-correct one (`litWbHoldsU` → `nfa.assertionHolds`,
+  decoding the adjacent code points), so `\bthe\b` over prose containing accents (`é`) is fast too.
+  New decls (`@stable-since v0.5.0`): `auto.WbAssert`, `Filter.lit_wb_confirm`/`lit_wb_lead`/`lit_wb_trail`.
+- **Fixed-offset interior-anchor confirm** (`auto`, `Filter.inner_fixed_off`; `hir.InnerAnchor.lead_fixed_cps`).
+  When the leading run before an interior anchor is *fixed-length* (`\d{4}-…` → 4) and the input is
+  all-ASCII, the anchor sits a fixed number of bytes into every match, so the prefilter jumps
+  anchor-to-anchor (`memchr`) and **bounded-confirms at the pinned start `q - off`** — one confirm per
+  occurrence — instead of a reverse-scan + native find that crawls a dash-dense, unselective haystack
+  (nginx `- -` placeholders). Non-ASCII input or a variable leading run keeps the sound reverse-scan
+  path. New decls (`@stable-since v0.5.0`): `hir.InnerAnchor.lead_fixed_cps`, `Filter.inner_fixed_off`.
+- **Line-anchored capture/span dispatch** (`auto`, `Filter.line_anchored`). A `(?m)^…` pattern with no
+  eager DFA (too big — `log_line`) now **attempts the match anchored at each line start** (`memchr` the
+  next `\n` to skip between lines) for both `count`/`search` (`lineAnchoredSpan`) and `captures`
+  (`lineAnchoredCaptures`), instead of a lazy-DFA span pass *plus* a separate capture-fill pass per
+  line. One pass per line. New decl (`@stable-since v0.5.0`): `Filter.line_anchored`.
+
+### Changed
+
+- **Eager-DFA determinization budget** (`auto`, `EAGER_BYTE_INST_MAX = 8000`). `auto` now only
+  *attempts* the eager DFA when the byte NFA is small enough that the full subset construction is
+  cheap; a big Unicode-class join (`\w+@\w+`, `[\w.+-]+@…`) goes straight to the lazy DFA. Eager
+  determinization cost scales with (DFA states × byte_insts) and explodes for these — and the email
+  pattern's overflowed `edfa.max_states` and **declined anyway** after burning ~0.9 s, only to use
+  the lazy DFA regardless. The lazy DFA computes the same states on demand, amortized over the input.
+  Results-invariant — it only changes which span engine runs. The comptime CTRE-lane keeps its
+  separate, tighter `tinyForComptimeEdfa` gate. New decl (`@stable-since v0.5.0`): `auto.EAGER_BYTE_INST_MAX`.
+
+### Performance
+
+Measured on `regex-bench` (Apple M4, ReleaseFast; non-overlapping `count` over the corpus):
+
+- **`\bthe\b` over prose** ~490 MiB/s → **~3.7 GiB/s (≈8×)** — the per-occurrence anchored DFA
+  confirm replaced by the O(1) boundary check (`lit_wb_confirm`), and the `memmem` finder hoisted out
+  of the per-occurrence loop (it was rebuilt on every "the" substring).
+- **`\d{4}-\d{2}-\d{2}` over logs** ~610 MiB/s → **~9.8 GiB/s (≈16×)** — the dash-to-dash fixed-offset
+  bounded confirm replaces a linear native-DFA find over a dash-dense haystack.
+- **`(?m)^…` log-line span** ~230 MiB/s → **~1.1 GiB/s (≈4.7×)** — line-anchored dispatch drops the
+  lazy DFA's reverse pass and re-scan.
+- **email compile time** ~0.88 s → **~6 ms (≈140×)** — the eager-determinization budget skips the
+  doomed attempt; runtime is unchanged (it already used the lazy DFA).
+
+All four are **results-invariant** — the cross-backend conformance suite pins every new path's spans
+and capture slots to the Pike VM (runtime and comptime), incl. non-ASCII `\b`, fixed-offset
+alignment, and line-skip cases.
+
 ## [0.4.0] - 2026-06-15
 
 ### Added

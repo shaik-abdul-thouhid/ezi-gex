@@ -20,13 +20,21 @@
 //!       - a `min_utf8_len` length gate (and an `anchored_start` `^…`/`\A…` short-circuit to
 //!         offset 0) always apply first;
 //!       - **single leading literal** → a portable two-byte SIMD `memmem` skip (`memmem.Finder`)
-//!         that leaps literal-to-literal (`\bthe\b` jumps "the"→"the");
+//!         that leaps literal-to-literal (`\bthe\b` jumps "the"→"the"); when the whole pattern is a
+//!         literal wrapped in word-boundary assertions (`\bthe\b`, `the\b`), a hit is confirmed by an
+//!         **O(1) word-boundary check** (`lit_wb_confirm`), not an anchored automaton walk;
 //!       - **multi-prefix set** — a top-level alternation's leading literals (`Holmes…|Watson…`)
 //!         OR a synthesised **case-variant set** for a small-class / `(?i)` lead (`(?i)the` →
 //!         `{THE…the}`, `(?i)что`) — → the **Teddy** SIMD multi-literal scan (`prefix_teddy`),
 //!         scalar `multiPrefixFrom` as the comptime/non-native fallback;
-//!       - **interior anchor** — a required literal after a leading variable class run
-//!         (`[\w.+-]+@…`) — → memchr to the anchor + a bounded reverse-scan;
+//!       - **interior anchor** — a required literal after a leading class run (`[\w.+-]+@…`,
+//!         `\d{4}-…`): memchr to the anchor, then either a bounded reverse-scan + native find
+//!         (variable run) or, when the leading run is **fixed-length** and the input is ASCII, a
+//!         bounded confirm at the pinned start `anchor − off` (`inner_fixed_off`, one confirm per
+//!         occurrence — the win on a dash-dense haystack);
+//!       - **line-anchored** — a `(?m)^…` pattern with no eager DFA (`log_line`) attempts the match
+//!         anchored at each line start (memchr the next `\n`), for span *and* captures, instead of a
+//!         lazy-DFA span pass plus a capture-fill pass (`line_anchored`);
 //!       - **leading-class scan** — a selective digit/number-class lead (`\d+`, `\p{N}+`) → a
 //!         SIMD scan to the next member of the class's first-byte set (`classscan.ClassFinder`);
 //!       - else the rarest unconditionally-required byte drives a presence fast-reject.
@@ -78,6 +86,20 @@ const Cell = backend.Cell;
 /// depth stay modest; the Pike VM is just as correct above it, only with different
 /// performance constants.
 const BACKTRACK_MAX_INPUT: usize = 4096;
+
+/// Byte-NFA instruction ceiling above which `auto` does **not** attempt the eager DFA at runtime,
+/// going straight to the lazy DFA. Eager determinization is a full subset construction over the
+/// byte NFA; its cost scales with (DFA states × byte_insts) and explodes for a big Unicode class
+/// repeated or joined (`\w+@\w+` ≈ 9.3k insts → ~0.5s; `[\w.+-]+@…` ≈ 14k → ~0.9s, and that one
+/// overflows `edfa.max_states` and **declines** — pure wasted work, since it then uses the lazy
+/// DFA regardless). Every fast-determinizing class scan measured stays well under this (`\d+`,
+/// `\p{N}+`, `\p{L}+`, `\p{Lu}\p{Ll}+`, `\w+` ≤ ~5k insts, ≤ ~50 ms), so they keep their eager
+/// DFA; only the explosive joins drop to the lazy DFA (same states on demand, amortized over the
+/// input). Results-invariant — it only changes which span engine runs, never the match. The
+/// comptime CTRE-lane uses the separate, tighter `tinyForComptimeEdfa` gate.
+///
+/// @stable-since: v0.5.0
+const EAGER_BYTE_INST_MAX: u32 = 8000;
 
 /// Cheap, **measure-free** HIR check for whether `auto` should build the eager DFA span arm
 /// **at comptime** (the CTRE-lane). It must be cheap because it gates a `comptime` call: the
@@ -256,7 +278,52 @@ pub const Filter = struct {
     ///
     /// @stable-since: v0.4.0
     class_lead: ?hir.ByteSet = null,
+
+    /// Fixed code-point distance from the match start to `inner_byte` when the leading run is
+    /// fixed-length (`\d{4}-…` → 4; mirror of `hir.InnerAnchor.lead_fixed_cps`). On **ASCII
+    /// input** the anchor sits exactly this many *bytes* into every match, so a hit at byte `q`
+    /// pins the start to `q - inner_fixed_off`: the `inner_byte` skip then jumps anchor-to-anchor
+    /// and **bounded-confirms** at the pinned start (one confirm per occurrence) instead of the
+    /// reverse-scan + native find, which is the win when the anchor byte is dense and not
+    /// selective (nginx `- -` placeholders make `-` appear several times per line). Null when the
+    /// leading run is variable; the call site additionally requires ASCII input and a bounded
+    /// match length (so each confirm is O(max_len) ⇒ the loop stays O(input), no Θ(n²)).
+    ///
+    /// @stable-since: v0.5.0
+    inner_fixed_off: ?u32 = null,
+
+    /// The whole pattern is a pure literal optionally wrapped in leading/trailing **word-boundary**
+    /// assertions (`\bthe\b`, `the\b`, `\bfoo`, `\Bfoo\B`): `prefix[0..prefix_len]` IS the entire
+    /// match. A `memmem` prefix hit therefore already confirms the literal, so the match needs only
+    /// two O(1) ASCII word-boundary checks (`lit_wb_lead` at the hit, `lit_wb_trail` at hit+len) —
+    /// no automaton walk per occurrence. The eager-DFA `\b` arm runs only on ASCII input
+    /// (`edfaArm` routes non-ASCII `\b` to the Pike VM), so the ASCII boundary check is exact there.
+    /// The headline win for `\bthe\b` over prose, where "the" occurs as a substring far more often
+    /// than as a whole word and every false hit otherwise paid a full anchored DFA confirm.
+    ///
+    /// @stable-since: v0.5.0
+    lit_wb_confirm: bool = false,
+    /// Word-boundary requirement at the match START / END for `lit_wb_confirm` (`.none` when that
+    /// side carries no boundary assertion). @stable-since: v0.5.0
+    lit_wb_lead: WbAssert = .none,
+    /// @stable-since: v0.5.0
+    lit_wb_trail: WbAssert = .none,
+
+    /// Every match begins at a **line start** (offset 0 or just after a `\n`): the pattern's
+    /// leading mandatory atom is `(?m)^` (`hir.analysis.line_anchored_start`, and not the tighter
+    /// `anchored_start`). Lets a capture search **attempt only at line starts** — `memchr` the next
+    /// `\n`, run the capturing engine anchored there — instead of locating each span with the lazy
+    /// DFA and then re-filling captures. The win for `log_line` ((?m)^…captures…), which no eager
+    /// DFA can hold (so it otherwise pays a lazy-DFA span pass *plus* a Pike VM capture pass per
+    /// line). Sound because no match can begin off a line start.
+    ///
+    /// @stable-since: v0.5.0
+    line_anchored: bool = false,
 };
+
+/// A word-boundary requirement at one end of a `lit_wb_confirm` literal match: none, `\b`
+/// (must be a boundary), or `\B` (must NOT be a boundary). @stable-since: v0.5.0
+pub const WbAssert = enum { none, boundary, not_boundary };
 
 /// Max match length (UTF-8 bytes) under which the per-occurrence multi-prefix confirm is
 /// used (see `Filter.bounded_confirm`). Each confirm reads ≤ this many bytes, so the loop is
@@ -332,6 +399,111 @@ fn encodeRun(h: hir.Hir, run: hir.Node.Run, out: *[MAX_PREFIX_LEN]u8) u8 {
     return @intCast(n);
 }
 
+/// Total UTF-8 byte length of literal run `run` (untruncated). Used to confirm a `\b`-literal's
+/// `prefix` run holds the *whole* match (`prefix_len == fullRunBytes`) before enabling the O(1)
+/// boundary confirm.
+fn fullRunBytes(h: hir.Hir, run: hir.Node.Run) usize {
+    var n: usize = 0;
+    var k: u32 = 0;
+    while (k < run.len) : (k += 1) {
+        const cp = h.literals[run.start + k];
+        if (!encoding.isValidCodePoint(cp)) return std.math.maxInt(usize); // can't encode → never == prefix_len
+        var buf: [4]u8 = undefined;
+        const m = utf8.encodeCodePointUnchecked(cp, &buf);
+        if (m == 0) return std.math.maxInt(usize);
+        n += m;
+    }
+    return n;
+}
+
+/// The `\b`/`\B` shape of a pattern that is exactly `[\b|\B]? literal-run [\b|\B]?` — a pure
+/// literal optionally wrapped in leading/trailing word-boundary assertions and nothing else —
+/// or null. Drives the `lit_wb_confirm` O(1) boundary check (see `Filter.lit_wb_confirm`). A
+/// leading `^`/`\A`/`$` (a non-word-boundary anchor), any extra consuming atom, or no boundary at
+/// all returns null (the last because a bare literal already takes the plain `memmem` path).
+const LitWbShape = struct { lead: WbAssert, trail: WbAssert, run: hir.Node.Run };
+fn literalWbShape(h: hir.Hir) ?LitWbShape {
+    if (h.nodes[h.root].tag != .concat) return null; // a bare literal has no boundary → not this shape
+    const d = h.nodes[h.root].data.children;
+    const kids = h.children[d.start .. d.start + d.len];
+    if (kids.len == 0) return null;
+
+    var i: usize = 0;
+    var lead: WbAssert = .none;
+    if (h.nodes[kids[0]].tag == .anchor) {
+        lead = wbKind(h.nodes[kids[0]]) orelse return null; // a non-word-boundary leading anchor → decline
+        i = 1;
+    }
+    if (i >= kids.len or h.nodes[kids[i]].tag != .literal) return null;
+    const run = h.nodes[kids[i]].data.run;
+    i += 1;
+    var trail: WbAssert = .none;
+    if (i < kids.len) {
+        if (h.nodes[kids[i]].tag != .anchor) return null; // another consuming atom → not a pure literal
+        trail = wbKind(h.nodes[kids[i]]) orelse return null;
+        i += 1;
+    }
+    if (i != kids.len) return null; // trailing atoms beyond the optional boundary
+    if (lead == .none and trail == .none) return null; // no boundary → plain `memmem`, no O(1) confirm needed
+    return .{ .lead = lead, .trail = trail, .run = run };
+}
+
+/// The `WbAssert` of an anchor node, or null when it is not a word-boundary anchor (`^ $ \A \z`).
+fn wbKind(node: hir.Node) ?WbAssert {
+    return switch (node.data.anchor.kind) {
+        .word_boundary => .boundary,
+        .not_word_boundary => .not_boundary,
+        else => null,
+    };
+}
+
+/// ASCII word boundary at byte offset `i` of `input`: the word-ness of the bytes straddling `i`
+/// differ (`isAsciiWordByte(input[i-1]) != isAsciiWordByte(input[i])`, with out-of-range treated
+/// as non-word). Exact for ASCII input — and `lit_wb_confirm` only runs on the eager-DFA `\b` arm,
+/// which `edfaArm` restricts to ASCII input. Comptime-safe (no `@Vector`).
+inline fn asciiWbAt(input: []const u8, i: usize) bool {
+    const left = i > 0 and byte.isAsciiWordByte(input[i - 1]);
+    const right = i < input.len and byte.isAsciiWordByte(input[i]);
+    return left != right;
+}
+
+/// Whether the two ASCII word-boundary requirements of a `lit_wb_confirm` match hold for a literal
+/// occupying `[p, p + len)` — the whole O(1) confirm (the literal itself is already confirmed by
+/// the `memmem` hit).
+inline fn litWbHolds(filter: *const Filter, input: []const u8, p: usize, len: usize) bool {
+    const lead_ok = switch (filter.lit_wb_lead) {
+        .none => true,
+        .boundary => asciiWbAt(input, p),
+        .not_boundary => !asciiWbAt(input, p),
+    };
+    if (!lead_ok) return false;
+    return switch (filter.lit_wb_trail) {
+        .none => true,
+        .boundary => asciiWbAt(input, p + len),
+        .not_boundary => !asciiWbAt(input, p + len),
+    };
+}
+
+/// Unicode-correct variant of `litWbHolds`: the boundary requirements evaluated with
+/// `nfa.assertionHolds` (it decodes the adjacent code points), so it is exact for **non-ASCII**
+/// input too. Used by the lazy-DFA arm (`runByteDfa`), which serves non-ASCII `\b` programs —
+/// `\bthe\b` over prose containing `é`/accents, where the eager ASCII `\b` arm is declined and the
+/// O(1) confirm here replaces the lazy DFA's decode-hybrid anchored-restart find. Correct for ASCII
+/// input as well (every code point is one byte). Comptime-safe (`assertionHolds` decodes, no @Vector).
+inline fn litWbHoldsU(filter: *const Filter, input: []const u8, p: usize, len: usize) bool {
+    const lead_ok = switch (filter.lit_wb_lead) {
+        .none => true,
+        .boundary => nfa.assertionHolds(.word_boundary, input, p),
+        .not_boundary => nfa.assertionHolds(.not_word_boundary, input, p),
+    };
+    if (!lead_ok) return false;
+    return switch (filter.lit_wb_trail) {
+        .none => true,
+        .boundary => nfa.assertionHolds(.word_boundary, input, p + len),
+        .not_boundary => nfa.assertionHolds(.not_word_boundary, input, p + len),
+    };
+}
+
 /// Distil the sound prefilter facts from the HIR analysis. Picks **at most one** start-skip
 /// in priority order — single leading literal, multi-prefix set, **case-variant set**,
 /// interior anchor, **leading-class scan** — falling back to the rarest-required-byte
@@ -341,6 +513,10 @@ fn filterFromAnalysis(h: hir.Hir) Filter {
     const an = h.analysis;
     var f = Filter{ .min_bytes = an.min_utf8_len, .anchored_start = an.anchored_start };
     f.bounded_confirm = if (an.max_utf8_len) |mx| mx <= CONFIRM_MAX else false;
+    // Line-start anchoring (`(?m)^…`): a capture search may attempt only at line starts. Disjoint
+    // from `anchored_start` (which is tighter — offset 0 only); set before the early return so it
+    // is false there.
+    f.line_anchored = an.line_anchored_start and !an.anchored_start;
     // A start-skip only helps an unanchored scan; for `anchored_start` the start
     // short-circuit already pins the search to offset 0.
     if (an.anchored_start) return f;
@@ -352,6 +528,20 @@ fn filterFromAnalysis(h: hir.Hir) Filter {
         if (n > 0) {
             f.prefix_len = n;
             f.prefix_byte = f.prefix[0];
+        }
+    }
+
+    // 1b. `\b`-wrapped pure literal (`\bthe\b`, `the\b`): the whole match IS the prefix run, so a
+    //     `memmem` hit needs only two O(1) ASCII boundary checks, not an anchored automaton confirm.
+    //     Requires the prefix to be the *complete* literal (untruncated) — else hit+prefix_len is
+    //     not the true match end.
+    if (f.prefix_len > 0) {
+        if (literalWbShape(h)) |shape| {
+            if (fullRunBytes(h, shape.run) == f.prefix_len) {
+                f.lit_wb_confirm = true;
+                f.lit_wb_lead = shape.lead;
+                f.lit_wb_trail = shape.trail;
+            }
         }
     }
 
@@ -390,6 +580,7 @@ fn filterFromAnalysis(h: hir.Hir) Filter {
             if (byteRarity(ia.byte) <= INNER_RARITY_MAX) {
                 f.inner_byte = ia.byte;
                 f.inner_lead = ia.lead_class;
+                f.inner_fixed_off = ia.lead_fixed_cps; // fixed leading run → dash-to-dash bounded confirm (ASCII)
             }
         }
     }
@@ -690,7 +881,16 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, opts: Options) BuildError!
     // compact NFA-only program (minimal memory, no determinization). `byteWorthLowering`
     // additionally declines a pathologically large byte automaton, keeping it on the NFA.
     if (opts.byte_engine != .disabled and edfa.supports(h) and byte.byteWorthLowering(h)) {
-        if (edfa.buildAlloc(gpa, h, .{})) |ep| {
+        // Only ATTEMPT the eager DFA when the byte NFA is small enough that determinization is
+        // cheap (`EAGER_BYTE_INST_MAX`). Eager determinization is a full subset construction whose
+        // cost scales with (states × byte_insts); for a big Unicode class joined/repeated
+        // (`\w+@\w+`, `[\w.+-]+@…`) it costs hundreds of ms — and an over-`max_states` pattern like
+        // email burns ~900ms only to DECLINE and use the lazy DFA anyway. Above the gate we skip
+        // straight to the lazy DFA (same states on demand, amortized over the input) — a large
+        // compile-time win and, for the declining cases, no runtime change at all.
+        const eager_small_enough = (byte.instCount(h) orelse 0) <= EAGER_BYTE_INST_MAX;
+        const eager: BuildError!edfa.Program = if (eager_small_enough) edfa.buildAlloc(gpa, h, .{}) else error.Unsupported;
+        if (eager) |ep| {
             program.edfa_prog = ep;
             // A `\b`/`\B` program's EAGER DFA does only the ASCII boundary; build the LAZY DFA too
             // as the **non-ASCII** arm — it evaluates Unicode word boundaries via the decode-hybrid.
@@ -704,11 +904,11 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, opts: Options) BuildError!
             }
         } else |e| switch (e) {
             error.OutOfMemory => return e,
-            else => { // eager DFA declined (exceeded its fixed bounds) — fall back to the lazy
-                // DFA when IT can run the pattern. The lazy DFA covers anchored-end `$`/`\z`
-                // (reverse-from-end), so a too-big trailing-`$` pattern stays on the DFA arm; a
-                // mixed `$`, `\b`/`\X`, a *prone* `(?m)` line pattern, or a too-big `(?m)` (the
-                // lazy DFA declines line anchors) lands on the NFA arm.
+            else => { // eager DFA declined (overflowed its bounds) OR was skipped (too big to
+                // determinize cheaply) — fall back to the lazy DFA when IT can run the pattern. The
+                // lazy DFA covers anchored-end `$`/`\z` (reverse-from-end), so a too-big trailing-`$`
+                // pattern stays on the DFA arm; a mixed `$`, `\b`/`\X`, a *prone* `(?m)` line pattern,
+                // or a too-big `(?m)` (the lazy DFA declines line anchors) lands on the NFA arm.
                 if (dfa.supports(h)) {
                     program.dfa_prog = dfa.buildAlloc(gpa, h, .{}) catch |e2| switch (e2) {
                         error.OutOfMemory => return e2,
@@ -1132,7 +1332,7 @@ fn dfaConfirmAt(dp: *const dfa.Program, d: *dfa.Scratch, input: []const u8, at: 
 /// is never slower than the default on prefix-literal / sparse-hit patterns. With no
 /// usable filter it runs one DFA pass (one-pass O(n) for `isMatch`, anchored-restart
 /// for `find`). Captures never come here — they always use the Pike VM (`runNfa`).
-fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.Teddy, cf: ?*const classscan.ClassFinder, d: *dfa.Scratch, input: []const u8, opts: SearchOptions, match_only: bool) ?Match {
+fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.Teddy, cf: ?*const classscan.ClassFinder, d: *dfa.Scratch, input: []const u8, opts: SearchOptions, match_only: bool, input_ascii: bool) ?Match {
     if (opts.start > input.len) return null;
     if (input.len - opts.start < filter.min_bytes) return null; // length gate
     if (opts.anchored) return dfaConfirmAt(dp, d, input, opts.start, match_only);
@@ -1147,7 +1347,24 @@ fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.
     // `anchored_start` above), so one leading skip + native find is leftmost-first and linear.
     var o = opts;
     if (filter.prefix_len > 0) {
-        o.start = memmemFrom(input, o.start, filter.prefix[0..filter.prefix_len]) orelse return null;
+        const pfx = filter.prefix[0..filter.prefix_len];
+        if (filter.lit_wb_confirm) {
+            // `\b`-wrapped pure literal on the lazy `\b` arm (non-ASCII input, e.g. `\bthe\b` over
+            // prose with accents): jump literal-to-literal and confirm with a **Unicode** word-boundary
+            // check (O(1) per hit) — bypasses the lazy DFA's decode-hybrid anchored-restart find. The
+            // memmem hit already confirms the literal, so `[hit, hit+prefix_len]` is the match iff the
+            // boundary checks hold. No automaton walk, no ReDoS surface (the literal is the whole match).
+            const finder: ?memmem.Finder = if (filter.prefix_len >= 2) memmem.Finder.init(pfx) else null;
+            var pos = o.start;
+            while (if (finder) |*fd| fd.find(input, pos) else memchrFrom(input, pos, pfx[0])) |hit| {
+                if (input.len - hit < filter.min_bytes) return null;
+                if (litWbHoldsU(filter, input, hit, filter.prefix_len))
+                    return Match{ .start = hit, .end = hit + filter.prefix_len };
+                pos = hit + 1;
+            }
+            return null;
+        }
+        o.start = memmemFrom(input, o.start, pfx) orelse return null;
         if (input.len - o.start < filter.min_bytes) return null;
     } else if (filter.prefix_set_n > 0) {
         // Multi-prefix: per-occurrence anchored confirm when bounded (the real win), else one
@@ -1163,7 +1380,23 @@ fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.
         }
         o.start = nextPrefixHit(filter, tdy, input, o.start) orelse return null;
         if (input.len - o.start < filter.min_bytes) return null;
-    } else if (filter.inner_byte != null) {
+    } else if (filter.inner_byte) |anchor| {
+        // Fixed-offset interior anchor on ASCII input (`\d{4}-…` too big for the eager DFA): jump
+        // anchor-to-anchor, bounded-confirm at `q - off` (one per occurrence). See `runEdfa`.
+        if (input_ascii and filter.bounded_confirm) {
+            if (filter.inner_fixed_off) |off| {
+                var pos = o.start;
+                while (memchrFrom(input, pos, anchor)) |q| {
+                    pos = q + 1;
+                    if (q < off) continue;
+                    const cand = q - off;
+                    if (cand < o.start) continue;
+                    if (input.len - cand < filter.min_bytes) return null;
+                    if (dfaConfirmAt(dp, d, input, cand, match_only)) |m| return m;
+                }
+                return null;
+            }
+        }
         o.start = innerSkipFrom(filter, input, o.start) orelse return null;
         if (input.len - o.start < filter.min_bytes) return null;
     } else if (cf) |c| {
@@ -1195,7 +1428,7 @@ fn edfaConfirmAt(ep: *const edfa.Program, input: []const u8, at: usize, match_on
 /// rarest-required-byte fast-reject) in front of the frozen-table walk. The eager DFA is
 /// stateless; the only state is `probes`, the ReDoS observable (`Scratch.confirm_probes`)
 /// incremented per per-occurrence confirm. Captures never come here — they always use the Pike VM.
-fn runEdfa(ep: *const edfa.Program, filter: *const Filter, tdy: ?*const teddy.Teddy, cf: ?*const classscan.ClassFinder, input: []const u8, opts: SearchOptions, match_only: bool, probes: *u64) ?Match {
+fn runEdfa(ep: *const edfa.Program, filter: *const Filter, tdy: ?*const teddy.Teddy, cf: ?*const classscan.ClassFinder, input: []const u8, opts: SearchOptions, match_only: bool, input_ascii: bool, probes: *u64) ?Match {
     if (opts.start > input.len) return null;
     if (input.len - opts.start < filter.min_bytes) return null; // length gate
     if (opts.anchored) return edfaConfirmAt(ep, input, opts.start, match_only);
@@ -1222,11 +1455,21 @@ fn runEdfa(ep: *const edfa.Program, filter: *const Filter, tdy: ?*const teddy.Te
             o.start = memmemFrom(input, o.start, pfx) orelse return null;
             if (input.len - o.start < filter.min_bytes) return null;
         } else {
+            // Build the 2-byte SIMD finder ONCE (prefix ≥ 2 bytes). A fresh `memmemFrom` per hit
+            // rebuilds the finder every time, which dominates a dense-prefix scan (`\bthe\b` /
+            // `foo\d+`: the prefix run recurs thousands of times in prose/logs). 1-byte prefix → memchr.
+            const finder: ?memmem.Finder = if (filter.prefix_len >= 2) memmem.Finder.init(pfx) else null;
             var pos = o.start;
-            while (memmemFrom(input, pos, pfx)) |hit| {
+            while (if (finder) |*fd| fd.find(input, pos) else memchrFrom(input, pos, pfx[0])) |hit| {
                 if (input.len - hit < filter.min_bytes) return null;
                 probes.* += 1; // ReDoS observable: a per-occurrence confirm (0 for prone/end_anchored)
-                if (edfaConfirmAt(ep, input, hit, match_only)) |m| return m;
+                if (filter.lit_wb_confirm) {
+                    // `\b`-wrapped pure literal: the memmem hit already confirms the literal, so the
+                    // match is exactly [hit, hit+prefix_len] iff the ASCII boundary checks hold (the
+                    // eager `\b` arm runs only on ASCII input — `edfaArm`). O(1) per hit, no walk.
+                    if (litWbHolds(filter, input, hit, filter.prefix_len))
+                        return Match{ .start = hit, .end = hit + filter.prefix_len };
+                } else if (edfaConfirmAt(ep, input, hit, match_only)) |m| return m;
                 pos = hit + 1;
             }
             return null;
@@ -1246,8 +1489,28 @@ fn runEdfa(ep: *const edfa.Program, filter: *const Filter, tdy: ?*const teddy.Te
         }
         o.start = nextPrefixHit(filter, tdy, input, o.start) orelse return null;
         if (input.len - o.start < filter.min_bytes) return null;
-    } else if (filter.inner_byte != null) {
-        // Interior-anchor skip → one native eager-DFA find from the reverse-scanned start.
+    } else if (filter.inner_byte) |anchor| {
+        // Fixed-offset interior anchor on ASCII input (`\d{4}-…`): jump anchor-to-anchor and
+        // bounded-confirm at the pinned start `q - off` — one confirm per occurrence, the win when
+        // the anchor byte is dense and unselective (nginx `- -` placeholders). A bounded match
+        // length keeps the loop O(input). Non-ASCII / variable leading run → reverse-scan path below.
+        if (input_ascii and filter.bounded_confirm) {
+            if (filter.inner_fixed_off) |off| {
+                var pos = o.start;
+                while (memchrFrom(input, pos, anchor)) |q| {
+                    pos = q + 1;
+                    if (q < off) continue;
+                    const cand = q - off;
+                    if (cand < o.start) continue;
+                    if (input.len - cand < filter.min_bytes) return null; // cand only grows ⇒ no later fit
+                    probes.* += 1;
+                    if (edfaConfirmAt(ep, input, cand, match_only)) |m| return m;
+                }
+                return null;
+            }
+        }
+        // Variable / non-ASCII interior anchor → skip to the next anchor, reverse-scan to the run
+        // start, then one native eager-DFA find. Sound + O(input).
         o.start = innerSkipFrom(filter, input, o.start) orelse return null;
         if (input.len - o.start < filter.min_bytes) return null;
     } else if (cf) |c| {
@@ -1316,19 +1579,105 @@ inline fn classPtr(program: *const Program) ?*const classscan.ClassFinder {
     return if (program.class_finder) |*c| c else null;
 }
 
+/// Whether the fixed-offset interior-anchor confirm may engage for this search: the program has a
+/// fixed leading run (`inner_fixed_off`) **and** the input is all-ASCII (so each leading code point
+/// is one byte and the anchor sits at a fixed byte offset). Computed (and cached on the scratch)
+/// only for such programs, so a pattern without the feature never pays the O(n) ASCII scan. `false`
+/// keeps the sound reverse-scan + native-find path.
+inline fn fixedAscii(program: *const Program, scratch: *Scratch, input: []const u8) bool {
+    return program.filter.inner_fixed_off != null and inputAllAscii(scratch, input);
+}
+
+/// Line-anchored capture search (`(?m)^…` patterns, `filter.line_anchored`): every match begins at
+/// a line start, so attempt the capturing engine **anchored at each line start** — `memchr` the
+/// next `\n` to skip between lines — instead of locating each span with the lazy DFA and then
+/// re-filling captures. One capture pass per candidate line, no DFA span pass. Leftmost-first and
+/// sound (no match can begin off a line start). `searchCaptures` uses this when there is no eager
+/// DFA span arm (the `log_line` case: a `(?m)^…captures…` pattern too big for the eager DFA, which
+/// otherwise pays a lazy-DFA span pass *and* a Pike VM capture pass per line).
+fn lineAnchoredCaptures(program: *const Program, scratch: *Scratch, p: *const nfa.Program, input: []const u8, slots: []?usize, opts: SearchOptions) ?Match {
+    if (opts.start > input.len) return null;
+    var pos = opts.start;
+    while (pos <= input.len) {
+        // Land `pos` on a line start (offset 0, or just after a `\n`); else jump to the next one.
+        if (pos != 0 and input[pos - 1] != '\n') {
+            const nl = memchrFrom(input, pos, '\n') orelse return null;
+            pos = nl + 1;
+            continue;
+        }
+        if (input.len - pos >= program.filter.min_bytes) {
+            const seed = Match{ .start = pos, .end = pos };
+            if (fillCapturesAnchored(program, &scratch.inner.nfa, p, input, slots, seed, opts)) |m| return m;
+        }
+        if (pos == input.len) break;
+        const nl = memchrFrom(input, pos, '\n') orelse return null;
+        pos = nl + 1;
+    }
+    return null;
+}
+
+/// Line-anchored **span** search (`(?m)^…`, `filter.line_anchored`): attempt the span engine
+/// anchored at each line start (`memchr` the next `\n` to skip between lines) instead of the lazy
+/// DFA's line-gated forward scan **plus** a reverse-DFA start pass. One anchored forward pass per
+/// candidate line — no reverse pass. Leftmost-first and sound (no match begins off a line start).
+/// `search`/`isMatch` use this when there is no eager DFA span arm (the `log_line` case).
+/// `match_only` selects isMatch (true/false token) vs search (the real span).
+fn lineAnchoredSpan(program: *const Program, scratch: *Scratch, p: *const nfa.Program, input: []const u8, opts: SearchOptions, match_only: bool) ?Match {
+    if (opts.start > input.len) return null;
+    var pos = opts.start;
+    while (pos <= input.len) {
+        if (pos != 0 and input[pos - 1] != '\n') {
+            const nl = memchrFrom(input, pos, '\n') orelse return null;
+            pos = nl + 1;
+            continue;
+        }
+        if (input.len - pos >= program.filter.min_bytes) {
+            if (lineAnchoredAttempt(program, scratch, p, input, pos, match_only)) |m| return m;
+        }
+        if (pos == input.len) break;
+        const nl = memchrFrom(input, pos, '\n') orelse return null;
+        pos = nl + 1;
+    }
+    return null;
+}
+
+/// One anchored span attempt at line start `at`: the lazy DFA when built (its `runAnchored`'s
+/// `startFor` selects the line-start start state, so an anchored run at a line start honours `(?m)^`),
+/// else the Pike VM. `null` when no match begins at `at`. A lazy-DFA `gave_up` falls through to the
+/// Pike VM (and disables the DFA arm for the rest of the search).
+fn lineAnchoredAttempt(program: *const Program, scratch: *Scratch, p: *const nfa.Program, input: []const u8, at: usize, match_only: bool) ?Match {
+    if (!scratch.dfa_disabled) {
+        if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
+            const m = dfaConfirmAt(dp, d, input, at, match_only);
+            if (d.gave_up) {
+                scratch.dfa_disabled = true; // cache thrashed → use the Pike VM below
+            } else {
+                return m;
+            }
+        };
+    }
+    const o = SearchOptions{ .start = at, .anchored = true };
+    const m = dispatch(p, &scratch.inner.nfa, input, o, null) orelse return null;
+    return if (match_only) Match{ .start = at, .end = at } else m;
+}
+
 /// @stable-since: v0.1.0
 pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) bool {
     switch (program.inner) {
         .literal => |*p| return literal.isMatch(p, &scratch.inner.literal, input, opts),
         .nfa => |*p| {
+            // Line-anchored span fast path (`(?m)^…`, no eager DFA — `log_line`): attempt anchored at
+            // each line start instead of the lazy DFA's forward + reverse find. See `lineAnchoredSpan`.
+            if (program.filter.line_anchored and !opts.anchored and program.edfa_prog == null)
+                return lineAnchoredSpan(program, scratch, p, input, opts, true) != null;
             // Eager DFA span scan (prefiltered, stateless) when built and usable — the fastest arm,
             // same result the NFA arm gives. A `\b` program's eager DFA is used only on ASCII input
             // (`edfaArm`); non-ASCII `\b` input falls through to the Pike VM (Unicode boundaries).
-            if (edfaArm(program, scratch, input)) |ep| return runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, true, &scratch.confirm_probes) != null;
+            if (edfaArm(program, scratch, input)) |ep| return runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, true, fixedAscii(program, scratch, input), &scratch.confirm_probes) != null;
             // Lazy DFA fallback (prefiltered) when built and not disabled.
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
-                    const r = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, true);
+                    const r = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, true, fixedAscii(program, scratch, input));
                     if (d.gave_up) scratch.dfa_disabled = true; // cache thrashed → stop using it
                     return r != null;
                 };
@@ -1343,10 +1692,13 @@ pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opt
     switch (program.inner) {
         .literal => |*p| return literal.search(p, &scratch.inner.literal, input, opts),
         .nfa => |*p| {
-            if (edfaArm(program, scratch, input)) |ep| return runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, false, &scratch.confirm_probes);
+            // Line-anchored span fast path (`(?m)^…`, no eager DFA — `log_line`): see `lineAnchoredSpan`.
+            if (program.filter.line_anchored and !opts.anchored and program.edfa_prog == null)
+                return lineAnchoredSpan(program, scratch, p, input, opts, false);
+            if (edfaArm(program, scratch, input)) |ep| return runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, false, fixedAscii(program, scratch, input), &scratch.confirm_probes);
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
-                    const r = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, false);
+                    const r = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, false, fixedAscii(program, scratch, input));
                     if (d.gave_up) scratch.dfa_disabled = true;
                     return r;
                 };
@@ -1361,6 +1713,12 @@ pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const
     switch (program.inner) {
         .literal => |*p| return literal.searchCaptures(p, &scratch.inner.literal, input, slots, opts),
         .nfa => |*p| {
+            // Line-anchored capture fast path (`(?m)^…`): when no eager DFA span arm exists (the
+            // pattern is too big — `log_line`), attempt the capturing engine anchored at each line
+            // start instead of a lazy-DFA span pass + a re-fill pass. Only for an unanchored search.
+            if (program.filter.line_anchored and !opts.anchored and program.edfa_prog == null) {
+                return lineAnchoredCaptures(program, scratch, p, input, slots, opts);
+            }
             // Capture handoff: when the byte DFA arm is available, locate the **span**
             // cheaply with the DFA, then fill captures **anchored at the span start**
             // (`fillCapturesAnchored`: the one-pass table when the pattern built one, else
@@ -1373,12 +1731,12 @@ pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const
             // A `\b` program's eager DFA is used only on ASCII input (`edfaArm`); otherwise the whole
             // capture search runs on the Pike VM (Unicode boundaries), via the NFA arm below.
             if (edfaArm(program, scratch, input)) |ep| {
-                const m = runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, false, &scratch.confirm_probes) orelse return null;
+                const m = runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, false, fixedAscii(program, scratch, input), &scratch.confirm_probes) orelse return null;
                 return fillCapturesAnchored(program, &scratch.inner.nfa, p, input, slots, m, opts);
             }
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
-                    const span = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, false);
+                    const span = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, false, fixedAscii(program, scratch, input));
                     if (d.gave_up) {
                         scratch.dfa_disabled = true; // cache thrashed → fall through to the NFA arm
                     } else {
@@ -1819,6 +2177,136 @@ test "auto: case-variant + class-scan prefilters find/count correctly (functiona
     var rn = try Compiled.init("\\d+");
     defer rn.deinit();
     try testing.expectEqual(@as(usize, 3), E.count(&rn.program, &rn.scratch, "1 .. 22 ... 333", .{}));
+}
+
+// ── White-box + functional tests for the v0.5.0 prefilters ──────────────────────────────
+// (`\b`-literal O(1) confirm, fixed-offset interior anchor, line-anchored capture/span dispatch)
+
+test "auto: lit_wb_confirm shape detection (revert-failing)" {
+    // The `\b`-wrapped pure-literal fast confirm must trigger for EXACTLY a literal wrapped in
+    // leading/trailing word-boundary assertions and nothing else. Reverting `literalWbShape`
+    // (or the `prefix_len == fullRunBytes` untruncated guard) flips one of these.
+    const gpa = testing.allocator;
+    const Case = struct { pat: []const u8, on: bool, lead: WbAssert = .none, trail: WbAssert = .none };
+    const cases = [_]Case{
+        .{ .pat = "\\bthe\\b", .on = true, .lead = .boundary, .trail = .boundary },
+        .{ .pat = "the\\b", .on = true, .lead = .none, .trail = .boundary },
+        .{ .pat = "\\bthe", .on = true, .lead = .boundary, .trail = .none },
+        .{ .pat = "\\Bthe\\B", .on = true, .lead = .not_boundary, .trail = .not_boundary },
+        .{ .pat = "the", .on = false }, // no boundary → plain memmem path
+        .{ .pat = "^the$", .on = false }, // text anchors, not word boundaries
+        .{ .pat = "\\bthe\\w+", .on = false }, // more than the literal consumes
+        .{ .pat = "\\bthe\\b!", .on = false }, // a trailing literal after the boundary
+        .{ .pat = "\\b\\d{4}\\b", .on = false }, // leading atom is a class, not a fixed literal
+        .{ .pat = "\\babcdefghijklmnopqrstuvwxyz\\b", .on = false }, // literal > MAX_PREFIX_LEN → truncated, declined
+    };
+    inline for (cases) |c| {
+        const f = try filterOf(gpa, c.pat);
+        try testing.expectEqual(c.on, f.lit_wb_confirm);
+        if (c.on) {
+            try testing.expectEqual(c.lead, f.lit_wb_lead);
+            try testing.expectEqual(c.trail, f.lit_wb_trail);
+        }
+    }
+}
+
+test "auto: inner_fixed_off (fixed leading run) detection (revert-failing)" {
+    // A fixed-length leading class run before the anchor yields `inner_fixed_off`; a variable run
+    // (`+`/`*`/`{m,n}`) leaves it null (the reverse-scan path). Reverting `leadFixedCps` breaks this.
+    const gpa = testing.allocator;
+    const Case = struct { pat: []const u8, byte: ?u8, off: ?u32 };
+    const cases = [_]Case{
+        .{ .pat = "\\d{4}-\\d{2}-\\d{2}", .byte = '-', .off = 4 },
+        .{ .pat = "\\d{2}-\\d{2}", .byte = '-', .off = 2 },
+        .{ .pat = "(\\d{4})-(\\d{2})-(\\d{2})", .byte = '-', .off = 4 }, // capture-wrapped leading run
+        .{ .pat = "[\\w.+-]+@[\\w-]+", .byte = '@', .off = null }, // variable `+` lead → no fixed offset
+    };
+    inline for (cases) |c| {
+        const f = try filterOf(gpa, c.pat);
+        try testing.expectEqual(c.byte, f.inner_byte);
+        try testing.expectEqual(c.off, f.inner_fixed_off);
+    }
+}
+
+test "auto: line_anchored detection (revert-failing)" {
+    const gpa = testing.allocator;
+    const Case = struct { pat: []const u8, on: bool };
+    const cases = [_]Case{
+        .{ .pat = "(?m)^foo", .on = true },
+        .{ .pat = "(?m)^(\\w+) (\\w+)", .on = true },
+        .{ .pat = "^foo", .on = false }, // text_start: the tighter `anchored_start` covers it
+        .{ .pat = "foo", .on = false },
+        .{ .pat = "(?m)foo$", .on = false }, // line_end, not a leading line_start
+    };
+    inline for (cases) |c| {
+        const f = try filterOf(gpa, c.pat);
+        try testing.expectEqual(c.on, f.line_anchored);
+    }
+}
+
+test "auto: \\b-literal fast confirm finds/counts correctly (ASCII + non-ASCII)" {
+    try expectFind("\\bthe\\b", "soothe the other", "the");
+    try expectNoMatch("\\bthe\\b", "breathe theory bathe");
+    try expectFind("\\bthe\\b", "café the end", "the"); // non-ASCII input → lazy Unicode-\b arm
+    try expectFind("the\\b", "soothe the!", "the");
+    try expectFind("\\bcat", "scatter a cat!", "cat");
+    var re = try Compiled.init("\\bthe\\b");
+    defer re.deinit();
+    try testing.expectEqual(@as(usize, 3), E.count(&re.program, &re.scratch, "the theatre then the end the", .{}));
+    var rn = try Compiled.init("\\bcat\\b"); // café (non-ASCII) must not break the count
+    defer rn.deinit();
+    try testing.expectEqual(@as(usize, 2), E.count(&rn.program, &rn.scratch, "a cat café a cat!", .{}));
+}
+
+test "auto: \\d{4}-\\d{2}-\\d{2} fixed-offset confirm (ASCII + non-ASCII + alignment)" {
+    try expectFind("\\d{4}-\\d{2}-\\d{2}", "ip - - 2026-06-07 ok", "2026-06-07"); // dash-dense
+    try expectFind("\\d{4}-\\d{2}-\\d{2}", "123456-78-90", "3456-78-90"); // alignment: 6 leading digits
+    try expectFind("\\d{4}-\\d{2}-\\d{2}", "café 2020-01-02 z", "2020-01-02"); // non-ASCII → reverse-scan fallback
+    try expectNoMatch("\\d{4}-\\d{2}-\\d{2}", "12-34-56 no four-digit year");
+    var re = try Compiled.init("\\d{4}-\\d{2}-\\d{2}");
+    defer re.deinit();
+    try testing.expectEqual(@as(usize, 2), E.count(&re.program, &re.scratch, "x 2020-01-02 y 1999-12-31 z", .{}));
+}
+
+test "auto: (?m)^ line-anchored span + captures fast path" {
+    var re = try Compiled.init("(?m)^(\\S+) \\[([^\\]]+)\\] (\\d{3})");
+    defer re.deinit();
+    try testing.expect(re.program.edfa_prog == null); // too big for the eager DFA → line-anchored arm
+    try testing.expect(re.program.filter.line_anchored);
+    const input = "a [x] 200\nbad line\nb [y] 404";
+    try testing.expectEqual(@as(usize, 2), E.count(&re.program, &re.scratch, input, .{})); // span via lineAnchoredSpan
+    var slots: [8]?usize = undefined;
+    const c = E.captures(&re.program, &re.scratch, input, &slots, re.meta, .{}).?; // via lineAnchoredCaptures
+    try testing.expectEqualStrings("a [x] 200", c.match().slice(input));
+    try testing.expectEqualStrings("a", c.groupSlice(1).?);
+    try testing.expectEqualStrings("x", c.groupSlice(2).?);
+    try testing.expectEqualStrings("200", c.groupSlice(3).?);
+}
+
+test "auto: a big-class join (`\\w+@\\w+`, email) skips the eager DFA for the lazy one (compile-time gate)" {
+    // The eager-DFA determinization budget (`EAGER_BYTE_INST_MAX`) keeps a big Unicode-class join
+    // off the eager arm: `\w+@\w+` / `[\w.+-]+@…` have huge byte NFAs whose determinization costs
+    // hundreds of ms (and email's overflows `max_states` and declines anyway). They must still get
+    // a DFA span arm — the LAZY one ("nfa+dfa") — and a small class scan must KEEP the eager arm.
+    const gpa = testing.allocator;
+    const Case = struct { pat: []const u8, route: []const u8 };
+    const cases = [_]Case{
+        .{ .pat = "\\d{4}-\\d{2}-\\d{2}", .route = "nfa+edfa" }, // small → eager kept
+        .{ .pat = "\\d+", .route = "nfa+edfa" },
+        .{ .pat = "\\p{L}+", .route = "nfa+edfa" }, // ~3.9k insts, still under the gate
+        .{ .pat = "\\w+@\\w+", .route = "nfa+dfa" }, // big join → lazy
+        .{ .pat = "[\\w.+-]+@[\\w-]+\\.[\\w.-]+", .route = "nfa+dfa" }, // email → lazy (was ~900ms eager waste)
+    };
+    inline for (cases) |c| {
+        var diag: compile.Diagnostic = .{};
+        const ast = try compile.parse(gpa, c.pat, &diag);
+        defer ast.deinit(gpa);
+        const h = try hir.buildAlloc(gpa, ast, .{});
+        defer hir.deinitHir(gpa, h);
+        var program = try buildAlloc(gpa, h, .{});
+        defer freeProgram(gpa, &program);
+        try testing.expectEqualStrings(c.route, route(&program));
+    }
 }
 
 test {

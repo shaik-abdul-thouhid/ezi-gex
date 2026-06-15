@@ -183,6 +183,23 @@ const wide_cases = [_]Case{
     .{ .pat = "\\Bcat\\B", .input = "locator", .expect = "cat" },
     .{ .pat = "\\b\\w+\\b", .input = "(héllo)", .expect = "héllo" },
     .{ .pat = "s\\b", .input = "cats dogs", .expect = "s" },
+    // \b-wrapped pure-literal fast confirm (a `memmem` hit + an O(1) boundary check: the ASCII
+    // eager arm, or the Unicode lazy arm). Must equal the Pike VM incl. on NON-ASCII input (`é`
+    // forces the lazy Unicode-boundary arm), with dense interior near-misses and lead-/trail-only
+    // boundaries. (v0.5.0 `lit_wb_confirm`.)
+    .{ .pat = "\\bthe\\b", .input = "soothe the other theory", .expect = "the" },
+    .{ .pat = "\\bthe\\b", .input = "the café — the end", .expect = "the" }, // non-ASCII input → lazy Unicode-\b arm
+    .{ .pat = "\\bthe\\b", .input = "breathe theory bathe", .expect = null }, // every "the" is interior
+    .{ .pat = "the\\b", .input = "soothe the!", .expect = "the" }, // trailing boundary only
+    .{ .pat = "\\bcat", .input = "scatter a cat!", .expect = "cat" }, // leading boundary only (interior "cat" rejected)
+    .{ .pat = "\\Bthe\\B", .input = "xtheyz", .expect = "the" }, // interior-only (\B…\B)
+    // fixed-offset interior anchor (`\d{4}-…`): dash-to-dash bounded confirm at q-4 on ASCII; a
+    // non-ASCII input falls back to the reverse-scan + native find. Both must equal the Pike VM.
+    // (v0.5.0 `inner_fixed_off`.)
+    .{ .pat = "\\d{4}-\\d{2}-\\d{2}", .input = "ip - - 2026-06-07 ok", .expect = "2026-06-07" }, // dash-dense (nginx-like)
+    .{ .pat = "\\d{4}-\\d{2}-\\d{2}", .input = "123456-78-90", .expect = "3456-78-90" }, // alignment: 6 leading digits
+    .{ .pat = "\\d{4}-\\d{2}-\\d{2}", .input = "café 2020-01-02 z", .expect = "2020-01-02" }, // non-ASCII → reverse-scan fallback
+    .{ .pat = "\\d{2}-\\d{2}", .input = "x - 11-22 y", .expect = "11-22" }, // off=2; placeholder dash fast-fails
     // dead-on-invalid (real 0xFF byte)
     .{ .pat = "abc", .input = "ab\xFFabc", .expect = "abc" },
     .{ .pat = "a.c", .input = "a\xFFc", .expect = null },
@@ -456,6 +473,9 @@ const line_cases = [_]LineCase{
     .{ .pat = "(?m)^a[^z]*z", .input = "az\nayz", .spans = &.{ .{ 0, 2 }, .{ 3, 6 } } }, // two line-anchored matches
     // log_line-shaped: bracket/quote fields with newline-crossing complements, multiple lines.
     .{ .pat = "(?m)^(\\S+) \\[([^\\]]+)\\] \"([^\"]*)\"", .input = "GET [ok] \"hi\"\nPUT [no] \"bye\"", .spans = &.{ .{ 0, 13 }, .{ 14, 28 } } },
+    // log_line span fast path (`lineAnchoredSpan`, v0.5.0): a non-matching middle line must be
+    // skipped and matching resume at the next line start (no eager DFA → the line-anchored arm).
+    .{ .pat = "(?m)^(\\S+) \\[([^\\]]+)\\] (\\d{3})", .input = "a [x] 200\nbad line\nb [y] 404", .spans = &.{ .{ 0, 9 }, .{ 19, 28 } } },
 };
 
 /// Collect every non-overlapping match's `[start, end)` for backend `B` over `input`, or null when
@@ -687,7 +707,9 @@ test "auto's byte_engine=.enabled is results-invariant (DFA span == NFA span) an
 test "auto with byte_engine=.enabled still fills captures via the Pike VM" {
     // The DFA finds the span; captures are span-only's job for the code-point engine.
     // A capture pattern compiled with the DFA enabled must still report correct groups
-    // (auto routes searchCaptures to the Pike VM, span scan to the DFA).
+    // (auto routes searchCaptures to the capture engine, span scan to the DFA). `(\w+)@(\w+)`
+    // has a big byte NFA (`\w` joined), so it exceeds `EAGER_BYTE_INST_MAX` and routes to the
+    // LAZY DFA span arm ("nfa+dfa") rather than the eager one — captures must still be correct.
     const gpa = testing.allocator;
     var diag: regex.Diagnostic = .{};
     var re = try regex.compileRuntimeWith(auto, gpa, "(\\w+)@(\\w+)", &diag, .{ .strategy = .{ .byte_engine = .enabled } });
@@ -695,7 +717,7 @@ test "auto with byte_engine=.enabled still fills captures via the Pike VM" {
     var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
     defer sc.deinit(gpa);
 
-    try testing.expectEqualStrings("nfa+edfa", auto.route(&re.program));
+    try testing.expectEqualStrings("nfa+dfa", auto.route(&re.program));
     var slots: [6]?usize = undefined;
     const c = re.captures(&sc, &slots, "ping bob@example").?;
     try testing.expectEqualStrings("bob@example", c.match().slice("ping bob@example"));
@@ -791,6 +813,40 @@ test "auto fills one-pass captures through its DFA→one-pass handoff" {
     try testing.expectEqualStrings("14", c.groupSlice(3).?);
 }
 
+test "line-anchored capture path agrees with the Pike VM (log_line shape, v0.5.0)" {
+    // A `(?m)^` capture pattern too big for the eager DFA → `auto` takes the line-anchored CAPTURE
+    // path (attempt the Pike VM anchored at each line start). The filled slots must equal the Pike
+    // VM oracle (which scans unanchored). Covers: match on line 1, match on a later line after a
+    // non-matching one (the line-skip), no match at all, and a single line.
+    const gpa = testing.allocator;
+    const pat = "(?m)^(\\S+) \\[([^\\]]+)\\] (\\d{3})";
+    { // confirm `auto` actually engages the line-anchored arm (edfa null, line_anchored set)
+        var diag: regex.Diagnostic = .{};
+        var re = try regex.compileRuntimeWith(auto, gpa, pat, &diag, .{});
+        defer re.deinit();
+        try testing.expect(re.program.edfa_prog == null);
+        try testing.expect(re.program.filter.line_anchored);
+    }
+    const inputs = [_][]const u8{
+        "a [x] 200\nb [y] 404", // line 1 matches
+        "bad line here\nb [y] 404", // line 1 fails → skip to line 2
+        "no match at all\nstill nope", // nothing matches
+        "a [x] 200", // single line
+        "\na [x] 200", // leading blank line
+    };
+    for (inputs) |in| {
+        var a: [16]?usize = undefined;
+        var b: [16]?usize = undefined;
+        const ra = try captureSlots(pikevm, gpa, pat, in, &a);
+        const rb = try captureSlots(auto, gpa, pat, in, &b);
+        testing.expectEqual(ra, rb) catch {
+            std.debug.print("line-anchored captures on \"{s}\": auto matched={}, Pike VM={}\n", .{ in, rb, ra });
+            return error.Mismatch;
+        };
+        if (ra) try testing.expectEqualSlices(?usize, &a, &b);
+    }
+}
+
 // ── auto's internal input-size switch is transparent ──────────────────────────────
 
 test "auto agrees with itself across the small/large input switch" {
@@ -820,7 +876,9 @@ const comptime_cases = [_]Case{
     .{ .pat = "cat|dog", .input = "a dog", .expect = "dog" },
     .{ .pat = "(\\w+)@(\\w+)", .input = "x a@b y", .expect = "a@b" },
     .{ .pat = "a{2,4}", .input = "aaaaaa", .expect = "aaaa" },
-    .{ .pat = "\\bword\\b", .input = "a word here", .expect = "word" },
+    .{ .pat = "\\bword\\b", .input = "a word here", .expect = "word" }, // lit_wb confirm (comptime edfa arm)
+    .{ .pat = "\\d{4}-\\d{2}-\\d{2}", .input = "x 2026-06-07 y", .expect = "2026-06-07" }, // interior anchor (v0.5.0)
+    .{ .pat = "(?m)^\\w+", .input = "ab\ncd", .expect = "ab" }, // line-anchored (v0.5.0)
 };
 
 fn checkComptime(comptime B: type, comptime case: Case) !void {

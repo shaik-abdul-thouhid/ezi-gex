@@ -58,13 +58,18 @@ build time (by analysis):
   byte DFA arm?  byte_engine != .disabled
               && byteWorthLowering(hir)
               && edfa.supports(hir) ?             → + eager DFA           (route "nfa+edfa")
-                  ↳ eager overflows max_states && dfa.supports(hir) ?
+                  ↳ byte NFA > EAGER_BYTE_INST_MAX (big Unicode join: \w+@\w+, email)
+                    OR eager overflows max_states, && dfa.supports(hir) ?
                                                   → + lazy DFA (fallback) (route "nfa+dfa")
                   ↳ neither                       → NFA only              (route "nfa")
 
 search time (span / prefilter): input shorter than min_utf8_len ?         → no match
                                 anchored_start ?                          → only offset 0
+                                (?m)^ & no eager DFA (line_anchored) ?     → attempt anchored at each line start
                                 leading fixed literal ?                   → SIMD memmem its whole run
+                                  ↳ \b-wrapped pure literal (lit_wb_confirm)? → O(1) boundary check, no automaton
+                                interior anchor after a fixed run (\d{4}-…)?  → jump to anchor, bounded-confirm at q−off
+                                leading selective class (\d+, \p{N}+) ?   → SIMD scan to next class byte
                                 rarest required byte absent from input ?  → no match (fast-reject)
 search time (NFA, by input):    no DFA arm, input ≤ 4096 B and fits ?     → backtrack : → pikevm
 ```

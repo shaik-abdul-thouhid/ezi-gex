@@ -99,6 +99,22 @@ Landed across `0.4.0-dev` (all on `main`):
   newline-crossing line pattern (`log_line`) is no longer stuck on the Pike VM — the quadratic-immune
   complement to the eager DFA's anchored-restart line support.
 
+**New in `0.5.0-dev`** (all results-invariant — every path pinned to the Pike VM, runtime + comptime):
+
+- **`\b`-wrapped pure-literal O(1) confirm** — when the whole pattern is a literal in word-boundary
+  assertions (`\bthe\b`, `the\b`), a `memmem` hit is confirmed by two O(1) boundary checks instead of
+  a per-occurrence anchored DFA walk (ASCII on the eager arm, Unicode on the lazy arm, so accented
+  prose is fast too). `\bthe\b` over prose **~490 MiB/s → ~3.7 GiB/s (≈8×)**.
+- **Fixed-offset interior anchor** — when the leading run before an interior literal is fixed-length
+  (`\d{4}-…`) and the input is ASCII, the skip jumps anchor-to-anchor and bounded-confirms at the
+  pinned start, instead of crawling a dash-dense haystack. `date_iso` **~610 MiB/s → ~9.8 GiB/s (≈16×)**.
+- **Line-anchored capture/span dispatch** — a `(?m)^…` pattern with no eager DFA attempts the match
+  anchored at each line start (for span *and* captures), dropping the lazy DFA's reverse + capture-fill
+  passes. `log_line` span **~230 MiB/s → ~1.1 GiB/s (≈4.7×)**.
+- **Eager-DFA determinization budget** — a big Unicode-class join (`\w+@\w+`, `[\w.+-]+@…`) skips the
+  eager DFA (which would burn hundreds of ms, often only to decline) and uses the lazy DFA directly.
+  `email` **compile ~0.88 s → ~6 ms (≈140×)**, runtime unchanged.
+
 `0.2.0`/`0.3.0` foundations still in place: full case folding, grapheme `\X`, a two-tier
 `Options` (semantic + results-invariant strategy), `(?x)` verbose mode, ASCII mode,
 dead-on-invalid UTF-8, and the **byte-NFA lowering + `ByteMap` equivalence classes**
@@ -580,23 +596,22 @@ table are built **only for prone or trailing-`$` patterns**, so a non-prone `\w+
 its forward `trans` table (~141 KB) instead of all three (~1 MB). Leftmost-first,
 conformance-pinned to the Pike VM.
 
-Since first writing this, several items here have **landed**: `\b`/`\B` and `(?m)` on the
-byte DFAs, a one-pass capture backend (`onepass`), DFA **Hopcroft minimization**, `$`/`\z`
-on the lazy DFA, the whole-run literal `memmem` start-skip (item 2 above), the **two-byte SIMD
-`memmem`** for single literals (item 1 — Sherlock now *faster than Rust*), and the **Teddy SIMD
-multi-literal prefilter** for alternations (item 1 — the multi-substring prefilter that was the
-single biggest remaining gap vs. Rust). Together these took Rust's overall geomean lead from
-**3.54× → 2.55×** (ezi_gex fastest in **9/32** bench cells).
+Since first writing this, most items here have **landed**: `\b`/`\B` and `(?m)` on the byte DFAs,
+a one-pass capture backend (`onepass`), DFA **Hopcroft minimization**, `$`/`\z` on the lazy DFA,
+the whole-run literal `memmem` start-skip, the **two-byte SIMD `memmem`** for single literals
+(Sherlock now *faster than Rust*), and the **Teddy SIMD multi-literal prefilter** for alternations
+(the single biggest remaining gap vs. Rust). **`0.5.0`** then closed the inner-literal, word-boundary
+and line-anchored cases: a **`\b`-wrapped pure-literal O(1) confirm** (`\bthe\b` over prose ~8×), a
+**fixed-offset interior anchor** (`\d{4}-…` ~16×), **line-anchored capture/span dispatch** for
+`(?m)^…` (`log_line` ~4.7×), and an **eager-DFA determinization budget** (email compile ~0.88 s →
+~6 ms). The **multi-prefix Teddy** on the NFA/DFA arm and a **case-variant set** for `(?i)`/small-class
+leads landed in 0.4.0.
 
-**Still open (additive, no API change):** the remaining gaps vs. Rust are concentrated in
-three classes, none a quick prefilter tweak — (a) **inner-literal prefilter** for patterns whose
-required literal is *interior*, not a prefix (`[\w.+-]+@…` — find `@`, then a bounded/reverse
-scan for the start; today only a *presence* fast-reject); (b) **case-insensitive literals**
-(`(?i)что`, `(?i)the`) — fold a short case-insensitive run into the literal-set Teddy already
-handles (cross-product of case variants, capped); and (c) **Unicode-class DFA throughput**
-(`\d{4}-\d{2}-\d{2}`, `\p{N}+`) — the determinized table walks slower than Rust's. Plus the
-**multi-prefix** Teddy on the NFA/DFA arm (`(foo|bar)\d+`, needs a prefix-literal *set*) and a
-**sparse DFA table encoding**. See [`docs/architecture.md`](docs/architecture.md) §10.
+**Still open (additive, no API change):** the remaining gaps vs. Rust are now concentrated in
+**dense Unicode-class DFA throughput** — patterns whose match runs are themselves the whole input,
+so no prefilter can skip and the determinized table walk is the work (`\p{L}+`, `\p{Lu}\p{Ll}+`/
+`cap_word`, `[A-Za-z]+`). The next levers are a **faster inner DFA loop** and a **sparse DFA table
+encoding** (the kept Unicode-class tables are dense). See [`docs/architecture.md`](docs/architecture.md) §10.
 
 ## Binary size
 

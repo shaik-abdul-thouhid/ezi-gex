@@ -591,10 +591,20 @@ _ = an.required_literal; // Node.Run for "abc" — longest run every match must 
 _ = an.required_bytes;   // a 256-bit ByteSet: has 'a','b','c','x','y'; NOT '0'
 // 0.4.0 prefilter facts (also one-sided bounds):
 _ = an.prefix_set;          // leading literal of every branch of a top-level alternation (→ Teddy)
-_ = an.inner_anchor;        // a required literal right after a leading variable class run ([\w.+-]+@…)
+_ = an.inner_anchor;        // a required literal right after a leading class run ([\w.+-]+@…, \d{4}-…)
+_ = an.inner_anchor.?.lead_fixed_cps; // 0.5.0: code-point length of the leading run when FIXED (\d{4}- → 4)
 _ = an.leading_class_first; // first-byte set of a leading class with no fixed literal (\d+ → {0-9,…})
 _ = an.line_anchored_start; // every match begins at a line start ((?m)^ / ^)
 ```
+
+Since **0.5.0** `auto` consumes three more facts (all results-invariant): a `\b`-wrapped pure
+literal (`\bthe\b`, `the\b`) is confirmed by an **O(1) word-boundary check** rather than a
+per-occurrence anchored automaton walk; a **fixed-length** leading run before an `inner_anchor`
+(`\d{4}-…`, via `lead_fixed_cps`) lets the skip jump anchor-to-anchor and bounded-confirm at the
+pinned start on ASCII input; and a `(?m)^…` pattern with no eager DFA (`line_anchored_start`)
+attempts the match anchored at each **line start** for span and captures. `auto` also gates the
+eager-DFA build attempt on byte-NFA size, so a big Unicode-class join (`\w+@\w+`, email) uses the
+lazy DFA directly instead of a multi-hundred-ms determinization (email compile ~0.88 s → ~6 ms).
 
 A couple more, illustrating soundness:
 
