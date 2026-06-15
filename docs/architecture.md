@@ -470,11 +470,14 @@ match, so a prefilter or length gate built on them never yields a false negative
 > and the `strategy.simd` flag governs it. The **one-pass capture path now exists**
 > (`backends.onepass`, since 0.4.0 — `auto` uses it for the anchored capture fill after a DFA
 > locates the span), though it proves one-pass-ness itself rather than reading the
-> `is_one_pass` flag. `required_literal` (a multi-substring Teddy prefilter on the **NFA/DFA
-> arm** for *multi-prefix* patterns like `(foo|bar)\d+`, distinct from the `literal`-backend
-> Teddy above) and `is_one_pass` remain unconsumed *as Analysis fields* — that NFA-arm wiring
-> needs the analysis to expose a prefix-literal *set*; any backend is free to read them today.
-> Toggle the whole prefilter with `strategy.prefilter`.
+> `is_one_pass` flag. **Since 0.4.0 the multi-prefix Teddy is wired on the NFA/DFA arm**
+> (`auto.Program.prefix_teddy`): it serves both a top-level alternation's leading-literal set
+> (`prefix_set` — `(foo|bar)\d+`, `near`) and a synthesised **case-variant set** for a small-class
+> / `(?i)` lead (`(?i)the` → `{THE…the}`), and a selective digit/number lead drives the
+> **leading-class SIMD scan** (`engine/classscan.zig`, `Analysis.leading_class_first`). The plain
+> `required_literal` (longest *interior* required run) and `is_one_pass` remain unconsumed *as
+> Analysis fields* — any backend is free to read them today. Toggle the whole prefilter with
+> `strategy.prefilter`.
 
 ---
 
@@ -488,8 +491,10 @@ match, so a prefilter or length gate built on them never yields a false negative
   **DFA-eligible** on **both** byte DFAs — anchored-end `$` via a reverse-DFA-from-end
   pass; see §10. So are `(?m)` line anchors and `\b`/`\B`: the **eager** DFA bakes in
   non-prone `(?m)` and **ASCII** `\b`, the **lazy** DFA carries **Unicode** `\b` on
-  non-ASCII input. Only **`\X`**, a *prone* `(?m)`/`\b`, a *mixed* `$`, and `\b` combined
-  with `$`/`(?m)` stay on the code-point Pike VM — `auto` routes all of this transparently.)
+  non-ASCII input **and (since 0.4.0) a single leading `(?m)^`** including the *prone*
+  newline-crossing shapes the eager DFA declines (`log_line`). Only **`\X`**, a *prone* `\b`,
+  `(?m)$`/interior `(?m)^`, a *mixed* `$`, and `\b` combined with `$`/`(?m)` stay on the
+  code-point Pike VM — `auto` routes all of this transparently.)
 - **`\X` (grapheme cluster) is `backtrack`-only.** `\X` matches one whole UAX #29
   extended grapheme cluster; it compiles to a variable-width `grapheme` NFA
   instruction. `backtrack` and `auto` set `caps.grapheme = true`; the breadth-first
@@ -570,10 +575,11 @@ The contract is the seam that makes these drop-in:
 | DFA minimization ✅ *(0.4.0)* | **Hopcroft/Moore** partition-refinement of the eager DFA tables (results-invariant; dense layout kept) | done | `\w+@\w+` reverse DFA ~3251 → ~1047 states (~3×) |
 | 3c+ | **sparse-encode** the (already minimized) eager DFA tables | weeks | shrinks the kept Unicode-class eager tables (the `\w+` ~141 KB dense → far smaller) — was paired with Hopcroft, which has landed |
 | 1+ ✅ *(0.4.0)* | **Teddy SIMD multi-literal prefilter** (`engine/teddy.zig` + `engine/simd.zig`) — a dynamic in-vector byte shuffle (`pshufb`/`vpshufb`/`tbl`) fingerprints the first 1–3 bytes of every literal-alternation branch across a 16-byte chunk at once, then verifies; **slim** (≤8 buckets, 128-bit) + **fat** (16 buckets, AVX2 256-bit). The one arch-specific op is quarantined in `simd.zig` (portable scalar fallback at comptime / on other targets); gated by `strategy.simd`. Wired into the `literal` backend's alternation scan | done | closes the `foo\|bar\|baz\|qux` multi-substring gap (the single biggest one vs. Rust); validated by execution on NEON, SSSE3, and AVX2 |
-| — | **Inner-literal prefilter** — for patterns whose required literal is *interior*, not a prefix (`[\w.+-]+@…`): find the literal (`@`) with `memmem`/`memchr`, then a bounded or **reverse-DFA** scan for the match start. Today only a *presence* fast-reject (`required_bytes` rarest byte) — it confirms `@` exists but still scans the whole input | weeks | the biggest remaining logs gap: `email` 411 MiB/s vs Rust 6.89 GiB/s |
-| — | **Case-insensitive literals** — fold a short `(?i)` literal run into the literal-**set** Teddy already handles (cross-product of per-letter case variants, capped at ~64) instead of the concat-of-classes that routes to the NFA | days–weeks | `(?i)что` 321 MiB/s, `(?i)the` 372 MiB/s vs Rust multi-GiB/s |
-| — | **Unicode-class DFA throughput** — the determinized table walk on Unicode classes lags Rust (`\d{4}-\d{2}-\d{2}` 353 MiB/s vs 6.31 GiB/s, `\p{N}+` ~550 MiB/s vs ~3 GiB/s) | weeks | the date/number extraction + counted-repeat cells |
-| — | **Teddy on the NFA/DFA arm** — extend the prefilter to *multi-prefix* patterns (`(foo\|bar)\d+`) via the unconsumed `required_literal` Analysis field (needs the analysis to expose a prefix-literal *set*) | weeks | extends the 0.4.0 literal-backend Teddy to prefixed engine patterns (`near`) |
+| ✅ *(0.4.0)* | **Inner-literal prefilter** — for a required literal that is *interior*, not a prefix (`[\w.+-]+@…`): `auto` memchr's the anchor (`@`, via `Analysis.inner_anchor`), reverse-scans the lead class to the earliest start, then dispatches once. Gated on the anchor being rare enough (`byteRarity`) | done | `email` ~411 MiB/s → ~4.5 GiB/s |
+| ✅ *(0.4.0)* | **Case-insensitive / small-class literals → case-variant Teddy** — `auto` synthesises a bounded case-variant set from a small-class / `(?i)` lead (`(?i)the` → `{THE…the}`) and drives the multi-prefix **Teddy** skip with it (`prefix_teddy`) | done | `(?i)the` ~4.6×, `(?i)sherlock holmes` ~17×, `(?i)что` ~15× |
+| ✅ *(0.4.0)* + ongoing | **Unicode-class throughput** — a **leading-class SIMD scan** (`engine/classscan.zig`) skips the inter-match gaps for a selective digit/number lead (`\d+`, `\p{N}+`). The raw determinized table walk on dense Unicode classes still lags Rust (`\p{L}+`, `\d{4}-\d{2}-\d{2}`) — a faster inner loop / structural prefilter is the next step | partial | `\d+`/`\p{N}+` on sparse corpora ~33–37× (now **faster than Rust**); `date_iso`/dense letter cells still behind |
+| ✅ *(0.4.0)* | **Teddy on the NFA/DFA arm** — the multi-prefix Teddy (`Program.prefix_teddy`) now serves any `prefix_set` ≥ 2 needles: a top-level alternation's leading literals (`near`'s `Holmes…\|Watson…`) AND the synthesised case-variant set above | done | `near` ~1.6× (3.4 → 5.4 GiB/s) |
+| ✅ *(0.4.0)* | **`(?m)^` line anchors on the lazy DFA** — a single leading `(?m)^` runs O(input) on the lazy DFA (line-gated forward re-seed + reverse line-accept), no anchored restart, so a *prone* / newline-crossing line pattern (`log_line`) is no longer stuck on the Pike VM | done | `log_line` ~1.3× (a 7-capture, complement-class, 2-pass-`find` pattern — the DFA per-byte win is largely offset by the forward+reverse passes; still ~6× behind Rust) |
 
 ### The byte substrate (tier 3a, landed)
 
@@ -665,10 +671,13 @@ Three design choices follow from the contract:
   prefilter (length gate, `^`/`\A` short-circuit, leading-literal **whole-run SIMD `memmem`**
   start-skip, rarest-required-byte fast-reject). A pattern with an *interior* `text_start` (rare, not
   fully `anchored_start`) keeps anchored restart so the cached reverse transitions stay
-  position-independent. It supports `\A` / non-multiline `^`, anchored-end `$`, and **isolated
+  position-independent. It supports `\A` / non-multiline `^`, anchored-end `$`, **isolated
   `\b`/`\B`** (Unicode word boundaries via the **decode-hybrid** — consumption stays the cached
-  byte walk, boundary positions decode the adjacent code points), and declines `\X`, `(?m)` line
-  anchors, and `\b`+`$` (those route to the code-point engines).
+  byte walk, boundary positions decode the adjacent code points), and **a single leading `(?m)^`**
+  (line-gated forward re-seed at line starts + a reverse line-accept check — O(input), no anchored
+  restart, so a *prone* newline-crossing line pattern like `log_line` runs here instead of the Pike
+  VM, the quadratic-immune complement to the eager DFA's anchored-restart line support). It declines
+  `\X`, `(?m)$` / interior `(?m)^`, and `\b`+`$` (those route to the code-point engines).
 
 The **byte DFA is on by default** (`Options.strategy.byte_engine = .auto`, which means *build
 and use the byte DFA* on an eligible pattern; `.disabled` opts back to the compact NFA-only
@@ -734,8 +743,10 @@ Three properties are specific to determinizing *eagerly*:
   one-byte `\n`-lookahead), and **isolated `\b`/`\B`** (as **ASCII** word boundaries — the lazy
   `dfa` complements it with the *Unicode* boundary on non-ASCII input). It **declines** `\X`, a
   **mixed** `$`, a **prone** `(?m)` (`(?m)\w+$`) or **prone** `\b` (declined at *build*), a
-  *chained* `\b\b`, and `\b` combined with `$`/`(?m)` — all routed to the code-point engines
-  (correct + linear there).
+  *chained* `\b\b`, and `\b` combined with `$`/`(?m)`. A **prone leading `(?m)^`** (`log_line`)
+  the eager DFA declines now routes to the **lazy DFA** (its single-pass line support is
+  quadratic-immune), not the Pike VM; everything else declined here routes to the code-point
+  engines (correct + linear there).
 - **It builds only the tables it will use, and minimizes them.** `utrans` and the reverse
   table are built **only for prone patterns**; a non-prone `\w+` stores just its forward `trans`
   table (~141 KB) instead of `trans` + `utrans` + reverse (~1 MB). The kept tables are then

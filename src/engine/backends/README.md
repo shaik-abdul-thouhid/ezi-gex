@@ -12,7 +12,7 @@ time). `auto` is the default.
 | `backtrack` | depth-first NFA + `(pc,sp)` memo | O(program × input) | ✅ | NFA pattern, small input that fits (≤ 4096 B) |
 | `bytepike` | breadth-first **byte** NFA (`../byte.zig`), one *byte*/step, zero-decode | O(program); larger for Unicode classes | ✅ | **never** — the byte-lowering reference VM / DFA substrate; refuses `\X`; evaluates `\b`/`\B` as **ASCII** word boundaries |
 | `edfa` | **eager DFA**: fully determinizes the byte NFA at build into a frozen `states × byte_classes` table — a bare table walk, zero decode | the frozen table (`ro_data` at comptime / heap at runtime); **empty `Scratch`** | **span-only** (`caps.captures = false`) | **the default span arm** (`isMatch`/`find`); captures come from the Pike VM |
-| `dfa` | **lazy DFA**: determinizes the byte NFA on the fly, one DFA *state*/byte via a cached `(state, class)` table | the transition cache in `Scratch` (heap; runtime-only) | **span-only** (`caps.captures = false`) | **the fallback** when the eager DFA overflows its `max_states` bound |
+| `dfa` | **lazy DFA**: determinizes the byte NFA on the fly, one DFA *state*/byte via a cached `(state, class)` table; O(input) `find` (forward end + reverse start). Handles `\b`/`\B` (Unicode, decode-hybrid), anchored-end `$`, and a single **leading `(?m)^`** (line-gated re-seed + reverse line-accept — the quadratic-immune line support the eager DFA's anchored-restart declines, e.g. `log_line`) | the transition cache in `Scratch` (heap; runtime-only) | **span-only** (`caps.captures = false`) | **the fallback** when the eager DFA overflows `max_states` or declines (prone `(?m)^`, big Unicode class) |
 | `auto` | dispatcher over the others | per sub-backend | ✅ | the default |
 
 ## The shared NFA

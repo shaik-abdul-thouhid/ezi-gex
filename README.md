@@ -33,7 +33,7 @@ a **pluggable backend** architecture.
 public surface is annotated `@stable-since: vX.Y.Z` and is covered by SemVer. Tracks a recent
 Zig dev build (`0.17.0-dev`); it will not compile on stable 0.16.
 
-**What works is tested** — **360 tests** pass (per-module behaviour; cross-backend
+**What works is tested** — **400+ tests** pass (per-module behaviour; cross-backend
 conformance, a wide differential corpus where every backend must agree with the Pike VM,
 runtime + comptime parity; and a dedicated **ReDoS-immunity suite**, `engine/redos.zig`,
 proving the engine is quadratic-immune).
@@ -83,6 +83,18 @@ Landed across `0.4.0-dev` (all on `main`):
   shuffle; **fat** (16 buckets, AVX2 256-bit) for large sets. The one piece of arch-specific
   inline asm is quarantined in `engine/simd.zig` with a portable scalar fallback (comptime + any
   unsupported target); the flag `strategy.simd` (`.auto`/`.off`) governs it. Results-invariant.
+- **Case-insensitive / small-class → Teddy multi-prefix skip** — a pattern that lowers to a short
+  run of small classes (`(?i)the` → `[Tt][Hh][Ee]`, `(?i)что`) gets a synthesised **case-variant
+  prefix set** (`(?i)the` → the 8 needles `{THE…the}`) that drives the multi-prefix Teddy skip,
+  now wired on the **NFA/DFA arm** too (so a top-level alternation like `Holmes…|Watson…` gets
+  Teddy as well). `(?i)the` ~4.6×, `(?i)sherlock holmes` ~17×, `(?i)что` ~15×, `near` ~1.6×.
+- **Leading-class SIMD scan** (`engine/classscan.zig`) — a selective digit/number-class lead
+  (`\d+`, `\p{N}+`) SIMD-skips the inter-match gaps to the next class byte. On sparse-match corpora
+  `\d+`/`\p{N}+` are now **~33–37× faster (ahead of Rust)**.
+- **`(?m)^` line anchors on the lazy DFA** — a single leading `(?m)^` runs O(input) on the lazy DFA
+  (line-gated forward re-seed + reverse line-accept), with no anchored restart, so a *prone*
+  newline-crossing line pattern (`log_line`) is no longer stuck on the Pike VM — the quadratic-immune
+  complement to the eager DFA's anchored-restart line support.
 
 `0.2.0`/`0.3.0` foundations still in place: full case folding, grapheme `\X`, a two-tier
 `Options` (semantic + results-invariant strategy), `(?x)` verbose mode, ASCII mode,
@@ -493,6 +505,13 @@ Full details in [`docs/architecture.md`](docs/architecture.md) §11 and the usag
 [§9 Thread-safety](docs/usage-guide.md#9-thread-safety).
 
 ## Performance
+
+> **Benchmark:** the numbers below come from a like-for-like, three-way throughput +
+> compile-time comparison against **Rust `regex`** and **Go `regexp`** on byte-identical
+> [rebar](https://github.com/BurntSushi/rebar) haystacks. The harness is a separate,
+> reproducible repo — clone it and run `./run.sh`:
+> **[github.com/shaik-abdul-thouhid/regex-bench](https://github.com/shaik-abdul-thouhid/regex-bench)**
+> (it fetches this engine from GitHub, so anyone can reproduce the comparison).
 
 Honest about where it stands. **Tier 1 — the literal / prefilter fast path — is now
 wired:**

@@ -211,6 +211,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   regression at 256 KiB). New `Program` fields `has_text_end`/`end_anchored`/`reaches_end`,
   `Scratch.state_match_eoi`, and the `revFindEnd` path are `@stable-since v0.4.0`.
 
+- **Case-insensitive / small-class prefilter → Teddy multi-prefix start-skip** (`backends.auto`).
+  A pattern that lowers to a short run of small classes — `(?i)the` → `[Tt][Hh][Ee]`, `(?i)что`,
+  `[Tt]he` — has no fixed leading literal and no top-level alternation, so it previously got **no**
+  prefilter and scanned the whole haystack on the DFA. `auto` now synthesises a bounded
+  **case-variant prefix set** (the cartesian product of the leading positions' choices, capped at
+  `MAX_PREFIX_BRANCHES` needles / `MAX_PREFIX_LEN` bytes — `(?i)the` → the 8 needles `{THE…the}`)
+  and drives the existing multi-prefix start-skip with it. The set feeds a new **Teddy** arm
+  (`Program.prefix_teddy`, built from any `prefix_set` ≥ 2 needles on a native-shuffle target — so a
+  top-level alternation like `near`'s `Holmes…|Watson…` gets Teddy too), with the scalar
+  `multiPrefixFrom` as the comptime / non-native fallback. Every needle is a sound necessary prefix,
+  so it is **results-invariant**; the per-occurrence bounded confirm keeps it O(input). Bench:
+  `(?i)the` ~4.6×, `(?i)sherlock holmes` ~17×, `(?i)что` ~15×, `near` ~1.6×.
+
+- **Leading-class first-byte SIMD scan** (`engine/classscan.zig`, new; `backends.auto`). A class-led
+  pattern with no fixed leading literal (`\d+`, `\p{N}+`, `\d{4}-…`) previously had an all-permissive
+  filter and crawled the inter-match gaps one byte at a time on the DFA. `auto` now SIMD-scans to the
+  next byte that could begin a match — a member of the leading class's first-byte set
+  (`Analysis.leading_class_first`) — via a portable one-bucket nibble classifier (`ClassFinder`,
+  built on `simd.shuffle16`, scalar fallback + comptime path). Gated on **selectivity**
+  (`classLeadSelective`: no whitespace, few ASCII lowercase, ≤ 16 high lead bytes) so a near-universal
+  letter class (`\p{L}+`, `[A-Za-z]+`) — which would land on almost every byte — is declined. Sound
+  (every match begins with a member) and results-invariant. Bench (sparse-match corpora): `\d+`/`\p{N}+`
+  on `sherlock` ~33–37× (now **faster than Rust**), `\d+` on `logs` ~1.9×.
+
+- **`(?m)^` line anchors on the lazy DFA** (`backends.dfa`). The lazy DFA previously declined every
+  `(?m)` line anchor, so a `(?m)^…` pattern too large or too **prone** for the eager DFA (whose line
+  support is anchored-restart, declined when a `[^…]`/`\S` run could make it Θ(n²) — e.g. `log_line`)
+  fell to the code-point Pike VM. It now runs a single **leading `(?m)^`** in **O(input)**, no
+  anchored restart: the forward scan re-seeds the pattern start **only at line starts** (offset 0 or
+  just after a `\n` — `ustep`/`startL`, gated on the `\n` byte class), and the reverse-DFA `find`
+  accepts a start only where the position is a line start (`revFind`, gated on `atLineStart`). So a
+  newline-crossing complement class (`[^"]*` spanning lines) is handled in one pass, quadratic-immune.
+  `supports` admits exactly the single-leading-`^` shape (no `$`/`\A`/`\b`/`line_end`, no interior or
+  repeated `^`); everything else stays on the code-point engines. Results-invariant (a new line-anchor
+  differential corpus pins lazy-DFA spans to the Pike VM, runtime + comptime). New `Program` fields
+  `has_line_start`/`nl_class`, `Scratch.startL`/`r_accept_line`, `@stable-since v0.4.0`.
+
 ### Changed / Fixed
 
 - **Eager DFA: build the unanchored `utrans` table only for prone patterns (two-phase build).** A

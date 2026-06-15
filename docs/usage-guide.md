@@ -211,7 +211,8 @@ defer re.deinit();
 > line context), and **isolated `\b`/`\B`** (evaluated as **ASCII** word boundaries baked into the
 > byte classes — the lazy `dfa` carries the *Unicode* `\b` for non-ASCII input). It declines
 > `\X`, a **mixed** `$` (`a$|b`), a **prone** `(?m)`/`\b`, a *chained* `\b\b`, and `\b` combined
-> with `$`/`(?m)` (those route to the code-point engines / the lazy DFA). It is **bounded**: a
+> with `$`/`(?m)` — a **prone leading `(?m)^`** (`log_line`) then routes to the **lazy DFA** (its
+> single-pass line support is quadratic-immune), the rest to the code-point engines. It is **bounded**: a
 > pattern whose full DFA exceeds `edfa.max_states` is declined (`error.Unsupported` / a
 > `@compileError`) — `auto` then falls back to the lazy `dfa`. Pin it directly when you want a
 > comptime-bakeable DFA; otherwise just use `auto`, which prefers it.
@@ -227,12 +228,15 @@ defer re.deinit();
 > **The `dfa` backend is the lazy DFA — span-only, runtime-only, the *fallback*.**
 > `gex.backends.dfa` determinizes the byte automaton on the fly (one cached DFA state per
 > byte). It does not fill captures (`re.captures`/`re.replaceAll` are a `@compileError` on
-> it; use `auto`/`pikevm`). It runs `\A`/`^` (`text_start`), anchored-end `$`/`\z`, and
+> it; use `auto`/`pikevm`). It runs `\A`/`^` (`text_start`), anchored-end `$`/`\z`,
 > **Unicode `\b`/`\B`** (via the *decode-hybrid* — it decodes the adjacent code points only at
-> boundary positions), and only at runtime (no `compileComptimeWith(dfa, …)`, because its cache
-> mutates while matching). It declines `\X` and `(?m)` line anchors (the eager DFA covers those).
-> Through `auto` it is the arm reached when the eager `edfa` overflows its `max_states` bound, or
-> for **Unicode** `\b` on non-ASCII input; you rarely pin it. When you *do* pin it, its
+> boundary positions), and **a single leading `(?m)^`** (line-gated forward re-seed + reverse
+> line-accept — O(input), no anchored restart, so a *prone* newline-crossing line pattern like
+> `log_line` runs here rather than the Pike VM), and only at runtime (no
+> `compileComptimeWith(dfa, …)`, because its cache mutates while matching). It declines `\X`,
+> `(?m)$` / interior `(?m)^`, and `\b`+`$` (the code-point engines cover those). Through `auto` it
+> is the arm reached when the eager `edfa` overflows its `max_states` bound **or declines a prone
+> leading `(?m)^`**, and for **Unicode** `\b` on non-ASCII input; you rarely pin it. When you *do* pin it, its
 > determinization cache is bounded by a `ScratchOptions`: plain `Scratch.init` uses the default
 > (`max_bytes = 1 MiB`, `on_full = .reset` — clear the cache and continue), and
 > `Scratch.initOptions(gpa, &re.program, .{ .max_bytes = …, .on_full = … })` overrides it
@@ -585,12 +589,18 @@ _ = an.min_utf8_len;     // 6     — bytes; ≥ min_len (here all ASCII)
 _ = an.prefix_literal;   // Node.Run for "abc" — every match starts with it
 _ = an.required_literal; // Node.Run for "abc" — longest run every match must contain
 _ = an.required_bytes;   // a 256-bit ByteSet: has 'a','b','c','x','y'; NOT '0'
+// 0.4.0 prefilter facts (also one-sided bounds):
+_ = an.prefix_set;          // leading literal of every branch of a top-level alternation (→ Teddy)
+_ = an.inner_anchor;        // a required literal right after a leading variable class run ([\w.+-]+@…)
+_ = an.leading_class_first; // first-byte set of a leading class with no fixed literal (\d+ → {0-9,…})
+_ = an.line_anchored_start; // every match begins at a line start ((?m)^ / ^)
 ```
 
 A couple more, illustrating soundness:
 
 ```zig
-// Top-level alternation: nothing is unconditionally required.
+// Top-level alternation: nothing is unconditionally required (but `prefix_set` holds each
+// branch's leading literal — Holmes…|Watson… — for the multi-prefix Teddy skip).
 //   "cat|dog" → prefix_literal == null, required_literal == null, required_bytes empty.
 
 // Multi-byte bytes vs. code points:
