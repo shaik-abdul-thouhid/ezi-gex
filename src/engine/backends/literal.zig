@@ -28,6 +28,9 @@ const std = @import("std");
 
 const backend = @import("../backend.zig");
 const hir = @import("../../core/hir.zig");
+const simd = @import("../simd.zig");
+const teddy = @import("../teddy.zig");
+const memmem = @import("../memmem.zig");
 
 const utils = @import("utils");
 const utf8 = utils.unicode.utf8;
@@ -44,14 +47,28 @@ const CodePoint = utils.unicode.CodePoint;
 /// @stable-since: v0.1.0
 pub const caps = Caps{ .captures = true, .stateless = true, .grapheme = false };
 
-/// Backend build options. The HIR has already applied flags/folding, so nothing is
-/// needed here; the field exists to satisfy the contract shape.
+/// Backend build options. The HIR has already applied flags/folding, so the only knob is
+/// the SIMD policy for the unanchored scan.
 ///
 /// @stable-since: v0.1.0
-pub const Options = struct {};
+pub const Options = struct {
+    /// Whether the unanchored alternation scan may use the Teddy SIMD accelerator. `.auto`
+    /// (default) builds it on a runtime program when the target has a native dynamic shuffle
+    /// and the set benefits; `.off` keeps the portable `indexOfAny` scan. Results-invariant.
+    ///
+    /// @stable-since: v0.4.0
+    simd: simd.SimdMode = .auto,
+};
 
 /// One needle's slice into `Program.needles`.
 const Bound = struct { start: u32, len: u32 };
+
+/// Optional SIMD accelerator (Teddy) for the unanchored alternation scan. `.none` on the
+/// comptime path, under `simd = .off`, on a target without a native dynamic shuffle, for a
+/// single needle (Boyer–Moore–Horspool wins), or when a branch is empty. **Results-
+/// invariant:** it locates the same leftmost-first match the scalar scan would (the verify
+/// step is shared with the scalar path's `matchAtPos`).
+const TeddyArm = union(enum) { none, slim: teddy.Teddy, fat: teddy.FatTeddy };
 
 /// Immutable program: every branch's UTF-8 bytes concatenated into `needles`, with
 /// `bounds` delimiting them **in alternation (priority) order**. Self-contained, so
@@ -61,6 +78,19 @@ const Bound = struct { start: u32, len: u32 };
 pub const Program = struct {
     needles: []const u8,
     bounds: []const Bound,
+    /// SIMD accelerator for the unanchored **alternation** scan (≥2 needles); `.none` ⇒ the
+    /// portable scan. Default `.none` so `buildComptime` (which never builds Teddy) gets the
+    /// scalar path.
+    ///
+    /// @stable-since: v0.4.0
+    teddy: TeddyArm = .none,
+    /// SIMD accelerator for the unanchored **single-literal** scan (one needle, ≥2 bytes): a
+    /// portable two-byte `memmem`. `null` ⇒ the scalar `firstMatchPos`. Set only by
+    /// `buildAlloc` under `simd != .off`; `buildComptime` leaves it `null`. Aliases `needles`,
+    /// so it owns nothing to free. **Results-invariant** (the verify is a full `eql`).
+    ///
+    /// @stable-since: v0.4.0
+    mem: ?memmem.Finder = null,
 };
 
 /// Stateless companion. Zero-size, with the standard lifecycle as no-ops so the
@@ -182,13 +212,53 @@ pub fn supports(h: hir.Hir) bool {
 /// Compile a HIR into a heap-allocated `Program` (free with `freeProgram`).
 ///
 /// @stable-since: v0.1.0
-pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Program {
+pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, opts: Options) BuildError!Program {
     const sizes = measure(h) catch return error.Unsupported;
     const needles = try gpa.alloc(u8, sizes.bytes);
     errdefer gpa.free(needles);
     const bounds = try gpa.alloc(Bound, sizes.bounds);
     errdefer gpa.free(bounds);
-    return emit(h, needles, bounds) catch error.Unsupported;
+    var program = emit(h, needles, bounds) catch return error.Unsupported;
+    program.teddy = try buildTeddy(gpa, program, opts);
+    program.mem = buildMem(program, opts);
+    return program;
+}
+
+/// Build the single-literal `memmem` accelerator, or `null`. **Runtime only** (`@Vector`
+/// is kept out of const-eval; `buildComptime` never calls this). Declines when SIMD is off,
+/// the pattern is not exactly one needle, or that needle is shorter than the two-byte filter
+/// needs (a 1-byte needle is already a SIMD memchr on the existing scalar path). Allocation-
+/// free: the `Finder` aliases `program.needles`.
+fn buildMem(program: Program, opts: Options) ?memmem.Finder {
+    if (opts.simd == .off) return null;
+    if (program.bounds.len != 1) return null;
+    const b = program.bounds[0];
+    if (b.len < memmem.MIN_LEN) return null;
+    return memmem.Finder.init(program.needles[b.start .. b.start + b.len]);
+}
+
+/// Choose and build the Teddy accelerator for an unanchored scan, or `.none`. **Runtime
+/// only** (the dynamic shuffle is asm; the comptime builder never calls this). Declines —
+/// keeping the portable scan — when SIMD is off, the target has no native shuffle (scalar
+/// Teddy would lose to `indexOfAny`/BMH), there is a lone needle (BMH wins), or any branch
+/// is empty (the scalar path handles the match-everywhere case). Picks **fat** (16 buckets)
+/// over **slim** only with AVX2 and a set larger than slim's buckets.
+fn buildTeddy(gpa: std.mem.Allocator, program: Program, opts: Options) BuildError!TeddyArm {
+    if (opts.simd == .off) return .none;
+    if (comptime !simd.has_native_shuffle16) return .none;
+    if (program.bounds.len < 2) return .none;
+    for (program.bounds) |b| if (b.len == 0) return .none;
+
+    const slices = try gpa.alloc([]const u8, program.bounds.len);
+    defer gpa.free(slices); // Teddy copies the needles, so this temp is freed after build.
+    for (program.bounds, 0..) |b, i| slices[i] = program.needles[b.start .. b.start + b.len];
+    std.debug.assert(teddy.supports(slices));
+
+    if (comptime simd.has_native_shuffle32) {
+        if (program.bounds.len > teddy.SLIM_BUCKETS)
+            return .{ .fat = try teddy.compileFatAlloc(gpa, slices) };
+    }
+    return .{ .slim = try teddy.compileAlloc(gpa, slices) };
 }
 
 /// Compile a HIR into a ro_data `Program` at comptime. An unsupported pattern is a
@@ -209,6 +279,11 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
 
 /// @stable-since: v0.1.0
 pub fn freeProgram(gpa: std.mem.Allocator, program: *Program) void {
+    switch (program.teddy) {
+        .slim => |*t| teddy.free(gpa, t),
+        .fat => |*t| teddy.freeFat(gpa, t),
+        .none => {},
+    }
     gpa.free(program.needles);
     gpa.free(program.bounds);
 }
@@ -283,16 +358,38 @@ pub fn search(program: *const Program, _: *Scratch, input: []const u8, opts: Sea
         return null;
     }
 
-    // Unanchored, leftmost-first. The leftmost byte position where *any* branch matches
-    // wins; ties at that position go to the earliest-listed (highest priority) branch.
+    // Unanchored SIMD fast path: when a Teddy accelerator was built (≥2 needles), it locates
+    // the same leftmost-first match the scalar scan below would (shared verify) — vectorised.
+    switch (program.teddy) {
+        .slim => |*t| return t.find(input, opts.start),
+        .fat => |*t| return t.find(input, opts.start),
+        .none => {},
+    }
+
+    // Single non-empty needle: a portable two-byte SIMD `memmem` (when built) skips far more
+    // input than the one-byte memchr prefilter the alternation path uses; `.off`/comptime keep
+    // the scalar `firstMatchPos`. An empty needle matches at `start`. Results-invariant.
+    if (program.bounds.len == 1) {
+        const b = program.bounds[0];
+        if (b.len == 0) return matchAtPos(program, input, opts.start);
+        const needle = program.needles[b.start .. b.start + b.len];
+        const at = if (program.mem) |*f|
+            f.find(input, opts.start)
+        else
+            firstMatchPos(input, opts.start, needle);
+        return if (at) |pos| Match{ .start = pos, .end = pos + needle.len } else null;
+    }
+
+    // Unanchored, leftmost-first **alternation** (≥2 needles). The leftmost byte position
+    // where *any* branch matches wins; ties at that position go to the earliest-listed
+    // (highest priority) branch.
     //
-    // A single needle is one `indexOfPos`. For an **alternation**, we collect the distinct
-    // first bytes of the branches and skip to the next position holding any of them with a
-    // single SIMD `indexOfAny` pass (`firstAnyPos`), then verify the branches in priority
-    // order there (`matchAtPos`). This is O(input) per search — unlike one `indexOfPos`
-    // per branch, which scans toward each needle's next occurrence and so re-scans the
-    // whole region looking for a *rare* branch on every `count` step (an accidental
-    // Θ(input²): `foo|bar|baz|qux` with a sparse `qux` was the worst cell in the bench).
+    // We collect the distinct first bytes of the branches and skip to the next position
+    // holding any of them with a single SIMD `indexOfAny` pass (`firstAnyPos`), then verify
+    // the branches in priority order there (`matchAtPos`). This is O(input) per search —
+    // unlike one `indexOfPos` per branch, which scans toward each needle's next occurrence
+    // and so re-scans the whole region looking for a *rare* branch on every `count` step (an
+    // accidental Θ(input²): `foo|bar|baz|qux` with a sparse `qux` was the worst cell).
     var lead: [64]u8 = undefined;
     var nlead: usize = 0;
     var has_empty = false;
@@ -374,13 +471,16 @@ const Compiled = struct {
     scratch: Scratch = .{},
 
     fn init(pattern: []const u8) !Compiled {
+        return initOpts(pattern, .{});
+    }
+    fn initOpts(pattern: []const u8, opts: Options) !Compiled {
         const gpa = testing.allocator;
         var diag: compile.Diagnostic = .{};
         const ast = try compile.parse(gpa, pattern, &diag);
         defer ast.deinit(gpa);
         const h = try hir.buildAlloc(gpa, ast, .{});
         defer hir.deinitHir(gpa, h);
-        return .{ .program = try buildAlloc(gpa, h, .{}) };
+        return .{ .program = try buildAlloc(gpa, h, opts) };
     }
     fn deinit(self: *Compiled) void {
         freeProgram(testing.allocator, &self.program);
@@ -507,6 +607,79 @@ test "literal runs at comptime (ro_data program, no allocator)" {
         break :blk m.slice(input);
     };
     try testing.expectEqualStrings("bird", got);
+}
+
+test "literal: Teddy arm is selected for an alternation on a native-shuffle target" {
+    // Guards against a vacuous results-invariance test: on a target with a native dynamic
+    // shuffle, a multi-needle alternation must actually take the Teddy path (not `.none`).
+    if (comptime !simd.has_native_shuffle16) return error.SkipZigTest;
+    var re = try Compiled.initOpts("foo|bar|baz", .{ .simd = .auto });
+    defer re.deinit();
+    try testing.expect(re.program.teddy != .none);
+    // A single needle must NOT use Teddy (Boyer–Moore–Horspool wins) — stays `.none`.
+    var one = try Compiled.initOpts("foobar", .{ .simd = .auto });
+    defer one.deinit();
+    try testing.expect(one.program.teddy == .none);
+    // `.off` always declines, even for an alternation.
+    var off = try Compiled.initOpts("foo|bar|baz", .{ .simd = .off });
+    defer off.deinit();
+    try testing.expect(off.program.teddy == .none);
+}
+
+test "literal: memmem arm is selected for a single multi-byte literal" {
+    // A single ≥2-byte needle takes the two-byte SIMD memmem (portable — no native-shuffle
+    // guard needed, unlike Teddy). Teddy stays `.none` for a lone needle.
+    var re = try Compiled.initOpts("Sherlock", .{ .simd = .auto });
+    defer re.deinit();
+    try testing.expect(re.program.mem != null);
+    try testing.expect(re.program.teddy == .none);
+    // A 1-byte needle stays on the scalar memchr path (no memmem).
+    var one = try Compiled.initOpts("a", .{ .simd = .auto });
+    defer one.deinit();
+    try testing.expect(one.program.mem == null);
+    // `.off` declines.
+    var off = try Compiled.initOpts("Sherlock", .{ .simd = .off });
+    defer off.deinit();
+    try testing.expect(off.program.mem == null);
+    // An alternation uses Teddy, not memmem.
+    var alt = try Compiled.initOpts("cat|dog", .{ .simd = .auto });
+    defer alt.deinit();
+    try testing.expect(alt.program.mem == null);
+}
+
+test "literal: simd flag is results-invariant (Teddy ON == OFF), revert-failing" {
+    // The crux Layer-3 guarantee: flipping `simd` changes only speed, never the match.
+    const cases = [_]struct { pat: []const u8, hay: []const u8 }{
+        .{ .pat = "cat|dog|fish", .hay = "the redfish swam past a dog and a cat then nothing" },
+        .{ .pat = "foo|far|fizz|fun|fab", .hay = "no f-word until far down here: fizz then fun, fab, foo" },
+        .{ .pat = "héllo|café|naïve", .hay = "a café, then héllo, a naïve remark, and café again" },
+        // > 8 needles (drives fat on AVX2; slim elsewhere) — both must equal `.off`.
+        .{ .pat = "aa|bb|cc|dd|ee|ff|gg|hh|ii|jj|kk|ll", .hay = "zz ll zz aa zz kk bb cc dd ee ff gg" },
+        .{ .pat = "abc|abcd", .hay = "xxabcdyy" }, // priority/overlap
+        .{ .pat = "ab|cd", .hay = "no match in this short-ish haystack whatsoever, none" },
+        // Single literals — drive the memmem arm (auto) vs scalar firstMatchPos (off).
+        .{ .pat = "Sherlock", .hay = "x Sherlock y Sherlock z, then no holmes, Sherlock!" },
+        .{ .pat = "the", .hay = "the theme of the theatre is the the the at the end" },
+        .{ .pat = "café", .hay = "le café, the cafe (no accent), un café noir, café." },
+        .{ .pat = "ab", .hay = "ababab no more ab here ab" }, // dense, overlapping-ish
+    };
+    for (cases) |c| {
+        var on = try Compiled.initOpts(c.pat, .{ .simd = .auto });
+        defer on.deinit();
+        var off = try Compiled.initOpts(c.pat, .{ .simd = .off });
+        defer off.deinit();
+        // Agree at EVERY start offset (leftmost-first, boundaries, tail).
+        var s: usize = 0;
+        while (s <= c.hay.len) : (s += 1) {
+            const a = E.find(&on.program, &on.scratch, c.hay, .{ .start = s });
+            const b = E.find(&off.program, &off.scratch, c.hay, .{ .start = s });
+            try testing.expectEqual(b == null, a == null);
+            if (b) |bm| {
+                try testing.expectEqual(bm.start, a.?.start);
+                try testing.expectEqual(bm.end, a.?.end);
+            }
+        }
+    }
 }
 
 test {

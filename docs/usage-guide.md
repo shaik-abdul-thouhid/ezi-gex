@@ -276,6 +276,13 @@ _ = try gex.compileRuntime(gpa, "\\w+", &diag, .{ .strategy = .{ .byte_engine = 
 //   prefilter (default true) → whole-run SIMD memmem start-skip + rarest-required-byte
 //   fast-reject; set false to scan without probing. unicode_word_boundary_in_dfa stays reserved.
 _ = try gex.compileRuntime(gpa, "abc", &diag, .{ .strategy = .{ .prefilter = false } });
+//   simd: .auto (default) / .off → governs the SIMD literal accelerators: the two-byte memmem
+//                for a SINGLE literal (Sherlock), Teddy for literal ALTERNATIONS (cat|dog|fish),
+//                and auto's ≥2-byte prefix start-skip. .auto uses SIMD where the target supports
+//                it (memmem is portable @Vector everywhere; Teddy needs x86 SSSE3/AVX2 or ARM
+//                NEON), else a portable scalar scan; .off forces the scalar scan everywhere. A
+//                PERMISSION, not a command — no way to force SIMD onto a target that lacks it.
+_ = try gex.compileRuntime(gpa, "cat|dog|fish", &diag, .{ .strategy = .{ .simd = .off } });
 ```
 
 > **The byte engine self-gates and stays compact.** `auto` builds the byte automaton only
@@ -292,6 +299,22 @@ _ = try gex.compileRuntime(gpa, "abc", &diag, .{ .strategy = .{ .prefilter = fal
 > ordinary text), so it never pays for the whole state space. None of this changes a match
 > — only which engine runs. (To bake a DFA into `ro_data` at comptime, see the **eager
 > DFA** — `gex.backends.edfa` — above / in `architecture.md`.)
+
+> **The SIMD prefilter (`simd`) accelerates literals, transparently.** A **single** literal
+> (`Sherlock`, `Sherlock Holmes`) is scanned by a portable two-byte **`memmem`**
+> (`engine/memmem.zig`): probe the two *rarest* needle bytes, AND their `@Vector` equality masks
+> across a 16/32-byte chunk, and verify only where both coincide — far fewer candidates than a
+> one-byte memchr on a common lead byte. It is **fully portable** (SSE2 `pcmpeqb`/NEON via
+> `@Vector`, no arch asm), so it runs everywhere; on Sherlock it edges out Rust (~41 GiB/s). A
+> literal **alternation** (`cat|dog|fish`, `foo|far|fizz`) is scanned by **Teddy** instead: one
+> dynamic in-vector byte shuffle (`pshufb`/`vpshufb`/`tbl`) fingerprints the first 1–3 bytes of
+> *all* branches across a 16-byte chunk at once, then verifies — far more selective than a
+> per-branch scan when branches share a first byte. Teddy picks **fat** (16 buckets, AVX2) for
+> large sets, else **slim** (≤8 buckets); its single piece of architecture-specific inline asm is
+> quarantined in `engine/simd.zig`, and the comptime path / any target without a native shuffle
+> uses the portable scalar scan. The same two-byte `memmem` also drives `auto`'s ≥2-byte prefix
+> start-skip (`\bthe\b`, `the\s+\p{L}+`). `simd = .off` opts all of it out. Results-invariant —
+> each finds exactly the match the scalar scan would.
 
 > `(?x)` **verbose / extended mode** is a lex-time flag, so it has no `Options` field —
 > set it inline (`(?x)…` globally, `(?x:…)` scoped). In verbose mode unescaped
@@ -546,7 +569,8 @@ match, so a prefilter or length gate built on them never drops a real match. The
 dispatcher consumes several to skip work; you can read them too (e.g. to pick a `memchr`
 needle, or gate a search before calling the engine). Since **0.4.0** `auto` skips on the
 *whole* `prefix_literal` run (a SIMD `memmem`-style leap — `\bthe\b` jumps "the"→"the",
-not 't'→'t'), not just its first byte.
+not 't'→'t'), not just its first byte — a ≥2-byte run via the portable two-byte
+`memmem.Finder` (probe the two rarest bytes, AND their `@Vector` masks).
 
 ```zig
 const h = try gex.buildHir(gpa, try gex.parse(gpa, "abc[0-9]+xy$", &diag), .{});

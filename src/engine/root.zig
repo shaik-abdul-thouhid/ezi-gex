@@ -12,6 +12,20 @@ pub const nfa = @import("nfa.zig");
 /// Pike VM executes it; the lazy DFA (`backends.dfa`) determinizes it.
 pub const byte = @import("byte.zig");
 
+/// Quarantined architecture-specific SIMD primitives (the dynamic byte shuffle that
+/// backs the Teddy prefilter). The only file in the engine that emits target-specific
+/// inline asm; everything else stays portable `@Vector`. Scalar fallback + comptime
+/// path always correct.
+pub const simd = @import("simd.zig");
+
+/// Teddy — the SIMD multi-literal prefilter (built on `simd`'s dynamic shuffle). Not a
+/// backend; an accelerator for literal alternations / multi-prefix start-skips.
+pub const teddy = @import("teddy.zig");
+
+/// memmem — a portable two-byte SIMD single-substring search (no arch asm). Not a backend;
+/// the single-literal accelerator for the `literal` backend (Teddy's single-needle peer).
+pub const memmem = @import("memmem.zig");
+
 /// Built-in backends. Each is independently pluggable; `auto` is the default
 /// dispatcher that composes them. Third-party backends implementing the contract
 /// (see `backend.verifyBackend`) drop in the same way.

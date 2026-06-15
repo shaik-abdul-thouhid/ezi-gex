@@ -19,10 +19,11 @@
 //!     (a tiny POD `Filter`): a `min_utf8_len` length gate rejects inputs too short
 //!     to hold any match; an `anchored_start` pattern (`^…`/`\A…`) only ever matches
 //!     at offset 0, so the leftward scan is skipped entirely; and when every match
-//!     must begin with a fixed literal, that whole literal run drives a SIMD `memmem`-style
-//!     skip (a `memchr` for the run's rarest byte + an inline verify, see `memmemFrom`) that
-//!     leaps straight to each candidate start — literal-to-literal, not byte-to-byte (`\bthe\b`
-//!     jumps "the"→"the") — confirming there with an anchored NFA/DFA run. Every `Analysis`
+//!     must begin with a fixed literal, that whole literal run drives a portable **two-byte**
+//!     SIMD `memmem` skip (`memmem.Finder`, via `memmemFrom`: AND the equality masks of the
+//!     run's two rarest bytes, verify only where both coincide) that leaps straight to each
+//!     candidate start — literal-to-literal, not byte-to-byte (`\bthe\b` jumps "the"→"the") —
+//!     confirming there with an anchored NFA/DFA run. Every `Analysis`
 //!     fact is a sound one-sided bound, so the prefilter never drops a real match — it only
 //!     avoids running the engine where one provably cannot start.
 //!
@@ -41,6 +42,8 @@ const std = @import("std");
 const backend = @import("../backend.zig");
 const hir = @import("../../core/hir.zig");
 const nfa = @import("../nfa.zig");
+const simd = @import("../simd.zig");
+const memmem = @import("../memmem.zig");
 
 const literal = @import("literal.zig");
 const pikevm = @import("pikevm.zig");
@@ -118,6 +121,15 @@ pub const Options = struct {
     ///
     /// @stable-since: v0.3.0
     prefilter: bool = true,
+
+    /// SIMD policy for the literal arm's Teddy accelerator, projected from
+    /// `Options.strategy.simd`. `.auto` builds Teddy for a literal-alternation pattern on a
+    /// target with a native dynamic shuffle; `.off` keeps the portable scan. Only the literal
+    /// arm consults it today (the NFA-arm multi-prefix prefilter is a follow-up).
+    /// Results-invariant.
+    ///
+    /// @stable-since: v0.4.0
+    simd: simd.SimdMode = .auto,
 
     /// @stable-since: v0.3.0
     pub const ByteEngine = enum { auto, enabled, disabled };
@@ -284,7 +296,7 @@ pub const Program = struct {
 /// @stable-since: v0.1.0
 pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, opts: Options) BuildError!Program {
     if (literal.supports(h)) {
-        return .{ .inner = .{ .literal = try literal.buildAlloc(gpa, h, .{}) } };
+        return .{ .inner = .{ .literal = try literal.buildAlloc(gpa, h, .{ .simd = opts.simd }) } };
     }
     if (!nfa.supports(h)) return error.Unsupported;
     var program = Program{
@@ -529,50 +541,25 @@ fn memchrFrom(input: []const u8, start: usize, b: u8) ?usize {
     return std.mem.indexOfScalarPos(u8, input, start, b);
 }
 
-/// Index of the rarest (most selective) byte of `needle` by `byteRarity` — the byte to
-/// SIMD-scan for in `memmemFrom`. Ties keep the earliest. Requires `needle.len >= 1`.
-fn rarestByteIndex(needle: []const u8) usize {
-    var best: usize = 0;
-    var best_score: u8 = byteRarity(needle[0]);
-    var i: usize = 1;
-    while (i < needle.len) : (i += 1) {
-        const s = byteRarity(needle[i]);
-        if (s < best_score) {
-            best = i;
-            best_score = s;
-        }
-    }
-    return best;
-}
-
 /// First byte offset `≥ start` at which `needle` occurs in `input`, or null — the prefilter's
 /// **multi-byte** start-skip primitive (a generalisation of `memchrFrom` that leaps literal-to-
-/// literal instead of byte-to-byte). Implemented as a SIMD `memchr` (`std.mem.indexOfScalarPos`,
-/// `@Vector`) for the needle's *rarest* byte, then a cheap inline `eql` verify of the whole run
-/// at each hit — genuinely vectorised even for short needles.
+/// literal instead of byte-to-byte). For a needle of two or more bytes this is the portable
+/// **two-byte** SIMD filter (`memmem.Finder`): it AND-s the SIMD equality masks of the needle's
+/// two rarest bytes and only verifies the whole run where both coincide — far fewer candidates
+/// than scanning the single rarest byte (the prefilter sees "the"/"http"/"foo"-sized needles,
+/// where one common lead byte leaves a candidate almost everywhere).
 ///
 /// We deliberately do **NOT** call `std.mem.indexOfPos`: it falls back to a *non-SIMD* linear
-/// scan for needles `≤ 4` bytes (`std.mem.findPos`) — exactly the "the"/"http"/"foo" sizes the
-/// prefilter sees — which scans slower than a SIMD `memchr` while only being more *selective*.
-/// Scanning the rarest byte gives the selectivity (few verifies) AND keeps the scan vectorised,
-/// so this beats both the single-byte memchr and `indexOfPos` here. A one-byte needle is exactly
-/// `memchrFrom`; an empty needle matches at `start`. Comptime uses the scalar `memchrFrom`/`eql`.
+/// scan for needles `≤ 4` bytes (`std.mem.findPos`) — exactly the sizes here. A one-byte needle
+/// is exactly `memchrFrom`; an empty needle matches at `start`. Comptime routes to the scalar
+/// fallback (`Finder.find` handles `@inComptime()` internally — no `@Vector` in const-eval).
 ///
 /// @stable-since: v0.4.0
 fn memmemFrom(input: []const u8, start: usize, needle: []const u8) ?usize {
     if (needle.len == 0) return if (start <= input.len) start else null;
     if (needle.len == 1) return memchrFrom(input, start, needle[0]);
-    if (start + needle.len > input.len) return null;
-    const off = rarestByteIndex(needle);
-    const key = needle[off];
-    var h = start + off; // earliest position of the key byte for a candidate at `start`
-    while (memchrFrom(input, h, key)) |p| {
-        const cand = p - off; // p ≥ start+off ⇒ cand ≥ start (no underflow)
-        if (cand + needle.len <= input.len and std.mem.eql(u8, input[cand .. cand + needle.len], needle))
-            return cand;
-        h = p + 1;
-    }
-    return null;
+    const f = memmem.Finder.init(needle);
+    return f.find(input, start);
 }
 
 // ── NFA-arm execution: dispatch + analysis-driven prefilter ───────────────────────

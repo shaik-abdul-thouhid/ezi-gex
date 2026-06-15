@@ -452,19 +452,29 @@ match, so a prefilter or length gate built on them never yields a false negative
 > (a `^`/`\A` start short-circuit — only try offset 0), and `prefix_literal`. **Since 0.4.0 the
 > *whole* `prefix_literal` run (not just its first byte) drives the start-skip:** a SIMD
 > `memmem`-style leap to the next occurrence of the entire run (`\bthe\b` jumps "the"→"the", not
-> 't'→'t'), each hit confirmed by an *anchored* run. The skip is a SIMD `memchr`
-> (`std.mem.indexOfScalarPos`, `@Vector`) for the run's **rarest** byte plus an inline `eql`
-> verify — deliberately **not** `std.mem.indexOfPos`, whose multi-byte path is a *non-SIMD*
-> linear scan for needles ≤ 4 bytes (`std.mem.findPos`), the common "the"/"http" sizes.
-> The `literal` backend likewise scans with `std.mem.indexOf` (memchr / Boyer–Moore–
-> Horspool). **Since 0.3.0 the rarest byte of `required_bytes` also drives a sound `memchr`
+> 't'→'t'), each hit confirmed by an *anchored* run. **Since 0.4.0 a ≥2-byte run uses a
+> portable two-byte SIMD `memmem`** (`engine/memmem.zig`, via `auto.memmemFrom`): probe the run's
+> two **rarest** bytes, AND their `@Vector` equality masks across a 16/32-byte chunk, verify only
+> where both coincide — far fewer candidates than the single-rarest-byte memchr it replaced, and
+> deliberately **not** `std.mem.indexOfPos`, whose multi-byte path is a *non-SIMD* linear scan for
+> needles ≤ 4 bytes (`std.mem.findPos`), the common "the"/"http" sizes.
+> The `literal` backend likewise scans a **single literal** with the same two-byte SIMD `memmem`
+> (`memmem.Finder`, a `literal.Program.mem` arm built for a ≥2-byte needle under `simd != .off`;
+> 1-byte needles stay on the SIMD `memchr`). **Since 0.3.0 the rarest byte of `required_bytes` also drives a sound `memchr`
 > fast-reject** — a byte every match must contain, absent from the input, means no match
-> (no `@` ⇒ no `\w+@\w+`). The **one-pass capture path now exists** (`backends.onepass`,
-> since 0.4.0 — `auto` uses it for the anchored capture fill after a DFA locates the span),
-> though it proves one-pass-ness itself rather than reading the `is_one_pass` flag.
-> `required_literal` (a multi-substring **Teddy** prefilter) and `is_one_pass` remain
-> unconsumed *as Analysis fields*; any backend is free to read them. Toggle the whole
-> prefilter with `strategy.prefilter`.
+> (no `@` ⇒ no `\w+@\w+`). **Since 0.4.0 a literal *alternation* is scanned with the SIMD
+> **Teddy** prefilter** (`engine/teddy.zig`): a dynamic in-vector byte shuffle fingerprints
+> the first 1–3 bytes of every branch across a 16-byte chunk at once, then verifies — slim
+> (≤8 buckets, 128-bit `pshufb`/`tbl`) or **fat** (16 buckets, AVX2 256-bit `vpshufb`); the
+> one arch-specific op is quarantined in `engine/simd.zig` with a portable scalar fallback,
+> and the `strategy.simd` flag governs it. The **one-pass capture path now exists**
+> (`backends.onepass`, since 0.4.0 — `auto` uses it for the anchored capture fill after a DFA
+> locates the span), though it proves one-pass-ness itself rather than reading the
+> `is_one_pass` flag. `required_literal` (a multi-substring Teddy prefilter on the **NFA/DFA
+> arm** for *multi-prefix* patterns like `(foo|bar)\d+`, distinct from the `literal`-backend
+> Teddy above) and `is_one_pass` remain unconsumed *as Analysis fields* — that NFA-arm wiring
+> needs the analysis to expose a prefix-literal *set*; any backend is free to read them today.
+> Toggle the whole prefilter with `strategy.prefilter`.
 
 ---
 
@@ -550,7 +560,8 @@ The contract is the seam that makes these drop-in:
 
 | Tier | Work | Effort | Lands at |
 |---|---|---|---|
-| 1 ✅ *(0.1.0)* | literal `eql` → `std.mem.indexOf`; `prefix_literal` first byte → `memchr` start-skip in `auto` (+ length/anchor gates); **0.3.0:** literal *alternation* skips with a single SIMD `indexOfAny` pass (was a Θ(n²) per-branch `indexOfPos`); **0.4.0:** the start-skip now uses the **whole `prefix_literal` run** (a SIMD `memmem`-style leap — `memchr` on the run's rarest byte + inline verify, *not* `std.mem.indexOfPos` whose ≤4-byte path is non-SIMD), so `\bthe\b` jumps "the"→"the" not 't'→'t' | done | ~20× on memchr-friendly literals and prefixed NFA patterns; `foo\|bar\|baz\|qux` 7.5 → ~460 MiB/s (no longer quadratic); **0.4.0:** `\bthe\b` on Sherlock 3.15 → 1.27 ms (2.5×), `the\s+\p{L}+` 1.22 ms → 794 µs |
+| 1 ✅ *(0.1.0)* | literal `eql` → `std.mem.indexOf`; `prefix_literal` first byte → `memchr` start-skip in `auto` (+ length/anchor gates); **0.3.0:** literal *alternation* skips with a single SIMD `indexOfAny` pass (was a Θ(n²) per-branch `indexOfPos`); **0.4.0:** the start-skip uses the **whole `prefix_literal` run** (`\bthe\b` jumps "the"→"the" not 't'→'t'), via the two-byte `memmem.Finder` (next row) | done | ~20× on memchr-friendly literals and prefixed NFA patterns; `foo\|bar\|baz\|qux` 7.5 → ~460 MiB/s (no longer quadratic) |
+| 1+ ✅ *(0.4.0)* | **Two-byte SIMD `memmem`** (`engine/memmem.zig`) — a portable single-substring search: probe the two **rarest** needle bytes, AND their `@Vector` equality masks across a 16/32-byte chunk, verify only where both coincide. **No arch asm** (SSE2 `pcmpeqb`/NEON via portable `@Vector`; `simd.zig` stays the only arch-specific file). Wired into both the `literal` backend's single-literal scan (`literal.Program.mem`) and `auto`'s ≥2-byte prefix start-skip (`auto.memmemFrom`); governed by `strategy.simd` | done | `Sherlock` 233.67 → 13.54 µs (**17×, 40.9 GiB/s — faster than Rust**); `the` 504.75 → 62.88 µs (8×); `\bthe\b` on logs 144.96 → 23.75 µs (6×); `the\s+\p{L}+` 837 → 670 µs |
 | 3a ✅ *(0.2.0, compacted 0.3.0)* | **byte-NFA lowering + `ByteMap`** (`engine/byte.zig`) — UTF-8 `utf8-ranges`, a `byte_range` Thompson NFA, byte equivalence classes; executed by the `bytepike` reference VM. **0.3.0:** UTF-8 suffix sharing (`(lo,hi,next)` cache) + single-copy `x+` shrink the NFA ~1.5–2.9×; `byteWorthLowering` cost-gate | done | the substrate for the DFAs below; smaller NFA ⇒ faster determinization |
 | 3c ✅ *(0.3.0)* — **the default span engine** | **eager DFA** (`backends/edfa.zig`) — fully determinizes the byte NFA into a frozen `states × byte_classes` table; **stateless** matcher (a bare table walk, zero decode), comptime *and* runtime, span-only. **`find` is O(input) on every pattern** via the build-time `program.prone` strategy: non-prone → anchored restart, prone → the reverse-DFA two-pass (`utrans` forward-end + a frozen reverse table for the start). Supports `text_start` **and `text_end`** (`$`/`\z`). **Builds only the tables it uses** (a non-prone `\w+` keeps just its `trans`, ~141 KB, not + `utrans` + reverse, ~1 MB) | done | class scans (`\w+`, `\d+`, `[A-Za-z]+`, `\p{L}+`) at **Rust parity** (~1.1–1.3×); the email `\w+@\w+` Θ(n²) stays fixed; tiny + bakeable for literal/ASCII (`abc` 5 states / 105 B) |
 | 3b ✅ *(0.3.0)* — **the fallback** | **lazy DFA** over the **byte** automaton (`engine/backends/dfa.zig`) — caches `(state, class)` transitions; span-only, runtime-only, leftmost-first via priority + cut-on-match determinization; with an **O(n) reverse-DFA `find`**. Now the fallback when the eager DFA overflows its `max_states` bound. **0.3.0 hot-loop pass:** cached raw table pointers refreshed only after a cold transition (`\w+` ~336 → ~517 MiB/s). **0.4.0:** also matches anchored-end `$`/`\z` (reverse-from-end) and carries **Unicode `\b`** (decode-hybrid) | done | one DFA state per byte (cached); serves patterns whose full eager table is too large |
@@ -558,7 +569,11 @@ The contract is the seam that makes these drop-in:
 | one-pass NFA capture path ✅ *(0.4.0)* | **`backends.onepass`** — a single deterministic thread fills `slots` in O(input) for provably one-pass patterns; `auto` uses it for the anchored capture fill after a DFA locates the span (else the Pike VM) | done | `(\w+)` capture extraction ASCII 64 → 206 MiB/s (~3.2×) |
 | DFA minimization ✅ *(0.4.0)* | **Hopcroft/Moore** partition-refinement of the eager DFA tables (results-invariant; dense layout kept) | done | `\w+@\w+` reverse DFA ~3251 → ~1047 states (~3×) |
 | 3c+ | **sparse-encode** the (already minimized) eager DFA tables | weeks | shrinks the kept Unicode-class eager tables (the `\w+` ~141 KB dense → far smaller) — was paired with Hopcroft, which has landed |
-| — | **Teddy / Aho-Corasick prefilter** — multi-substring SIMD for literal alternations | weeks | closes the `foo\|bar\|baz\|qux` gap (the single biggest remaining one — Rust's Teddy is ~14–30× ahead) |
+| 1+ ✅ *(0.4.0)* | **Teddy SIMD multi-literal prefilter** (`engine/teddy.zig` + `engine/simd.zig`) — a dynamic in-vector byte shuffle (`pshufb`/`vpshufb`/`tbl`) fingerprints the first 1–3 bytes of every literal-alternation branch across a 16-byte chunk at once, then verifies; **slim** (≤8 buckets, 128-bit) + **fat** (16 buckets, AVX2 256-bit). The one arch-specific op is quarantined in `simd.zig` (portable scalar fallback at comptime / on other targets); gated by `strategy.simd`. Wired into the `literal` backend's alternation scan | done | closes the `foo\|bar\|baz\|qux` multi-substring gap (the single biggest one vs. Rust); validated by execution on NEON, SSSE3, and AVX2 |
+| — | **Inner-literal prefilter** — for patterns whose required literal is *interior*, not a prefix (`[\w.+-]+@…`): find the literal (`@`) with `memmem`/`memchr`, then a bounded or **reverse-DFA** scan for the match start. Today only a *presence* fast-reject (`required_bytes` rarest byte) — it confirms `@` exists but still scans the whole input | weeks | the biggest remaining logs gap: `email` 411 MiB/s vs Rust 6.89 GiB/s |
+| — | **Case-insensitive literals** — fold a short `(?i)` literal run into the literal-**set** Teddy already handles (cross-product of per-letter case variants, capped at ~64) instead of the concat-of-classes that routes to the NFA | days–weeks | `(?i)что` 321 MiB/s, `(?i)the` 372 MiB/s vs Rust multi-GiB/s |
+| — | **Unicode-class DFA throughput** — the determinized table walk on Unicode classes lags Rust (`\d{4}-\d{2}-\d{2}` 353 MiB/s vs 6.31 GiB/s, `\p{N}+` ~550 MiB/s vs ~3 GiB/s) | weeks | the date/number extraction + counted-repeat cells |
+| — | **Teddy on the NFA/DFA arm** — extend the prefilter to *multi-prefix* patterns (`(foo\|bar)\d+`) via the unconsumed `required_literal` Analysis field (needs the analysis to expose a prefix-literal *set*) | weeks | extends the 0.4.0 literal-backend Teddy to prefixed engine patterns (`near`) |
 
 ### The byte substrate (tier 3a, landed)
 

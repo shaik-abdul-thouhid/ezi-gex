@@ -69,6 +69,7 @@ const hir = core.hir;
 const parser = core.compile;
 const backend = @import("backend.zig");
 const auto = @import("backends/auto.zig");
+const simd = @import("simd.zig");
 
 /// Re-export: a parse-failure report — error code + byte span + message + caret renderer.
 pub const Diagnostic = parser.Diagnostic;
@@ -158,6 +159,16 @@ pub const Options = struct {
         ///
         /// @stable-since: v0.3.0
         prefilter: bool = true,
+
+        /// SIMD policy (a **permission, not a command**): `.auto` (default) uses the native
+        /// dynamic-shuffle accelerator (Teddy) for literal-alternation scans where the build
+        /// target supports it, falling back to the portable scan elsewhere; `.off` forces the
+        /// portable/scalar path everywhere. There is no "force on" — a target without a native
+        /// shuffle resolves to scalar regardless, so no setting yields a broken binary.
+        /// Results-invariant (only speed changes). See `simd.SimdMode`.
+        ///
+        /// @stable-since: v0.4.0
+        simd: simd.SimdMode = .auto,
     };
 
     /// Project these front-door options onto the HIR builder's options.
@@ -457,6 +468,9 @@ fn backendOptions(comptime B: type, comptime opts: Options) B.Options {
     }
     if (comptime @hasField(B.Options, "prefilter")) {
         bo.prefilter = opts.strategy.prefilter;
+    }
+    if (comptime @hasField(B.Options, "simd")) {
+        bo.simd = opts.strategy.simd;
     }
     return bo;
 }
@@ -862,6 +876,7 @@ test "Options.strategy is results-invariant (reserved tier)" {
         .byte_engine = .disabled,
         .prefilter = false,
         .unicode_word_boundary_in_dfa = true,
+        .simd = .off,
     } });
     defer b.deinit();
     var sa = try @TypeOf(a).Scratch.init(testing.allocator, &a.program);
@@ -871,6 +886,19 @@ test "Options.strategy is results-invariant (reserved tier)" {
     const input = "  héllo_42  ";
     // Flipping every strategy knob must not change which text matches.
     try testing.expectEqualStrings(a.find(&sa, input).?.slice(input), b.find(&sb, input).?.slice(input));
+
+    // The `simd` knob reaches the literal arm (front-door projection): a literal
+    // alternation must match identically with Teddy on (`.auto`) vs off (`.off`).
+    var la = try compileRuntime(testing.allocator, "cat|dog|fish", &diag, .{ .strategy = .{ .simd = .auto } });
+    defer la.deinit();
+    var lb = try compileRuntime(testing.allocator, "cat|dog|fish", &diag, .{ .strategy = .{ .simd = .off } });
+    defer lb.deinit();
+    var sla = try @TypeOf(la).Scratch.init(testing.allocator, &la.program);
+    defer sla.deinit(testing.allocator);
+    var slb = try @TypeOf(lb).Scratch.init(testing.allocator, &lb.program);
+    defer slb.deinit(testing.allocator);
+    const lin = "no pets here until a dog then a fish, never a cat first";
+    try testing.expectEqualStrings(la.find(&sla, lin).?.slice(lin), lb.find(&slb, lin).?.slice(lin));
 }
 
 test "SearchOptions.span_end limits the search to a sub-range" {

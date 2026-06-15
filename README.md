@@ -67,9 +67,22 @@ Landed across `0.4.0-dev` (all on `main`):
 - **Hopcroft/Moore minimization** of the eager DFA (results-invariant; shrinks the auxiliary
   tables, e.g. `\w+@\w+`'s reverse DFA ~3× fewer states).
 - **`$`/`\z` (`text_end`) on the lazy DFA** — closing the last eager/lazy capability gap.
-- **Whole-run literal `memmem` prefilter** in `auto` — the leading-literal start-skip now
-  leaps on the *whole* literal run (`\bthe\b` jumps "the"→"the", not 't'→'t'), via a SIMD
-  `memchr` on the run's rarest byte + inline verify. See *Performance*.
+- **Two-byte SIMD `memmem` for single literals** (`engine/memmem.zig`) — a single literal
+  (`Sherlock`, `Sherlock Holmes`) now scans with a portable two-byte filter (probe the two
+  *rarest* needle bytes, AND their SIMD equality masks, verify only where both coincide)
+  instead of a one-byte memchr. No arch asm (portable `@Vector` compare + movemask). On
+  Sherlock this is **17× faster than before and edges out Rust** (40.9 GiB/s). See *Performance*.
+- **Whole-run literal `memmem` prefilter** in `auto` — the leading-literal start-skip leaps on
+  the *whole* literal run (`\bthe\b` jumps "the"→"the", not 't'→'t'); a ≥2-byte run now rides the
+  same **two-byte** `memmem.Finder`, so every prefix-literal NFA/DFA pattern got the upgrade
+  (`\bthe\b` on logs **6×**). See *Performance*.
+- **Teddy SIMD multi-literal prefilter** — literal *alternations* (`cat|dog|fish`,
+  `foo|far|fizz`) now scan with the Teddy algorithm: a dynamic in-vector byte shuffle
+  (`pshufb`/`vpshufb`/`tbl`) fingerprints the first 1–3 bytes of all branches across a 16-byte
+  chunk at once, then verifies candidates. Slim (≤8 buckets, 128-bit) everywhere with a native
+  shuffle; **fat** (16 buckets, AVX2 256-bit) for large sets. The one piece of arch-specific
+  inline asm is quarantined in `engine/simd.zig` with a portable scalar fallback (comptime + any
+  unsupported target); the flag `strategy.simd` (`.auto`/`.off`) governs it. Results-invariant.
 
 `0.2.0`/`0.3.0` foundations still in place: full case folding, grapheme `\X`, a two-tier
 `Options` (semantic + results-invariant strategy), `(?x)` verbose mode, ASCII mode,
@@ -367,7 +380,7 @@ treated as `\z`. See [`docs/architecture.md`](docs/architecture.md) §Caveats.
 | `auto` *(default)* | dispatches the others | ✅ | ✅ | just use this |
 | `pikevm` | breadth-first NFA | ✅ | ✅ | general, large inputs; Unicode `\b` |
 | `backtrack` | bounded depth-first NFA | ✅ | ✅ | small inputs; the only `\X` backend |
-| `literal` | substring / literal-alternation | whole-match | ✅ | pure-literal patterns |
+| `literal` | substring (two-byte SIMD **`memmem`**) / literal-alternation (SIMD **Teddy**) | whole-match | ✅ | pure-literal patterns |
 | `onepass` | single deterministic NFA thread | ✅ | ✅ | provably one-pass capture fill (anchored) |
 | `bytepike` | byte-stepping Pike VM (zero-decode) | ✅ | ✅ | byte-automaton substrate; ASCII `\b`, no `\X` |
 | `edfa` *(default span engine)* | **eager** DFA — frozen `states × byte_classes` table | span-only | ✅ | fast O(n) span scan; ASCII `\b`, `(?m)`, `$`/`\z` |
@@ -382,6 +395,16 @@ is correct for every pattern and input: ASCII `\b` and non-prone `(?m)` ride the
 `$` stay on the code-point Pike VM. The DFA is **on by default** (`byte_engine = .auto`/
 `.enabled`); `.disabled` opts back to the NFA-only program. Force a specific backend with the
 `*With` variants: `gex.compileRuntimeWith(gex.backends.pikevm, gpa, pat, &diag, .{})`.
+
+A **single** literal (`Sherlock`) routed to `literal` is scanned with a portable two-byte SIMD
+**`memmem`** (`engine/memmem.zig`): probe the two rarest needle bytes, AND their `@Vector` equality
+masks across a 16/32-byte chunk, verify only where both coincide — no arch asm (lowers to SSE2/NEON
+everywhere). A literal **alternation** (`cat|dog|fish`) instead uses the **Teddy** SIMD prefilter on
+a target with a native dynamic shuffle (x86-64 SSSE3/AVX2, aarch64 NEON) — fingerprint all branches
+across a 16-byte chunk at once, then verify. Slim (≤8 buckets) by default; **fat** (16 buckets) on
+AVX2 for larger sets; portable scalar fallback at comptime and on other targets. Both are governed by
+`strategy.simd` (`.auto`/`.off`) — a *permission*, not a command: there is no way to force SIMD onto
+a target that lacks it, so the result is always correct.
 
 The usage guide covers [choosing a backend](docs/usage-guide.md#choosing-a-specific-backend)
 and walks the whole [*write your own backend*](docs/usage-guide.md#8-writing-your-own-backend)
@@ -474,19 +497,27 @@ Full details in [`docs/architecture.md`](docs/architecture.md) §11 and the usag
 Honest about where it stands. **Tier 1 — the literal / prefilter fast path — is now
 wired:**
 
-1. The `literal` backend scans with `std.mem.indexOf`: SIMD `memchr` to locate a
-   one-byte needle, Boyer–Moore–Horspool with a skip table for longer ones — instead
-   of an `eql` at every byte position. On memchr-friendly needles that is **~20×** the
-   old position-by-position scan; it is never slower.
+1. The `literal` backend scans a **single** literal (`Sherlock`, `Sherlock Holmes`) with a
+   portable **two-byte SIMD `memmem`** (`engine/memmem.zig`): probe the two *rarest* needle
+   bytes, AND their SIMD equality masks across a 16/32-byte chunk, and verify only where both
+   coincide — far fewer candidates than a one-byte memchr on a common lead byte. No arch asm
+   (portable `@Vector` compare + movemask, lowering to SSE2/NEON everywhere). On Sherlock this
+   is **17×** the old `std.mem.indexOf` scan and **edges out Rust** (40.9 GiB/s). A literal
+   **alternation** (`cat|dog|fish`) uses the **Teddy** SIMD prefilter instead: a dynamic
+   in-vector byte shuffle (`pshufb`/`vpshufb`/`tbl`) fingerprints the first 1–3 bytes of all
+   branches across a 16-byte chunk at once (slim ≤8 buckets; **fat** 16 buckets on AVX2), then
+   verifies candidates — far more selective than one `indexOfAny` when branches share a first
+   byte. Teddy's one bit of arch-specific asm is quarantined in `engine/simd.zig` (portable
+   scalar fallback at comptime / on other targets); both toggle with `strategy.simd`.
 2. `auto` consumes the HIR [`Analysis`](docs/usage-guide.md#7-the-analysis-prefilter-facts)
    on NFA *and* DFA patterns: when every match must begin
    with a fixed literal, the **whole leading literal run** drives a SIMD `memmem`-style skip
    that leaps straight to each candidate start — literal-to-literal, not byte-to-byte
-   (`\bthe\b` jumps "the"→"the" instead of 't'→'t', skipping every interior "the"). The skip
-   is a SIMD `memchr` (`std.mem.indexOfScalarPos`, `@Vector`) for the run's *rarest* byte plus
-   a cheap inline `eql` verify — deliberately **not** `std.mem.indexOfPos`, which falls back to
-   a non-SIMD scan for needles ≤ 4 bytes (the common "the"/"http" sizes). Each candidate is
-   confirmed with an *anchored* run; a `^`/`\A` pattern
+   (`\bthe\b` jumps "the"→"the" instead of 't'→'t', skipping every interior "the"). A ≥2-byte
+   run rides the same **two-byte** `memmem.Finder` as item 1 (AND the SIMD masks of the run's
+   two rarest bytes, verify only where both coincide) — deliberately **not** `std.mem.indexOfPos`,
+   which falls back to a non-SIMD scan for needles ≤ 4 bytes (the common "the"/"http" sizes). Each
+   candidate is confirmed with an *anchored* run; a `^`/`\A` pattern
    skips the leftward scan entirely; the **rarest required byte** drives a sound
    fast-reject (no `@` in the input ⇒ no `\w+@\w+` match, return at once); and a
    min-length gate rejects inputs too short to hold any match. Every `Analysis` fact is a
@@ -530,12 +561,21 @@ conformance-pinned to the Pike VM.
 
 Since first writing this, several items here have **landed**: `\b`/`\B` and `(?m)` on the
 byte DFAs, a one-pass capture backend (`onepass`), DFA **Hopcroft minimization**, `$`/`\z`
-on the lazy DFA, and the whole-run literal `memmem` start-skip (item 2 above).
+on the lazy DFA, the whole-run literal `memmem` start-skip (item 2 above), the **two-byte SIMD
+`memmem`** for single literals (item 1 — Sherlock now *faster than Rust*), and the **Teddy SIMD
+multi-literal prefilter** for alternations (item 1 — the multi-substring prefilter that was the
+single biggest remaining gap vs. Rust). Together these took Rust's overall geomean lead from
+**3.54× → 2.55×** (ezi_gex fastest in **9/32** bench cells).
 
-**Still open (additive, no API change):** a **multi-substring (Teddy / Aho-Corasick)
-prefilter** for literal alternations — the single biggest remaining gap vs. Rust — and a
-**sparse DFA table encoding** to shrink the (already minimized) Unicode-class eager tables.
-See [`docs/architecture.md`](docs/architecture.md) §10 for the tier roadmap.
+**Still open (additive, no API change):** the remaining gaps vs. Rust are concentrated in
+three classes, none a quick prefilter tweak — (a) **inner-literal prefilter** for patterns whose
+required literal is *interior*, not a prefix (`[\w.+-]+@…` — find `@`, then a bounded/reverse
+scan for the start; today only a *presence* fast-reject); (b) **case-insensitive literals**
+(`(?i)что`, `(?i)the`) — fold a short case-insensitive run into the literal-set Teddy already
+handles (cross-product of case variants, capped); and (c) **Unicode-class DFA throughput**
+(`\d{4}-\d{2}-\d{2}`, `\p{N}+`) — the determinized table walks slower than Rust's. Plus the
+**multi-prefix** Teddy on the NFA/DFA arm (`(foo|bar)\d+`, needs a prefix-literal *set*) and a
+**sparse DFA table encoding**. See [`docs/architecture.md`](docs/architecture.md) §10.
 
 ## Binary size
 

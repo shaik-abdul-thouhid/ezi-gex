@@ -11,27 +11,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Teddy SIMD multi-literal prefilter** (`backends.literal`, on by default) — a vectorised
+  scanner for literal *alternations* (`cat|dog|fish`, `foo|far|fizz`), the case the single-needle
+  `memmem`/`indexOfAny` scan handles least well (many branches, or branches sharing a first byte).
+  Teddy fingerprints the first `n ∈ 1..3` bytes of every literal and tests all of them across a
+  16-byte input chunk at once via a **dynamic in-vector byte shuffle**, producing candidate
+  positions that are then verified against the actual literals in priority order. **Leftmost-first
+  and results-invariant** — it locates exactly the match the scalar scan would (the verify step is
+  shared), so it only ever changes speed, never which text matches.
+  - **`engine/simd.zig`** (new) — the **only** file in the engine that emits target-specific inline
+    asm, quarantining the one operation that cannot be written portably: the dynamic shuffle.
+    `shuffle16` lowers to **`pshufb`** (x86-64 SSSE3) / **`tbl`** (aarch64 NEON); `shuffle32` to
+    **`vpshufb`** (x86-64 AVX2, the per-128-bit-lane "fat" variant). Gated on the **CPU feature
+    set** (not the arch name — SSSE3 is x86-64-v2, the baseline lacks it) and routed to a portable
+    **scalar fallback** at comptime (`@inComptime()`) and on every unsupported target, so the
+    engine stays correct everywhere. New pub decls (`@stable-since v0.4.0`): `simd.shuffle16`,
+    `simd.shuffle32`, `simd.SimdMode`, `simd.has_pshufb`/`has_vpshufb`/`has_tbl`/
+    `has_native_shuffle16`/`has_native_shuffle32`.
+  - **`engine/teddy.zig`** (new) — the algorithm: an ≤8-bucket **slim-128** matcher (`Teddy`) and a
+    16-bucket **fat-256** matcher (`FatTeddy`, AVX2 only — it spends the 256-bit register on
+    bucket count, not throughput, halving collisions for large sets). The multi-byte fingerprint
+    carry is a comptime `@shuffle` (overlapping windows with a within-chunk lower-lane shift), so
+    only the fingerprint lookup is arch-specific; the rest — nibble split, carry, candidate mask,
+    verify — is portable `@Vector`. Pub decls (`@stable-since v0.4.0`): `teddy.Teddy`,
+    `teddy.FatTeddy`, `teddy.compileAlloc`/`compileFatAlloc`/`free`/`freeFat`/`supports`.
+  - **Integration & policy.** The `literal` backend builds a Teddy arm for an unanchored
+    alternation when the target has a native shuffle and the set benefits (declines a lone needle —
+    Boyer–Moore–Horspool wins — an empty branch, and the comptime path; **fat** only with AVX2 and
+    more needles than slim's buckets). A new front-door knob **`Options.strategy.simd`**
+    (`enum { auto, off }`) governs it — a **permission, not a command**: `.auto` (default) uses
+    Teddy where supported and falls back to scalar otherwise; `.off` forces the portable scan
+    everywhere. There is deliberately **no "force on"** — a target without a native shuffle resolves
+    to scalar regardless, so no setting can produce a broken binary. New decls (`@stable-since
+    v0.4.0`): `regex.Options.Strategy.simd`, `auto.Options.simd`, `literal.Options.simd`.
+  - **Unicode/flags** need **zero** handling in Teddy: the HIR resolves all folding/flags before any
+    backend, and a case-insensitive *letter* becomes a `class`/alternation (never a literal run), so
+    Teddy only ever receives exact, post-fold, case-sensitive literal runs — byte-scanning sound for
+    UTF-8 (a needle's bytes occur only at code-point boundaries). It inherits `literal.zig`'s exact
+    semantics.
+  - **Validated by execution on all three SIMD targets**, not just assembly: arm64 **NEON `tbl`**
+    natively; x86-64 **SSSE3 `pshufb`** and **AVX2 `vpshufb`** under Rosetta 2 (`-Dtarget=x86_64-macos
+    -Dcpu=x86_64_v2`/`_v3`). Differential tests pin every Teddy result (slim and fat) to a reference
+    scan at every offset (chunk boundaries, tail, priority ties, shared first bytes, >8/>16 needles,
+    multi-byte UTF-8); the cross-backend conformance suite pins the integrated literal arm to the
+    Pike VM; and a revert-failing `simd = .auto` vs `.off` results-invariance test guards the flag.
+
+- **Portable two-byte SIMD `memmem` for single literals** (`engine/memmem.zig`, new; on by default)
+  — the single-needle counterpart to Teddy. A pattern that reduces to **one** literal run
+  (`Sherlock`, `Sherlock Holmes`, `héllo`) previously skipped candidate-to-candidate with a
+  **one-byte** memchr on the needle's first byte + verify; a common lead byte (`'S'`, `'t'`) leaves
+  a candidate at nearly every occurrence, so most of the work was wasted verification. `memmem`
+  replaces that with the classic **two-byte filter**: probe the two needle offsets whose bytes are
+  rarest in typical text (a comptime `freq` table — **speed-only**, never affecting which matches are
+  found), AND their two SIMD equality masks, and verify only where *both* coincide. Candidate density
+  drops to ≈ `(f_lo/256)·(f_hi/256)`.
+  - **Portable — no arch asm.** Unlike Teddy's dynamic shuffle, the only SIMD ops are a broadcast
+    compare (`vec == @splat(b)`) and a movemask (`@bitCast` of the bool vector); LLVM lowers them to
+    SSE2 `pcmpeqb`/NEON on every target, with **no feature gate** (`simd.zig` stays the *only*
+    arch-specific file). Vector width widens to 256-bit on AVX2, else 128-bit. **Sound**: a real
+    occurrence has both probe bytes, so it never false-negates; false positives cost only a verify.
+    Comptime routes to a scalar fallback (`Finder.find` handles `@inComptime()` — no `@Vector` in
+    const-eval). New pub decls (`@stable-since v0.4.0`): `memmem.Finder`, `memmem.W`, `memmem.MIN_LEN`.
+  - **Integration.** The `literal` backend builds a `memmem.Finder` for a single ≥2-byte needle under
+    `Options.simd != .off` (new `literal.Program.mem`; allocation-free — it aliases `needles`), and the
+    single-literal unanchored scan uses it instead of the one-byte memchr. A 1-byte needle stays on the
+    SIMD `memchr` path; an alternation uses Teddy. Governed by the **same** `Options.strategy.simd`
+    permission as Teddy (`.off` keeps the scalar `firstMatchPos`). Results-invariant.
+  - **The `auto` NFA-arm prefix prefilter rides the same filter.** `auto.memmemFrom` — the
+    leading-literal start-skip used by **all three** span arms (Pike VM, lazy DFA, eager DFA) — now
+    routes a ≥2-byte prefix run through `memmem.Finder` instead of a single-rarest-byte memchr, so
+    every prefix-literal NFA/DFA pattern (`\bthe\b`, `the\s+\p{L}+`, `https?://…`) got the two-byte
+    upgrade for free.
+  - **Validated:** `memmem.zig` differential tests pin the `Finder` to a reference scan at **every**
+    start offset (chunk/scalar-tail seam, boundaries, overlap, repeated bytes, UTF-8, needles longer
+    than a vector, no-match); a revert-failing `simd = .auto` vs `.off` results-invariance test over
+    single literals in `literal.zig`; cross-backend conformance unchanged.
+  - **Benchmark** (`zig/regex-bench`, Apple M4): `Sherlock` **233.67 → 13.54 µs (17×, 40.9 GiB/s —
+    now faster than Rust)**, `Sherlock Holmes` **227.33 → 13.54 µs (16.8×, 41.6 GiB/s > Rust)**, `the`
+    **504.75 → 62.88 µs (8×, 7.56 GiB/s > Rust)**; via the prefix upgrade, `\bthe\b` on logs
+    **144.96 → 23.75 µs (6×)** and `the\s+\p{L}+` **837 → 670 µs**. Overall geomean Rust lead
+    **3.54× → 2.55×**; ezi_gex fastest in **9/32** cells (was 4).
+
 - **Whole-run literal prefilter (SIMD `memmem` start-skip) in `auto`.** The analysis prefilter's
   leading-literal start-skip previously used only the **first byte** of `prefix_literal` (a SIMD
   `memchr`); it now skips on the **whole leading literal run**, so a structured pattern leaps
   literal-to-literal instead of byte-to-byte — `\bthe\b` jumps "the"→"the" past every interior "the"
   (in "other", "there") rather than stopping at every 't'. The skip (`auto.memmemFrom`,
-  `@stable-since v0.4.0`) is implemented as a SIMD `memchr` (`std.mem.indexOfScalarPos`, `@Vector`)
-  on the run's **rarest** byte plus a cheap inline `eql` verify — deliberately **not**
-  `std.mem.indexOfPos`, whose multi-byte path falls back to a *non-SIMD* linear scan for needles
-  ≤ 4 bytes (`std.mem.findPos`), i.e. exactly the common "the"/"http"/"foo" sizes (a first cut using
-  `indexOfPos` regressed `uri` 2.5× before the rarest-byte rewrite). The whole run drives the skip
-  across **all three arms** (Pike VM, lazy DFA, eager DFA), and in the eager DFA's per-occurrence
-  confirm loop it confirms once per literal-run occurrence instead of once per first-byte occurrence
-  (strictly fewer `Scratch.confirm_probes`). Sound and results-invariant: the run is a *necessary*
-  prefix of every match (truncated at `MAX_PREFIX_LEN` = 16 bytes, still sound), so no match is ever
-  skipped — pinned by the cross-backend conformance/differential suites and a revert-failing
-  white-box test (`filterFromAnalysis` must distil the *whole* run, not the first byte). The ReDoS
-  guard is unaffected: a counted repeat like `a{4}b` keeps a 1-byte prefix run (`prefixLiteral`
-  recurses through the `min≥1` repetition to its single-char child), so `memmemFrom` degrades to the
-  same `memchr` there. **Benchmark** (`zig/regex-bench`, Apple M4, matched thermal): `\bthe\b` on
-  Sherlock **3.15 → 1.27 ms (2.5×)**, `the\s+\p{L}+` **1.22 ms → 794 µs**, `\bthe\b` on logs
-  **209 → 158 µs**; `uri` (`https?://…`) holds parity (~270 µs). New decls `@stable-since v0.4.0`:
+  `@stable-since v0.4.0`) now routes a ≥2-byte run through the **two-byte** `memmem.Finder` (see the
+  `memmem` entry above) — AND the SIMD equality masks of the run's **two** rarest bytes, verify only
+  where both coincide. (The first cut used a one-byte memchr on the single rarest byte; the two-byte
+  filter is strictly more selective. It is deliberately **not** `std.mem.indexOfPos`, whose multi-byte
+  path falls back to a *non-SIMD* linear scan for needles ≤ 4 bytes — exactly the common
+  "the"/"http"/"foo" sizes.) The run drives the skip across **all three arms** (Pike VM, lazy DFA,
+  eager DFA), and in the eager DFA's per-occurrence confirm loop it confirms once per literal-run
+  occurrence instead of once per first-byte occurrence (strictly fewer `Scratch.confirm_probes`).
+  Sound and results-invariant: the run is a *necessary* prefix of every match (truncated at
+  `MAX_PREFIX_LEN` = 16 bytes, still sound), so no match is ever skipped — pinned by the cross-backend
+  conformance/differential suites and a revert-failing white-box test (`filterFromAnalysis` must
+  distil the *whole* run, not the first byte). The ReDoS guard is unaffected: a counted repeat like
+  `a{4}b` keeps a 1-byte prefix run (`prefixLiteral` recurses through the `min≥1` repetition to its
+  single-char child), so `memmemFrom` degrades to a `memchr` there. New decls `@stable-since v0.4.0`:
   `auto.memmemFrom`, `auto.Filter.{prefix, prefix_len}`.
 
 - **`\b`/`\B` word boundaries on the byte DFAs** (`backends.edfa` + `backends.dfa`) — previously a
