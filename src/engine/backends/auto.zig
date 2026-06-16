@@ -1213,6 +1213,17 @@ fn confirmAt(p: *const nfa.Program, s: *Scratch.NfaScratch, input: []const u8, a
 /// are leftmost-first, so they fill identical slots (`conformance.zig` pins it) — this only
 /// changes the capture cost, never the result.
 fn fillCapturesAnchored(program: *const Program, s: *Scratch.NfaScratch, p: *const nfa.Program, input: []const u8, slots: []?usize, m: Match, opts: SearchOptions) ?Match {
+    // No capture groups ⇒ the DFA span IS the entire answer (slots are just group 0). Fill it
+    // directly and skip the capturing engine — the win for `replace`/`captures` on a group-less
+    // pattern (`\d+`, `\w+`), which would otherwise pay a Pike VM pass per match just to re-derive
+    // the span the DFA already found. Results-identical (group 0 = the match span).
+    if (p.slot_count <= 2) {
+        if (slots.len >= 2) {
+            slots[0] = m.start;
+            slots[1] = m.end;
+        }
+        return m;
+    }
     var o = opts;
     o.start = m.start;
     o.anchored = true;

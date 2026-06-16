@@ -4,7 +4,7 @@ A copy-paste tutorial for **using** ezi_gex, end to end:
 
 1. [Quick start](#1-quick-start) — match something in 30 seconds.
 2. [The pipeline at a glance](#2-the-pipeline-at-a-glance) — `pattern → AST → HIR → Program → match`.
-3. [Front-door recipes](#3-front-door-recipes) — `isMatch` / `find` / captures / `findAll` / `split` / `replaceAll`.
+3. [Front-door recipes](#3-front-door-recipes) — `isMatch` / `find` / captures (`+At`, `groupIndex`/`groupName`) / `findAll` / `split` (`+N`) / replace (`replaceAll`/`replace`/`replaceN`/`replaceAllAlloc`/`replaceAllWith`).
 4. [Comptime & no-allocator usage](#4-comptime--no-allocator-usage).
 5. [Using the stages from lexing up](#5-using-the-stages-from-lexing-up) — drive the scanner, HIR, and a backend by hand.
 6. [Reading the HIR](#6-reading-the-hir) — what the resolved IR looks like, with concrete output.
@@ -133,6 +133,15 @@ if (re.captures(&sc, slots, "ping bob@example")) |c| {
 }
 ```
 
+`capturesAt(&sc, slots, input, .{ .start = n })` is the same but with `SearchOptions` — the
+capture-filling peer of `findAt`/`isMatchAt`, for resuming or anchoring a capture search. And you
+can map names ↔ indices straight from the compiled pattern, no match needed:
+
+```zig
+_ = re.groupIndex("user"); // ?usize → 1
+_ = re.groupName(1);       // ?[]const u8 → "user"
+```
+
 ### Iterate all matches / count
 
 ```zig
@@ -165,12 +174,15 @@ defer ssc.deinit(gpa);
 
 var parts = sep.split(&ssc, "the  quick fox");
 while (parts.next()) |p| std.debug.print("[{s}]", .{p}); // [the][quick][fox]
+
+var head = sep.splitN(&ssc, "the  quick fox", 2); // at most 2: [the][quick fox]
+while (head.next()) |p| std.debug.print("[{s}]", .{p});
 ```
 
-### replaceAll (with a `$`-template)
+### replace (templates, counts, an owned string, or a callback)
 
-`replaceAll` writes to any `std.Io.Writer`. The template references captures: `$0`/`$1`/…
-by number, `${name}` by name (`${0}`/`${12}` to disambiguate), and `$$` for a literal `$`.
+The template references captures: `$0`/`$&` is the whole match, `$1`/`${name}` reference groups
+(`${0}`/`${12}` to disambiguate), and `$$` is a literal `$`. There are four forms:
 
 ```zig
 var re = try gex.compileRuntime(gpa, "(\\w+)@(\\w+)", &diag, .{});
@@ -180,11 +192,30 @@ defer sc.deinit(gpa);
 const slots = try gpa.alloc(?usize, re.slotCount());
 defer gpa.free(slots);
 
+// (a) write to any std.Io.Writer:
 var buf: [128]u8 = undefined;
 var w = std.Io.Writer.fixed(&buf);
 try re.replaceAll(&sc, "from a@b to c@d", "$2.$1", slots, &w);
-std.debug.print("{s}\n", .{w.buffered()});   // from b.a to d.c
+std.debug.print("{s}\n", .{w.buffered()});                 // from b.a to d.c
+
+// (b) get an owned []u8 (no Writer to manage):
+const out = try re.replaceAllAlloc(gpa, &sc, "a@b c@d", "$2.$1", slots);
+defer gpa.free(out);                                       // "b.a d.c"
+
+// (c) bounded — first match only (`replace`), or first n (`replaceN(..., n)`):
+try re.replace(&sc, "a@b c@d", "<$1>", slots, &w);         // only "a@b" → "<a>"
+
+// (d) callback — compute each replacement from the captures:
+try re.replaceAllWith(&sc, "a@b c@d", slots, &w, {}, struct {
+    fn run(_: void, c: gex.Captures, out_w: *std.Io.Writer) std.Io.Writer.Error!void {
+        for (c.groupSlice(1).?) |ch| try out_w.writeByte(std.ascii.toUpper(ch));
+    }
+}.run);                                                    // "A C"
 ```
+
+> **Performance:** a template that references no group (a constant, or only `$0`) runs at
+> span-search speed — the capture engine is skipped entirely. Only `$1`+/`${name}` templates pay
+> for captures.
 
 ### Choosing a specific backend
 

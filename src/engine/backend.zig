@@ -618,13 +618,22 @@ pub fn Engine(comptime Backend: type) type {
             input: []const u8,
             last: usize,
             finished: bool,
+            /// Pieces still allowed to yield (`splitN`'s bound). `maxInt` ⇒ unlimited (plain
+            /// `split`). When it reaches 1, the next `next()` yields the **whole remainder**
+            /// (no further splitting), exactly like Rust `splitn` / Python `maxsplit`. 0 ⇒ none.
+            remaining: usize = std.math.maxInt(usize),
 
             pub fn next(self: *SplitIterator) ?[]const u8 {
                 if (self.finished) return null;
+                if (self.remaining <= 1) { // last allowed piece is the unsplit remainder (or none if 0)
+                    self.finished = true;
+                    return if (self.remaining == 0) null else self.input[self.last..];
+                }
                 while (self.it.next()) |m| {
                     if (m.isEmpty()) continue;
                     const piece = self.input[self.last..m.start];
                     self.last = m.end;
+                    self.remaining -= 1;
                     return piece;
                 }
                 self.finished = true;
@@ -634,6 +643,13 @@ pub fn Engine(comptime Backend: type) type {
 
         pub fn split(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) SplitIterator {
             return .{ .it = findAll(program, scratch, input, opts), .input = input, .last = opts.start, .finished = false };
+        }
+
+        /// Like `split`, but yields **at most `n` pieces**: after `n − 1` separators the
+        /// remainder is returned unsplit as the final piece (`n == 0` ⇒ no pieces). The
+        /// `splitn`/`maxsplit` form. @stable-since: v0.5.0
+        pub fn splitN(program: *const Program, scratch: *Scratch, input: []const u8, n: usize, opts: SearchOptions) SplitIterator {
+            return .{ .it = findAll(program, scratch, input, opts), .input = input, .last = opts.start, .finished = false, .remaining = n };
         }
 
         // ── replace ───────────────────────────────────────────────────────────────────
@@ -651,15 +667,107 @@ pub fn Engine(comptime Backend: type) type {
             meta: Meta,
             writer: *std.Io.Writer,
         ) std.Io.Writer.Error!void {
+            return replaceCore(program, scratch, input, template, slots, meta, writer, std.math.maxInt(usize));
+        }
+
+        /// Replace only the **first** match (the `re.sub(count=1)` / Rust `replace` form).
+        /// @stable-since: v0.5.0
+        pub fn replace(
+            program: *const Program,
+            scratch: *Scratch,
+            input: []const u8,
+            template: []const u8,
+            slots: []?usize,
+            meta: Meta,
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            return replaceCore(program, scratch, input, template, slots, meta, writer, 1);
+        }
+
+        /// Replace the first **`n`** matches (`n == 0` ⇒ copy `input` verbatim). The
+        /// `replacen` / `maxsplit`-style bound. @stable-since: v0.5.0
+        pub fn replaceN(
+            program: *const Program,
+            scratch: *Scratch,
+            input: []const u8,
+            template: []const u8,
+            slots: []?usize,
+            meta: Meta,
+            writer: *std.Io.Writer,
+            n: usize,
+        ) std.Io.Writer.Error!void {
+            return replaceCore(program, scratch, input, template, slots, meta, writer, n);
+        }
+
+        /// Shared replace core: rewrite up to `limit` matches into `writer`, expanding
+        /// `template` per match. **Capture fast path:** captures are filled (the heavier
+        /// `searchCaptures`) only when the template actually references a group ≥ 1 or a
+        /// named group *and* the pattern has groups (`templateRefsGroup`); otherwise the
+        /// span-only `search` runs (the fast DFA path) and `$0`/`$$`/literals expand from
+        /// the span alone. So replacing with a constant or `$0` runs at search speed, not
+        /// capture-fill speed.
+        fn replaceCore(
+            program: *const Program,
+            scratch: *Scratch,
+            input: []const u8,
+            template: []const u8,
+            slots: []?usize,
+            meta: Meta,
+            writer: *std.Io.Writer,
+            limit: usize,
+        ) std.Io.Writer.Error!void {
             if (comptime !Backend.caps.captures)
-                @compileError("backend `" ++ @typeName(Backend) ++ "` does not support captures (replaceAll needs them)");
+                @compileError("backend `" ++ @typeName(Backend) ++ "` does not support captures (replace needs them)");
+            const needs_caps = meta.capture_count > 0 and templateRefsGroup(template);
             var written: usize = 0; // input consumed/emitted up to here
             var from: usize = 0; // next search start
+            var done: usize = 0; // replacements made so far
+            while (done < limit and from <= input.len) {
+                @memset(slots, null);
+                var m: Match = undefined;
+                if (needs_caps) {
+                    m = Backend.searchCaptures(program, scratch, input, slots, .{ .start = from }) orelse break;
+                } else {
+                    m = Backend.search(program, scratch, input, .{ .start = from }) orelse break;
+                    if (slots.len >= 2) { // group 0 (the whole match) drives `$0`/`$&`
+                        slots[0] = m.start;
+                        slots[1] = m.end;
+                    }
+                }
+                try writer.writeAll(input[written..m.start]);
+                try expandTemplate(writer, template, .{ .slots = slots, .meta = meta, .input = input });
+                written = m.end;
+                from = if (m.end > m.start) m.end else advanceCodePoint(input, m.end);
+                done += 1;
+            }
+            try writer.writeAll(input[written..]);
+        }
+
+        /// Replace every match, computing each replacement with a **callback** instead of a
+        /// `$`-template: `replacer(context, caps, writer)` writes the replacement for one
+        /// match (it may read `caps.group(i)`/`caps.named(...)` and format freely). The
+        /// escape hatch for replacements the template DSL can't express. Captures are always
+        /// resolved (the callback may want them); a group-less pattern stays cheap via the
+        /// backend's anchored capture short-circuit. @stable-since: v0.5.0
+        pub fn replaceAllWith(
+            program: *const Program,
+            scratch: *Scratch,
+            input: []const u8,
+            slots: []?usize,
+            meta: Meta,
+            writer: *std.Io.Writer,
+            context: anytype,
+            comptime replacer: fn (@TypeOf(context), Captures, *std.Io.Writer) std.Io.Writer.Error!void,
+        ) std.Io.Writer.Error!void {
+            if (comptime !Backend.caps.captures)
+                @compileError("backend `" ++ @typeName(Backend) ++ "` does not support captures (replaceAllWith needs them)");
+            var written: usize = 0;
+            var from: usize = 0;
             while (from <= input.len) {
                 @memset(slots, null);
                 const m = Backend.searchCaptures(program, scratch, input, slots, .{ .start = from }) orelse break;
                 try writer.writeAll(input[written..m.start]);
-                try expandTemplate(writer, template, .{ .slots = slots, .meta = meta, .input = input });
+                try replacer(context, .{ .slots = slots, .meta = meta, .input = input }, writer);
                 written = m.end;
                 from = if (m.end > m.start) m.end else advanceCodePoint(input, m.end);
             }
@@ -682,6 +790,55 @@ fn advanceCodePoint(input: []const u8, i: usize) usize {
 
 fn isDigit(c: u8) bool {
     return c >= '0' and c <= '9';
+}
+
+/// Whether `template` references a capture **group** — `$N`/`${N}` with `N ≥ 1`, or a named
+/// `${name}` — i.e. anything beyond `$0`/`$&` (the whole match), `$$`, and literal text. Drives
+/// the replace capture fast path: a template that needs no group runs span-only (`$0` comes from
+/// the match span). Conservative — any `${…}` whose key is not all-digits, or a digit ref ≥ 1,
+/// counts. Scanned once per replace call, not per match.
+///
+/// @stable-since: v0.5.0
+fn templateRefsGroup(template: []const u8) bool {
+    var i: usize = 0;
+    while (i < template.len) {
+        if (template[i] != '$' or i + 1 >= template.len) {
+            i += 1;
+            continue;
+        }
+        const n = template[i + 1];
+        switch (n) {
+            '$' => i += 2, // escaped literal `$`
+            '{' => {
+                const close = std.mem.indexOfScalarPos(u8, template, i + 2, '}') orelse {
+                    i += 1;
+                    continue;
+                };
+                const key = template[i + 2 .. close];
+                var all_digits = key.len > 0;
+                var num: usize = 0;
+                for (key) |c| {
+                    if (!isDigit(c)) {
+                        all_digits = false;
+                        break;
+                    }
+                    num = num * 10 + (c - '0');
+                }
+                // A named key, or `${N}` with N ≥ 1, needs captures; `${0}` is the whole match.
+                if (!all_digits or num >= 1) return true;
+                i = close + 1;
+            },
+            '0'...'9' => {
+                var j = i + 1;
+                var num: usize = 0;
+                while (j < template.len and isDigit(template[j])) : (j += 1) num = num * 10 + (template[j] - '0');
+                if (num >= 1) return true; // `$1`+ → a real group
+                i = j; // `$0` → the whole match, no captures needed
+            },
+            else => i += 1, // `$` then something else → literal `$`
+        }
+    }
+    return false;
 }
 
 /// Expand a `$`-template against one set of captures (`$$`, `$N`, `${N}`, `${name}`).
@@ -883,6 +1040,77 @@ test "replaceAll with $ template expansion" {
     var w2 = std.Io.Writer.fixed(&buf);
     try E.replaceAll(&prog, &s, "abc", "[$1|$$]", &slots, meta, &w2);
     try testing.expectEqualStrings("a[bc|$]", w2.buffered());
+}
+
+test "templateRefsGroup classifies templates (drives the replace fast path)" {
+    // No group reference → span-only fast path is sound.
+    try testing.expect(!templateRefsGroup("literal text"));
+    try testing.expect(!templateRefsGroup("<$0>")); // $0 = whole match, not a group
+    try testing.expect(!templateRefsGroup("a $$ b")); // escaped $
+    try testing.expect(!templateRefsGroup("${0}")); // ${0} = whole match
+    try testing.expect(!templateRefsGroup("trailing $")); // dangling $
+    // Real group references → captures required.
+    try testing.expect(templateRefsGroup("$1"));
+    try testing.expect(templateRefsGroup("$2/$1"));
+    try testing.expect(templateRefsGroup("${name}"));
+    try testing.expect(templateRefsGroup("${12}"));
+    try testing.expect(templateRefsGroup("x$0y$3z")); // $0 ok but $3 forces captures
+}
+
+test "replace / replaceN honor the limit" {
+    var prog = MockLiteral.Program{ .needle = "x" };
+    var s = MockLiteral.Scratch{};
+    var slots: [2]?usize = undefined;
+    const meta = Meta{ .capture_count = 0 };
+    var buf: [64]u8 = undefined;
+
+    var w = std.Io.Writer.fixed(&buf);
+    try E.replace(&prog, &s, "xxx", "-", &slots, meta, &w); // first only
+    try testing.expectEqualStrings("-xx", w.buffered());
+
+    var w2 = std.Io.Writer.fixed(&buf);
+    try E.replaceN(&prog, &s, "xxxx", "-", &slots, meta, &w2, 2);
+    try testing.expectEqualStrings("--xx", w2.buffered());
+
+    var w3 = std.Io.Writer.fixed(&buf);
+    try E.replaceN(&prog, &s, "xxxx", "-", &slots, meta, &w3, 0); // verbatim
+    try testing.expectEqualStrings("xxxx", w3.buffered());
+}
+
+const Wrap = struct {
+    fn run(_: Wrap, caps: Captures, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.writeByte('(');
+        try w.writeAll(caps.match().slice(caps.input));
+        try w.writeByte(')');
+    }
+};
+
+test "replaceAllWith: callback replacement" {
+    var prog = MockLiteral.Program{ .needle = "ab" };
+    var s = MockLiteral.Scratch{};
+    var slots: [2]?usize = undefined;
+    const meta = Meta{ .capture_count = 0 };
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try E.replaceAllWith(&prog, &s, "ababc", &slots, meta, &w, Wrap{}, Wrap.run);
+    try testing.expectEqualStrings("(ab)(ab)c", w.buffered());
+}
+
+test "splitN: bounded pieces, remainder unsplit" {
+    var prog = MockLiteral.Program{ .needle = "," };
+    var s = MockLiteral.Scratch{};
+
+    var it = E.splitN(&prog, &s, "a,b,c,d", 2, .{});
+    try testing.expectEqualStrings("a", it.next().?);
+    try testing.expectEqualStrings("b,c,d", it.next().?);
+    try testing.expect(it.next() == null);
+
+    var it1 = E.splitN(&prog, &s, "a,b,c", 1, .{});
+    try testing.expectEqualStrings("a,b,c", it1.next().?);
+    try testing.expect(it1.next() == null);
+
+    var it0 = E.splitN(&prog, &s, "a,b", 0, .{});
+    try testing.expect(it0.next() == null);
 }
 
 test {

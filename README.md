@@ -309,7 +309,10 @@ while (it.next()) |hit| _ = hit.slice(text); // "the","quick","brown","fox"
 
 var parts = re.split(&sc, "a, b ,c");      // split on the pattern
 while (parts.next()) |piece| _ = piece;    // "a, b ,c" split on /\w+/ → punctuation/spaces
+var head = re.splitN(&sc, "a,b,c,d", 2);   // at most 2 pieces: "a", then "b,c,d"
 ```
+
+The `*At` variants take `SearchOptions` to resume/anchor: `isMatchAt`, `findAt`, `capturesAt`.
 
 Matching is **leftmost-first** (Perl/JS), linear-time, and Unicode-correct. `find`
 returns `null` (not an error) when there is no match.
@@ -349,7 +352,14 @@ var cit = re.capturesAll(&sc, slots, "a@b x@y");
 while (cit.next()) |c| _ = c.namedSlice("user"); // "a", then "x"
 ```
 
-### 4. Replace — `replaceAll` with `$0`/`$1`/`$name` templates
+Map group names ↔ indices straight from the compiled pattern (no match needed) with
+`re.groupIndex("user")` (→ `?usize`) and `re.groupName(1)` (→ `?[]const u8`).
+
+### 4. Replace — templates, counts, an owned string, or a callback
+
+`$0`/`$&` is the whole match, `$1`/`${name}` reference groups, `$$` is a literal `$`.
+There's a `Writer`-based form, a count-bounded form, an **allocating** form, and a
+**callback** form:
 
 ```zig
 var re = try gex.compileRuntime(gpa, "(\\w+)@(\\w+)", &diag, .{});
@@ -359,10 +369,29 @@ defer sc.deinit(gpa);
 const slots = try gpa.alloc(?usize, re.slotCount());
 defer gpa.free(slots);
 
+// (a) into a Writer:
 var out: std.Io.Writer.Allocating = .init(gpa);
 defer out.deinit();
 try re.replaceAll(&sc, "bob@example", "$2/$1", slots, &out.writer); // "example/bob"
+
+// (b) get an owned []u8 directly — no Writer to build:
+const s = try re.replaceAllAlloc(gpa, &sc, "bob@example", "$2/$1", slots); // "example/bob"
+defer gpa.free(s);
+
+// (c) bounded: only the first match (`replace`), or the first n (`replaceN(..., n)`).
+try re.replace(&sc, "a@b c@d", "<$1>", slots, &out.writer); // first match only
+
+// (d) callback — compute each replacement from the captures:
+try re.replaceAllWith(&sc, "a@b c@d", slots, &out.writer, {}, struct {
+    fn run(_: void, c: gex.Captures, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        for (c.groupSlice(1).?) |ch| try w.writeByte(std.ascii.toUpper(ch)); // upper-case the user
+    }
+}.run);
 ```
+
+Replace is **fast by default**: a template that references no group (a constant, or only
+`$0`) runs at span-search speed (the DFA), skipping the capture engine entirely; only
+`$1`+/`${name}` templates pay for captures.
 
 ### 5. The same calls at comptime
 

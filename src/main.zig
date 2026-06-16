@@ -141,6 +141,54 @@ pub fn main(init: std.process.Init) !void {
     const year = comptime ReNamed.capturesComptime("y2026-06").?.namedSlice("year").?;
     std.debug.print("comptime const:    year = \"{s}\"\n", .{year});
 
+    // ── replace family / splitN / capturesAt / group lookups (v0.5.0) ─────────
+    std.debug.print("\n── replace / split / group lookups ──\n", .{});
+
+    // group name ↔ index straight from the compiled metadata — no match needed.
+    std.debug.print("groupIndex(\"word\")={?d}  groupName(1)=\"{?s}\"\n", .{ re.groupIndex("word"), re.groupName(1) });
+
+    // capturesAt: resume a capture search at a byte offset (the peer of findAt/isMatchAt).
+    if (re.capturesAt(&sc, cap_slots, text, .{ .start = 5 })) |c|
+        std.debug.print("capturesAt(start=5): word=\"{s}\"\n", .{c.namedSlice("word").?});
+
+    // The replace family, on a capturing pattern.
+    var mdiag: ezi_gex.Diagnostic = .{};
+    var mre = try ezi_gex.compileRuntime(gpa, "(\\w+)@(\\w+)", &mdiag, .{});
+    defer mre.deinit();
+    var msc = try @TypeOf(mre).Scratch.init(gpa, &mre.program);
+    defer msc.deinit(gpa);
+    const mslots = try gpa.alloc(?usize, mre.slotCount());
+    const emails = "to alice@example and bob@test";
+
+    var rbuf: [256]u8 = undefined;
+    var rw = std.Io.Writer.fixed(&rbuf);
+    try mre.replace(&msc, emails, "<$1>", mslots, &rw); // first match only
+    std.debug.print("replace (first):    {s}\n", .{rw.buffered()});
+
+    // replaceAllAlloc — get the rewritten string as an owned slice; no Writer to manage.
+    const swapped = try mre.replaceAllAlloc(gpa, &msc, emails, "$2.$1", mslots);
+    std.debug.print("replaceAllAlloc:    {s}\n", .{swapped});
+
+    // replaceAllWith — a callback computes each replacement (here: upper-case the user).
+    var cw = std.Io.Writer.fixed(&rbuf);
+    try mre.replaceAllWith(&msc, emails, mslots, &cw, {}, struct {
+        fn run(_: void, c: ezi_gex.Captures, out: *std.Io.Writer) std.Io.Writer.Error!void {
+            for (c.groupSlice(1).?) |ch| try out.writeByte(std.ascii.toUpper(ch));
+        }
+    }.run);
+    std.debug.print("replaceAllWith:     {s}\n", .{cw.buffered()});
+
+    // splitN — at most N pieces; the remainder after N−1 separators is the final piece.
+    var cdiag: ezi_gex.Diagnostic = .{};
+    var cre = try ezi_gex.compileRuntime(gpa, ",", &cdiag, .{});
+    defer cre.deinit();
+    var csc = try @TypeOf(cre).Scratch.init(gpa, &cre.program);
+    defer csc.deinit(gpa);
+    std.debug.print("splitN(\"a,b,c,d\", 2):", .{});
+    var nit = cre.splitN(&csc, "a,b,c,d", 2);
+    while (nit.next()) |piece| std.debug.print(" [{s}]", .{piece});
+    std.debug.print("\n", .{});
+
     // ══ Byte engine: the zero-decode byte-NFA substrate (v0.2.0) ═══════════════
     // `bytepike` executes a byte-grained lowering of the HIR: each step consumes one
     // input BYTE against a byte range, so a Unicode class matches with NO decode. It

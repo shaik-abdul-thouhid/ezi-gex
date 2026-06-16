@@ -11,6 +11,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Replace family + iterator/lookup API round-out.** The public surface gains the methods that
+  bring it to parity with Rust `regex` / Python `re` / Go `regexp`, on both `Compiled` and the
+  agnostic `Engine`. All `@stable-since v0.5.0`, results-pinned by the conformance suite:
+  - **`replace`** — rewrite only the **first** match (`re.sub(count=1)` / Rust `replace`).
+  - **`replaceN`** — rewrite the first **`n`** matches (`n == 0` copies verbatim).
+  - **`replaceAllAlloc`** — replace-all returning an owned `[]u8` (no caller-built `Writer`) — the
+    most-requested replace ergonomic.
+  - **`replaceAllWith`** — replace-all where a **callback** `fn(ctx, Captures, *Writer)` computes
+    each replacement, the escape hatch for replacements the `$`-template DSL can't express.
+  - **`capturesAt`** — `captures` with `SearchOptions` (resume at `.start` / `.anchored`), the
+    capture-filling peer of `findAt`/`isMatchAt` (closes that asymmetry).
+  - **`splitN`** — split into at most `n` pieces (the remainder after `n − 1` separators is the
+    final piece) — the `splitn`/`maxsplit` form.
+  - **`groupIndex(name)` / `groupName(index)`** — map capture-group names ↔ indices straight from
+    the compiled metadata, no match required (Rust `capture_names`, Python `groupindex`).
 - **`\b`-wrapped pure-literal O(1) boundary confirm** (`auto`, `Filter.lit_wb_confirm`). When the
   whole pattern is a literal wrapped in leading/trailing word-boundary assertions (`\bthe\b`,
   `the\b`, `\bfoo`, `\Bx\B`), a `memmem` prefix hit already confirms the literal, so the match is
@@ -34,6 +49,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Replace runs at search speed when the template needs no captures.** `replaceAll`/`replace`/
+  `replaceN` previously ran the capturing engine (`searchCaptures` → the Pike VM / one-pass table)
+  on **every** match — even replacing with a constant or `$0`, where no group is referenced. The
+  template is now analysed **once** (`templateRefsGroup`): if it references no group ≥ 1 and no named
+  group, the loop uses the span-only `search` (the fast DFA path) and expands `$0`/`$$`/literals from
+  the match span alone. Capture-referencing templates (`$2/$1`, `${name}`) are unchanged. Paired with
+  a **group-less short-circuit** in `auto.fillCapturesAnchored` (a pattern with no capture groups
+  fills group 0 straight from the DFA span — no engine), so `captures`/`capturesAll`/`replaceAllWith`
+  on `\d+`/`\w+`-style patterns also skip the Pike VM pass. Results-invariant (the conformance
+  differential and a revert-failing replace test pin span and bytes).
 - **Eager-DFA / byte-lowering build is no longer quadratic in a Unicode class's size** — the
   `\p{…}`/`\w` compile-time cliff is gone. Two independent `O(class²)` hot spots were the cause, both
   now linear:

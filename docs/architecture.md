@@ -191,8 +191,14 @@ pub fn Scratch.deinit(self, allocator) void;
 
 `Engine(Backend)` implements **everything else once, generically** on top of
 `search`/`searchCaptures`: `find`, `findAll`, `captures`, `capturesAll`, `count`,
-`split`, `replaceAll`. A backend never writes iteration, capture views, or template
-expansion.
+`split`/`splitN`, and the replace family — `replaceAll`, `replace` (first), `replaceN`
+(first *n*), and `replaceAllWith` (a callback computes each replacement). A backend never
+writes iteration, capture views, or template expansion.
+
+The replace ops share a core that analyses the `$`-template **once**: when it references no
+capture group (only `$0`/`$$`/literals) the core uses the span-only `search` (the fast DFA
+path) and expands from the match span alone — only `$1`+/`${name}` templates invoke
+`searchCaptures`. So replacing with a constant runs at search speed, not capture-fill speed.
 
 ### The split of responsibilities
 
@@ -601,6 +607,7 @@ The contract is the seam that makes these drop-in:
 | ✅ *(0.5.0)* | **Eager-DFA determinization budget** (`auto.EAGER_BYTE_INST_MAX`) — `auto` only attempts the eager DFA when the byte NFA is small enough to determinize cheaply; a big Unicode-class join (`\w+@\w+`, `[\w.+-]+@…`) goes straight to the lazy DFA. The email pattern's eager DFA overflowed `max_states` and declined anyway after burning ~0.9 s | done | **email compile ~0.88 s → ~6 ms (≈140×)**, runtime unchanged (already lazy) |
 | ✅ *(0.5.0)* | **Determinization + byte-lowering are no longer `O(class²)`** — a Unicode class is an `x+` loop over a fan-out split tree, so every char-completing edge re-closed the loop-back split (re-walk the whole tree, re-intern the same big state), and the byte lowering's suffix cache scanned the byte-range DAG linearly per tail. Fixed by a **single-seed closure cache** (`Det.ss_cache`/`RDet.rss_cache` — memoize `closure([pc])` by `(seed pc, ctx)`, forward + reverse; exact key, context bits folded in for `\b`/`(?m)`) and a **hashed suffix cache** (`Builder.tail_hash`, `(lo,hi,next)` → pc). Pure build-time, results-invariant | done | compile: `\p{L}+` 31.9 → ~1.0 ms (≈32×), `\w+` 45 → ~0.8 ms (≈54×), `\b\w+\b` 47.6 → ~1.3 ms (≈38×); email byte-lowering 6 → <1 ms |
 | ✅ *(0.5.0)* | **Prone + prefiltered → lazy-DFA cascade** (`edfa.Options.decline_if_prone`) — a *prone* pattern needs the eager DFA's frozen **reverse** table for its two-pass `find`, but when `auto` has a start-skip prefilter (leading literal / alternation / interior anchor) the find is prefilter-driven and that table is built-but-unused. `auto` declines the eager DFA right after the cheap proneness check and uses the lazy DFA (same prefilter, same spans, near-zero build) | done | **`the\s+\p{L}+` compile ~107 ms → ~0.6 ms (≈188×)**, search unchanged |
+| ✅ *(0.5.0)* | **Replace skips the capture engine when the template needs none** — `replaceAll`/`replace`/`replaceN` analyse the `$`-template once (`templateRefsGroup`); a template that references no group ≥ 1 / named group runs the span-only `search` (DFA) and expands `$0`/`$$`/literals from the span, instead of a Pike VM / one-pass capture fill per match. Plus a group-less short-circuit in `auto.fillCapturesAnchored` (0-group pattern → fill group 0 from the span, no engine) — also speeds `captures`/`capturesAll`/`replaceAllWith` | done | a constant/`$0` replace runs at DFA span speed instead of capture-fill speed (GiB/s vs ~hundreds of MiB/s) |
 
 ### The byte substrate (tier 3a, landed)
 

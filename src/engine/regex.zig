@@ -356,6 +356,102 @@ pub fn Compiled(comptime B: type) type {
             return Eng.replaceAll(&self.program, scratch, input, template, slots, self.meta, writer);
         }
 
+        /// `captures` with explicit `SearchOptions` (resume at `.start`, or `.anchored`) —
+        /// the capture-filling peer of `findAt`/`isMatchAt`.
+        ///
+        /// @stable-since: v0.5.0
+        pub fn capturesAt(self: *const Self, scratch: *Scratch, slots: []?usize, input: []const u8, opts: backend.SearchOptions) ?Captures {
+            return Eng.captures(&self.program, scratch, input, slots, self.meta, opts);
+        }
+        /// Replace only the **first** match (template syntax as `replaceAll`).
+        ///
+        /// @stable-since: v0.5.0
+        pub fn replace(
+            self: *const Self,
+            scratch: *Scratch,
+            input: []const u8,
+            template: []const u8,
+            slots: []?usize,
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            return Eng.replace(&self.program, scratch, input, template, slots, self.meta, writer);
+        }
+        /// Replace the first **`n`** matches (`n == 0` copies the input verbatim).
+        ///
+        /// @stable-since: v0.5.0
+        pub fn replaceN(
+            self: *const Self,
+            scratch: *Scratch,
+            input: []const u8,
+            template: []const u8,
+            slots: []?usize,
+            writer: *std.Io.Writer,
+            n: usize,
+        ) std.Io.Writer.Error!void {
+            return Eng.replaceN(&self.program, scratch, input, template, slots, self.meta, writer, n);
+        }
+        /// Replace every match and return the result as a freshly **allocated** `[]u8`
+        /// (caller frees). The convenience over `replaceAll` for when you just want the
+        /// string and don't have a `Writer` (errors are `OutOfMemory`).
+        ///
+        /// @stable-since: v0.5.0
+        pub fn replaceAllAlloc(
+            self: *const Self,
+            allocator: std.mem.Allocator,
+            scratch: *Scratch,
+            input: []const u8,
+            template: []const u8,
+            slots: []?usize,
+        ) std.mem.Allocator.Error![]u8 {
+            var out: std.Io.Writer.Allocating = .init(allocator);
+            errdefer out.deinit();
+            // An Allocating writer fails only on OOM, so `WriteFailed` ⇒ `OutOfMemory`.
+            Eng.replaceAll(&self.program, scratch, input, template, slots, self.meta, &out.writer) catch return error.OutOfMemory;
+            return out.toOwnedSlice();
+        }
+        /// Replace every match, computing each replacement with a **callback**
+        /// `replacer(context, captures, writer)` instead of a `$`-template — the escape
+        /// hatch for replacements the template DSL can't express (uppercase the match,
+        /// look up a table, format a number from a group).
+        ///
+        /// @stable-since: v0.5.0
+        pub fn replaceAllWith(
+            self: *const Self,
+            scratch: *Scratch,
+            input: []const u8,
+            slots: []?usize,
+            writer: *std.Io.Writer,
+            context: anytype,
+            comptime replacer: fn (@TypeOf(context), Captures, *std.Io.Writer) std.Io.Writer.Error!void,
+        ) std.Io.Writer.Error!void {
+            return Eng.replaceAllWith(&self.program, scratch, input, slots, self.meta, writer, context, replacer);
+        }
+        /// Iterator over the substrings between matches, yielding **at most `n` pieces**
+        /// (the remainder after `n − 1` separators is the final piece). The `splitn` form.
+        ///
+        /// @stable-since: v0.5.0
+        pub fn splitN(self: *const Self, scratch: *Scratch, input: []const u8, n: usize) Eng.SplitIterator {
+            return Eng.splitN(&self.program, scratch, input, n, .{});
+        }
+        /// The index of the capture group named `name` (1-based; group 0 is the whole
+        /// match), or null if there is no such name. Resolves from the compiled metadata —
+        /// no match required.
+        ///
+        /// @stable-since: v0.5.0
+        pub fn groupIndex(self: Self, name: []const u8) ?usize {
+            for (self.meta.group_names, 0..) |gn, g| {
+                if (gn) |n| if (std.mem.eql(u8, n, name)) return g;
+            }
+            return null;
+        }
+        /// The name of capture group `index`, or null (no name, or out of range).
+        ///
+        /// @stable-since: v0.5.0
+        pub fn groupName(self: Self, index: usize) ?[]const u8 {
+            if (index >= self.meta.group_names.len) return null;
+            return self.meta.group_names[index];
+        }
+
         // ── comptime matching (no allocator, no runtime cost) ─────────────────────
         //
         // When the whole regex is comptime-known (`compileComptime`), these run the
@@ -684,6 +780,147 @@ test "front-door iterators and replace" {
     try testing.expectEqualStrings("quick", it.next().?);
     try testing.expectEqualStrings("fox", it.next().?);
     try testing.expect(it.next() == null);
+}
+
+// ── v0.5.0 API additions: replace family, capturesAt, splitN, group name/index ──
+
+test "replace / replaceN: bounded replacement counts" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "\\d+", &diag, .{});
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    var slots: [2]?usize = undefined;
+    var buf: [64]u8 = undefined;
+
+    var w = std.Io.Writer.fixed(&buf);
+    try re.replace(&sc, "a1b22c333", "#", &slots, &w); // first only
+    try testing.expectEqualStrings("a#b22c333", w.buffered());
+
+    var w2 = std.Io.Writer.fixed(&buf);
+    try re.replaceN(&sc, "a1b22c333", "#", &slots, &w2, 2); // first two
+    try testing.expectEqualStrings("a#b#c333", w2.buffered());
+
+    var w3 = std.Io.Writer.fixed(&buf);
+    try re.replaceN(&sc, "a1b22c333", "#", &slots, &w3, 0); // none → verbatim
+    try testing.expectEqualStrings("a1b22c333", w3.buffered());
+}
+
+test "replaceAllAlloc returns an owned slice" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "(\\w+)@(\\w+)", &diag, .{});
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    const slots = try testing.allocator.alloc(?usize, re.slotCount());
+    defer testing.allocator.free(slots);
+    const out = try re.replaceAllAlloc(testing.allocator, &sc, "to bob@host now", "$2/$1", slots);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("to host/bob now", out);
+}
+
+const UpperCtx = struct {
+    fn run(_: UpperCtx, caps: Captures, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        for (caps.match().slice(caps.input)) |c| try w.writeByte(std.ascii.toUpper(c));
+    }
+};
+
+test "replaceAllWith: callback computes each replacement" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "[a-z]+", &diag, .{});
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    var slots: [2]?usize = undefined;
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try re.replaceAllWith(&sc, "say hi to bob", &slots, &w, UpperCtx{}, UpperCtx.run);
+    try testing.expectEqualStrings("SAY HI TO BOB", w.buffered());
+}
+
+test "replace fast path is results-identical to the capture path (revert-failing)" {
+    // A group-referencing template MUST still fill captures — if `templateRefsGroup` wrongly
+    // returned false, `$2$1` would expand to empty. And a group-LESS pattern with a `$0`/literal
+    // template runs the span-only fast path and must produce the same bytes as before.
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "(\\d)(\\d)", &diag, .{});
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    const slots = try testing.allocator.alloc(?usize, re.slotCount());
+    defer testing.allocator.free(slots);
+    var buf: [64]u8 = undefined;
+
+    var w = std.Io.Writer.fixed(&buf);
+    try re.replaceAll(&sc, "x12y34z", "$2$1", slots, &w); // refs groups → must swap digits
+    try testing.expectEqualStrings("x21y43z", w.buffered());
+
+    // Group-less pattern, `$0` + literal template → fast (span-only) path, same result.
+    var re2 = try compileRuntime(testing.allocator, "\\d+", &diag, .{});
+    defer re2.deinit();
+    var sc2 = try @TypeOf(re2).Scratch.init(testing.allocator, &re2.program);
+    defer sc2.deinit(testing.allocator);
+    var slots2: [2]?usize = undefined;
+    var w2 = std.Io.Writer.fixed(&buf);
+    try re2.replaceAll(&sc2, "a1b22c", "<$0>", &slots2, &w2);
+    try testing.expectEqualStrings("a<1>b<22>c", w2.buffered());
+}
+
+test "captures on a group-less pattern (fillCapturesAnchored short-circuit) still gives group 0" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "\\d+", &diag, .{});
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    var slots: [2]?usize = undefined;
+    const c = re.captures(&sc, &slots, "ab123cd").?;
+    try testing.expectEqualStrings("123", c.groupSlice(0).?);
+    try testing.expectEqual(@as(usize, 1), c.count());
+}
+
+test "capturesAt resumes a capture search at an offset" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "(\\d+)", &diag, .{});
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    var slots: [4]?usize = undefined;
+    // Skip the first number by starting past it.
+    const c = re.capturesAt(&sc, &slots, "11 22 33", .{ .start = 3 }).?;
+    try testing.expectEqualStrings("22", c.groupSlice(1).?);
+}
+
+test "splitN: at most n pieces, remainder unsplit" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, ",", &diag, .{});
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+
+    var it = re.splitN(&sc, "a,b,c,d", 2);
+    try testing.expectEqualStrings("a", it.next().?);
+    try testing.expectEqualStrings("b,c,d", it.next().?); // remainder, unsplit
+    try testing.expect(it.next() == null);
+
+    var it1 = re.splitN(&sc, "a,b,c", 1);
+    try testing.expectEqualStrings("a,b,c", it1.next().?); // whole input
+    try testing.expect(it1.next() == null);
+
+    var it0 = re.splitN(&sc, "a,b,c", 0);
+    try testing.expect(it0.next() == null); // no pieces
+}
+
+test "groupIndex / groupName resolve named groups without a match" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "(?<year>\\d{4})-(?<mon>\\d{2})", &diag, .{});
+    defer re.deinit();
+    try testing.expectEqual(@as(?usize, 1), re.groupIndex("year"));
+    try testing.expectEqual(@as(?usize, 2), re.groupIndex("mon"));
+    try testing.expectEqual(@as(?usize, null), re.groupIndex("nope"));
+    try testing.expectEqualStrings("year", re.groupName(1).?);
+    try testing.expectEqualStrings("mon", re.groupName(2).?);
+    try testing.expect(re.groupName(0) == null); // whole match has no name
+    try testing.expect(re.groupName(9) == null); // out of range
 }
 
 // ── Full case folding (case_fold = .full) ─────────────────────────────────────
