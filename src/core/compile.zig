@@ -55,6 +55,15 @@ pub const Outcome = union(enum) {
 ///
 /// @stable-since: v0.1.0
 pub fn parse(allocator: std.mem.Allocator, pattern: []const u8, diag: *Diagnostic) Error!Ast {
+    return parseWith(allocator, pattern, diag, .{});
+}
+
+/// `parse` with caller-chosen scan `Limits` (currently the `{m,n}` ceiling).
+/// `parse` is exactly `parseWith(.., .{})`; everything else — heap provisioning,
+/// dupe-to-exact, the `Diagnostic` contract — is identical.
+///
+/// @stable-since: v0.1.0
+pub fn parseWith(allocator: std.mem.Allocator, pattern: []const u8, diag: *Diagnostic, limits: scanner.Limits) Error!Ast {
     const sizes = scanner.requiredSizes(pattern.len);
 
     // Oversized backing storage. Released unconditionally on the way out; the
@@ -74,7 +83,7 @@ pub fn parse(allocator: std.mem.Allocator, pattern: []const u8, diag: *Diagnosti
     const frames = try allocator.alloc(scanner.Frame, sizes.frames);
     defer allocator.free(frames);
 
-    const raw = try scanner.scan(pattern, diag, .{
+    const raw = try scanner.scanWith(pattern, diag, .{
         .nodes = nodes,
         .children = children,
         .class_items = items,
@@ -82,7 +91,7 @@ pub fn parse(allocator: std.mem.Allocator, pattern: []const u8, diag: *Diagnosti
         .seq = seq,
         .alt = alt,
         .frames = frames,
-    });
+    }, limits);
 
     const final_nodes = try allocator.dupe(ast.Node, raw.nodes);
     errdefer allocator.free(final_nodes);
@@ -128,6 +137,14 @@ pub fn parseReporting(allocator: std.mem.Allocator, pattern: []const u8, ctx: an
 ///
 /// @stable-since: v0.1.0
 pub fn parseComptime(comptime pattern: []const u8) Outcome {
+    return parseComptimeWith(pattern, .{});
+}
+
+/// `parseComptime` with caller-chosen scan `Limits` (currently the `{m,n}`
+/// ceiling). `parseComptime` is exactly `parseComptimeWith(.., .{})`.
+///
+/// @stable-since: v0.1.0
+pub fn parseComptimeWith(comptime pattern: []const u8, comptime limits: scanner.Limits) Outcome {
     // The quota is a CEILING on comptime backward-branches (a runaway-loop
     // guard), not a cost — raising it is free unless the work reaches it, and
     // the compiler stops at the actual work done. It must scale with the input
@@ -149,7 +166,7 @@ pub fn parseComptime(comptime pattern: []const u8) Outcome {
     var frames: [sizes.frames]scanner.Frame = undefined;
     var diag: Diagnostic = .{};
 
-    const raw = scanner.scan(pattern, &diag, .{
+    const raw = scanner.scanWith(pattern, &diag, .{
         .nodes = &nodes,
         .children = &children,
         .class_items = &items,
@@ -157,7 +174,7 @@ pub fn parseComptime(comptime pattern: []const u8) Outcome {
         .seq = &seq,
         .alt = &alt,
         .frames = &frames,
-    }) catch return .{ .fail = diag };
+    }, limits) catch return .{ .fail = diag };
 
     // Copy the used sub-slices into const arrays; `&` promotes them to ro_data
     // so the returned AST outlives this function's comptime locals.
@@ -183,8 +200,17 @@ pub fn parseComptime(comptime pattern: []const u8) Outcome {
 ///
 /// @stable-since: v0.1.0
 pub fn compile(comptime pattern: []const u8) Ast {
+    return compileWith(pattern, .{});
+}
+
+/// `compile` with caller-chosen scan `Limits` (currently the `{m,n}` ceiling).
+/// `compile` is exactly `compileWith(.., .{})`; a bad pattern (now including an
+/// over-limit `{m,n}`) is still a located `@compileError`.
+///
+/// @stable-since: v0.1.0
+pub fn compileWith(comptime pattern: []const u8, comptime limits: scanner.Limits) Ast {
     comptime {
-        return switch (parseComptime(pattern)) {
+        return switch (parseComptimeWith(pattern, limits)) {
             .ok => |a| a,
             .fail => |d| @compileError(std.fmt.comptimePrint(
                 "invalid regex: {s}\n  pattern: \"{s}\"\n  here:    \"{s}\" (bytes {d}..{d})",
@@ -327,6 +353,41 @@ test "comptime compiles a realistic, non-trivial pattern" {
     try testing.expectEqual(@as(u32, 3), re.capture_count);
     try testing.expectEqualStrings("user", re.names[0]);
     try testing.expectEqualStrings("tld", re.names[2]);
+}
+
+// ── Repetition limit (parseWith / compileWith) ───────────────────────────────
+
+test "parseWith enforces a custom repetition limit at runtime" {
+    var diag: Diagnostic = .{};
+    // Within the limit: parses fine.
+    const a = try parseWith(testing.allocator, "a{8}", &diag, .{ .max_repetition = 8 });
+    a.deinit(testing.allocator);
+    // Over the limit: InvalidPattern + the dedicated diagnostic.
+    try testing.expectError(error.InvalidPattern, parseWith(testing.allocator, "a{9}", &diag, .{ .max_repetition = 8 }));
+    try testing.expectEqual(ErrorCode.quantifier_exceeds_limit, diag.code);
+    try testing.expectEqualStrings("{9}", diag.faultySlice("a{9}"));
+}
+
+test "parse uses the default repetition limit" {
+    var diag: Diagnostic = .{};
+    // The default (100_000) accepts large but sane counts and rejects beyond it.
+    const a = try parse(testing.allocator, "a{4000}", &diag);
+    a.deinit(testing.allocator);
+    try testing.expectError(error.InvalidPattern, parse(testing.allocator, "a{100001}", &diag));
+    try testing.expectEqual(ErrorCode.quantifier_exceeds_limit, diag.code);
+}
+
+test "parseComptimeWith surfaces the limit diagnostic without compiling" {
+    const outcome = comptime parseComptimeWith("a{9}", .{ .max_repetition = 8 });
+    switch (outcome) {
+        .ok => return error.TestUnexpectedSuccess,
+        .fail => |d| try testing.expectEqual(ErrorCode.quantifier_exceeds_limit, d.code),
+    }
+}
+
+test "compileWith accepts a count within a raised limit" {
+    const a = comptime compileWith("a{500000}", .{ .max_repetition = 1_000_000 });
+    try testing.expect(a.nodes.len > 0);
 }
 
 test {

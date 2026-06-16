@@ -59,6 +59,33 @@ pub const Span = errors.Span;
 /// `OutOfMemory` for its heap path.
 pub const Fail = errors.SyntaxError; // error{InvalidPattern}
 
+// ── Scan-time limits ──────────────────────────────────────────────────────────
+
+/// Default ceiling for a bounded-repetition count (`{m,n}`, `{m}`, `{m,}`). A
+/// finite bound (`min`, or `max` when present) larger than this is rejected at
+/// scan time with `.quantifier_exceeds_limit`. Chosen well above any realistic
+/// hand-written count (e.g. `{2,63}`, `{4000}`) yet far below the hard u32
+/// ceiling, so a pathological `a{900000000}` is refused before it can blow up the
+/// downstream NFA/DFA. Override per-compile via `Options.max_repetition`.
+///
+/// @stable-since: v0.5.0
+pub const default_max_repetition: u32 = 100_000;
+
+/// Tunable limits the caller imposes on a single scan. Storage-agnostic like the
+/// rest of the scanner — these are pure value config, not buffers. The struct is
+/// open for additive growth (new fields get their own default), so passing `.{}`
+/// stays correct as it gains members.
+///
+/// @stable-since: v0.5.0
+pub const Limits = struct {
+    /// Largest finite bound permitted in a `{m,n}` / `{m}` / `{m,}` quantifier.
+    /// Both `m` and (when present) `n` are checked against it. `{m,}`'s unbounded
+    /// upper end is `*`-like and costs nothing, so only its `m` is checked.
+    /// A bound past this fails with `.quantifier_exceeds_limit`. The hard u32
+    /// overflow ceiling (`.quantifier_too_large`) still applies above this.
+    max_repetition: u32 = default_max_repetition,
+};
+
 // ── Lexer support types ───────────────────────────────────────────────────────
 
 /// Lexing context. `next` consults `Scanner.mode` to decide how bytes map to
@@ -159,6 +186,12 @@ pub const Scanner = struct {
     flags: token.Flags = .{},
     prev: Prev = .start,
     count_overflow: bool = false,
+
+    // config
+    /// Bounded-repetition ceiling for this scan (see `Limits.max_repetition`).
+    ///
+    /// @stable-since v0.5.0
+    max_repetition: u32 = default_max_repetition,
 
     inline fn atEnd(self: *const Scanner) bool {
         return self.pos >= self.len;
@@ -917,7 +950,12 @@ pub const Scanner = struct {
             const after = self.pos;
             if (try self.tryParseBrace()) |bq| {
                 if (self.count_overflow) return self.fail(.quantifier_too_large, Span.range(span.start, self.pos));
+                // Configurable ceiling (DoS guard), checked before order so an
+                // absurd bound is reported as "exceeds limit" even when reversed.
+                // `{m,}`'s unbounded upper end is free, so only finite bounds count.
+                if (bq.min > self.max_repetition) return self.fail(.quantifier_exceeds_limit, Span.range(span.start, self.pos));
                 if (bq.max) |mx| {
+                    if (mx > self.max_repetition) return self.fail(.quantifier_exceeds_limit, Span.range(span.start, self.pos));
                     if (bq.min > mx) return self.fail(.quantifier_out_of_order, Span.range(span.start, self.pos));
                 }
                 const child = self.seq[self.seq_len - 1];
@@ -1187,6 +1225,16 @@ pub const Buffers = struct {
 ///
 /// @stable-since: v0.1.0
 pub fn scan(pattern: []const u8, diag: *Diagnostic, buffers: Buffers) Fail!Ast {
+    return scanWith(pattern, diag, buffers, .{});
+}
+
+/// `scan` with caller-chosen `Limits` (currently the bounded-repetition ceiling).
+/// `scan` is exactly `scanWith(.., .{})`. Same storage-agnostic, no-allocation,
+/// comptime-and-runtime contract; the only difference is the count ceiling a
+/// `{m,n}` is checked against.
+///
+/// @stable-since: v0.5.0
+pub fn scanWith(pattern: []const u8, diag: *Diagnostic, buffers: Buffers, limits: Limits) Fail!Ast {
     diag.* = .{};
     var sc = Scanner{
         .pattern = pattern,
@@ -1199,6 +1247,7 @@ pub fn scan(pattern: []const u8, diag: *Diagnostic, buffers: Buffers) Fail!Ast {
         .seq = buffers.seq,
         .alt = buffers.alt,
         .frames = buffers.frames,
+        .max_repetition = limits.max_repetition,
     };
     const root = try sc.run();
     return Ast{
@@ -1444,6 +1493,38 @@ fn expectError(pattern: []const u8, code: ErrorCode) !void {
     }
 }
 
+/// Scan under explicit `limits` and assert it fails with exactly `code`.
+fn expectErrorWith(pattern: []const u8, limits: Limits, code: ErrorCode) !void {
+    var arena = try TestArena.init(pattern.len);
+    defer arena.deinit();
+    var diag: Diagnostic = .{};
+    if (scanWith(pattern, &diag, arena.buffers(), limits)) |_| {
+        std.debug.print("expected error {s} for \"{s}\" but it parsed\n", .{ @tagName(code), pattern });
+        return error.TestUnexpectedSuccess;
+    } else |e| {
+        try testing.expectEqual(error.InvalidPattern, e);
+        if (diag.code != code) {
+            std.debug.print("for \"{s}\": expected {s}, got {s}\n", .{ pattern, @tagName(code), @tagName(diag.code) });
+            return error.TestWrongErrorCode;
+        }
+    }
+}
+
+/// Scan under explicit `limits` and assert it succeeds (round-trips to `expected`).
+fn expectSexprWith(pattern: []const u8, limits: Limits, expected: []const u8) !void {
+    var arena = try TestArena.init(pattern.len);
+    defer arena.deinit();
+    var diag: Diagnostic = .{};
+    const a = scanWith(pattern, &diag, arena.buffers(), limits) catch |e| {
+        std.debug.print("unexpected error {s} ({s}) parsing \"{s}\"\n", .{ @errorName(e), @tagName(diag.code), pattern });
+        return e;
+    };
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try formatAst(a, &w);
+    try testing.expectEqualStrings(expected, w.buffered());
+}
+
 // ── Literals and concatenation ─────────────────────────────────────────────
 
 test "single literal" {
@@ -1533,6 +1614,36 @@ test "quantifier errors" {
     try expectError("a{99999999999}", .quantifier_too_large);
     try expectError("|*", .nothing_to_repeat);
     try expectError("(*)", .nothing_to_repeat);
+}
+
+test "bounded repetition respects the default limit" {
+    // At the default ceiling (100_000): a count just under it parses, the
+    // u32-overflow ceiling stays distinct, and an over-limit count is rejected
+    // with the dedicated `quantifier_exceeds_limit` (not `quantifier_too_large`).
+    try expectSexpr("a{4000}", "(rep 4000 4000 g (lit a))");
+    try expectSexpr("a{100000}", "(rep 100000 100000 g (lit a))");
+    try expectError("a{100001}", .quantifier_exceeds_limit);
+    try expectError("a{0,100001}", .quantifier_exceeds_limit);
+    try expectError("a{200000,}", .quantifier_exceeds_limit);
+    // The hard u32 ceiling is still its own error, above the configurable limit.
+    try expectError("a{99999999999}", .quantifier_too_large);
+}
+
+test "bounded repetition honors a custom limit" {
+    const tight: Limits = .{ .max_repetition = 8 };
+    try expectSexprWith("a{8}", tight, "(rep 8 8 g (lit a))");
+    try expectSexprWith("a{2,8}", tight, "(rep 2 8 g (lit a))");
+    try expectErrorWith("a{9}", tight, .quantifier_exceeds_limit);
+    try expectErrorWith("a{0,9}", tight, .quantifier_exceeds_limit);
+    try expectErrorWith("a{9,}", tight, .quantifier_exceeds_limit);
+    // An over-limit min still trumps an out-of-order pair (limit is checked first).
+    try expectErrorWith("a{9,1}", tight, .quantifier_exceeds_limit);
+    // Order check still fires when both bounds are within the limit.
+    try expectErrorWith("a{5,3}", tight, .quantifier_out_of_order);
+
+    // A generous limit accepts what the default would reject.
+    const wide: Limits = .{ .max_repetition = 1_000_000 };
+    try expectSexprWith("a{500000}", wide, "(rep 500000 500000 g (lit a))");
 }
 
 // ── Groups ─────────────────────────────────────────────────────────────────

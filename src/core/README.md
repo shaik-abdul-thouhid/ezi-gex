@@ -9,8 +9,8 @@ library you could use on its own (e.g. to build a different engine).
 | `token.zig` | token types; every escape/`\p{…}` name fully resolved here (no ambiguity leaves the lexer) |
 | `error.zig` | the diagnostic catalogue — `ErrorCode`, `Span`, `Diagnostic` (code + byte span + message + caret renderer). Comptime-evaluable |
 | `ast.zig` | the flat AST: three parallel arrays (`nodes`/`children`/`class_items`), no heap pointers, root is the *last*-emitted node |
-| `scanner.zig` | the lexer + single-pass parser. **Storage-agnostic** (`scan` fills caller `Buffers`); explicit stack, no recursion; handles the lex-time `(?x)` verbose flag (global + scoped) |
-| `compile.zig` | the comptime/runtime storage wrappers over `scan`: `parse` (heap), `parseComptime`/`compile` (ro_data) |
+| `scanner.zig` | the lexer + single-pass parser. **Storage-agnostic** (`scan` fills caller `Buffers`); explicit stack, no recursion; handles the lex-time `(?x)` verbose flag (global + scoped). `scanWith` takes a `Limits` (the `{m,n}` repetition ceiling, default `default_max_repetition` = 100_000), rejecting an over-limit bound with `quantifier_exceeds_limit` |
+| `compile.zig` | the comptime/runtime storage wrappers over `scan`: `parse` (heap), `parseComptime`/`compile` (ro_data), plus their `*With` peers that thread a `scanner.Limits` |
 | `hir.zig` | **AST → HIR**: applies/drops flags, resolves all Unicode to sorted/merged code-point ranges, case folding (simple + full 1→many for literals), simplification, and the prefilter `Analysis` |
 | `root.zig` | re-exports the above |
 

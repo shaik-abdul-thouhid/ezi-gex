@@ -36,7 +36,12 @@
 //! with `$`/`(?m)`, a *prone* `\b` (`\b.*x`), or a *chained* `\b\b` are declined. **Known,
 //! intentional gaps**, each declined to the code-point engines (correct + linear, just not
 //! DFA-accelerated): *mixed* `$` (`a$|b`), *prone* `(?m)`/`\b`, `\b`+`$`/`(?m)`, chained `\b\b`, and
-//! `\X` (a grapheme — variable-width, not a byte property). **Build-time:** determinization is
+//! `\X` (a grapheme — variable-width, not a byte property). **Plus the v0.5.0 leftmost-first safety
+//! gates** (the longest-match DFA can't reproduce leftmost-first around empty/zero-width constructs):
+//! `\b`/`\B` in/beside a nullable alternation (`\b|.`, `\B(?:|.*)`) or with a lazy repetition
+//! (`a*?\b`), a repetition over a nullable alternation (`(?:|.)+`), a non-trailing `$`/`\z` (`$b$`),
+//! and a non-trailing / under-repetition / anchor-mixed `(?m)` line anchor (`(?m:$\n)`). See the
+//! `hir.Analysis.*` flags consulted in `supports`. **Build-time:** determinization is
 //! hash-interned (~O(states)), so even big Unicode-class builds stay fast — a one-time cost, match
 //! time is O(input). All detailed below.
 //!
@@ -365,11 +370,12 @@ pub const Program = struct {
 pub fn supports(h: hir.Hir) bool {
     if (!byte.byteLowerable(h)) return false; // excludes \X (grapheme)
     var has_text_end = false;
+    var has_text_start = false;
     var has_line = false;
     var has_word = false;
     for (h.nodes) |n| {
         if (n.tag == .anchor) switch (n.data.anchor.kind) {
-            .text_start => {}, // text_start at offset 0 (the start closures)
+            .text_start => has_text_start = true, // `\A` / non-multiline `^`
             .line_start, .line_end => has_line = true, // line anchors via anchored restart
             .text_end => has_text_end = true,
             .word_boundary, .not_word_boundary => has_word = true, // ASCII \b/\B (see below)
@@ -388,6 +394,37 @@ pub fn supports(h: hir.Hir) bool {
     // **non-ASCII** input on the Pike VM too (Unicode word boundaries). Chained boundaries
     // (`\b\b`) are declined at build (`buildAlloc`/`buildComptime`).
     if (has_word and (has_text_end or has_line)) return false;
+    // A `\b`/`\B` inside an alternation needs leftmost-FIRST branch priority across
+    // the assertion, which the leftmost-longest DFA cannot encode: `\b|.` on `"b"`
+    // is the empty match `{0,0}` (first branch), not `{0,1}`. Decline to the Pike
+    // VM (correct + linear). See `hir.Analysis.word_boundary_in_alternation`.
+    if (h.analysis.word_boundary_in_alternation) return false;
+    // A repetition over a nullable alternation (`(?:|.)+`) has the same leftmost-
+    // first-vs-longest mismatch in the empty-loop direction — the DFA can't encode
+    // the JS-style empty-loop priority the Pike VM gives. Decline to the Pike VM.
+    // See `hir.Analysis.nullable_alternation_in_repetition`.
+    if (h.analysis.nullable_alternation_in_repetition) return false;
+    // A non-trailing `text_end` (`$a`, `\z.\z`): unsatisfiable past the anchor, but
+    // the reverse-from-end path keys off the trailing one and ignores the interior
+    // one → wrong match. Decline. See `hir.Analysis.interior_text_end`.
+    if (h.analysis.interior_text_end) return false;
+    // A `\b`/`\B` adjacent to a nullable alternation (`\B(?:|.*)`): same leftmost-
+    // first-across-an-assertion issue as `word_boundary_in_alternation`, boundary
+    // beside rather than inside the `|`. See `hir.Analysis.word_boundary_with_nullable_alternation`.
+    if (h.analysis.word_boundary_with_nullable_alternation) return false;
+    // A `\b`/`\B` with a lazy repetition (`a*?\b`, `[^a]+?\B *`): the lazy "prefer
+    // fewer" picks the short match where the boundary holds, but the longest-match
+    // DFA picks the long one. Decline. See `hir.Analysis.word_boundary_with_lazy_repetition`.
+    if (h.analysis.word_boundary_with_lazy_repetition) return false;
+    // `(?m)` line anchors are matched by anchored-restart with a one-byte `\n`
+    // lookahead — correct only for a clean leading `(?m)^` or trailing `(?m)$` in
+    // isolation. Mixed with a `text_start` (`\A`) / `text_end` (`\z`, non-`(?m)` `$`),
+    // the start-context / end-of-input interactions diverge from the Pike VM; decline.
+    if (has_line and (has_text_end or has_text_start)) return false;
+    // And a line anchor in a non-leading/non-trailing/under-a-repetition position
+    // (`(?m:$\n)`, `(?m:\n$)*`) is outside what the lookahead model covers — decline.
+    // See `hir.Analysis.complex_line_anchor`.
+    if (h.analysis.complex_line_anchor) return false;
     return true;
 }
 
@@ -3140,9 +3177,10 @@ test "differential vs Pike VM: (?m) line-anchor corpus (spans must agree)" {
 
 test "prone (?m) line patterns are declined (Unsupported) → auto routes them to the Pike VM" {
     const gpa = testing.allocator;
-    // An unbounded run before the line anchor makes anchored restart Θ(n²); since the reverse-DFA
-    // fix can't carry line context, the eager DFA declines these (and `auto` falls to the Pike VM).
-    for ([_][]const u8{ "(?m)\\w+$", "(?m)[a-z]+$", "(?m).*^x" }) |pat| {
+    // A trailing `(?m)$` with an unbounded run before it (`\w+$`) is a *clean* trailing
+    // line anchor — `supports` admits it — but anchored restart would be Θ(n²), so the
+    // BUILD declines it as prone (and `auto` falls to the Pike VM).
+    for ([_][]const u8{ "(?m)\\w+$", "(?m)[a-z]+$" }) |pat| {
         var diag: compile.Diagnostic = .{};
         const ast = try compile.parse(gpa, pat, &diag);
         defer ast.deinit(gpa);
@@ -3150,6 +3188,17 @@ test "prone (?m) line patterns are declined (Unsupported) → auto routes them t
         defer hir.deinitHir(gpa, hh);
         try testing.expect(supports(hh)); // the capability gate admits it…
         try testing.expectError(error.Unsupported, buildAlloc(gpa, hh, .{})); // …but the build declines (prone)
+    }
+    // A NON-leading `(?m)^` (a consumer precedes it, `.*^x`) is a *complex* line anchor
+    // the lookahead model can't carry — declined earlier, at the capability gate
+    // (`complex_line_anchor`). Same end result: `auto` routes it to the Pike VM.
+    {
+        var diag: compile.Diagnostic = .{};
+        const ast = try compile.parse(gpa, "(?m).*^x", &diag);
+        defer ast.deinit(gpa);
+        const hh = try hir.buildAlloc(gpa, ast, .{});
+        defer hir.deinitHir(gpa, hh);
+        try testing.expect(!supports(hh)); // declined at the capability gate now
     }
 }
 

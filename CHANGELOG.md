@@ -46,6 +46,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   next `\n` to skip between lines) for both `count`/`search` (`lineAnchoredSpan`) and `captures`
   (`lineAnchoredCaptures`), instead of a lazy-DFA span pass *plus* a separate capture-fill pass per
   line. One pass per line. New decl (`@stable-since v0.5.0`): `Filter.line_anchored`.
+- **Configurable bounded-repetition ceiling** (`Options.max_repetition`, default `100_000`). A finite
+  `{m,n}` / `{m}` / `{m,}` bound past the ceiling is now rejected **at scan time** with the new
+  `error.InvalidPattern` code `quantifier_exceeds_limit` (a located `@compileError` on the comptime
+  path) — a DoS guard so an absurd `a{900000000}` can't blow up the automaton, *before* any
+  lowering. The hard u32 overflow (`quantifier_too_large`) still applies above whatever you set.
+  Lower it to harden against adversarial input; raise it for genuinely huge counts. New decls
+  (`@stable-since v0.5.0`): `Options.max_repetition`, `scanner.Limits`, `scanner.default_max_repetition`
+  (= 100_000), `scanWith`, `parseWith`, `parseComptimeWith`, `compileWith`, and the
+  `ErrorCode.quantifier_exceeds_limit` diagnostic. The plain `scan`/`parse`/`parseComptime`/`compile`
+  are unchanged — each is exactly its `*With` peer at the default limit.
+- **Coverage-guided fuzzing harness** (`fuzz/`, `zig build fuzz`). A new, independently-cacheable
+  `fuzz` test unit built on Zig's `std.testing.fuzz` + `Smith` (structure-aware input generation),
+  driving the published `ezi_gex` surface exactly as a downstream user would. **Eight targets** over
+  three `Smith` generators (`gen` / `genAnchors` / `genUnicode`): scanner-never-crashes (arbitrary
+  bytes + fuzzer-chosen `max_repetition`); cross-backend **span** agreement (pikevm / backtrack /
+  auto); exact `{m,n}`-limit accept/reject; the **anchor/zero-width** supports-gate differential;
+  full **capture-slot** agreement (incl. `onepass`); **`findAll` sequence + `count`** consistency;
+  **Unicode** (`\p{}`/scripts/multi-byte/folding) over valid *and* invalid UTF-8 (+ a `\X` no-crash
+  target); and **`strategy`-tier results-invariance**. The bodies double as finite corpus-replay
+  smoke tests under a plain `zig build test`, so CI stays green; `zig build fuzz --fuzz=N` runs a
+  bounded coverage-guided session (see `fuzz/README.md`). (A complementary *cross-engine* differential
+  against Rust `regex` — which catches shared-front-end bugs the in-process targets structurally
+  cannot, and did find `word_boundary_with_lazy_repetition` — is a comparison activity that lives in
+  the sibling `regex-bench` project, not in this library.)
+
+### Fixed
+
+- **`auto` lost leftmost-first priority for a `\b`/`\B` alternated with a consuming branch** — found
+  by the new differential fuzzer. `\b|.` on `"b"` returned `{0,1}` (`"b"`) instead of the correct
+  empty match `{0,0}`: the `\b` branch matches empty at offset 0 and, leftmost-first, must win, but
+  `auto` routed the pattern to a byte DFA whose leftmost-**longest** merge can't encode branch
+  priority across an assertion. Fixed by declining a `\b`/`\B`-inside-an-alternation to the Pike VM
+  (correct + still O(input)), via the new `hir.Analysis.word_boundary_in_alternation` flag gated in
+  `dfa.supports`/`edfa.supports`. Conservative (any `\b` under an `|` is declined, even when both
+  branches consume) — it only forgoes the DFA fast path, never correctness; no benchmarked pattern
+  uses `\b`-in-alternation, so there is no measured regression. Pinned by a conformance regression
+  (`word-boundary-in-alternation keeps leftmost-first on auto`).
+- **`auto` lost the empty-loop match for a repetition over a nullable alternation** — also found by
+  the fuzzer. `(?:|.)+` on `"c"` returned `""` `{0,0}` instead of `"c"` `{0,1}`. ezi_gex's
+  leftmost-first (JS-style) semantics — what the Pike VM and backtracker give, verified against
+  JS/V8 and the `(|a)*`→`"aaa"` tiebreaker — take the consuming branch when the preferred empty
+  branch makes no progress in the loop; the byte DFA's leftmost-**longest** merge took the empty
+  exit. (RE2/Rust/Go/Python/Perl return `""` here; ezi_gex follows JS consistently.) Fixed by
+  declining the shape to the Pike VM via `hir.Analysis.nullable_alternation_in_repetition` (any
+  nullable alternation under a repetition), gated in `dfa.supports`/`edfa.supports`. Pinned by a
+  conformance regression (`nullable-alternation-in-repetition agrees across backends`).
+- **`auto` byte-DFA `supports`-gate hardening for anchors + zero-width** — a focused fuzz campaign
+  (`fuzz/` target #4, `pattern_smith.genAnchors`, 400k trials + minimization) catalogued 31 distinct
+  `auto`-vs-Pike-VM span divergences, all in the leftmost-longest byte DFA's `supports` gate, and
+  **zero `pikevm != backtrack`** (the NFA core was sound). All are fixed by declining the offending
+  shape to the Pike VM (a re-run of the campaign now finds 0). Three further `hir.Analysis` flags,
+  gated in `dfa.supports`/`edfa.supports`, each pinned by a conformance regression whose controls
+  prove the benchmarked DFA fast paths (`\d+$`, `^abc$`, `\bthe\b`, `(?m)^\w+`, `(?m)foo$`) stay
+  DFA-eligible:
+  - **`interior_text_end`** — a non-trailing `$`/`\z` (`$b$`, `\z.?\z`, `$^\z`): unsatisfiable past
+    the anchor, but the reverse-from-end path keyed off a *trailing* anchor and wrongly matched.
+  - **`word_boundary_with_nullable_alternation`** — a `\b`/`\B` *adjacent to* a nullable alternation
+    (`\B(?:|.*)`), the sibling-of analogue of `word_boundary_in_alternation`.
+  - **`complex_line_anchor`** (+ a `has_line and (has_text_end or has_text_start)` gate) — a `(?m)`
+    line anchor that is non-trailing (`(?m:$\n)`), under a repetition (`(?m:\n$)*`), or mixed with a
+    `text_start`/`text_end` (`(?m:$)\A`, `$^\z`). The eager-DFA `\n`-lookahead model only covers a
+    clean leading `(?m)^` / trailing `(?m)$`.
+  - **`word_boundary_with_lazy_repetition`** — a `\b`/`\B` with a *lazy* repetition (`a*?\b`,
+    `[^a]+?\B *`): the lazy "prefer fewer" picks the short match where the boundary holds, but the
+    longest-match DFA picks the long one. Caught by the **external Rust oracle** (the internal
+    differential had missed it); greedy `\w*\b`/`a*\b` are unaffected and stay DFA-eligible.
+  Verified results-invariant by the regex-bench parity suite: **all 32 match counts unchanged and no
+  search regression** (geomean vs Rust still 1.12×) — no benchmarked pattern is newly declined.
 
 ### Changed
 

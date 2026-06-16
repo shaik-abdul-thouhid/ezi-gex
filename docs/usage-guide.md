@@ -295,6 +295,15 @@ _ = try gex.compileRuntime(gpa, "a.b", &diag, .{ .dot_matches_newline = true });
 // stay Unicode-aware. Default is unicode = true.
 _ = try gex.compileRuntime(gpa, "\\w+", &diag, .{ .unicode = false });               // \w = [0-9A-Za-z_]
 
+// max_repetition: ceiling on a {m,n} bound (default 100_000). A finite bound past it
+// is rejected AT SCAN TIME with `error.InvalidPattern` (code `quantifier_exceeds_limit`)
+// — a DoS guard, before any lowering. Lower it to harden against adversarial input.
+_ = try gex.compileRuntime(gpa, "a{4000}", &diag, .{});                               // ok (< 100_000)
+_ = gex.compileRuntime(gpa, "a{9}", &diag, .{ .max_repetition = 8 });                 // → error.InvalidPattern
+// diag.code == .quantifier_exceeds_limit. (The hard u32 ceiling stays `quantifier_too_large`.)
+// The same ceiling reaches the AST/scanner layers via Limits: gex.parseWith / gex.compileWith /
+// gex.scanWith all take `gex.Limits{ .max_repetition = … }` (default `gex.default_max_repetition`).
+
 // strategy tier — results-invariant: flipping any field changes only speed/memory,
 // never which text matches.
 //   byte_engine: .auto (default) ≡ .enabled → `auto` builds the byte DFA and uses it for

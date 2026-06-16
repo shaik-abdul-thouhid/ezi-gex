@@ -178,8 +178,18 @@ pub const ErrorCode = enum {
     /// A quantifier immediately following another quantifier (e.g. `a**`),
     /// which also covers unsupported possessive quantifiers (`a*+`).
     multiple_quantifiers,
-    /// A `{m,n}` bound that does not fit in the count type.
+    /// A `{m,n}` bound that does not fit in the count type (the hard u32 ceiling).
+    ///
+    /// @stable-since v0.5.0
     quantifier_too_large,
+    /// A `{m,n}` bound exceeds the configured repetition limit
+    /// (`Options.max_repetition` / `scanner.Limits.max_repetition`). Distinct from
+    /// `quantifier_too_large`, which is the absolute u32 ceiling: this is the
+    /// tunable, lower DoS guard, so the bound was syntactically fine but too big
+    /// for the caller's policy.
+    ///
+    /// @stable-since v0.5.0
+    quantifier_exceeds_limit,
     /// `{m,n}` with `m > n`.
     quantifier_out_of_order,
 
@@ -244,6 +254,7 @@ pub fn messageFor(code: ErrorCode) []const u8 {
         .nothing_to_repeat => "quantifier has nothing to repeat",
         .multiple_quantifiers => "a quantifier cannot directly follow another quantifier",
         .quantifier_too_large => "quantifier count is too large",
+        .quantifier_exceeds_limit => "quantifier count exceeds the configured repetition limit",
         .quantifier_out_of_order => "quantifier range is out of order (min greater than max)",
 
         .pattern_too_complex => "pattern exceeds the scanner's complexity limits",

@@ -49,6 +49,25 @@ also evaluates Unicode `\b`). `byteWorthLowering(hir)` adds a cost gate — a pa
 byte automaton (a big Unicode class repeated dozens of times, `\p{L}{60}`) declines the byte path
 and stays on the compact code-point engine.
 
+**Byte-DFA leftmost-first safety gates (v0.5.0).** The byte DFAs match leftmost-**longest** over the
+merged automaton, which silently loses the Pike VM's leftmost-**first** priority around empty/zero-width
+constructs. `dfa.supports`/`edfa.supports` therefore **decline** the following shapes to the Pike VM
+(correct + O(input)); each is a `hir.Analysis` flag, surfaced by the fuzz suite + external Rust oracle,
+and pinned by a conformance regression whose controls keep the benchmarked fast paths (`\bthe\b`,
+`\b\w+\b`, `\d+$`, `^abc$`, `(?m)^\w+`, `(?m)foo$`) DFA-eligible:
+
+| Flag | Declines (example) | Why |
+|---|---|---|
+| `word_boundary_in_alternation` | `\b\|.` | empty-`\b` branch must win, DFA takes the longer |
+| `word_boundary_with_nullable_alternation` | `\B(?:\|.*)` | empty-branch priority beside a boundary |
+| `word_boundary_with_lazy_repetition` | `a*?\b`, `[^a]+?\B *` | lazy "prefer fewer" vs longest-match |
+| `nullable_alternation_in_repetition` | `(?:\|.)+` | JS empty-loop semantics (consume), DFA takes empty |
+| `interior_text_end` | `$b$`, `\z.?\z`, `$^\z` | a non-trailing `$`/`\z` is masked by a trailing one |
+| `complex_line_anchor` | `(?m:$\n)`, `(?m:\n$)*`, `(?m:$)\A` | `(?m)` anchor non-trailing / under-rep / anchor-mixed |
+
+Conservative by design (whole-pattern co-occurrence): they may forgo the DFA on an uncommon pattern
+that would have been fine, but never trade correctness. (See `../../../fuzz/README.md`.)
+
 ## How `auto` dispatches
 
 ```

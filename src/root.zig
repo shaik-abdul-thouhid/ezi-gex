@@ -110,14 +110,26 @@ pub const Compiled = engine.Compiled;
 
 /// Runtime: build a heap-allocated AST (free with `Ast.deinit`).
 pub const parse = build.parse;
+/// Runtime: build a heap-allocated AST with caller-chosen scan `Limits`.
+pub const parseWith = build.parseWith;
 /// Runtime: build, handing any diagnostic to a caller-supplied context.
 pub const parseReporting = build.parseReporting;
 /// Comptime: build into ro_data, returning `.ok`/`.fail`.
 pub const parseComptime = build.parseComptime;
+/// Comptime: build into ro_data with caller-chosen scan `Limits`.
+pub const parseComptimeWith = build.parseComptimeWith;
 /// Comptime: build into ro_data, failing compilation on a bad pattern.
 pub const compile = build.compile;
+/// Comptime: build into ro_data with caller-chosen scan `Limits`.
+pub const compileWith = build.compileWith;
 /// Storage-agnostic core: build into caller-owned `Buffers` (see scanner.zig).
 pub const scan = scanner.scan;
+/// Storage-agnostic core with caller-chosen scan `Limits` (see scanner.zig).
+pub const scanWith = scanner.scanWith;
+/// Tunable scan-time limits (currently the `{m,n}` repetition ceiling).
+pub const Limits = scanner.Limits;
+/// Default `{m,n}` repetition ceiling (see `Options.max_repetition`).
+pub const default_max_repetition = scanner.default_max_repetition;
 
 test {
     std.testing.refAllDecls(core);

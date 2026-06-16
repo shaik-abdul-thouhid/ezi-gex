@@ -338,6 +338,24 @@ pub fn supports(h: hir.Hir) bool {
     // non-prone, pattern; a direct `backends.dfa` user on a prone `\b` like `\b.*x` should prefer
     // `auto`.)
     if (has_word and has_text_end) return false;
+    // A `\b`/`\B` inside an alternation needs leftmost-FIRST branch priority across
+    // the assertion, which the leftmost-longest DFA cannot encode (`\b|.` on `"b"`
+    // must be the empty match `{0,0}`, not `{0,1}`). Decline to the Pike VM. See
+    // `hir.Analysis.word_boundary_in_alternation`.
+    if (h.analysis.word_boundary_in_alternation) return false;
+    // A repetition over a nullable alternation (`(?:|.)+`) has the same leftmost-
+    // first-vs-longest mismatch in the empty-loop direction — decline to the Pike
+    // VM. See `hir.Analysis.nullable_alternation_in_repetition`.
+    if (h.analysis.nullable_alternation_in_repetition) return false;
+    // A non-trailing `text_end` (`$a`, `\z.\z`) wrongly matches via the reverse-end
+    // path. Decline. See `hir.Analysis.interior_text_end`.
+    if (h.analysis.interior_text_end) return false;
+    // A `\b`/`\B` adjacent to a nullable alternation (`\B(?:|.*)`). Decline. See
+    // `hir.Analysis.word_boundary_with_nullable_alternation`.
+    if (h.analysis.word_boundary_with_nullable_alternation) return false;
+    // A `\b`/`\B` with a lazy repetition (`a*?\b`, `[^a]+?\B *`). Decline. See
+    // `hir.Analysis.word_boundary_with_lazy_repetition`.
+    if (h.analysis.word_boundary_with_lazy_repetition) return false;
     return true;
 }
 

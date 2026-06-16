@@ -747,12 +747,12 @@ zig build bench                             # benchmarks (ReleaseFast by default
 zig build test -Doptimize=ReleaseSafe       # full suite (ReleaseSafe is faster than Debug)
 ```
 
-The test suite is split into **15 independently-cacheable units** — one named module per area, so a
+The test suite is split into **16 independently-cacheable units** — one named module per area, so a
 test binary only ever contains its own `test {}` blocks (Zig pulls a file's tests into every module
 that reaches it via a *relative* import, but never across a *named*-module boundary). Editing one
 file recompiles and re-runs only the unit(s) whose inputs changed; the rest stay cached. The units:
 `utils`, `core`, `engine_base`, the eight backends (`backtrack`, `pikevm`, `bytepike`, `dfa`, `edfa`,
-`onepass`, `literal`, `auto`), `regex`, `conformance`, `redos`, and `exe`.
+`onepass`, `literal`, `auto`), `regex`, `conformance`, `redos`, `fuzz`, and `exe`.
 
 ```sh
 zig build test-core                         # run ONE unit (cached; also test-auto, test-edfa, …)
@@ -764,6 +764,21 @@ zig build test -Dinclude-test=auto -Dinclude-test=conformance -Doptimize=Release
 
 Use `test-<unit>` while iterating on one file; run the full `zig build test` before committing.
 `zig build test` prints nothing and exits `0` on success; a failure prints the failing test.
+
+### Fuzzing
+
+The `fuzz` unit is a coverage-guided harness (Zig's `std.testing.fuzz` + `Smith`) over the public
+API — see [`fuzz/README.md`](fuzz/README.md). It runs **finite** by default (replays a seed corpus,
+doubling as a smoke test in `zig build test`); add `--fuzz=N` for a bounded soak:
+
+```sh
+zig build fuzz                              # finite smoke run (no instrumentation)
+zig build fuzz --fuzz=200000                # bounded coverage-guided session (K/M/G suffixes ok)
+```
+
+> ⚠️ Bare `zig build test --fuzz` (no `=N`) fuzzes **forever** across every binary by design — for a
+> bounded run always use `--fuzz=N` and target the `fuzz` unit. Targets: scanner-never-crashes,
+> cross-backend span agreement (Pike VM oracle), and exact `{m,n}`-limit accept/reject.
 
 ## License
 

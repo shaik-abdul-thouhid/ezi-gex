@@ -64,8 +64,12 @@ already `[Aa]`, `(?m)^` is already `line_start`.
 `Options` has two tiers. The **semantic** tier changes what matches: `case_fold`
 (`.none`/`.simple`/`.full`); `case_insensitive`/`multiline`/`dot_matches_newline`,
 which *seed* the `(?i)`/`(?m)`/`(?s)` flag state for the whole pattern (inline `(?…)`
-flags OR-merge on top of the seed); and `unicode`, which toggles ASCII vs. Unicode
-`\d\w\s`. The **strategy** tier (`Options.strategy`) is **results-invariant by
+flags OR-merge on top of the seed); `unicode`, which toggles ASCII vs. Unicode
+`\d\w\s`; and `max_repetition` (default `100_000`), the ceiling on a `{m,n}` bound —
+a finite bound past it is rejected **at scan time** with `error.InvalidPattern`
+(`ErrorCode.quantifier_exceeds_limit`), a DoS guard *before* any lowering. (The same
+ceiling is reachable on the lower layers via `scanner.Limits` → `scanWith`/`parseWith`/
+`compileWith`.) The **strategy** tier (`Options.strategy`) is **results-invariant by
 contract** — its knobs (`byte_engine`, the byte-DFA selector on by default, and
 `prefilter`, the literal/required-byte prefilter on by default) may change only
 speed/memory, never which text matches. (See `usage-guide.md` §Options for recipes.)
@@ -452,6 +456,16 @@ match, so a prefilter or length gate built on them never yields a false negative
   `memmem` needle), and `required_bytes` — a 256-bit set of bytes every match must
   contain (pick the rarest for a `memchr` prefilter).
 - `has_grapheme`, `has_word_boundary`, `is_whole_literal`, `is_one_pass`.
+- **Byte-DFA safety gates (v0.5.0).** A cluster of flags lets `dfa`/`edfa.supports`
+  decline the shapes where the leftmost-**longest** byte DFA can't reproduce the Pike
+  VM's leftmost-**first** semantics, routing them to the Pike VM (correct + O(input)):
+  `word_boundary_in_alternation` (`\b|.`), `word_boundary_with_nullable_alternation`
+  (`\B(?:|.*)`), `word_boundary_with_lazy_repetition` (`a*?\b`, `[^a]+?\B *`),
+  `nullable_alternation_in_repetition` (`(?:|.)+`), `interior_text_end` (a non-trailing
+  `$`/`\z`, `$b$`), and `complex_line_anchor` (a `(?m)` anchor that is non-trailing /
+  under a repetition / mixed with `\A`/`\z`). All were surfaced by the fuzz suite
+  (`fuzz/`) and the external Rust oracle; each is pinned by a conformance regression
+  whose controls keep the benchmarked `\b`/`$`/`(?m)` fast paths DFA-eligible.
 
 > **As of 0.1.0 the `auto` dispatcher consumes the prefilter facts on its NFA *and* DFA
 > arms:** `min_utf8_len` (a length gate — reject inputs too short to match), `anchored_start`

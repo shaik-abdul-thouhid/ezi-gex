@@ -30,6 +30,7 @@ const TestEnum = enum {
     regex,
     conformance,
     redos,
+    fuzz,
     exe,
 };
 
@@ -199,6 +200,20 @@ pub fn build(b: *std.Build) void {
         .imports = &.{ utils, core, engine },
     });
 
+    // ── fuzz: coverage-guided fuzz targets (Smith-driven) over the facade ──────
+    // Imports only the published `ezi_gex` module, exactly as a downstream user
+    // would — the fuzzer drives the public surface, not internals. `fuzz` is left
+    // null (default), so instrumentation is added only under `--fuzz`; a plain
+    // `zig build test-fuzz` runs the bodies as finite corpus-replay smoke tests.
+    const fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("fuzz/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ezi_gex", .module = mod },
+        },
+    });
+
     // ── demo executable ───────────────────────────────────────────────────────
     const exe = b.addExecutable(.{
         .name = "ezi_gex",
@@ -239,6 +254,7 @@ pub fn build(b: *std.Build) void {
     const regex_tests = b.addTest(.{ .root_module = regex_mod });
     const conformance_tests = b.addTest(.{ .root_module = conformance_mod });
     const redos_tests = b.addTest(.{ .root_module = redos_mod });
+    const fuzz_tests = b.addTest(.{ .root_module = fuzz_mod });
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
 
     const run_utils_tests = b.addRunArtifact(utils_tests);
@@ -255,6 +271,7 @@ pub fn build(b: *std.Build) void {
     const run_regex_tests = b.addRunArtifact(regex_tests);
     const run_conformance_tests = b.addRunArtifact(conformance_tests);
     const run_redos_tests = b.addRunArtifact(redos_tests);
+    const run_fuzz_tests = b.addRunArtifact(fuzz_tests);
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     // Pair each unit's tag with its run step, so the `test` step gates them by
@@ -275,6 +292,7 @@ pub fn build(b: *std.Build) void {
         .{ .tag = .regex, .run = &run_regex_tests.step, .name = "test-regex" },
         .{ .tag = .conformance, .run = &run_conformance_tests.step, .name = "test-conformance" },
         .{ .tag = .redos, .run = &run_redos_tests.step, .name = "test-redos" },
+        .{ .tag = .fuzz, .run = &run_fuzz_tests.step, .name = "test-fuzz" },
         .{ .tag = .exe, .run = &run_exe_tests.step, .name = "test-exe" },
     };
 
@@ -286,6 +304,12 @@ pub fn build(b: *std.Build) void {
         // Fold into the aggregate `test` step iff selected by -Dinclude-test.
         if (selected(include_tests, u.tag)) test_step.dependOn(u.run);
     }
+
+    // Alias: `zig build fuzz` runs the fuzz unit (finite smoke run). Add `--fuzz=N`
+    // for a bounded coverage-guided session — see fuzz/root.zig. (Bare `--fuzz`
+    // soaks forever by design; always bound it with `=N`.)
+    const fuzz_step = b.step("fuzz", "Run the fuzz targets (add --fuzz=N to fuzz; bare run is a finite smoke test)");
+    fuzz_step.dependOn(&run_fuzz_tests.step);
 
     // ── Benchmarks ────────────────────────────────────────────────────────────
     // Built against an `ezi_gex` module in ReleaseFast by default so the engine is

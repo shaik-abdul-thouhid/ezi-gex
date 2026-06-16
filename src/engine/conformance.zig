@@ -333,6 +333,180 @@ test "general cases agree across pikevm / backtrack / auto" {
     }
 }
 
+// Regression (v0.5.0): a `\b`/`\B` alternated with a *consuming* branch must keep
+// leftmost-FIRST priority on `auto`. Found by the differential fuzzer: `auto`
+// routed `\b|.` to a byte DFA, which matches leftmost-LONGEST and returned `{0,1}`
+// ("b") instead of the empty `{0,0}` the Pike VM / backtracker give (the `\b`
+// branch matches empty at position 0 and wins). Fixed by declining a
+// `\b`-in-alternation to the Pike VM (`hir.Analysis.word_boundary_in_alternation`,
+// gated in `dfa.supports` / `edfa.supports`). These cases pin the exact spans and
+// would fail on `auto` before the fix.
+const word_boundary_alternation_cases = [_]Case{
+    // `\b` branch matches empty at 0 → leftmost-first picks it (empty match).
+    .{ .pat = "\\b|.", .input = "b", .expect = "" },
+    .{ .pat = "\\b-*|.", .input = "b", .expect = "" },
+    .{ .pat = "\\ba*|.", .input = "b", .expect = "" },
+    .{ .pat = "\\bx*|.", .input = "b", .expect = "" },
+    .{ .pat = "(\\b)|.", .input = "b", .expect = "" },
+    .{ .pat = "\\b|c", .input = "b", .expect = "" },
+    .{ .pat = "\\b-*|.", .input = "b\n \n", .expect = "" },
+    // Controls — the consuming branch legitimately wins, so spans must NOT change:
+    // at offset 0 before a word char, `\B` (not-a-boundary) fails, so `.` matches.
+    .{ .pat = "\\B-*|.", .input = "b", .expect = "b" },
+    // `\b` after a separator still finds the empty boundary before the word char.
+    .{ .pat = "x|\\b", .input = " a", .expect = "" },
+};
+
+test "word-boundary-in-alternation keeps leftmost-first on auto (v0.5.0 regression)" {
+    for (word_boundary_alternation_cases) |c| {
+        try checkRuntime(pikevm, c); // oracle
+        try checkRuntime(backtrack, c);
+        try checkRuntime(auto, c); // the one that regressed
+    }
+}
+
+// Regression (v0.5.0): a repetition over a nullable alternation (`(?:|.)+`). Found
+// by the differential fuzzer. The byte DFA's leftmost-*longest* merge produced the
+// empty `{0,0}` where the engine's leftmost-first (JS-style) empty-loop semantics —
+// shared by the Pike VM and backtracker, and ezi_gex's reference here — give the
+// consuming match: the preferred empty branch makes no progress, so the iteration
+// takes the consuming branch. (Verified against JS/V8; RE2/Python/Perl differ — they
+// return empty — but ezi_gex follows the JS interpretation consistently, see the
+// `(|a)*` → "aaa" case below.) Fixed by declining the shape to the Pike VM
+// (`hir.Analysis.nullable_alternation_in_repetition`, gated in `dfa`/`edfa.supports`).
+const nullable_alt_repetition_cases = [_]Case{
+    .{ .pat = "(?:|.)+", .input = "c", .expect = "c" }, // auto regressed to "" here
+    .{ .pat = "(?:|a)+", .input = "aa", .expect = "aa" }, // and here
+    .{ .pat = "(?:|.)*", .input = "c", .expect = "c" },
+    .{ .pat = "(|a)*", .input = "aaa", .expect = "aaa" }, // tiebreaker: ezi == JS, not RE2's ""
+    .{ .pat = "(|a)+", .input = "aa", .expect = "aa" },
+    .{ .pat = "(a|)+", .input = "aa", .expect = "aa" },
+    .{ .pat = "(?:a|)*b", .input = "aab", .expect = "aab" },
+    // Controls — an alternation under a repetition with NO nullable branch is NOT
+    // declined (stays DFA-eligible) and must still agree.
+    .{ .pat = "(?:a|b)+", .input = "abab", .expect = "abab" },
+    .{ .pat = "(cat|dog)+", .input = "catdog", .expect = "catdog" },
+};
+
+test "nullable-alternation-in-repetition agrees across backends (v0.5.0 regression)" {
+    for (nullable_alt_repetition_cases) |c| {
+        try checkRuntime(pikevm, c); // oracle (JS-aligned empty-loop semantics)
+        try checkRuntime(backtrack, c);
+        try checkRuntime(auto, c); // the one that regressed on `(?:|.)+`/`(?:|a)+`
+    }
+}
+
+// Regression (v0.5.0): a NON-trailing `text_end` (`$` outside `(?m)`, or `\z`).
+// Found by the supports-gate fuzz campaign. The pattern is unsatisfiable past the
+// interior anchor, but the DFA's reverse-from-end path keyed off the *trailing*
+// `text_end` (which sets `anchored_end`) and ignored the interior one — so `auto`
+// wrongly matched. Fixed by declining a non-trailing `text_end` to the Pike VM
+// (`hir.Analysis.interior_text_end`). The controls must STAY on the DFA fast path.
+const interior_text_end_cases = [_]Case{
+    .{ .pat = "$b$", .input = "b", .expect = null }, // auto wrongly matched {0,1}
+    .{ .pat = "\\z.\\z", .input = "a", .expect = null },
+    .{ .pat = "\\za\\z", .input = "a", .expect = null },
+    .{ .pat = "$\n$", .input = "\n", .expect = null },
+    .{ .pat = "\\z.$", .input = "a", .expect = null },
+    // …including a NULLABLE (not must-consume) atom between the anchors — the
+    // interior `text_end` is still non-trailing, so it must still be declined.
+    // These match the empty string at end-of-text on the Pike VM.
+    .{ .pat = "\\z.?\\z", .input = "a", .expect = "" },
+    .{ .pat = "$\n?$", .input = "\n", .expect = "" },
+    .{ .pat = "\\za*\\z", .input = "a", .expect = "" },
+    // Controls — a single TRAILING `$`/`\z` is the common shape and must NOT be
+    // declined (it stays DFA-eligible and must match correctly).
+    .{ .pat = "a$", .input = "a", .expect = "a" },
+    .{ .pat = "\\d+$", .input = "12", .expect = "12" },
+    .{ .pat = "^abc$", .input = "abc", .expect = "abc" },
+    .{ .pat = "abc\\z", .input = "abc", .expect = "abc" },
+};
+
+test "interior text_end is declined / trailing $ still matches (v0.5.0 regression)" {
+    for (interior_text_end_cases) |c| {
+        try checkRuntime(pikevm, c);
+        try checkRuntime(backtrack, c);
+        try checkRuntime(auto, c);
+    }
+}
+
+// Regression (v0.5.0): a `\b`/`\B` ADJACENT to a nullable alternation (sibling of,
+// not inside, the `|`). Found by the supports-gate fuzz campaign. Same leftmost-
+// first-across-an-assertion problem as `word_boundary_in_alternation`. Fixed by
+// declining `\b`-with-a-nullable-alternation to the Pike VM
+// (`hir.Analysis.word_boundary_with_nullable_alternation`). Controls: a `\b` with a
+// NON-nullable alternation (and the benched `\bthe\b`) must STAY on the DFA.
+const word_boundary_nullable_cases = [_]Case{
+    .{ .pat = "\\B(?:|.*)", .input = "ab", .expect = "" }, // auto wrongly matched "a" ({1,2})
+    .{ .pat = "b{0}\\b(|b)", .input = "b", .expect = "" },
+    .{ .pat = "(?:a?|aa*)\\b", .input = "aa", .expect = "" },
+    // Controls — `\b` with NO nullable alternation stays DFA-eligible.
+    .{ .pat = "\\b(?:cat|dog)", .input = "cat", .expect = "cat" },
+    .{ .pat = "\\bthe\\b", .input = "the", .expect = "the" },
+    .{ .pat = "\\b\\w+\\b", .input = "hello", .expect = "hello" },
+};
+
+test "word-boundary-adjacent-nullable-alternation agrees across backends (v0.5.0 regression)" {
+    for (word_boundary_nullable_cases) |c| {
+        try checkRuntime(pikevm, c);
+        try checkRuntime(backtrack, c);
+        try checkRuntime(auto, c);
+    }
+}
+
+// Regression (v0.5.0): a LAZY repetition anywhere in a `\b`/`\B` pattern. Found by
+// the differential fuzzer (`\n??\B`) and the external Rust oracle (`[^a]+?\B *`). A
+// lazy quantifier prefers fewer reps, so leftmost-first takes the short match where
+// the boundary holds; the longest-match DFA took the long one. Fixed by declining to
+// the Pike VM (`hir.Analysis.word_boundary_with_lazy_repetition` — any non-greedy
+// rep, not just nullable). Controls: the GREEDY forms (`a*\b`, `\w*\b`) agree on the
+// DFA and must STAY on it (no bench loss).
+const word_boundary_lazy_cases = [_]Case{
+    .{ .pat = "a*?\\b", .input = "a", .expect = "" }, // auto wrongly matched "a"
+    .{ .pat = "a??\\b", .input = "a", .expect = "" },
+    .{ .pat = "\n??\\B", .input = "\n", .expect = "" },
+    .{ .pat = "[^a]+?\\B *", .input = "-@11", .expect = "-" }, // lazy `+?` (min≥1); Rust-oracle find
+    // Controls — greedy (nullable or not) before `\b` is correct on the DFA, stays eligible.
+    .{ .pat = "a*\\b", .input = "ab", .expect = "" }, // greedy backtracks to {0,0}
+    .{ .pat = "\\w*\\b", .input = "ab", .expect = "ab" },
+    .{ .pat = "\n?\\B", .input = "\n", .expect = "\n" },
+};
+
+test "word-boundary-with-lazy-nullable agrees across backends (v0.5.0 regression)" {
+    for (word_boundary_lazy_cases) |c| {
+        try checkRuntime(pikevm, c);
+        try checkRuntime(backtrack, c);
+        try checkRuntime(auto, c);
+    }
+}
+
+// Regression (v0.5.0): a `(?m)` line anchor in a shape the eager DFA's `\n`-lookahead
+// model can't carry — a non-trailing `(?m)$` (`(?m:$\n)`), a line anchor under a
+// repetition (`(?m:\n$)*`), or a line anchor mixed with a `text_start`/`text_end`
+// (`(?m:$)\A`, `$^\z`). Found by the supports-gate fuzz campaign (the largest
+// family). Declined to the Pike VM (`hir.Analysis.complex_line_anchor` + the
+// `has_line and (has_text_end or has_text_start)` gate). The benchmarked clean
+// leading-`(?m)^` / trailing-`(?m)$` controls must STAY on the DFA fast path.
+const complex_line_anchor_cases = [_]Case{
+    .{ .pat = "(?m:$\n)", .input = "\n", .expect = "\n" }, // non-trailing (?m)$ (auto missed it)
+    .{ .pat = "(?m:\n$)*", .input = "\n\n", .expect = "\n\n" }, // line anchor under *
+    .{ .pat = "(?m:$\n){2}", .input = "\n\n", .expect = "\n\n" },
+    .{ .pat = "(?m:$)\\A", .input = "", .expect = "" }, // line + text_start
+    .{ .pat = "$^\\z", .input = "", .expect = "" }, // text_end + text_start + text_end
+    // Controls — clean leading `(?m)^` / trailing `(?m)$` stay DFA-eligible.
+    .{ .pat = "(?m)^line2", .input = "line1\nline2\nline3", .expect = "line2" },
+    .{ .pat = "(?m)line2$", .input = "line2\nline3", .expect = "line2" },
+    .{ .pat = "(?m)^\\w+", .input = "\nword", .expect = "word" },
+};
+
+test "complex line anchors decline to Pike VM / simple (?m) stays on DFA (v0.5.0 regression)" {
+    for (complex_line_anchor_cases) |c| {
+        try checkRuntime(pikevm, c);
+        try checkRuntime(backtrack, c);
+        try checkRuntime(auto, c);
+    }
+}
+
 test "literal cases agree across all four backends (incl. literal)" {
     for (literal_cases) |c| {
         try checkRuntime(pikevm, c);

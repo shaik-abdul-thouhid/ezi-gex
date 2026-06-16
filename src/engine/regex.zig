@@ -126,6 +126,18 @@ pub const Options = struct {
     /// stay code-point / Unicode-aware. See `hir.Options.unicode`.
     unicode: bool = true,
 
+    /// Ceiling on a bounded-repetition count (`{m,n}`, `{m}`, `{m,}`). A finite
+    /// bound past this is rejected **at scan time** with `error.InvalidPattern` and
+    /// a `.quantifier_exceeds_limit` diagnostic (a `@compileError` on the comptime
+    /// path) — a DoS guard so an absurd `a{900000000}` can't blow up the automaton.
+    /// The default (`scanner.default_max_repetition`, 100_000) clears any realistic
+    /// hand-written count; raise it for genuinely huge counts, lower it to harden
+    /// against adversarial patterns. The hard u32 ceiling
+    /// (`.quantifier_too_large`) still applies above whatever you set here.
+    ///
+    /// @stable-since: v0.5.0
+    max_repetition: u32 = core.scanner.default_max_repetition,
+
     /// Execution-strategy knobs. **Results-invariant by contract:** changing any
     /// field here may affect only speed/memory, never which text matches (the
     /// conformance suite fuzzes over them and pins the match). The byte engine wiring
@@ -174,6 +186,11 @@ pub const Options = struct {
     /// Project these front-door options onto the HIR builder's options.
     fn toHir(self: Options) hir.Options {
         return .{ .case_fold = self.case_fold, .unicode = self.unicode };
+    }
+
+    /// Project these front-door options onto the scanner's scan-time limits.
+    fn scanLimits(self: Options) core.scanner.Limits {
+        return .{ .max_repetition = self.max_repetition };
     }
 
     /// The initial inline-flag state to seed the pattern with. OR-merged with any
@@ -575,7 +592,7 @@ fn backendOptions(comptime B: type, comptime opts: Options) B.Options {
 ///
 /// @stable-since: v0.1.0
 pub fn compileRuntimeWith(comptime B: type, allocator: std.mem.Allocator, pattern: []const u8, diag: *Diagnostic, comptime opts: Options) Error!Compiled(B) {
-    const ast = parser.parse(allocator, pattern, diag) catch |e| switch (e) {
+    const ast = parser.parseWith(allocator, pattern, diag, opts.scanLimits()) catch |e| switch (e) {
         error.InvalidPattern => return error.InvalidPattern,
         error.OutOfMemory => return error.OutOfMemory,
     };
@@ -604,7 +621,7 @@ pub fn compileRuntimeWith(comptime B: type, allocator: std.mem.Allocator, patter
 ///
 /// @stable-since: v0.1.0
 pub fn compileComptimeWith(comptime B: type, comptime pattern: []const u8, comptime opts: Options) Compiled(B) {
-    const ast = comptime parser.compile(pattern); // @compileError on a bad pattern
+    const ast = comptime parser.compileWith(pattern, opts.scanLimits()); // @compileError on a bad pattern
     // Seed the front-door flag options (OR-merged with any bare inline flags).
     const seeded = comptime blk: {
         var a = ast;
@@ -696,6 +713,44 @@ test "compileRuntime: invalid pattern returns error + diagnostic, no crash" {
     try testing.expectError(error.InvalidPattern, r);
     try testing.expectEqual(core.errors.ErrorCode.unclosed_group, diag.code);
     try testing.expectEqualStrings("(", diag.faultySlice("a(b"));
+}
+
+test "Options.max_repetition: a custom ceiling is enforced at the front door" {
+    var diag: Diagnostic = .{};
+    // Within the ceiling: compiles and matches as usual.
+    var re = try compileRuntime(testing.allocator, "a{3}", &diag, .{ .max_repetition = 3 });
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    try testing.expect(re.isMatch(&sc, "aaa"));
+
+    // Over the ceiling: InvalidPattern, surfaced at scan time with the dedicated code.
+    const r = compileRuntime(testing.allocator, "a{4}", &diag, .{ .max_repetition = 3 });
+    try testing.expectError(error.InvalidPattern, r);
+    try testing.expectEqual(core.errors.ErrorCode.quantifier_exceeds_limit, diag.code);
+}
+
+test "Options.max_repetition: the default ceiling accepts large but sane counts" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "a{4000}", &diag, .{});
+    defer re.deinit();
+    // And rejects beyond the 100_000 default.
+    const r = compileRuntime(testing.allocator, "a{100001}", &diag, .{});
+    try testing.expectError(error.InvalidPattern, r);
+    try testing.expectEqual(core.errors.ErrorCode.quantifier_exceeds_limit, diag.code);
+}
+
+test "Options.max_repetition: the option threads through the comptime path" {
+    // A count within the (here tightened) ceiling compiles and matches; the
+    // ceiling flows all the way to the comptime scanner. (An over-limit count on
+    // this path is a located `@compileError`, exercised in compile.zig's
+    // `parseComptimeWith` test, which stops at the scanner before NFA expansion.)
+    const Re = compileComptime("a{6}", .{ .max_repetition = 10 });
+    var re = Re;
+    var sc = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer sc.deinit(testing.allocator);
+    try testing.expect(re.isMatch(&sc, "aaaaaa"));
+    try testing.expect(!re.isMatch(&sc, "aaaaa"));
 }
 
 test "compileComptime: program in ro_data, used at runtime" {
