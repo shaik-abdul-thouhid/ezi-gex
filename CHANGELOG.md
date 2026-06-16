@@ -34,6 +34,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Eager-DFA / byte-lowering build is no longer quadratic in a Unicode class's size** — the
+  `\p{…}`/`\w` compile-time cliff is gone. Two independent `O(class²)` hot spots were the cause, both
+  now linear:
+  - **Determinization single-seed closure cache** (`edfa`, `Det.ss_cache` / `RDet.rss_cache`). A
+    Unicode class lowers to an `x+` loop over a fan-out **split tree** (hundreds of UTF-8 sequences),
+    so *every* char-completing transition re-closed the loop-back split — re-walking the whole tree
+    and re-interning the same large loop-header state, hundreds of times. Since a closure is a
+    deterministic function of its seed list, the one-seed case (the loop-back pc, continuation pcs —
+    the overwhelming majority of edges) is now memoized on `(seed pc, context)`: an exact key (no
+    hash), with the two context bits (`at_line_start`, `at_word_left`) folded in so it is valid for
+    `\b`/`\B` and `(?m)` programs too. The reverse determinizer gets the same cache. Determinization
+    of `\p{L}+` dropped **~56 ms → ~1 ms**; `\w+` ~50 ms → ~1 ms; `\b\w+\b` ~45 ms → ~1 ms.
+  - **Byte-lowering suffix-cache is now an O(1) hash index** (`byte`, `Builder.tail_hash`). The UTF-8
+    suffix-sharing cache (`internTail`) scanned the class's growing byte-range DAG linearly per tail
+    node — `O(class²)` per class, the dominant cost once determinization was fixed (and the whole cost
+    for a pattern that declines the eager DFA, e.g. `email`). It is now an open-addressing hash keyed
+    on `(lo, hi, next)`, so a class lowers in `O(class)`. `[\w.+-]+@[\w-]+\.[\w.-]+` (three big
+    classes) build **~6 ms → <1 ms**. Both changes are pure build-time optimizations — the emitted
+    automaton, determinized tables and every match are byte-identical (pinned by `conformance.zig`).
+- **`auto` cascades a *prone* pattern with a start-skip prefilter from the eager to the lazy DFA**
+  (`edfa.Options.decline_if_prone`). A prone pattern (one that can consume an unbounded non-accepting
+  run before it can accept — `the\s+\p{L}+`, `\w+@\w+`) needs the eager DFA's frozen **reverse** table
+  for its O(input) two-pass `find`. But when `auto` also has a leading-literal / alternation /
+  interior-anchor prefilter, the find is *prefilter-driven* (skip to the candidate, one bounded native
+  find), so that reverse table is built but barely used — pure compile-time waste (the reverse build
+  of `the\s+\p{L}+` was ~8 ms). `auto` now tells `edfa` to decline such a pattern right after the
+  cheap proneness check (before the `utrans` + reverse phases), and falls back to the lazy DFA: same
+  prefilter, same spans, near-zero build. `the\s+\p{L}+` compile **~10 ms → ~0.6 ms**. Non-prone
+  patterns (`\p{L}+`, `\w+`) and prefilter-less prone patterns keep the eager DFA unchanged.
+  New decl (`@stable-since v0.5.0`): `edfa.Options.decline_if_prone`. Results-invariant.
 - **Eager-DFA determinization budget** (`auto`, `EAGER_BYTE_INST_MAX = 8000`). `auto` now only
   *attempts* the eager DFA when the byte NFA is small enough that the full subset construction is
   cheap; a big Unicode-class join (`\w+@\w+`, `[\w.+-]+@…`) goes straight to the lazy DFA. Eager
@@ -71,6 +101,24 @@ Measured on `regex-bench` (Apple M4, ReleaseFast; non-overlapping `count` over t
 All four are **results-invariant** — the cross-backend conformance suite pins every new path's spans
 and capture slots to the Pike VM (runtime and comptime), incl. non-ASCII `\b`, fixed-offset
 alignment, and line-skip cases.
+
+**Compile time — the `\p{…}`/`\w` cliff is gone** (the determinization + byte-lowering linearization
+and the prone-prefilter cascade above; `auto` compile, median, Apple M4 ReleaseFast). Search
+throughput is **unchanged** — the same automaton runs, only the build got cheaper:
+
+| pattern | before | after | speedup |
+|---|--:|--:|--:|
+| `\p{L}+` | 31.9 ms | ~1.0 ms | ≈32× |
+| `\w+` | 45.2 ms | ~0.83 ms | ≈54× |
+| `\b\w+\b` | 47.6 ms | ~1.25 ms | ≈38× |
+| `\p{Lu}\p{Ll}+` | 10.1 ms | ~0.59 ms | ≈17× |
+| `the\s+\p{L}+` | 107.4 ms | ~0.57 ms | ≈188× |
+| `[\w.+-]+@[\w-]+\.[\w.-]+` (email) | 6.4 ms | ~0.82 ms | ≈7.8× |
+| `\p{N}+` | 956 µs | ~130 µs | ≈7× |
+
+These are **results-invariant** too — pinned by the cross-backend conformance differential (the
+`the\s+\p{L}+` cascade and the reverse single-seed cache are in the `edfa` vs Pike VM corpus, and a
+direct `decline_if_prone` / cascade-routing test guards the new dispatch).
 
 ### Docs
 

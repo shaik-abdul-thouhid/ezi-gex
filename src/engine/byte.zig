@@ -316,6 +316,13 @@ fn Builder(comptime mode: Mode) type {
         entries: if (is_emit) []u32 else void = if (is_emit) undefined else {},
         seq_idx: u32 = 0,
         dag_start: u32 = 0,
+        // Suffix-cache **hash index** (emit only): `tail_hash[slot] = pc + 1` (0 = empty), keyed on a
+        // byte-range node's `(lo, hi, next)`. Turns `internTail`'s per-tail DAG scan from O(DAG) into
+        // O(1) — the class lowering from O(class²) into O(class) (`[\w.+-]+@…`'s three big classes:
+        // ~6 ms → <1 ms). Reset per class (`emitScalarRanges`), so stale post-back-patch keys never
+        // leak across classes. A power-of-two length; `tail_htmask = len - 1`.
+        tail_hash: if (is_emit) []u32 else void = if (is_emit) undefined else {},
+        tail_htmask: u32 = 0,
 
         fn emit(self: *Self, inst: Inst) u32 {
             const i = self.inst_len;
@@ -437,6 +444,7 @@ fn Builder(comptime mode: Mode) type {
             while (j + 1 < total) : (j += 1) _ = self.emit(.{ .split = .{ .a = 0, .b = 0 } });
             self.dag_start = self.inst_len;
             self.seq_idx = 0;
+            @memset(self.tail_hash, 0); // fresh suffix-cache index for this class's DAG
             for (ranges) |r| enumerate(r.lo, r.hi, self, buildSeqChain);
 
             // Back-patch the split tree to the sequence entries: `split[j]` tries entry
@@ -489,17 +497,24 @@ fn Builder(comptime mode: Mode) type {
         }
 
         /// Suffix cache: the pc of an existing `byte_range{range, next}` in this class's
-        /// DAG (scanned from `dag_start`), or a freshly emitted one. Identical
-        /// `(lo, hi, next)` nodes — the common UTF-8 continuation tails — are emitted
-        /// once and shared by every sequence that ends in them. The scan is bounded by
-        /// the class's own (shared, hence small) DAG, not the whole program.
+        /// DAG, or a freshly emitted one. Identical `(lo, hi, next)` nodes — the common
+        /// UTF-8 continuation tails — are emitted once and shared by every sequence that
+        /// ends in them. Looked up via the per-class **hash index** (`tail_hash`, keyed on
+        /// `(lo, hi, next)`): O(1) amortized, a collision falling back to a node compare —
+        /// so a big class lowers in O(class), not O(class²) (the former per-tail DAG scan).
         fn internTail(self: *Self, range: ByteRange, next: u32) u32 {
-            var p = self.dag_start;
-            while (p < self.inst_len) : (p += 1) switch (self.insts[p]) {
-                .byte_range => |r| if (r.next == next and r.range.lo == range.lo and r.range.hi == range.hi) return p,
-                else => {},
-            };
-            return self.emit(.{ .byte_range = .{ .range = range, .next = next } });
+            const h = (@as(u64, range.lo) | (@as(u64, range.hi) << 8) | (@as(u64, next) << 16)) *% 0x9E3779B97F4A7C15;
+            var slot: u32 = @as(u32, @truncate(h >> 40)) & self.tail_htmask;
+            while (self.tail_hash[slot] != 0) : (slot = (slot + 1) & self.tail_htmask) {
+                const p = self.tail_hash[slot] - 1;
+                switch (self.insts[p]) {
+                    .byte_range => |r| if (r.next == next and r.range.lo == range.lo and r.range.hi == range.hi) return p,
+                    else => {},
+                }
+            }
+            const new_pc = self.emit(.{ .byte_range = .{ .range = range, .next = next } });
+            self.tail_hash[slot] = new_pc + 1;
+            return new_pc;
         }
 
         fn emitSeq(self: *Self, seq: Seq) void {
@@ -639,12 +654,21 @@ fn measure(h: hir.Hir) error{Unsupported}!Sizes {
     return .{ .insts = b.inst_len };
 }
 
+/// Suffix-cache hash capacity for an emit pass over `n` instructions: the next power of two
+/// keeping the load factor ≤ 0.5 (so linear probing always finds an empty slot), floored at 16.
+/// Sized off the count-pass upper bound, so the index is a fixed buffer — comptime-able too.
+fn htCap(n: u32) u32 {
+    var c: u32 = 16;
+    while (c < n *| 2) c *|= 2;
+    return c;
+}
+
 /// Emit pass: fill caller buffers (`insts`/`entries` ≥ the measured size, `patch` ≥
-/// `insts.len`). Suffix sharing makes the used prefix of `insts` shorter than the
-/// measured upper bound; the returned `Program.insts` is sub-sliced to the real length
-/// (callers trim the backing store accordingly).
-fn build(h: hir.Hir, insts: []Inst, patch: []u32, entries: []u32) error{Unsupported}!Program {
-    var b = Builder(.emit){ .h = h, .insts = insts, .patch = patch, .entries = entries };
+/// `insts.len`, `tail_hash` a power-of-two suffix-cache index ≥ `htCap(insts.len)`). Suffix
+/// sharing makes the used prefix of `insts` shorter than the measured upper bound; the returned
+/// `Program.insts` is sub-sliced to the real length (callers trim the backing store accordingly).
+fn build(h: hir.Hir, insts: []Inst, patch: []u32, entries: []u32, tail_hash: []u32) error{Unsupported}!Program {
+    var b = Builder(.emit){ .h = h, .insts = insts, .patch = patch, .entries = entries, .tail_hash = tail_hash, .tail_htmask = @intCast(tail_hash.len - 1) };
     _ = b.emit(.{ .save = 0 });
     try b.compileNode(h.root);
     _ = b.emit(.{ .save = 1 });
@@ -717,7 +741,9 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir) BuildError!Program {
     defer gpa.free(patch);
     const entries = try gpa.alloc(u32, sizes.insts); // sequence entries ≤ #insts per class
     defer gpa.free(entries);
-    var prog = build(h, insts, patch, entries) catch return error.Unsupported;
+    const tail_hash = try gpa.alloc(u32, htCap(sizes.insts)); // suffix-cache index (open-addressing)
+    defer gpa.free(tail_hash);
+    var prog = build(h, insts, patch, entries, tail_hash) catch return error.Unsupported;
     // Suffix sharing leaves `insts` shorter than the measured upper bound; return the
     // slack so `freeProgram` releases exactly what `Program.insts` holds.
     if (prog.insts.len != insts.len) prog.insts = try gpa.realloc(insts, prog.insts.len);
@@ -729,18 +755,16 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir) BuildError!Program {
 /// @stable-since: v0.2.0
 pub fn buildComptime(comptime h: hir.Hir) Program {
     const work: u64 = @as(u64, h.nodes.len) + h.literals.len + h.ranges.len;
-    // The suffix cache scans a class's growing DAG per tail node, so emit work scales
-    // roughly with the square of a class's sequence count (≈ its range count). Size the
-    // quota for that. (Unicode classes only build at comptime when a caller explicitly
-    // bakes a byte program — `auto` never does — so this floor stays unused in the
-    // common, small comptime patterns; a caller may always raise it further.)
-    const rsq: u64 = @as(u64, h.ranges.len) * h.ranges.len;
-    @setEvalBranchQuota(@intCast(@min(50_000 + work * 200 + rsq * 40, std.math.maxInt(u32))));
+    // The suffix cache is now an O(1) hash index, so emit work is ~linear in the byte-program
+    // size (was ~quadratic in a class's sequence count). The quota stays generous — it only ever
+    // caps a caller explicitly baking a big Unicode class at comptime (`auto` never does).
+    @setEvalBranchQuota(@intCast(@min(50_000 + work * 200, std.math.maxInt(u32))));
     const sizes = comptime (measure(h) catch @compileError("byte: HIR is not byte-lowerable (\\X grapheme)"));
     comptime var insts: [sizes.insts]Inst = undefined;
     comptime var patch: [sizes.insts]u32 = undefined;
     comptime var entries: [sizes.insts]u32 = undefined;
-    const prog = build(h, &insts, &patch, &entries) catch unreachable;
+    comptime var tail_hash: [htCap(sizes.insts)]u32 = undefined;
+    const prog = build(h, &insts, &patch, &entries, &tail_hash) catch unreachable;
     const final = insts[0..prog.insts.len].*;
     return .{ .insts = &final, .slot_count = prog.slot_count };
 }

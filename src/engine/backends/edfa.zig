@@ -99,14 +99,21 @@
 //! could keep it on the DFA, but the shape is rare and already linear, so it is intentionally
 //! deferred.
 //!
-//! ## Build-time cost — determinization is ~O(states) (hash-interned)
+//! ## Build-time cost — determinization is ~O(states), per-edge closures are memoized
 //!
 //! The forward and reverse determinizers intern DFA states through an **open-addressing hash
 //! index** (`hashPcs`), so building a big Unicode-class DFA is **~linear in the state count**.
 //! (This was an O(states²) linear scan — `\w+@\w+`, `\w+@\w+$`, `\p{L}+$` took ~seconds to
-//! *compile*; now milliseconds.) Determinizing a large Unicode class (hundreds-to-thousands of
-//! states over a ~100-symbol alphabet) is still the dominant build cost, but it is a **one-time
-//! cost; match time is O(input), unaffected**. ASCII-class and literal patterns build instantly.
+//! *compile*; now milliseconds.) On top of that, a **single-seed closure cache** (`Det.ss_cache`,
+//! `RDet.rss_cache`) memoizes the epsilon-closure of a one-seed transition by `(seed pc, context)`:
+//! a Unicode class is an `x+` loop over a fan-out split tree, so every char-completing edge used to
+//! re-close the loop-back split — re-walking the whole tree and re-interning the same big state.
+//! Caching collapses those to one computation, taking `\p{L}+`/`\w+`/`\b\w+\b` determinization from
+//! **~50 ms to ~1 ms**. (The byte *lowering* that feeds this — `byte.zig` — was likewise made
+//! `O(class)` via a hashed suffix cache.) Determinization is a **one-time cost; match time is
+//! O(input), unaffected**. ASCII-class and literal patterns build instantly. A *prone* pattern with
+//! a start-skip prefilter avoids the reverse build entirely (`auto` declines it via
+//! `Options.decline_if_prone` and uses the lazy DFA — same spans, near-zero build).
 //!
 //! ## Invalid UTF-8 — dead-on-invalid, for free
 //!
@@ -161,11 +168,22 @@ const pool_factor: u32 = 16;
 /// @stable-since: v0.3.0
 pub const caps = Caps{ .captures = false, .stateless = true, .grapheme = false };
 
-/// Backend build options. The byte lowering needs nothing beyond the HIR (flags and
-/// folding are already applied); the field exists to satisfy the contract shape.
+/// Backend build options.
 ///
 /// @stable-since: v0.3.0
-pub const Options = struct {};
+pub const Options = struct {
+    /// Decline (`error.Unsupported`) a **prone** pattern early — right after the cheap proneness
+    /// check, before the expensive `utrans` phase and reverse-DFA build. `auto` sets this when it
+    /// has a **start-skip prefilter** (a leading literal / alternation / interior anchor): a prone
+    /// pattern's `find` is then prefilter-driven (skip to the candidate, one bounded native find),
+    /// so the eager DFA's frozen reverse table is built but barely used — pure compile-time waste
+    /// (`the\s+\p{L}+`: ~8 ms of reverse build). On decline, `auto` falls back to the lazy DFA
+    /// (near-zero build; same prefilter, same spans). Results-invariant; defaults off, so a direct
+    /// `compileRuntimeWith(backends.edfa, …)` keeps the full eager DFA.
+    ///
+    /// @stable-since: v0.5.0
+    decline_if_prone: bool = false,
+};
 
 /// The compiled, immutable eager DFA. It is the frozen determinization of the byte
 /// automaton: `trans` is a dense `n_states × n_classes` table keyed on `classes` (the
@@ -440,6 +458,21 @@ const Det = struct {
     /// **anchored restart** only (the `.*?`-prefix unanchored automaton can't carry line-start /
     /// word-left context), so their `utrans` would be unused dead weight that also inflates states.
     skip_utrans: bool = false,
+    /// **Single-seed closure cache** (`seed pc × context → interned state id + 1`, 0 = empty), keyed
+    /// on the raw successor pc when a transition has exactly **one** seed. The big build cost on a
+    /// Unicode class is that every char-completing edge re-closes the `x+` loop-back split — walking
+    /// the whole class split-tree (~hundreds of pcs) and re-interning the same large loop-header
+    /// state. All those edges share one seed (the loop split pc), so caching `closure([pc])`'s result
+    /// collapses them to a single computation (`\p{L}+`/`\w+`/`\b\w+\b` determinization: ~50 ms → ~1 ms).
+    /// Exact (the key *is* the pc + context, no hash), and sound because in the transition loop a
+    /// closure is a deterministic function of `(seed pc, at_line_start, at_word_left)` — `at_start` is
+    /// always false there (the four start states are interned separately, never via the cache). The
+    /// two context bits are folded into the key (`seed * 4 + ctx`), so the cache is valid for **every**
+    /// program, including `\b`/`\B` (`at_word_left`) and `(?m)` (`at_line_start`). One entry per
+    /// `(pc, ctx)`; `&.{}` only on the never-taken default.
+    ///
+    /// @stable-since: v0.5.0
+    ss_cache: []u32 = &.{},
 
     // ── frozen-DFA outputs (caller buffers) ──
     state_off: []u32, // state id → start of its pc list in `pc_pool`
@@ -630,6 +663,28 @@ const Det = struct {
         return id;
     }
 
+    /// Close `seeds[0..n]` (already in `self.seeds`) in the per-transition context and intern the
+    /// resulting state — with the single-seed fast path (see `ss_cache`). When the cache applies and
+    /// the edge has exactly one seed, a hit returns the memoized id with **no** closure/intern; a
+    /// miss closes, interns, and records it. Multi-seed edges (and disabled-cache programs) fall
+    /// through to the plain closure + intern, unchanged. Results-invariant.
+    fn closeIntern(self: *Det, n: u32, at_line_start: bool, at_word_left: bool) DetError!u32 {
+        if (n == 1) {
+            // Fold the two context bits into the key — `at_start` is always false in the transition
+            // loop, so `(seed pc, at_line_start, at_word_left)` is a complete, exact key.
+            const ctx = (@as(u32, @intFromBool(at_line_start)) << 1) | @intFromBool(at_word_left);
+            const key = self.seeds[0] * 4 + ctx;
+            const cached = self.ss_cache[key];
+            if (cached != 0) return cached - 1;
+            self.closure(self.seeds[0..1], false, at_line_start, at_word_left);
+            const id = try self.intern();
+            self.ss_cache[key] = id + 1;
+            return id;
+        }
+        self.closure(self.seeds[0..n], false, at_line_start, at_word_left);
+        return self.intern();
+    }
+
     /// Successor pcs of `state_id` on the class with representative byte `rep`: the
     /// `next` of every `byte_range` in the state that contains `rep`, in priority order,
     /// appended starting at `seeds[base]`. Returns the COUNT appended (so callers can
@@ -708,6 +763,7 @@ const Det = struct {
     fn run(self: *Det) DetError!void {
         @memset(self.seen, 0);
         @memset(self.state_hash, 0); // empty index (0 = empty slot)
+        @memset(self.ss_cache, 0); // state ids are re-minted each run (phase1/phase2)
 
         // DEAD = the empty set (work_len already 0).
         self.work_len = 0;
@@ -747,16 +803,14 @@ const Det = struct {
                 // Anchored row: successors of this state only (a parked boundary that fires for this
                 // class contributes its continuation's byte transitions — see collectSeeds).
                 const na = self.collectSeeds(sid, rep, 0, word_right);
-                self.closure(self.seeds[0..na], false, at_line_start, word_right); // a transition is always at sp > 0
-                self.trans[sid * self.n_classes + c] = try self.intern();
+                self.trans[sid * self.n_classes + c] = try self.closeIntern(na, at_line_start, word_right); // a transition is always at sp > 0
                 // Unanchored row: this state's successors ∪ a fresh start (`startN`) — the implicit
                 // `(?s:.)*?` prefix. Skipped for line / word-boundary programs (they run on anchored
                 // restart; the position-independent re-seed can't carry line-start / word-left context).
                 if (!self.skip_utrans) {
                     var nu = self.collectSeeds(sid, rep, 0, word_right);
                     nu += self.collectSeeds(self.startN, rep, nu, word_right);
-                    self.closure(self.seeds[0..nu], false, false, word_right);
-                    self.utrans[sid * self.n_classes + c] = try self.intern();
+                    self.utrans[sid * self.n_classes + c] = try self.closeIntern(nu, false, word_right);
                 }
             }
         }
@@ -822,6 +876,14 @@ const RDet = struct {
     rstart: u32 = DEAD,
     r_state_hash: []u32, // open-addressing index keyed on the (sorted) pc list: slot → rstate id + 1
     r_htmask: u32, // r_state_hash.len - 1 (a power of two)
+    /// Single-seed reverse-closure cache (`seed pc → rstate id + 1`, 0 = empty) — the reverse-DFA
+    /// analogue of `Det.ss_cache`. `revClosure` takes no position context, so a one-seed reverse
+    /// transition is fully keyed by its seed pc; caching it collapses the many edges that all walk
+    /// back through the same loop structure (the prone `\w+@\w+` / `the\s+\p{L}+` reverse build).
+    /// Exact, results-invariant.
+    ///
+    /// @stable-since: v0.5.0
+    rss_cache: []u32,
 
     // ── per-closure work buffers ──
     seen: []u32,
@@ -1010,6 +1072,7 @@ const RDet = struct {
         self.buildAdj();
         @memset(self.seen, 0);
         @memset(self.r_state_hash, 0); // empty index (0 = empty slot)
+        @memset(self.rss_cache, 0); // single-seed reverse-closure cache
 
         self.work_len = 0;
         self.work_match = false;
@@ -1023,6 +1086,21 @@ const RDet = struct {
             var c: u32 = 0;
             while (c < self.n_classes) : (c += 1) {
                 const ns = self.collectRevSeeds(rid, self.class_rep[c]);
+                // Single-seed fast path: `revClosure` is context-free, so one seed is a complete
+                // cache key (collapses the repeated loop-back reverse closures — the prone reverse build).
+                if (ns == 1) {
+                    const seed = self.seeds[0];
+                    const cached = self.rss_cache[seed];
+                    if (cached != 0) {
+                        self.rtrans[rid * self.n_classes + c] = cached - 1;
+                        continue;
+                    }
+                    self.revClosure(self.seeds[0..1]);
+                    const id = try self.intern();
+                    self.rss_cache[seed] = id + 1;
+                    self.rtrans[rid * self.n_classes + c] = id;
+                    continue;
+                }
                 self.revClosure(self.seeds[0..ns]);
                 self.rtrans[rid * self.n_classes + c] = try self.intern();
             }
@@ -1083,6 +1161,8 @@ fn reverseAlloc(gpa: std.mem.Allocator, insts: []const byte.Inst, class_rep: *co
     const r_ht = htCap(r_state_cap);
     const r_state_hash = try gpa.alloc(u32, r_ht); // open-addressing intern index (≤ 0.5 load)
     defer gpa.free(r_state_hash);
+    const rss_cache = try gpa.alloc(u32, n); // single-seed reverse-closure cache (one slot per pc)
+    defer gpa.free(rss_cache);
 
     var rdet = RDet{
         .insts = insts,
@@ -1107,6 +1187,7 @@ fn reverseAlloc(gpa: std.mem.Allocator, insts: []const byte.Inst, class_rep: *co
         .seeds = seeds,
         .r_state_hash = r_state_hash,
         .r_htmask = r_ht - 1,
+        .rss_cache = rss_cache,
     };
     rdet.run() catch return error.Unsupported;
 
@@ -1503,7 +1584,7 @@ fn minimizeDfa(
 /// keeps it on the lazy DFA / code-point engines.
 ///
 /// @stable-since: v0.3.0
-pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Program {
+pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, opts: Options) BuildError!Program {
     if (!supports(h)) return error.Unsupported;
     var bp = try byte.buildAlloc(gpa, h);
     defer byte.freeProgram(gpa, &bp); // the NFA is a build-time scaffold; only the DFA escapes
@@ -1590,6 +1671,11 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     const ht = htCap(state_cap);
     const state_hash = try gpa.alloc(u32, ht); // open-addressing intern index (≤ 0.5 load)
     defer gpa.free(state_hash);
+    // Single-seed closure cache (seed pc × context → state id) — the build-cost crusher for big
+    // Unicode classes (`\p{L}+`, `\w+`, `\b\w+\b`). Four context slots per pc (at_line_start ×
+    // at_word_left), so it is valid for `\b`/`(?m)` programs too.
+    const ss_cache = try gpa.alloc(u32, ic * 4);
+    defer gpa.free(ss_cache);
 
     var det = Det{
         .insts = bp.insts,
@@ -1601,6 +1687,7 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
         .reaches_meps = reaches_meps,
         .nl_class = nl_class,
         .has_word = has_word,
+        .ss_cache = ss_cache,
         .skip_utrans = true, // phase 1: trans only (utrans is built in phase 2, prone-only — below)
         .state_off = state_off,
         .state_len = state_len,
@@ -1621,7 +1708,6 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
         .htmask = ht - 1,
     };
     det.run() catch return error.Unsupported; // phase 1: anchored `trans` only
-
     // Anchored-restart safety on the **unminimized** trans-only DFA: a non-accepting cycle, OR a
     // long bounded non-accepting prefix (`computeProne`). It is a language property (preserved by
     // minimization and unaffected by the utrans phase), so computing it on the trans-only DFA is
@@ -1638,7 +1724,6 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
         defer gpa.free(plong);
         break :blk computeProne(det.trans[0 .. pc * nc], det.accept, det.accept_before_word, det.accept_before_nonword, pc, nc, det.start0, det.startN, det.startL, det.startNW, pcolor, pstack, piter, plong);
     };
-
     // Quadratic-immunity gate for line anchors: a *prone* `(?m)` pattern (an unbounded/long run
     // before the anchor, e.g. `(?m)\w+$`, `(?m).*^x`) can't run linearly on anchored restart, and
     // the reverse fix can't carry line context — so decline it to the linear Pike VM. Non-prone
@@ -1650,6 +1735,11 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     // shapes (`\bword\b`, `\b\w+\b`, `s\b`) are non-prone (their loop accepts via the word
     // lookahead, which `computeProne` honours), so they keep the fast anchored restart.
     if (has_word and prone) return error.Unsupported;
+    // Caller (`auto`) has a start-skip prefilter, so a prone pattern's `find` is prefilter-driven —
+    // the eager DFA's `utrans` + reverse table would be built but barely used. Decline now (before
+    // those expensive phases) so `auto` falls back to the lazy DFA: same prefilter, same spans,
+    // near-zero build (`the\s+\p{L}+`: ~10 ms → <1 ms). Non-prone patterns are unaffected.
+    if (prone and opts.decline_if_prone) return error.Unsupported;
 
     // **Phase 2 (prone, non-line only): re-determinize with the unanchored `utrans` table** for the
     // O(input) reverse two-pass. A NON-prone pattern runs entirely on anchored restart (`trans`),
@@ -1705,7 +1795,6 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
         det.startNW = blk[det.startNW];
         n = n_new;
     }
-
     // Keep only the used prefix of the (now minimized) tables + accept flags (right-sized copies).
     const trans = try gpa.dupe(u32, det.trans[0 .. n * nc]);
     errdefer gpa.free(trans);
@@ -1866,6 +1955,7 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
     comptime var seeds: [2 * ic + 2]u32 = undefined; // unanchored row unions two states' seeds
     const ht = htCap(state_cap);
     comptime var state_hash: [ht]u32 = undefined; // open-addressing intern index (zeroed in run)
+    comptime var ss_cache: [ic * 4]u32 = undefined; // single-seed closure cache (seed × ctx; zeroed in run)
 
     comptime var det = Det{
         .insts = bp.insts,
@@ -1877,6 +1967,7 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
         .reaches_meps = &reaches_meps,
         .nl_class = nl_class,
         .has_word = has_word,
+        .ss_cache = &ss_cache,
         .skip_utrans = true, // phase 1: trans only (utrans built in phase 2, prone-only — below)
         .state_off = &state_off,
         .state_len = &state_len,
@@ -1998,6 +2089,7 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
     comptime var rseeds: [ic + 1]u32 = undefined;
     const r_ht = htCap(r_state_cap);
     comptime var r_state_hash: [r_ht]u32 = undefined; // open-addressing intern index (zeroed in run)
+    comptime var rss_cache: [ic]u32 = undefined; // single-seed reverse-closure cache (zeroed in run)
     comptime var rdet = RDet{
         .insts = bp.insts,
         .class_rep = &class_rep,
@@ -2021,6 +2113,7 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
         .seeds = &rseeds,
         .r_state_hash = &r_state_hash,
         .r_htmask = r_ht - 1,
+        .rss_cache = &rss_cache,
     };
     if (rev_built) rdet.run() catch @compileError("edfa: reverse DFA exceeds bounds; use the runtime lazy DFA (backends.dfa) instead");
 
@@ -2582,6 +2675,38 @@ test "a too-complex pattern is declined (Unsupported), not mis-determinized" {
     try testing.expectError(error.Unsupported, buildAlloc(gpa, h, .{}));
 }
 
+test "decline_if_prone: a prone pattern declines early; a non-prone one is unaffected" {
+    const gpa = testing.allocator;
+    const Case = struct { pat: []const u8, prone: bool };
+    // `the\s+\p{L}+` / `\w+@\w+` are prone (an unbounded non-accepting run before they can accept);
+    // `\w+` / `\p{L}+` are non-prone (their consuming loop is itself accepting). With the flag set,
+    // only the prone ones decline — `auto` then routes them to the lazy DFA.
+    const cases = [_]Case{
+        .{ .pat = "the\\s+\\p{L}+", .prone = true },
+        .{ .pat = "\\w+@\\w+", .prone = true },
+        .{ .pat = "\\w+", .prone = false },
+        .{ .pat = "\\p{L}+", .prone = false },
+        .{ .pat = "\\p{Lu}\\p{Ll}+", .prone = false },
+    };
+    inline for (cases) |c| {
+        var diag: compile.Diagnostic = .{};
+        const ast = try compile.parse(gpa, c.pat, &diag);
+        defer ast.deinit(gpa);
+        const h = try hir.buildAlloc(gpa, ast, .{});
+        defer hir.deinitHir(gpa, h);
+        // Default options: every case builds the full eager DFA (no decline).
+        var full = try buildAlloc(gpa, h, .{});
+        freeProgram(gpa, &full);
+        // With decline_if_prone, the prone ones decline; the non-prone ones still build.
+        if (c.prone) {
+            try testing.expectError(error.Unsupported, buildAlloc(gpa, h, .{ .decline_if_prone = true }));
+        } else {
+            var still = try buildAlloc(gpa, h, .{ .decline_if_prone = true });
+            freeProgram(gpa, &still);
+        }
+    }
+}
+
 test "eager DFA builds and matches at COMPTIME (ro_data table, stateless scratch)" {
     const got = comptime blk: {
         @setEvalBranchQuota(20_000_000);
@@ -2646,6 +2771,11 @@ test "differential vs Pike VM across a corpus (spans must agree)" {
         "^abc",       "\\Aword", "^\\d+",   "\\w+@\\w+",
         // `text_end` ($/\z) — now DFA-eligible (matched by anchored restart + `accept_eoi`).
         "a$",         "\\d+$",   "^abc$",   "\\w+@\\w+$",
+        // Prone + leading-literal/space-run patterns — exercise the reverse-DFA single-seed cache
+        // (the determinization-cost fix). `the\s+\p{L}+` is the headline `the_word` bench pattern.
+        // (`\b` lives in the dedicated ASCII corpus below — its ASCII boundary diverges from the Pike
+        // VM's Unicode boundary on the non-ASCII inputs here, by design.)
+        "the\\s+\\p{L}+", "foo\\s+\\w+", "\\p{Lu}\\p{Ll}+",
     };
     const inputs = [_][]const u8{
         "",                        "abc",        "  abc123def  ",      "xxabcyy",
@@ -2653,6 +2783,7 @@ test "differential vs Pike VM across a corpus (spans must agree)" {
         "aaaaab",                  "a\xFFc abc", "no match here !!!",  "ababab end",
         "forty2 and 9 lives",      "x٤٥٦y",      "ééééX",              "ABCxyz",
         "word here",              "a word",     "alice@host now",      "trailing 42",
+        "the   lazy fox",         "the Quick Brown Fox",              "foo \t bar baz",
     };
     for (patterns) |p| try agreesWithPikeVM(testing.allocator, p, &inputs);
 }

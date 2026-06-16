@@ -889,7 +889,13 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, opts: Options) BuildError!
         // straight to the lazy DFA (same states on demand, amortized over the input) — a large
         // compile-time win and, for the declining cases, no runtime change at all.
         const eager_small_enough = (byte.instCount(h) orelse 0) <= EAGER_BYTE_INST_MAX;
-        const eager: BuildError!edfa.Program = if (eager_small_enough) edfa.buildAlloc(gpa, h, .{}) else error.Unsupported;
+        // A start-skip prefilter (leading literal / alternation / interior anchor) drives the find
+        // for a *prone* pattern, so the eager DFA's reverse table would be wasted build work — tell
+        // `edfa` to decline a prone pattern early and let the lazy DFA serve it (the user's cascade:
+        // edfa → lazy when the eager build is not worth it). `the\s+\p{L}+`: ~10 ms → <1 ms compile,
+        // search unchanged (prefilter-driven either way). Results-invariant.
+        const has_start_skip = program.filter.prefix_len > 0 or program.filter.prefix_set_n > 0 or program.filter.inner_byte != null;
+        const eager: BuildError!edfa.Program = if (eager_small_enough) edfa.buildAlloc(gpa, h, .{ .decline_if_prone = has_start_skip }) else error.Unsupported;
         if (eager) |ep| {
             program.edfa_prog = ep;
             // A `\b`/`\B` program's EAGER DFA does only the ASCII boundary; build the LAZY DFA too
@@ -1851,6 +1857,35 @@ test "auto matches across literal and nfa routes" {
     try expectFind("a.*c", "abXYZc end c", "abXYZc end c"); // nfa route
     try expectFind("\\w+", "héllo, wörld", "héllo"); // unicode, nfa route
     try expectFind("(\\d{4})-(\\d{2})", "y 2026-06 z", "2026-06"); // captures, nfa route
+}
+
+test "auto cascades a PRONE + prefiltered pattern from the eager to the lazy DFA" {
+    const gpa = testing.allocator;
+    // A prone pattern with a start-skip prefilter (a leading literal `the`) drives its find from the
+    // prefilter, so the eager DFA's reverse table would be wasted build work — `auto` declines the
+    // eager DFA and routes the span scan to the lazy DFA (`decline_if_prone`). A *non-prone* class
+    // scan keeps the eager DFA. Results are identical either way (the spans below pin it).
+    const Case = struct { pat: []const u8, route_str: []const u8 };
+    const cases = [_]Case{
+        .{ .pat = "the\\s+\\p{L}+", .route_str = "nfa+dfa" }, // prone + "the" prefilter → lazy DFA
+        .{ .pat = "\\p{L}+", .route_str = "nfa+edfa" }, // non-prone → eager DFA (no cascade)
+        .{ .pat = "\\w+", .route_str = "nfa+edfa" },
+        .{ .pat = "\\bthe\\b", .route_str = "nfa+edfa" }, // prefilter but NON-prone → keeps eager
+    };
+    for (cases) |c| {
+        var diag: compile.Diagnostic = .{};
+        const ast = try compile.parse(gpa, c.pat, &diag);
+        defer ast.deinit(gpa);
+        const h = try hir.buildAlloc(gpa, ast, .{});
+        defer hir.deinitHir(gpa, h);
+        var program = try buildAlloc(gpa, h, .{});
+        defer freeProgram(gpa, &program);
+        try testing.expectEqualStrings(c.route_str, route(&program));
+    }
+    // The cascade must not change a single match: spans identical to what the eager DFA produced.
+    try expectFind("the\\s+\\p{L}+", "say the  quick fox", "the  quick");
+    try expectFind("the\\s+\\p{L}+", "in the lazy dog", "the lazy");
+    try expectNoMatch("the\\s+\\p{L}+", "theater (no space then letter)");
 }
 
 test "auto captures (nfa route)" {

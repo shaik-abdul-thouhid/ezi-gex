@@ -114,6 +114,17 @@ Landed across `0.4.0-dev` (all on `main`):
 - **Eager-DFA determinization budget** — a big Unicode-class join (`\w+@\w+`, `[\w.+-]+@…`) skips the
   eager DFA (which would burn hundreds of ms, often only to decline) and uses the lazy DFA directly.
   `email` **compile ~0.88 s → ~6 ms (≈140×)**, runtime unchanged.
+- **The `\p{…}`/`\w` compile-time cliff is gone** — the eager-DFA build is no longer quadratic in a
+  Unicode class's size. A class lowers to an `x+` loop over a fan-out split tree, so determinization
+  re-closed the loop-back split (re-walking the whole tree, re-interning the same big state) on every
+  char-completing edge, and the byte lowering's suffix cache scanned the byte-range DAG linearly per
+  tail — two independent `O(class²)` hot spots. Both are now linear: a **single-seed closure cache**
+  (memoizing `closure([pc])` by `(seed pc, context)`, forward *and* reverse) and a **hashed suffix
+  cache**. Compile, `auto` median: `\p{L}+` **31.9 ms → ~1.0 ms (≈32×)**, `\w+` **45 ms → ~0.8 ms
+  (≈54×)**, `\b\w+\b` **47.6 ms → ~1.3 ms (≈38×)**, `\p{Lu}\p{Ll}+` **10 ms → ~0.6 ms (≈17×)**. And a
+  *prone* pattern with a start-skip prefilter (`the\s+\p{L}+`) **cascades to the lazy DFA** — its
+  reverse table would be built-but-unused — so `the\s+\p{L}+` **compile ~107 ms → ~0.6 ms (≈188×)**.
+  Search throughput is unchanged (same automaton; the eager DFA already beats Rust on `\p{L}+`/`\w+`).
 
 `0.2.0`/`0.3.0` foundations still in place: full case folding, grapheme `\X`, a two-tier
 `Options` (semantic + results-invariant strategy), `(?x)` verbose mode, ASCII mode,

@@ -599,6 +599,8 @@ The contract is the seam that makes these drop-in:
 | ✅ *(0.5.0)* | **Fixed-offset interior anchor** (`Filter.inner_fixed_off`, `InnerAnchor.lead_fixed_cps`) — when the leading run before the anchor is fixed-length (`\d{4}-…` → 4) and the input is ASCII, jump anchor-to-anchor and **bounded-confirm at `q − off`** (one confirm per occurrence) instead of a reverse-scan + native find that crawls a dash-dense haystack (nginx `- -`). Non-ASCII / variable-run keeps the reverse-scan path | done | `date_iso` ~610 MiB/s → **~9.8 GiB/s (≈16×)** |
 | ✅ *(0.5.0)* | **Line-anchored capture/span dispatch** (`Filter.line_anchored`) — a `(?m)^…` pattern with no eager DFA attempts the match anchored at each line start (`memchr` the next `\n`) for **both** span (`count`/`find`) and captures, dropping the lazy DFA's reverse pass and the separate capture-fill pass | done | `log_line` span ~230 MiB/s → **~1.1 GiB/s (≈4.7×)** |
 | ✅ *(0.5.0)* | **Eager-DFA determinization budget** (`auto.EAGER_BYTE_INST_MAX`) — `auto` only attempts the eager DFA when the byte NFA is small enough to determinize cheaply; a big Unicode-class join (`\w+@\w+`, `[\w.+-]+@…`) goes straight to the lazy DFA. The email pattern's eager DFA overflowed `max_states` and declined anyway after burning ~0.9 s | done | **email compile ~0.88 s → ~6 ms (≈140×)**, runtime unchanged (already lazy) |
+| ✅ *(0.5.0)* | **Determinization + byte-lowering are no longer `O(class²)`** — a Unicode class is an `x+` loop over a fan-out split tree, so every char-completing edge re-closed the loop-back split (re-walk the whole tree, re-intern the same big state), and the byte lowering's suffix cache scanned the byte-range DAG linearly per tail. Fixed by a **single-seed closure cache** (`Det.ss_cache`/`RDet.rss_cache` — memoize `closure([pc])` by `(seed pc, ctx)`, forward + reverse; exact key, context bits folded in for `\b`/`(?m)`) and a **hashed suffix cache** (`Builder.tail_hash`, `(lo,hi,next)` → pc). Pure build-time, results-invariant | done | compile: `\p{L}+` 31.9 → ~1.0 ms (≈32×), `\w+` 45 → ~0.8 ms (≈54×), `\b\w+\b` 47.6 → ~1.3 ms (≈38×); email byte-lowering 6 → <1 ms |
+| ✅ *(0.5.0)* | **Prone + prefiltered → lazy-DFA cascade** (`edfa.Options.decline_if_prone`) — a *prone* pattern needs the eager DFA's frozen **reverse** table for its two-pass `find`, but when `auto` has a start-skip prefilter (leading literal / alternation / interior anchor) the find is prefilter-driven and that table is built-but-unused. `auto` declines the eager DFA right after the cheap proneness check and uses the lazy DFA (same prefilter, same spans, near-zero build) | done | **`the\s+\p{L}+` compile ~107 ms → ~0.6 ms (≈188×)**, search unchanged |
 
 ### The byte substrate (tier 3a, landed)
 
@@ -622,7 +624,10 @@ alphabet a DFA keys transitions on.
 >   continuation-byte tails (`[0x80, 0xBF]`) shared across hundreds of a class's
 >   sequences are emitted **once** and converged on. `\w`: **3930** insts (was 5691);
 >   `\p{L}`: **3337** (was 4777); `\d`: **252** (was 391). This needs `byte_range` to
->   carry an explicit `next` (a plain chain still sets `pc + 1`).
+>   carry an explicit `next` (a plain chain still sets `pc + 1`). *(0.5.0: the cache is an
+>   open-addressing **hash index** keyed on `(lo, hi, next)`, so lowering a big class is
+>   `O(class)` not `O(class²)` — the former per-tail DAG scan; `email`'s three classes lower
+>   ~6 ms → <1 ms.)*
 > - **Single-copy `x+`.** An unbounded `x{min,}` with a capture-free body compiles to one
 >   looped body, not a duplicated one: `\w+` **3931** (was 11381), `\w+@\w+` **7860** (was
 >   22760 — ~94 KB vs ~273 KB), `\d+` **253** (was 781). ASCII patterns are unchanged.
