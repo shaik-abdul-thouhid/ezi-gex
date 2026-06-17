@@ -27,7 +27,7 @@ a **pluggable backend** architecture.
 
 ## Status
 
-**Latest release: `v0.5.0`.** `main` is the active development branch (now `0.6.0-dev`); see
+**Latest release: `v0.5.1`.** `main` is the active development branch (`0.6.0-dev`); see
 [Installing](#installing) for pinning the tag vs. tracking `main`. Pre-1.0, so the API may still
 change, but everything in the public surface is annotated `@stable-since: vX.Y.Z` and is covered by
 SemVer. Tracks a recent Zig dev build (`0.17.0-dev`); it will not compile on stable 0.16.
@@ -133,17 +133,17 @@ dead-on-invalid UTF-8, and the **byte-NFA lowering + `ByteMap` equivalence class
 
 ## Installing
 
-The latest **tagged** release is **`v0.5.0`** — the recommended choice for reproducible
+The latest **tagged** release is **`v0.5.1`** — the recommended choice for reproducible
 builds. Via git ref (resolves the tag and pins its content hash in `build.zig.zon`):
 
 ```sh
-zig fetch --save git+https://github.com/shaik-abdul-thouhid/ezi-gex.git#v0.5.0
+zig fetch --save git+https://github.com/shaik-abdul-thouhid/ezi-gex.git#v0.5.1
 ```
 
 Or via plain HTTP tarball (also pins the content hash):
 
 ```sh
-zig fetch --save https://github.com/shaik-abdul-thouhid/ezi-gex/archive/refs/tags/v0.5.0.tar.gz
+zig fetch --save https://github.com/shaik-abdul-thouhid/ezi-gex/archive/refs/tags/v0.5.1.tar.gz
 ```
 
 **Tracking `main` (unreleased `0.6.0-dev`)** — if you want the latest in-development surface
@@ -155,7 +155,7 @@ zig fetch --save git+https://github.com/shaik-abdul-thouhid/ezi-gex.git#main
 ```
 
 `main` is the development branch: it builds and is tested, but APIs there are not yet covered
-by a tag, so they can still change before `0.6.0`. For reproducible builds prefer the `v0.5.0`
+by a tag, so they can still change before `0.6.0`. For reproducible builds prefer the `v0.5.1`
 tag; reach for `main` only when you specifically need unreleased work.
 
 Then in `build.zig` (the `ezi_code` dependency is resolved transitively — you only
@@ -779,6 +779,14 @@ zig build fuzz --fuzz=200000                # bounded coverage-guided session (K
 > ⚠️ Bare `zig build test --fuzz` (no `=N`) fuzzes **forever** across every binary by design — for a
 > bounded run always use `--fuzz=N` and target the `fuzz` unit. Targets: scanner-never-crashes,
 > cross-backend span agreement (Pike VM oracle), and exact `{m,n}`-limit accept/reject.
+
+## Known limitations
+
+A few deliberate semantic choices (JS-style empty-loop ties, `\X` on the backtracker only)
+and two deferred edge cases on pathological patterns — an empty-width loop over a nullable
+concat body (`pikevm`/`backtrack` only; `auto` correct), and `\b`/`\B` after a length-varying
+alternation (eager DFA / `auto`) — are documented, with repro tables and workarounds, in
+[`docs/limitations.md`](docs/limitations.md).
 
 ## License
 

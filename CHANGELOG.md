@@ -5,9 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.1] - 2026-06-17
 
-`0.6.0-dev` on `main`.
+Patch release: leftmost-first correctness fixes for degenerate anchor / empty-width-loop /
+`\b` patterns surfaced by the coverage-guided fuzz suite, plus a new `docs/limitations.md`.
+Results-invariant for real-world patterns; the benchmarked `\b`/`$`/`(?m)` fast paths stay
+DFA-eligible (regex-bench parity unchanged).
+
+### Fixed
+
+- **Empty-width-loop over-consumption.** An **unbounded** outer repetition
+  (`*`/`+`/`{m,}`) wrapped around a body that lowers to a **nullable** repetition
+  (`S*`/`S*?`, and bounded `S?`/`S??`/`S{0,k}`, optionally captured) over-consumed on
+  the Pike VM — `(?:c*?)+.` matched `"cc"`, `(?:c*?){3,}.` matched `"cc"`, and
+  `(?:a??){3,}` matched `"aaa"`, where leftmost-first (Rust `regex` / RE2) gives
+  `"c"` / `""`. Repeating a nullable repetition any number of times matches the same
+  language as one unbounded repetition (`(S*)* ≡ S*`, `(S??){3,} ≡ S*?`), so the
+  redundant outer loop is now collapsed in HIR (`astNullableRepBody` +
+  `widenBodyRepToUnbounded`), keeping the body's own greediness and consume
+  capability (`(?:a*?)+b` → `"aaab"` is intact). The fix is in the shared front end,
+  so every backend agrees. Found by the differential fuzzer (`b(){5,}|(?:[cc]*?){3,}.`,
+  then `(?i:[cca-c1]??){3,}`); spans **and** capture slots cross-checked against Rust
+  `regex`; pinned by conformance regressions with non-nullable/greedy/bounded-outer
+  controls. (Empty-alternation nullable bodies — `(?:|a)+` — keep ezi's JS-style
+  empty-loop semantics, unchanged.)
+- **`(?m)` line-anchor leftmost-first divergences (two more sub-shapes).** Both
+  matched on the Pike VM but diverged on the eager byte DFA (`auto`), now declined
+  to the Pike VM by a widened `hir.Analysis.complex_line_anchor`; the benchmarked
+  leading-`(?m)^` / trailing-`(?m)$` fast paths are unaffected.
+  - A `line_end` immediately followed by a `line_start` (`(?m:$^)`, `(?m:$$^)`) over
+    an empty/zero-width position — the two line contexts can't be carried at one
+    offset by the DFA's anchored-restart + `\n`-lookahead model (the natural `^…$`
+    order is fine). Found by a 1.5M-run supports-gate fuzz campaign.
+  - A line anchor **inside an alternation branch** (`(?m:$)|.`, `(?m:b{0,2}$)|…`) —
+    the branch matches empty leftmost-first at offset 0, but the DFA can't
+    priority-order that zero-width branch against a consuming sibling and took the
+    longer branch (the line analogue of `\b`-in-alternation). Found by a 2M-run
+    campaign. Both pinned by conformance regressions.
+- **`\b` with two adjacent repetitions leftmost-first divergence.** A `\b`/`\B`
+  preceded by two **adjacent consuming repetitions** whose split is ambiguous
+  (`\n+(\n.*){0,2}\b` — leading `\n+` overlapping a `(\n.*){0,2}` body) let the
+  boundary hold at an early (greedy-first, shorter) end *and* a later one: the Pike
+  VM takes the early end leftmost-first (`{0,2}`), the leftmost-longest byte DFA took
+  the late one (`{0,4}`). New `hir.Analysis.word_boundary_with_adjacent_repetition`
+  declines it to the Pike VM; a single rep tight against the boundary (`\b\w+\b`,
+  `\w*\b`, `.*\b`) is unambiguous and stays on the DFA fast path. Found by a 3M-run
+  differential fuzz campaign; pinned by a conformance regression.
+
+### Docs
+
+- Added [`docs/limitations.md`](docs/limitations.md): the deliberate semantic choices
+  (JS-style empty-loop ties for empty alternations, `\X` on the backtracker only,
+  the bounded `{m,n}` ceiling) and **two deferred** edge cases on pathological patterns,
+  each pinned by a conformance test:
+  - An empty-width loop over a nullable *concat* body (`(?:a?b??)+`) over-consumes on the
+    `pikevm`/`backtrack` backends; the default `auto` is correct
+    (`empty_loop_concat_auto_cases`).
+  - A `\b`/`\B` after a length-varying alternation (`(b+|.+)\B`) loses leftmost-first
+    priority on the eager byte DFA, and so on `auto`; `pikevm`/`backtrack`/lazy-`dfa` are
+    correct (`word_boundary_after_alt_ref_cases`).
 
 ## [0.5.0] - 2026-06-17
 
