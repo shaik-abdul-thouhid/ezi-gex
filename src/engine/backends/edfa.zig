@@ -416,14 +416,22 @@ pub fn supports(h: hir.Hir) bool {
     // fewer" picks the short match where the boundary holds, but the longest-match
     // DFA picks the long one. Decline. See `hir.Analysis.word_boundary_with_lazy_repetition`.
     if (h.analysis.word_boundary_with_lazy_repetition) return false;
+    // A `\b`/`\B` with two adjacent consuming repetitions (`\n+(\n.*){0,2}\b`): the
+    // ambiguous split lets the boundary hold at an early (greedy-first) end and a later
+    // one; leftmost-first takes the early end, the longest-match DFA the late one.
+    // Decline. See `hir.Analysis.word_boundary_with_adjacent_repetition`.
+    if (h.analysis.word_boundary_with_adjacent_repetition) return false;
     // `(?m)` line anchors are matched by anchored-restart with a one-byte `\n`
     // lookahead — correct only for a clean leading `(?m)^` or trailing `(?m)$` in
     // isolation. Mixed with a `text_start` (`\A`) / `text_end` (`\z`, non-`(?m)` `$`),
     // the start-context / end-of-input interactions diverge from the Pike VM; decline.
     if (has_line and (has_text_end or has_text_start)) return false;
     // And a line anchor in a non-leading/non-trailing/under-a-repetition position
-    // (`(?m:$\n)`, `(?m:\n$)*`) is outside what the lookahead model covers — decline.
-    // See `hir.Analysis.complex_line_anchor`.
+    // (`(?m:$\n)`, `(?m:\n$)*`), a `line_end` followed by a `line_start` (`(?m:$^)` —
+    // zero-width but the two contexts can't sit at one offset), or a line anchor inside
+    // an alternation branch (`(?m:$)|.` — a zero-width branch the line model can't
+    // priority-order against a consuming sibling), is outside what the lookahead model
+    // covers — decline. See `hir.Analysis.complex_line_anchor`.
     if (h.analysis.complex_line_anchor) return false;
     return true;
 }

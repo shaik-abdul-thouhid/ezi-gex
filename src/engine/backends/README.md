@@ -61,9 +61,10 @@ and pinned by a conformance regression whose controls keep the benchmarked fast 
 | `word_boundary_in_alternation` | `\b\|.` | empty-`\b` branch must win, DFA takes the longer |
 | `word_boundary_with_nullable_alternation` | `\B(?:\|.*)` | empty-branch priority beside a boundary |
 | `word_boundary_with_lazy_repetition` | `a*?\b`, `[^a]+?\B *` | lazy "prefer fewer" vs longest-match |
+| `word_boundary_with_adjacent_repetition` | `\n+(\n.*){0,2}\b` | two adjacent reps + `\b`: ambiguous split, boundary holds early & late |
 | `nullable_alternation_in_repetition` | `(?:\|.)+` | JS empty-loop semantics (consume), DFA takes empty |
 | `interior_text_end` | `$b$`, `\z.?\z`, `$^\z` | a non-trailing `$`/`\z` is masked by a trailing one |
-| `complex_line_anchor` | `(?m:$\n)`, `(?m:\n$)*`, `(?m:$)\A` | `(?m)` anchor non-trailing / under-rep / anchor-mixed |
+| `complex_line_anchor` | `(?m:$\n)`, `(?m:\n$)*`, `(?m:$)\A`, `(?m:$^)`, `(?m:$)\|.` | `(?m)` anchor non-trailing / under-rep / anchor-mixed / `$^` (line_end before line_start) / in an alternation branch |
 
 Conservative by design (whole-pattern co-occurrence): they may forgo the DFA on an uncommon pattern
 that would have been fine, but never trade correctness. (See `../../../fuzz/README.md`.)

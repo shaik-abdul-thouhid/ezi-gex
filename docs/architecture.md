@@ -9,7 +9,9 @@ This is the document for two readers:
 If you only want to *use* the library, the [README](../README.md) is enough, and
 [`usage-guide.md`](usage-guide.md) is its hands-on companion — copy-paste recipes for
 every op, the pipeline driven from lexing, and a runnable, step-by-step "write your own
-backend" walkthrough. This document goes a layer down: the *why* behind that *how*.
+backend" walkthrough. [`limitations.md`](limitations.md) lists the deliberate semantic
+choices and the one deferred edge case. This document goes a layer down: the *why* behind
+that *how*.
 
 ---
 
@@ -461,9 +463,11 @@ match, so a prefilter or length gate built on them never yields a false negative
   VM's leftmost-**first** semantics, routing them to the Pike VM (correct + O(input)):
   `word_boundary_in_alternation` (`\b|.`), `word_boundary_with_nullable_alternation`
   (`\B(?:|.*)`), `word_boundary_with_lazy_repetition` (`a*?\b`, `[^a]+?\B *`),
+  `word_boundary_with_adjacent_repetition` (`\n+(\n.*){0,2}\b`),
   `nullable_alternation_in_repetition` (`(?:|.)+`), `interior_text_end` (a non-trailing
   `$`/`\z`, `$b$`), and `complex_line_anchor` (a `(?m)` anchor that is non-trailing /
-  under a repetition / mixed with `\A`/`\z`). All were surfaced by the fuzz suite
+  under a repetition / mixed with `\A`/`\z` / a `line_end` before a `line_start` `(?m:$^)` /
+  inside an alternation branch `(?m:$)|.`). All were surfaced by the fuzz suite
   (`fuzz/`) and the external Rust oracle; each is pinned by a conformance regression
   whose controls keep the benchmarked `\b`/`$`/`(?m)` fast paths DFA-eligible.
 

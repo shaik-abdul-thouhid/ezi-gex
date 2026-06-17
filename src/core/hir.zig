@@ -553,16 +553,36 @@ pub const Analysis = struct {
     ///
     /// @stable-since: v0.5.0
     word_boundary_with_lazy_repetition: bool,
+    /// The pattern has a `\b`/`\B` word boundary AND two **adjacent** consuming
+    /// repetitions in a concat (a repetition immediately followed by another, e.g.
+    /// `\n+(\n.*){0,2}`). When the two reps can consume the same leading byte their
+    /// split is ambiguous, and a trailing `\b` can then hold at an earlier
+    /// (greedy-first, shorter) end *and* a later one: leftmost-first takes the early
+    /// end (`\n+(\n.*){0,2}\b` on `"\n\nab"` is `{0,2}`), the leftmost-**longest** byte
+    /// DFA's word-context model takes the late one (`{0,4}`). A single repetition
+    /// tight against the boundary (`\w*\b`, `\b\w+\b`, `.*\b`) is unambiguous and is
+    /// NOT flagged — the benchmarked `\b` fast paths stay on the DFA. Declined to the
+    /// Pike VM. Conservative whole-pattern co-occurrence (it may forgo the DFA on an
+    /// adjacent-rep `\b` pattern that would have agreed), never trading correctness.
+    ///
+    /// @stable-since: v0.5.1
+    word_boundary_with_adjacent_repetition: bool,
     /// A `(?m)` line anchor (`line_start`/`line_end`) appears in a shape the eager
-    /// byte DFA's line support cannot handle: a **non-leading** `(?m)^` (a consumer
-    /// precedes it), a **non-trailing** `(?m)$` (a consumer follows it, `(?m:$\n)`),
-    /// or **any** line anchor inside a repetition (`(?m:\n$)*`). The eager DFA does
-    /// line anchors by anchored-restart with a one-byte `\n`-lookahead, which is only
-    /// correct for a single leading `(?m)^…` or trailing `…(?m)$`; the shapes above
-    /// diverge from the Pike VM (both over- and under-matching), so they are declined
-    /// to it. The benchmarked leading-`(?m)^` (`(?m)^\w+`, `log_line`) and trailing
-    /// `(?m)$` are NOT flagged — they keep the DFA fast path. (Mixing a line anchor
-    /// with a `text_start`/`text_end` is a separate boolean check in the supports gate.)
+    /// byte DFA's line support cannot handle: a **non-leading** `(?m)^` (a consumer —
+    /// or an earlier `line_end`, `$^` — precedes it), a **non-trailing** `(?m)$` (a
+    /// consumer follows it, `(?m:$\n)`), **any** line anchor inside a repetition
+    /// (`(?m:\n$)*`), or **any** line anchor inside an alternation branch
+    /// (`(?m:$)|.` — a zero-width branch the line model can't priority-order against a
+    /// consuming sibling, so the DFA takes the longer branch). The eager DFA does line
+    /// anchors by anchored-restart with a
+    /// one-byte `\n`-lookahead, which is only correct for a single leading `(?m)^…` or
+    /// trailing `…(?m)$`; the shapes above diverge from the Pike VM (both over- and
+    /// under-matching), so they are declined to it. Note `$^` (line_end then
+    /// line_start) is interior even though it is zero-width — the two line contexts
+    /// can't be carried at one offset — whereas the natural `^…$` order is fine. The
+    /// benchmarked leading-`(?m)^` (`(?m)^\w+`, `log_line`) and trailing `(?m)$` are
+    /// NOT flagged — they keep the DFA fast path. (Mixing a line anchor with a
+    /// `text_start`/`text_end` is a separate boolean check in the supports gate.)
     ///
     /// @stable-since: v0.5.0
     complex_line_anchor: bool,
@@ -1221,12 +1241,71 @@ fn Builder(comptime mode: Mode) type {
             const q = r.quantifier;
             if (q.min == 1 and q.max != null and q.max.? == 1) return child; // {1} → child
             if (q.min == 0 and q.max != null and q.max.? == 0) return self.addNode(.{ .tag = .empty, .data = .{ .none = {} } });
+            // Empty-width-loop collapse: an UNBOUNDED outer (`*`/`+`/`{m,}`) over a
+            // body that lowers to a NULLABLE repetition (`S*`, `S?`, `S{0,k}` and their
+            // lazy forms, optionally wrapped in a capture) is idempotent up to the
+            // body's unbounded form — `(S*)* ≡ S*`, `(S?)+ ≡ S*`, `(S??){3,} ≡ S*?` —
+            // because repeating a nullable repetition any number of times matches the
+            // same language as one unbounded repetition with the body's greediness.
+            // Without this, the redundant outer loop lets the Pike VM over-consume on a
+            // nullable lazy body (`(?:c*?)+.` matched "cc" not "c"; `(?:a??){3,}` matched
+            // "aaa" not ""), diverging from leftmost-first (Rust/RE2). So drop the outer
+            // and widen the body's repetition to unbounded (`max = null`); the body
+            // keeps its consume capability, so downstream-forced cases (`(?:a*?)+b` →
+            // "aaab") are intact. Decided from the AST (mirrors these collapses
+            // recursively) so the count/emit passes agree; the widening mutates the
+            // freshly-lowered body in place (emit only — a no-op for an already
+            // unbounded body), adding no node. See `astNullableRepBody`.
+            if (q.max == null and self.astNullableRepBody(r.child)) {
+                if (emit) self.widenBodyRepToUnbounded(child);
+                return child;
+            }
             return self.addNode(.{ .tag = .repetition, .data = .{ .repetition = .{
                 .child = child,
                 .min = q.min,
                 .max = q.max,
                 .greedy = q.greedy,
             } } });
+        }
+
+        /// Widen the repetition reached through `idx` (looking past a capture wrapper)
+        /// to unbounded (`max = null`) — the emit-only half of the empty-width-loop
+        /// collapse. The body is already nullable (`min == 0`), so only `max` changes;
+        /// for an already-unbounded body this is a no-op.
+        fn widenBodyRepToUnbounded(self: *Self, idx: u32) void {
+            switch (self.nodes[idx].tag) {
+                .repetition => self.nodes[idx].data.repetition.max = null,
+                .capture => self.widenBodyRepToUnbounded(self.nodes[idx].data.capture.child),
+                else => {},
+            }
+        }
+
+        /// Whether the AST subtree at `idx` lowers to a **nullable repetition** (a
+        /// `repetition` node with `min == 0` — `S*`/`S*?`/`S?`/`S??`/`S{0,k}`), seen
+        /// through transparent wrappers and the same structural collapses `lower`
+        /// applies. Used to decide the empty-width-loop collapse in `lowerRepetition`;
+        /// pure over the AST so both builder passes agree.
+        fn astNullableRepBody(self: *Self, idx: u32) bool {
+            const node = self.a.nodes[idx];
+            return switch (node.tag) {
+                .non_capture => self.astNullableRepBody(node.data.non_capture.child),
+                .capture => self.astNullableRepBody(node.data.capture.child),
+                .range => blk: {
+                    const q = node.data.range.quantifier;
+                    // `{1}` → child: defer to the child's lowering.
+                    if (q.min == 1 and q.max != null and q.max.? == 1)
+                        break :blk self.astNullableRepBody(node.data.range.child);
+                    // `{0,0}` → `empty` (not a repetition).
+                    if (q.max != null and q.max.? == 0) break :blk false;
+                    if (q.min == 0) break :blk true; // nullable rep: `S*`/`S*?`/`S?`/`S??`/`S{0,k}`
+                    // `S+` / `S{k,}` (min ≥ 1): unbounded ones collapse to their child
+                    // iff that child is itself a nullable rep (same rule, one level
+                    // down); bounded min-≥1 reps are not nullable.
+                    if (q.max == null) break :blk self.astNullableRepBody(node.data.range.child);
+                    break :blk false;
+                },
+                else => false,
+            };
         }
 
         fn lowerCapture(self: *Self, idx: u32, flags: Flags) BuildError!u32 {
@@ -1435,7 +1514,9 @@ fn analyze(
             hasNullableAlternation(nodes, children, root),
         .word_boundary_with_lazy_repetition = hasWordBoundary(nodes, children, root) and
             hasLazyRepetition(nodes, children, root),
-        .complex_line_anchor = complexLineAnchor(nodes, children, root, false, false, false),
+        .word_boundary_with_adjacent_repetition = hasWordBoundary(nodes, children, root) and
+            hasAdjacentRepetition(nodes, children, root),
+        .complex_line_anchor = complexLineAnchor(nodes, children, root, false, false, false, false, false),
         .is_whole_literal = nodes[root].tag == .literal,
         .is_one_pass = false, // decided by the backend's NFA compiler; see Analysis
         .prefix_literal = prefixLiteral(nodes, children, root),
@@ -1689,6 +1770,58 @@ fn hasLazyRepetition(nodes: []const Node, children: []const u32, idx: u32) bool 
     };
 }
 
+/// Whether any concat holds two **adjacent consuming repetitions** — a repetition
+/// (looking through a capture wrapper) immediately followed by another, with no
+/// consumer between. Their split is ambiguous, which combined with a `\b` defeats the
+/// byte DFA's leftmost-first priority (see
+/// `Analysis.word_boundary_with_adjacent_repetition`). Used only gated behind
+/// `hasWordBoundary`, so a rep pair without a boundary stays on the DFA.
+fn hasAdjacentRepetition(nodes: []const Node, children: []const u32, idx: u32) bool {
+    const node = nodes[idx];
+    switch (node.tag) {
+        .concat => {
+            const d = node.data.children;
+            const slice = children[d.start .. d.start + d.len];
+            var prev_is_rep = false;
+            for (slice) |ci| {
+                if (hasAdjacentRepetition(nodes, children, ci)) return true; // nested
+                const leads = leadingRepetition(nodes, children, ci);
+                if (leads and prev_is_rep) return true;
+                // A purely zero-width atom (anchor/empty) doesn't break adjacency;
+                // any consuming non-rep resets it.
+                if (!isZeroWidth(nodes, children, ci)) prev_is_rep = leads;
+            }
+            return false;
+        },
+        .alternation => {
+            const d = node.data.children;
+            for (children[d.start .. d.start + d.len]) |ci| {
+                if (hasAdjacentRepetition(nodes, children, ci)) return true;
+            }
+            return false;
+        },
+        .capture => return hasAdjacentRepetition(nodes, children, node.data.capture.child),
+        .repetition => return hasAdjacentRepetition(nodes, children, node.data.repetition.child),
+        else => return false,
+    }
+}
+
+/// Whether `idx` is (or, through a capture, wraps) a repetition node — its match
+/// begins with a repeated atom.
+fn leadingRepetition(nodes: []const Node, children: []const u32, idx: u32) bool {
+    return switch (nodes[idx].tag) {
+        .repetition => true,
+        .capture => leadingRepetition(nodes, children, nodes[idx].data.capture.child),
+        else => false,
+    };
+}
+
+/// Whether the subtree is purely zero-width (no path consumes a byte): an anchor,
+/// `empty`, or a capture/alternation/concat built only from those.
+fn isZeroWidth(nodes: []const Node, children: []const u32, idx: u32) bool {
+    return !canConsume(nodes, children, idx);
+}
+
 /// Whether a `text_end` anchor sits in a non-trailing position — i.e. a consuming
 /// atom can follow it (see `Analysis.interior_text_end`). `consumer_follows`
 /// tracks, top-down, whether something after the current node in the match can
@@ -1765,10 +1898,20 @@ fn subtreeHasTextStart(nodes: []const Node, children: []const u32, idx: u32) boo
 
 /// Whether a `(?m)` line anchor sits in a shape the eager byte DFA can't handle —
 /// a non-leading `line_start`, a non-trailing `line_end`, or any line anchor under a
-/// repetition (see `Analysis.complex_line_anchor`). `consumer_before`/`consumer_after`
-/// track whether something on the match path can consume before/after the current
-/// node; `in_rep` is set once we descend through a repetition (whose body repeats, so
-/// a line anchor there can never be cleanly leading/trailing).
+/// repetition (see `Analysis.complex_line_anchor`). The DFA can model at most a
+/// *leading* line-start context and a *trailing* line-end context, so a `line_start`
+/// must have nothing but other line-starts before it and a `line_end` nothing but
+/// other line-ends after it. `consumer_before`/`consumer_after` track whether
+/// something on the match path can consume before/after the current node;
+/// `line_end_before` tracks whether a `line_end` precedes it with no consumer between
+/// (which makes a following `line_start` interior — `$^` is zero-width yet the two
+/// contexts can't be carried at one offset, unlike the natural `^$` order); `in_rep`
+/// is set once we descend through a repetition (whose body repeats, so a line anchor
+/// there can never be cleanly leading/trailing); `in_alt` is set once we descend into
+/// an alternation branch — a line anchor there is a zero-width branch the DFA's line
+/// model can't priority-order against a consuming sibling (`(?m:$)|.` matches empty
+/// leftmost-first, the DFA takes the longer branch), the line analogue of
+/// `word_boundary_in_alternation`.
 fn complexLineAnchor(
     nodes: []const Node,
     children: []const u32,
@@ -1776,12 +1919,16 @@ fn complexLineAnchor(
     in_rep: bool,
     consumer_before: bool,
     consumer_after: bool,
+    line_end_before: bool,
+    in_alt: bool,
 ) bool {
     const node = nodes[idx];
     switch (node.tag) {
         .anchor => return switch (node.data.anchor.kind) {
-            .line_start => in_rep or consumer_before, // a `(?m)^` that isn't leading
-            .line_end => in_rep or consumer_after, // a `(?m)$` that isn't trailing
+            // a `(?m)^` that isn't leading: a consumer or an earlier `line_end`
+            // (`$^`) on the path before it puts it past the match's leading edge.
+            .line_start => in_rep or consumer_before or line_end_before or in_alt,
+            .line_end => in_rep or consumer_after or in_alt, // a `(?m)$` that isn't trailing / is a branch
             else => false,
         },
         .concat => {
@@ -1789,28 +1936,51 @@ fn complexLineAnchor(
             const slice = children[d.start .. d.start + d.len];
             for (slice, 0..) |ci, i| {
                 var cb = consumer_before;
+                var le_before = line_end_before;
                 for (slice[0..i]) |cj| {
                     if (canConsume(nodes, children, cj)) cb = true;
+                    if (subtreeHasLineEnd(nodes, children, cj)) le_before = true;
                 }
                 var ca = consumer_after;
                 for (slice[i + 1 ..]) |cj| {
                     if (canConsume(nodes, children, cj)) ca = true;
                 }
-                if (complexLineAnchor(nodes, children, ci, in_rep, cb, ca)) return true;
+                if (complexLineAnchor(nodes, children, ci, in_rep, cb, ca, le_before, in_alt)) return true;
             }
             return false;
         },
         .alternation => {
             const d = node.data.children;
             for (children[d.start .. d.start + d.len]) |ci| {
-                if (complexLineAnchor(nodes, children, ci, in_rep, consumer_before, consumer_after)) return true;
+                if (complexLineAnchor(nodes, children, ci, in_rep, consumer_before, consumer_after, line_end_before, true)) return true;
             }
             return false;
         },
-        .capture => return complexLineAnchor(nodes, children, node.data.capture.child, in_rep, consumer_before, consumer_after),
-        .repetition => return complexLineAnchor(nodes, children, node.data.repetition.child, true, consumer_before, consumer_after),
+        .capture => return complexLineAnchor(nodes, children, node.data.capture.child, in_rep, consumer_before, consumer_after, line_end_before, in_alt),
+        .repetition => return complexLineAnchor(nodes, children, node.data.repetition.child, true, consumer_before, consumer_after, line_end_before, in_alt),
         else => return false,
     }
+}
+
+/// Whether the subtree contains a `line_end` (`(?m)$`) anchor — used to detect a
+/// `line_end` that precedes a later `line_start` on the match path (`$^`), a shape the
+/// eager byte DFA can't carry. Conservative: a `line_end` anywhere in an earlier
+/// sibling counts (an over-match just declines the pattern to the correct Pike VM).
+fn subtreeHasLineEnd(nodes: []const Node, children: []const u32, idx: u32) bool {
+    const node = nodes[idx];
+    return switch (node.tag) {
+        .anchor => node.data.anchor.kind == .line_end,
+        .concat, .alternation => blk: {
+            const d = node.data.children;
+            for (children[d.start .. d.start + d.len]) |ci| {
+                if (subtreeHasLineEnd(nodes, children, ci)) break :blk true;
+            }
+            break :blk false;
+        },
+        .capture => subtreeHasLineEnd(nodes, children, node.data.capture.child),
+        .repetition => subtreeHasLineEnd(nodes, children, node.data.repetition.child),
+        else => false,
+    };
 }
 
 /// The literal run every match must begin with, or null. Follows the mandatory

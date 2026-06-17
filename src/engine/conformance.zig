@@ -480,6 +480,34 @@ test "word-boundary-with-lazy-nullable agrees across backends (v0.5.0 regression
     }
 }
 
+// Regression (0.5.1): a `\b`/`\B` with two ADJACENT consuming repetitions whose split
+// is ambiguous (`\n+(\n.*){0,2}\b` — a leading `\n+` overlapping a `(\n.*){0,2}` body).
+// The boundary then holds at an early (greedy-`\n+`-first, shorter) end AND a later
+// one; leftmost-first takes the early end (`{0,2}`), the longest-match byte DFA took
+// the late one (`{0,4}`). Found by the 2M-run differential fuzz campaign. Declined to
+// the Pike VM (`hir.Analysis.word_boundary_with_adjacent_repetition`). Controls: a
+// single rep tight against the boundary (`\b\w+\b`, `\w*\b`, `.*\b`) is unambiguous and
+// must STAY on the DFA (verified DFA-routed in the supports tests).
+const word_boundary_adjacent_rep_cases = [_]Case{
+    .{ .pat = "\n+(\n.*){0,2}\\b", .input = "\n\nab", .expect = "\n\n" }, // auto matched "\n\nab"
+    .{ .pat = "\n+(\\B?\n.*){0,2}\\b", .input = "\n\nab", .expect = "\n\n" }, // the raw fuzzer find
+    .{ .pat = "\n+(\n.*)*\\b", .input = "\n\nab", .expect = "\n\n" }, // unbounded outer too
+    .{ .pat = "\n*(\n.*){0,2}\\b", .input = "\n\nab", .expect = "\n\n" }, // `\n*` leading
+    // Controls — a single boundary-tight rep agrees on the DFA, stays eligible.
+    .{ .pat = "\\b\\w+\\b", .input = "ab cd", .expect = "ab" },
+    .{ .pat = "\\w*\\b", .input = "abc", .expect = "abc" },
+    .{ .pat = ".*\\b", .input = "ab cd", .expect = "ab cd" },
+    .{ .pat = "(\n.*){1,2}\\b", .input = "\n\nab", .expect = "\n\nab" }, // min-1, no leading overlap: stays
+};
+
+test "word-boundary-with-adjacent-repetition agrees across backends (0.5.1 regression)" {
+    for (word_boundary_adjacent_rep_cases) |c| {
+        try checkRuntime(pikevm, c);
+        try checkRuntime(backtrack, c);
+        try checkRuntime(auto, c);
+    }
+}
+
 // Regression (v0.5.0): a `(?m)` line anchor in a shape the eager DFA's `\n`-lookahead
 // model can't carry — a non-trailing `(?m)$` (`(?m:$\n)`), a line anchor under a
 // repetition (`(?m:\n$)*`), or a line anchor mixed with a `text_start`/`text_end`
@@ -493,14 +521,131 @@ const complex_line_anchor_cases = [_]Case{
     .{ .pat = "(?m:$\n){2}", .input = "\n\n", .expect = "\n\n" },
     .{ .pat = "(?m:$)\\A", .input = "", .expect = "" }, // line + text_start
     .{ .pat = "$^\\z", .input = "", .expect = "" }, // text_end + text_start + text_end
-    // Controls — clean leading `(?m)^` / trailing `(?m)$` stay DFA-eligible.
+    // `(?m)$^` — a line_end immediately FOLLOWED by a line_start (the two contexts
+    // can't be carried at one zero-width offset). The natural `^$` order is fine
+    // (it's a control below); only `$`-then-`^` is interior. Found by the v0.5.0
+    // supports-gate fuzz campaign (`(?m:$$^)` over "").
+    .{ .pat = "(?m:$^)", .input = "", .expect = "" },
+    .{ .pat = "(?m:$$^)", .input = "", .expect = "" },
+    .{ .pat = "(?m:$^)", .input = "x", .expect = null }, // no match: x is neither at EOI nor 0-width
+    // A `(?m)` line anchor INSIDE an alternation branch — a zero-width branch the
+    // DFA's line model can't priority-order against a consuming sibling, so it took
+    // the longer branch (leftmost-longest) instead of the empty leftmost-first match.
+    // The line analogue of `\b`-in-alternation (class 1). Found by the 0.5.1 2M-run
+    // fuzz campaign (`(?m:b{0,2}$)|(\n+|).?`).
+    .{ .pat = "(?m:$)|(\n+|).?", .input = "\n\n", .expect = "" }, // line_end branch wins empty at 0
+    .{ .pat = "(?m:b{0,2}$)|(\n+|).?", .input = "\n\n", .expect = "" },
+    // Controls — clean leading `(?m)^` / trailing `(?m)$` (and the natural `^…$`
+    // order) stay DFA-eligible.
     .{ .pat = "(?m)^line2", .input = "line1\nline2\nline3", .expect = "line2" },
     .{ .pat = "(?m)line2$", .input = "line2\nline3", .expect = "line2" },
     .{ .pat = "(?m)^\\w+", .input = "\nword", .expect = "word" },
+    .{ .pat = "(?m)^\\w+$", .input = "ab\ncd", .expect = "ab" }, // ^…$ natural order stays on DFA
 };
 
 test "complex line anchors decline to Pike VM / simple (?m) stays on DFA (v0.5.0 regression)" {
     for (complex_line_anchor_cases) |c| {
+        try checkRuntime(pikevm, c);
+        try checkRuntime(backtrack, c);
+        try checkRuntime(auto, c);
+    }
+}
+
+// Regression (0.5.1): the empty-width-loop collapse. An UNBOUNDED outer repetition
+// (`*`/`+`/`{m,}`) over a body that lowers to a NULLABLE repetition (`S*`/`S*?`, but
+// also bounded `S?`/`S??`/`S{0,k}`, optionally captured) is idempotent up to the body's
+// unbounded form — `(S*)* ≡ S*`, `(S??){3,} ≡ S*?` — and is collapsed in HIR
+// (`astNullableRepBody` + `widenBodyRepToUnbounded`). Without it the redundant outer
+// loop made the Pike VM over-consume on a nullable lazy body (`(?:c*?)+.` matched "cc";
+// `(?:a??){3,}` matched "aaa"; leftmost-first / Rust say "c" / ""). Found by the
+// differential fuzzer (`b(){5,}|(?:[cc]*?){3,}.`, then `(?i:[cca-c1]??){3,}`).
+// Expectations cross-checked against Rust `regex` (an automata, leftmost-first engine).
+// Controls: non-nullable inner (`c+?`), greedy bounded inner (`a?`→ greedy `a*`),
+// bounded OUTER (`{2,3}`), and downstream-forced consume (`(?:a*?)+b`) UNAFFECTED.
+const empty_loop_collapse_cases = [_]Case{
+    .{ .pat = "(?:c*?)+.", .input = "ccc", .expect = "c" }, // was "cc"
+    .{ .pat = "(?:c*?){3,}.", .input = "ccc", .expect = "c" }, // the fuzzer's seed
+    .{ .pat = "(?:c*?)+", .input = "ccc", .expect = "" }, // was "c"
+    .{ .pat = "(?:c*?){2,}", .input = "ccc", .expect = "" },
+    .{ .pat = "(?:c*?)*", .input = "ccc", .expect = "" },
+    .{ .pat = "(?:(?:c*?)+)+", .input = "ccc", .expect = "" }, // doubly nested
+    .{ .pat = "(c*?)+", .input = "ccc", .expect = "" }, // capturing body
+    .{ .pat = "(?:c*?){2,}?", .input = "ccc", .expect = "" }, // lazy outer too
+    // Bounded nullable inner (`S?`/`S??`/`S{0,k}`) — collapses to a star (2nd fuzz find):
+    .{ .pat = "(?:a??){3,}", .input = "aaa", .expect = "" }, // ≡ a*? ; was "aaa"
+    .{ .pat = "(?:a??)+", .input = "aaa", .expect = "" },
+    .{ .pat = "(?:a?){3,}", .input = "aaa", .expect = "aaa" }, // a? greedy ≡ a* ; stays "aaa"
+    .{ .pat = "(?:a{0,3}?)+b", .input = "aaab", .expect = "aaab" }, // lazy bounded, forced
+    .{ .pat = "(a??){2,}", .input = "aaa", .expect = "" }, // capturing bounded nullable
+    // Controls — must stay exactly as before (NOT collapsed):
+    .{ .pat = "(?:c+?)+", .input = "ccc", .expect = "ccc" }, // non-nullable inner
+    .{ .pat = "(?:c*)+.", .input = "ccc", .expect = "ccc" }, // greedy inner
+    .{ .pat = "(?:c*?){2,3}.", .input = "ccc", .expect = "c" }, // bounded outer
+    .{ .pat = "(?:a*?)+b", .input = "aaab", .expect = "aaab" }, // downstream-forced
+    .{ .pat = "(?:[ab]*?)+c", .input = "abbac", .expect = "abbac" },
+};
+
+test "empty-width-loop collapse: unbounded-over-nullable matches leftmost-first (0.5.1 regression)" {
+    for (empty_loop_collapse_cases) |c| {
+        try checkRuntime(pikevm, c);
+        try checkRuntime(backtrack, c);
+        try checkRuntime(auto, c);
+    }
+}
+
+// KNOWN LIMITATION (0.5.1): the empty-width-loop bug also affects an unbounded outer
+// over a nullable CONCAT body with a lazy part (`(?:a?b??)+`, `(?:a??b??)+`). The HIR
+// collapse above cannot reach these — a concat body is not a single repetition to
+// widen — so they would need the general empty-width-loop guard in the Pike VM closure
+// (a deep change deferred for now). The byte DFA handles them correctly, so the DEFAULT
+// `auto` (which runs the DFA on all but tiny inputs) yields the leftmost-first answer
+// that matches Rust `regex`; these cases pin that. The `pikevm`/`backtrack` backends
+// chosen *directly* still over-consume here — a documented gap, not a regression. The
+// expectations below are cross-checked against Rust.
+const empty_loop_concat_auto_cases = [_]Case{
+    .{ .pat = "(?:a?b??)+", .input = "ab", .expect = "a" }, // pikevm-direct gives "ab"
+    .{ .pat = "(?:a??b??)+", .input = "ab", .expect = "" }, // pikevm-direct gives "a"
+    .{ .pat = "(?:a?b?c??)+", .input = "abc", .expect = "ab" },
+    // Forced-consume controls (all engines already agree here):
+    .{ .pat = "(?:a?b??)+x", .input = "abx", .expect = "abx" },
+    .{ .pat = "(?:a??b??)+b", .input = "ab", .expect = "ab" },
+};
+
+test "empty-width-loop over a nullable concat body: auto (byte DFA) is leftmost-first correct (0.5.1)" {
+    // Only `auto` is asserted: the byte DFA gets these right, the Pike VM does not (a
+    // documented limitation — see the comment above). Do NOT add pikevm/backtrack here.
+    for (empty_loop_concat_auto_cases) |c| {
+        try checkRuntime(auto, c);
+    }
+}
+
+// KNOWN LIMITATION (0.5.1): a `\b`/`\B` trailing an alternation with length-varying,
+// OVERLAPPING branches loses leftmost-first priority on the EAGER byte DFA (`edfa`), and
+// therefore on `auto` (which routes ASCII `\b` to the eager arm). `(b+|.+)\B` on "baaa":
+// leftmost-first tries `b+` first → "b" `[0,1)` (`\B` holds between 'b' and 'a'); the
+// eager DFA takes the longer `.+` branch → `[0,3)`. The `pikevm`/`backtrack`/lazy-`dfa`
+// backends are leftmost-first correct. A correct fix needs the eager DFA to preserve
+// alternation priority across a trailing boundary (deferred — same eager-DFA `\b`-priority
+// theme as `word_boundary_with_adjacent_repetition`). Found by a differential anchor fuzz
+// campaign. See docs/limitations.md.
+const word_boundary_after_alt_ref_cases = [_]Case{
+    .{ .pat = "(b+|.+)\\B", .input = "baaa", .expect = "b" }, // edfa/auto give "baa"
+    .{ .pat = "(?:b|baaa)\\B", .input = "baaab", .expect = "b" }, // edfa/auto give "baaa"
+};
+const word_boundary_after_alt_ok_cases = [_]Case{
+    // Control: non-overlapping branches → no priority conflict → ALL backends agree.
+    .{ .pat = "(?:b+|a+)\\B", .input = "baaa", .expect = "b" },
+};
+
+test "word boundary after a length-varying alternation: pikevm/backtrack stay leftmost-first (0.5.1, eager-DFA gap documented)" {
+    // Reference backends only on the diverging set; the eager DFA / `auto` take the longer
+    // match — a documented limitation (docs/limitations.md). Do NOT add auto/edfa here.
+    for (word_boundary_after_alt_ref_cases) |c| {
+        try checkRuntime(pikevm, c);
+        try checkRuntime(backtrack, c);
+    }
+    // The non-overlapping control stays correct on every backend, incl. `auto`.
+    for (word_boundary_after_alt_ok_cases) |c| {
         try checkRuntime(pikevm, c);
         try checkRuntime(backtrack, c);
         try checkRuntime(auto, c);
@@ -908,6 +1053,13 @@ const capture_cases = [_][]const u8{
     "(a+)(b+)",
     "(?<y>\\d+)-(?<m>\\d+)",
     "((a)(b))+",
+    // Empty-width-loop collapse cases (0.5.1): capture slots must stay identical
+    // across backends after the HIR collapse drops a redundant unbounded outer rep.
+    "(c*?)+", // collapses to (c*?); slot must be the body's, not the loop's
+    "((?:c*?)+)x", // outer capture, inner loop collapsed
+    "(?:(c*?)+)x", // inner capture, outer loop collapsed
+    "((c*?)){3,}", // nested captures through the collapse
+    "(a(b*?)+)b", // collapse inside a larger capture
 };
 
 fn captureSlots(comptime B: type, gpa: std.mem.Allocator, pattern: []const u8, input: []const u8, out: []?usize) !bool {
@@ -922,7 +1074,7 @@ fn captureSlots(comptime B: type, gpa: std.mem.Allocator, pattern: []const u8, i
 
 test "capture slot arrays agree across pikevm / backtrack / auto" {
     const gpa = testing.allocator;
-    const inputs = [_][]const u8{ "2026-06-07", "alice@example.com", "abc", "aaabb", "2026-06", "abab" };
+    const inputs = [_][]const u8{ "2026-06-07", "alice@example.com", "abc", "aaabb", "2026-06", "abab", "ccc", "ccx", "abbb", "aaab" };
     for (capture_cases) |pat| {
         for (inputs) |in| {
             var a: [16]?usize = undefined;

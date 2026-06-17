@@ -114,7 +114,7 @@ fast paths stay eligible.
 | 2 | repetition over a **nullable alternation** | `(?:\|.)+` on `"c"` → `{0,0}`, want `{0,1}` | `nullable_alternation_in_repetition` |
 | 3 | **non-trailing** `$`/`\z` (incl. nullable middle, trailing text_start) | `$b$`, `\z.?\z`, `$^\z` wrongly matched | `interior_text_end` |
 | 4 | `\b`/`\B` **adjacent to** a nullable alternation | `\B(?:\|.*)` on `"ab"` → `{1,2}`, want `{1,1}` | `word_boundary_with_nullable_alternation` |
-| 5 | **`(?m)` line anchor** non-trailing/under-rep/anchor-mixed | `(?m:$\n)`, `(?m:\n$)*`, `(?m:$)\A` | `complex_line_anchor` (+ `has_line and has_text_*` gate) |
+| 5 | **`(?m)` line anchor** non-trailing/under-rep/anchor-mixed/`$^`/in-alternation | `(?m:$\n)`, `(?m:\n$)*`, `(?m:$)\A`, `(?m:$^)`, `(?m:$)\|.` | `complex_line_anchor` (+ `has_line and has_text_*` gate) |
 | 6 | `\b`/`\B` with a **lazy repetition** | `a*?\b`, `[^a]+?\B *` → over-matched | `word_boundary_with_lazy_repetition` |
 
 Class 6 was the one the **external Rust oracle** caught that the internal differential
@@ -130,6 +130,78 @@ The campaign is a permanent target (#4, `genAnchors`); it is **fuzzing-only** (a
 no-op under plain `zig build test`, so CI stays green) and active under `--fuzz`, so
 it keeps watch for regressions and new classes. Re-run the catalogue with the
 deterministic search described under *Triaging* below.
+
+A later 1.5M-run `--fuzz` campaign surfaced one more class-5 sub-shape the first
+catalogue missed: `(?m:$^)` (a `line_end` immediately **followed by** a `line_start`)
+over `""` — zero-width, yet the eager DFA can't carry both line contexts at one
+offset, while the natural `^$` order is fine. Fixed by widening `complex_line_anchor`
+to flag a `line_start` with a `line_end` before it on the match path (pinned by
+`(?m:$^)` / `(?m:$$^)` conformance regressions, with `(?m)^\w+$` as the `^…$` control).
+
+The **general** differential (target #2) then caught a deeper, pre-existing core bug
+unrelated to the DFA gate: an **unbounded** outer repetition over a **nullable
+unbounded** body (`b(){5,}|(?:[cc]*?){3,}.`) made the *Pike VM itself* over-consume —
+`(?:c*?)+.` matched `"cc"`, leftmost-first (Rust/RE2) says `"c"`. Here the Pike VM was
+wrong (it matched neither Rust's `"c"` nor V8's `"ccc"`), so declining to it would have
+enshrined a wrong answer; instead the nesting is collapsed in HIR
+(`astNullableRepBody` + `widenBodyRepToUnbounded`: `(S*)* ≡ S*`), fixing all backends at
+once. Spans **and** capture slots were cross-checked against Rust `regex` before landing.
+(Empty-*alternation* nullable bodies — `(?:|a)+` — keep ezi's JS-style empty-loop
+semantics; all backends agree there, so they are not differential failures. Bounded-lazy
+*single-rep* inners are a later finding fixed by the same collapse — see below.)
+
+A follow-up 2M-run campaign then found one more class-5 sub-shape: a `(?m)` line anchor
+**inside an alternation branch** (`(?m:b{0,2}$)|(\n+|).?` over `"\n\n"`) — the branch
+matches empty leftmost-first at offset 0, but the DFA's line model can't priority-order
+that zero-width branch against the consuming sibling, so it took the longer branch
+(`[0,2)`). The line analogue of class 1 (`\b`-in-alternation); folded into
+`complex_line_anchor` (flag a `line_start`/`line_end` reached through an alternation),
+pinned by a conformance regression with `(?m)^\w+` / `(?m)\w+$` controls.
+
+A further 3M-run campaign found a new `\b` class: **two adjacent consuming repetitions +
+a trailing `\b`** (`\n+(\n.*){0,2}\b` over `"\n\nab"`). The leading `\n+` overlaps the
+`(\n.*){0,2}` body, so the boundary can hold at an early (greedy-`\n+`-first, `{0,2}`)
+end and a later (`{0,4}`) one; leftmost-first takes the early end, the longest-match byte
+DFA the late one. A new flag `word_boundary_with_adjacent_repetition` declines it; a
+single rep tight against the boundary (`\b\w+\b`, `\w*\b`, `.*\b`) is unambiguous and
+stays DFA-routed (verified). Pinned by a conformance regression.
+
+A 5M-run campaign (iteration target #6) then found the empty-width-loop bug recurring for
+a **bounded** lazy inner: `(?i:[cca-c1]??){3,}` (and minimal `(?:a??){3,}`) — the Pike VM
+over-consumed (`"aaa"`) where Rust gives `""`. The byte DFA was already correct here, so
+this was a Pike VM bug, not a routing one. Since `(S??){3,} ≡ S*?` (repeating a nullable
+optional = a star), it folds into the **same HIR collapse** — broadened from "unbounded
+inner" to "any nullable inner" (`astNullableRepBody`, widening the body to unbounded),
+which fixes every backend at once. Spans and captures re-checked against Rust.
+
+### Known limitation: empty-width loop over a nullable *concat* body
+
+A final 5M-run campaign surfaced the empty-width-loop bug's last form: an unbounded outer
+over a nullable **concat** body with a lazy part — `(?:a?b??)+`, `(?:a??b??)+`. The Pike
+VM over-consumes (`(?:a?b??)+` on `"ab"` → `"ab"`); Rust/RE2 and ezi's **byte DFA** give
+the leftmost-first `"a"`. The HIR collapse **cannot** reach this — a concat body is not a
+single repetition to widen — so a correct fix needs the general empty-width-loop guard in
+the Pike VM closure (a deep change, **deferred**). Because the byte DFA is correct, the
+default `auto` engine (DFA on all but tiny inputs) returns the right answer; only the
+`pikevm`/`backtrack` backends chosen *directly* diverge. This is **documented and
+deliberately left**, pinned by an `auto`-only conformance test
+(`empty_loop_concat_auto_cases`). Consequence for fuzzing: the iteration/anchor
+differentials (which assert `pikevm == auto`) will **re-flag this class** under a long
+`--fuzz` run — that is the known gap above, not a new bug; confirm the minimized repro is
+a nullable-concat-lazy body under an unbounded rep before investigating.
+
+### Known limitation: `\b`/`\B` after a length-varying alternation
+
+A ~10M-cumulative anchor campaign surfaced a second deferred class: a `\b`/`\B` *following*
+an alternation with **overlapping, length-varying** branches (`(b+|.+)\B` over `"baaa"`).
+Leftmost-first tries `b+` first → `"b"`; the **eager** byte DFA takes the longer `.+` branch
+→ `"baa"`. Unlike the concat case, **`auto` is affected** (ASCII `\b` routes to the eager
+arm); `pikevm`/`backtrack`/lazy-`dfa` are correct. Same eager-DFA `\b`-priority theme as
+`word_boundary_with_adjacent_repetition`; a correct fix (preserve alternation priority across
+a trailing boundary, or route the shape eager → lazy) is **deferred**. Documented and
+deliberately left, pinned by `word_boundary_after_alt_ref_cases`. Like the case above, a
+long `--fuzz` will re-flag it — confirm the repro is `\b`/`\B` after a length-varying
+alternation before investigating. See `../docs/limitations.md`.
 
 ## Triaging a finding
 

@@ -356,6 +356,10 @@ pub fn supports(h: hir.Hir) bool {
     // A `\b`/`\B` with a lazy repetition (`a*?\b`, `[^a]+?\B *`). Decline. See
     // `hir.Analysis.word_boundary_with_lazy_repetition`.
     if (h.analysis.word_boundary_with_lazy_repetition) return false;
+    // A `\b`/`\B` with two adjacent consuming repetitions (`\n+(\n.*){0,2}\b`): their
+    // ambiguous split + the boundary defeats leftmost-first on the DFA. Decline. See
+    // `hir.Analysis.word_boundary_with_adjacent_repetition`.
+    if (h.analysis.word_boundary_with_adjacent_repetition) return false;
     return true;
 }
 
