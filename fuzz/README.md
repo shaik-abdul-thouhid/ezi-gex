@@ -85,11 +85,10 @@ shared-front-end class — and did once: `word_boundary_with_lazy_repetition`
 
 That is a **cross-language comparison activity, not a library concern**, so it lives
 in the sibling **`regex-bench`** project (which already builds ezi against Rust/Go
-for parity), *not* here. Caveat for anyone running it: ezi follows *JS* empty-loop
-semantics and Rust *RE2*'s, so a meaningful differential must restrict its generator
-to the subset where the two provably coincide (quantifiers only on consuming leaves,
-no empty alternation branches, ASCII inputs) — otherwise the known semantic
-differences read as false "disagreements".
+for parity), *not* here. As of v0.6.0 ezi follows **RE2/Rust leftmost-first**
+semantics uniformly — including the empty-width-loop rule (`(?:|.)+` → `""`,
+`(?:a?b??)+` → `"a"`) — so a Rust differential no longer needs to carve out an
+empty-loop subset; the two coincide across the full ASCII space.
 
 ## Findings so far
 
@@ -117,13 +116,16 @@ fast paths stay eligible.
 | 5 | **`(?m)` line anchor** non-trailing/under-rep/anchor-mixed/`$^`/in-alternation | `(?m:$\n)`, `(?m:\n$)*`, `(?m:$)\A`, `(?m:$^)`, `(?m:$)\|.` | `complex_line_anchor` (+ `has_line and has_text_*` gate) |
 | 6 | `\b`/`\B` with a **lazy repetition** | `a*?\b`, `[^a]+?\B *` → over-matched | `word_boundary_with_lazy_repetition` |
 
-Class 6 was the one the **external Rust oracle** caught that the internal differential
-had missed (`[^a]+?\B *`). Class 2's direction came from a cross-engine study:
-ezi_gex follows **JS** empty-loop semantics (the `(\|a)*`→`"aaa"` tiebreaker;
-RE2/Rust/Go/Python/Perl return `""`), so the consuming branch must win — which the
-Pike VM/backtracker already do. The capture, iteration, Unicode, and
-strategy-invariance targets (5–8) found **0** divergences in 150k-trial campaigns
-each — the capture engines, iterator, Unicode handling, and results-invariance
+Class 6 was the one the **external Rust differential** caught that the internal
+differential had missed (`[^a]+?\B *`). Class 2 stays declined to the Pike VM
+(`nullable_alternation_in_repetition`), but **v0.6.0 changed what that means**: ezi no
+longer follows JS empty-loop semantics — the Pike VM is now uniformly RE2/Rust leftmost-first
+(`(?:|.)+`→`""`, the `(\|a)*`→`""` tiebreaker), so the decline is a routing detail, not a
+semantic divergence. (A 2M `--fuzz` run for this work confirmed the byte DFA still cannot
+reproduce that priority for a complex nullable alternation —
+`(b*)(?:b{0}(?:\n*)|.{2}(?:(){0}))+` — so the decline must stay.) The capture, iteration,
+Unicode, and strategy-invariance targets (5–8) found **0** divergences in 150k-trial
+campaigns each — the capture engines, iterator, Unicode handling, and results-invariance
 contract are solid.
 
 The campaign is a permanent target (#4, `genAnchors`); it is **fuzzing-only** (a
@@ -146,8 +148,9 @@ wrong (it matched neither Rust's `"c"` nor V8's `"ccc"`), so declining to it wou
 enshrined a wrong answer; instead the nesting is collapsed in HIR
 (`astNullableRepBody` + `widenBodyRepToUnbounded`: `(S*)* ≡ S*`), fixing all backends at
 once. Spans **and** capture slots were cross-checked against Rust `regex` before landing.
-(Empty-*alternation* nullable bodies — `(?:|a)+` — keep ezi's JS-style empty-loop
-semantics; all backends agree there, so they are not differential failures. Bounded-lazy
+(Empty-*alternation* nullable bodies — `(?:|a)+` — follow the same RE2 empty-width-loop rule
+since v0.6.0: `(?:|.)+`→`""`; they stay routed to the Pike VM via
+`nullable_alternation_in_repetition`, which is now leftmost-first correct. Bounded-lazy
 *single-rep* inners are a later finding fixed by the same collapse — see below.)
 
 A follow-up 2M-run campaign then found one more class-5 sub-shape: a `(?m)` line anchor
@@ -174,34 +177,40 @@ optional = a star), it folds into the **same HIR collapse** — broadened from "
 inner" to "any nullable inner" (`astNullableRepBody`, widening the body to unbounded),
 which fixes every backend at once. Spans and captures re-checked against Rust.
 
-### Known limitation: empty-width loop over a nullable *concat* body
+### Fixed in v0.6.0: empty-width loop over a nullable *concat* body
 
-A final 5M-run campaign surfaced the empty-width-loop bug's last form: an unbounded outer
-over a nullable **concat** body with a lazy part — `(?:a?b??)+`, `(?:a??b??)+`. The Pike
-VM over-consumes (`(?:a?b??)+` on `"ab"` → `"ab"`); Rust/RE2 and ezi's **byte DFA** give
-the leftmost-first `"a"`. The HIR collapse **cannot** reach this — a concat body is not a
-single repetition to widen — so a correct fix needs the general empty-width-loop guard in
-the Pike VM closure (a deep change, **deferred**). Because the byte DFA is correct, the
-default `auto` engine (DFA on all but tiny inputs) returns the right answer; only the
-`pikevm`/`backtrack` backends chosen *directly* diverge. This is **documented and
-deliberately left**, pinned by an `auto`-only conformance test
-(`empty_loop_concat_auto_cases`). Consequence for fuzzing: the iteration/anchor
-differentials (which assert `pikevm == auto`) will **re-flag this class** under a long
-`--fuzz` run — that is the known gap above, not a new bug; confirm the minimized repro is
-a nullable-concat-lazy body under an unbounded rep before investigating.
+A 5M-run campaign surfaced the empty-width-loop bug's last form: an unbounded outer over a
+nullable **concat** body with a lazy part — `(?:a?b??)+`, `(?:a??b??)+`. The Pike VM (and
+backtracker, onepass) over-consumed (`(?:a?b??)+` on `"ab"` → `"ab"`); Rust/RE2 give the
+leftmost-first `"a"`. The HIR collapse could not reach it — a concat body is not a single
+repetition to widen. **Fixed in v0.6.0 by the general empty-width-loop guard**: a loop-back
+that closes an empty iteration routes to the loop exit at the empty path's priority. It lives
+in every epsilon closure — the pikevm/backtrack/onepass `.jmp` handlers, and `byte.zig`'s
+do-while loop shape for the byte DFAs (`dfa`/`edfa`/`bytepike`). Triage during this work also
+showed the byte DFAs over-consumed the **capturing** form (`(a?b??)+`, the `save` forced the
+buggy loop shape) — also fixed. Now **every backend agrees** (`empty_loop_concat_cases` pins
+pikevm + backtrack + auto; the byte engines are pinned via their eligible-subset tests).
 
-### Known limitation: `\b`/`\B` after a length-varying alternation
+### Fixed in v0.6.0: `\b`/`\B` after a length-varying alternation
 
-A ~10M-cumulative anchor campaign surfaced a second deferred class: a `\b`/`\B` *following*
-an alternation with **overlapping, length-varying** branches (`(b+|.+)\B` over `"baaa"`).
-Leftmost-first tries `b+` first → `"b"`; the **eager** byte DFA takes the longer `.+` branch
-→ `"baa"`. Unlike the concat case, **`auto` is affected** (ASCII `\b` routes to the eager
-arm); `pikevm`/`backtrack`/lazy-`dfa` are correct. Same eager-DFA `\b`-priority theme as
-`word_boundary_with_adjacent_repetition`; a correct fix (preserve alternation priority across
-a trailing boundary, or route the shape eager → lazy) is **deferred**. Documented and
-deliberately left, pinned by `word_boundary_after_alt_ref_cases`. Like the case above, a
-long `--fuzz` will re-flag it — confirm the repro is `\b`/`\B` after a length-varying
-alternation before investigating. See `../docs/limitations.md`.
+A ~10M-cumulative anchor campaign surfaced the eager-DFA class: a `\b`/`\B` *following* an
+alternation with **overlapping, length-varying** branches (`(b+|.+)\B` over `"baaa"`).
+Leftmost-first tries `b+` first → `"b"`; the **eager** byte DFA took the longer `.+` branch
+→ `"baa"`. The `pikevm`/`backtrack`/lazy-`dfa` were correct. **Fixed in v0.6.0** by declining
+the shape from the eager arm only (`hir.Analysis.word_boundary_after_varying_alternation`,
+gated in `edfa.supports`): `auto` then serves it on the leftmost-first-correct path and the
+lazy `dfa` stays eligible. Disjoint-first alternations (`(?:b+|a+)\B`, `\b(foo|bar)\b`) are
+unambiguous and stay on the eager DFA fast path. Pinned by `word_boundary_after_alt_cases`.
+
+### Fixed in v0.6.0: `\b`/`\B` inside a repetition
+
+A later anchor campaign found a sibling eager-DFA `\b` shape: a boundary **lexically inside a
+repetition** (`(b.{0,2}\B)+` over `"bbbab…"`). The repeated body makes the boundary's end ambiguous
+across iterations; leftmost-first is `"bbb"`, the eager DFA took `"bbbab"`. The
+`pikevm`/`backtrack`/lazy-`dfa` were correct. **Fixed in v0.6.0** by declining a boundary under a
+repetition from the eager arm (`hir.Analysis.word_boundary_in_repetition`, gated in
+`edfa.supports`). A top-level boundary (`\b\w+\b`, `\bthe\b`) is not inside a repetition and stays
+on the eager DFA. Pinned by `word_boundary_in_rep_cases`.
 
 ## Triaging a finding
 

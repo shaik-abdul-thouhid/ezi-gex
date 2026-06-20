@@ -399,10 +399,10 @@ pub fn supports(h: hir.Hir) bool {
     // is the empty match `{0,0}` (first branch), not `{0,1}`. Decline to the Pike
     // VM (correct + linear). See `hir.Analysis.word_boundary_in_alternation`.
     if (h.analysis.word_boundary_in_alternation) return false;
-    // A repetition over a nullable alternation (`(?:|.)+`) has the same leftmost-
-    // first-vs-longest mismatch in the empty-loop direction — the DFA can't encode
-    // the JS-style empty-loop priority the Pike VM gives. Decline to the Pike VM.
-    // See `hir.Analysis.nullable_alternation_in_repetition`.
+    // A repetition over a nullable alternation (`(?:|.)+`, `(b{0}\n*|.{2}…)+`): the
+    // priority-ordered DFA can't reliably reproduce the leftmost-first empty-width-loop
+    // priority for this shape — decline to the Pike VM (correct + linear). See
+    // `hir.Analysis.nullable_alternation_in_repetition`.
     if (h.analysis.nullable_alternation_in_repetition) return false;
     // A non-trailing `text_end` (`$a`, `\z.\z`): unsatisfiable past the anchor, but
     // the reverse-from-end path keys off the trailing one and ignores the interior
@@ -421,6 +421,17 @@ pub fn supports(h: hir.Hir) bool {
     // one; leftmost-first takes the early end, the longest-match DFA the late one.
     // Decline. See `hir.Analysis.word_boundary_with_adjacent_repetition`.
     if (h.analysis.word_boundary_with_adjacent_repetition) return false;
+    // A `\b`/`\B` immediately FOLLOWING an alternation with overlapping-first, length-varying
+    // branches (`(b+|.+)\B`): the eager DFA's word-boundary determinization loses the
+    // alternation's leftmost-first priority across the trailing boundary and takes the longest
+    // boundary-valid end. The lazy `dfa` (decode-hybrid) and the Pike VM are correct, so this
+    // gates ONLY the eager arm. See `hir.Analysis.word_boundary_after_varying_alternation`.
+    if (h.analysis.word_boundary_after_varying_alternation) return false;
+    // A `\b`/`\B` lexically inside a repetition (`(b.{0,2}\B)+`): the repeated body makes the
+    // boundary position ambiguous across iterations and the eager DFA takes the longer end. The
+    // lazy `dfa` / Pike VM are correct, so decline only here (the eager arm). See
+    // `hir.Analysis.word_boundary_in_repetition`.
+    if (h.analysis.word_boundary_in_repetition) return false;
     // `(?m)` line anchors are matched by anchored-restart with a one-byte `\n`
     // lookahead — correct only for a clean leading `(?m)^` or trailing `(?m)$` in
     // isolation. Mixed with a `text_start` (`\A`) / `text_end` (`\z`, non-`(?m)` `$`),

@@ -9,6 +9,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 `0.6.0-dev` on `main`.
 
+The empty-width-loop work below closes the two remaining **deferred** entries from
+`docs/limitations.md` (an empty loop over a nullable concat body, and a `\b`/`\B` after a
+length-varying alternation) — there are now **no known cross-backend correctness gaps** — and
+adopts **uniform RE2/Rust leftmost-first** empty-loop semantics across every backend.
+
+### Changed
+
+- **Empty-loop semantics are now uniformly RE2/Rust leftmost-first** (BREAKING for a narrow
+  shape). A repetition iteration that matches the empty string terminates the loop on **every**
+  backend. Through 0.5.1 ezi deliberately diverged to JS/V8 for a nullable **alternation** body
+  (the consuming branch won): `(?:|.)+` on `"c"` returned `"c"`, `(|a)*` on `"aaa"` returned
+  `"aaa"`. Those now return `""` (the empty-first branch wins the empty iteration and the loop
+  exits), matching RE2/Rust/Go/Python/Perl. A **consuming-first** branch is unchanged: `(a|)+`
+  on `"aa"` is still `"aa"`. The former "Empty-alternation loops follow JS, not RE2" deliberate
+  limitation is **removed** from the docs. The `nullable_alternation_in_repetition` routing
+  (these patterns are served on the Pike VM, not the byte DFA) is **kept** — the priority-ordered
+  byte DFA can't reliably reproduce this empty-loop priority (a fuzz repro:
+  `(b*)(?:b{0}(?:\n*)|.{2}(?:(){0}))+`) — but it is now a pure routing detail: the Pike VM gives
+  the RE2/Rust span, so the result no longer depends on the route.
+
+### Fixed
+
+- **Empty-width-loop over a nullable *concat* body — fixed on every backend** (was a deferred
+  limitation through 0.5.1). An unbounded outer repetition over a nullable concatenation with a
+  lazy part — `(?:a?b??)+` on `"ab"`, `(?:a??b??)+` on `"ab"` — over-consumed (`"ab"` / `"a"`)
+  where leftmost-first (Rust/RE2) gives `"a"` / `""`. The HIR collapse could not reach it (a
+  concat body is not a single repetition to widen). Fixed by the **general empty-width-loop
+  guard**: a loop-back that closes an empty iteration routes to the loop exit at the empty path's
+  priority instead of looping. It lives in every epsilon closure — the `pikevm`, `backtrack`, and
+  `onepass` `.jmp` handlers, plus a do-while (test-at-bottom) loop shape for nullable `x*` bodies
+  in `byte.zig` that the byte DFAs (`dfa`/`edfa`) and `bytepike` determinize empty-loop-correctly
+  (the non-nullable `a*`/`\w*` hot path keeps its leaner jmp shape). Spans and captures
+  cross-checked against Rust `regex`; pinned by `empty_loop_concat_cases` across pikevm +
+  backtrack + auto.
+- **Byte DFAs over-consumed the *capturing* nullable-concat-lazy form.** Surfaced while fixing the
+  above: `(a?b??)+` on `"ab"` returned `"ab"` on `dfa`/`edfa`/`bytepike` (a capture forces the
+  buggy `x*` loop shape, where the non-capturing form happened to determinize correctly). The
+  `auto` engine inherited it for capturing patterns. Fixed by the same do-while loop shape.
+- **`\b`/`\B` after a length-varying alternation — fixed** (was a deferred limitation through
+  0.5.1; the eager-DFA case where `auto` was affected). `(b+|.+)\B` on `"baaa"` returned `"baa"`
+  on the eager byte DFA / `auto`; leftmost-first is `"b"` (the `b+` branch matches `"b"`, `\B`
+  holds, the longer `.+` branch is never tried). New
+  `hir.Analysis.word_boundary_after_varying_alternation` declines the shape from the **eager** arm
+  only (gated in `edfa.supports`); `auto` serves it on the leftmost-first-correct path and the
+  lazy `dfa` (decode-hybrid boundary) stays eligible. Disjoint-first alternations (`(?:b+|a+)\B`,
+  `\b(foo|bar)\b`, `\bthe\b`) are unambiguous and stay on the eager DFA fast path. Pinned by
+  `word_boundary_after_alt_cases`.
+- **`\b`/`\B` inside a repetition — fixed** (found by the differential anchor fuzz during this
+  work). `(b.{0,2}\B)+` on `"bbbab…"` returned `"bbbab"` on the eager byte DFA / `auto`;
+  leftmost-first is `"bbb"` (the repeated body makes the boundary's end ambiguous and the eager DFA
+  took the longer one). New `hir.Analysis.word_boundary_in_repetition` declines a boundary that
+  sits lexically inside a repetition from the **eager** arm only; `pikevm`/`backtrack`/lazy `dfa`
+  were already correct. Top-level boundaries (`\b\w+\b`, `\bthe\b`) are not inside a repetition and
+  stay on the eager DFA. Pinned by `word_boundary_in_rep_cases`.
+
+### Performance
+
+- **Leading-class SIMD scan (`classscan`) — shufti per-high-nibble classifier.** The `class_lead`
+  prefilter `auto` uses for a class-led pattern (`\p{N}+`, `\d+`, `\d{4}-…`) replaces its
+  single-bucket nibble classifier with a **shufti**-style one that gives each distinct UTF-8 high
+  nibble its own bucket bit. For a set with **≤ 8 distinct high nibbles** (the common case — `\p{N}`
+  has 5, `\d` has 1) the nibble pre-test is now **exact**, eliminating the false-positive confirms
+  that dominated a sparse class scan over non-ASCII text. The old single-bucket scheme saturated
+  the low-nibble table for a broad lead set like `\p{N}` (lead bytes `30-39 c2 d9 db df e0-e3 ea ef
+  f0`), so every Cyrillic lead byte (`0xD0`/`0xD1`) survived to the scalar confirm — half the bytes
+  of 2-byte Cyrillic text. **~1.7× faster** `\p{N}+` on `subtitles-ru` (`regex-bench`, 515µs →
+  308µs) and ~1.2× on `subtitles-zh`, no regression on the ASCII `\p{N}+`/`\d+` fast paths (still
+  exact, ~18 GiB/s on `sherlock`). Correctness is unchanged regardless (every survivor is confirmed
+  against the exact bitset); pinned by white-box precision tests in `classscan.zig` and the
+  end-to-end `class_lead_nonascii_cases` conformance differential.
+- **Case-insensitive phrase search (`(?i)…`) — rarest-window Teddy prefilter.** For a bounded
+  case-variant phrase the `auto` dispatcher now seeds its Teddy prefilter from the **rarest**
+  2–3-position window instead of always the leading one (`(?i)sherlock holmes` probes the rare
+  `[cC][kK] ` window rather than the common leading `[sS][hH][eE]`, ~2× fewer candidates to
+  confirm) — **~1.13× faster** on the `ci_phrase` benchmark (`regex-bench`), no regression on the
+  other case-variant cases (`ci_the` ~1.06×). The window sits at a byte-offset **range** from the
+  match start (`Filter.prefix_set_off_min/off_max`) so a variable-length fold variant of a
+  preceding position (`s`→2-byte `ſ`) is handled soundly; every hit is still fully confirmed, so
+  the choice never changes which matches are found (pinned by the conformance differential plus an
+  explicit `ſ`-shifted functional test). New `memmem.byteFreq` exposes the byte-frequency model.
+
+### Internal
+
+- Added `hir.Analysis.word_boundary_after_varying_alternation` (with first-set overlap analysis:
+  `firstSet`/`firstSetsOverlap`/`alternationBranchesOverlapFirst`).
+- `hir.Analysis.nullable_alternation_in_repetition` is retained as a routing gate (see *Changed*);
+  its doc no longer frames it as a JS-vs-RE2 semantic divergence.
+
 ## [0.5.1] - 2026-06-17
 
 Patch release: leftmost-first correctness fixes for degenerate anchor / empty-width-loop /

@@ -598,8 +598,29 @@ fn Builder(comptime mode: Mode) type {
                 const split_at = self.emit(.{ .split = .{ .a = 0, .b = 0 } });
                 const after = self.pc();
                 self.set(split_at, if (rep.greedy) .{ .split = .{ .a = body, .b = after } } else .{ .split = .{ .a = after, .b = body } });
+            } else if (self.nodeNullable(rep.child)) {
+                // `x*` over a NULLABLE body: use the **do-while** (test-at-bottom) shape — a
+                // split before the body for the zero-times option, then a *backward-split*
+                // loop-back after it (same form as the capture-free `x+` above). A do-while
+                // loop-back is the empty-width-loop-correct shape: when the body matches empty
+                // the loop-back split's high-priority arm targets the (already-seen) body, so
+                // the determinizer / byte Pike VM dedup it and take the exit at the right
+                // priority — leftmost-first terminates the loop (`(?:a?b??)+` → "a", matching
+                // Rust). The classic test-at-top `split; body; jmp` shape (below) over-consumes
+                // here, because the jmp loop-back demotes the exit below a consuming sibling.
+                const skip_at = self.emit(.{ .split = .{ .a = 0, .b = 0 } });
+                const body = self.pc();
+                try self.compileNode(rep.child);
+                const loop_at = self.emit(.{ .split = .{ .a = 0, .b = 0 } });
+                const after = self.pc();
+                const arms: struct { a: u32, b: u32 } = if (rep.greedy) .{ .a = body, .b = after } else .{ .a = after, .b = body };
+                self.set(loop_at, .{ .split = .{ .a = arms.a, .b = arms.b } });
+                self.set(skip_at, .{ .split = .{ .a = arms.a, .b = arms.b } });
             } else {
-                // `x*` (min == 0): a split before the body so it may match zero times.
+                // `x*` over a NON-nullable body (`a*`, `\w*`, `.*` — the common case): a single
+                // split before the body, looping back with a `jmp`. No empty iteration is
+                // possible (the body always consumes), so the test-at-top shape is correct and
+                // one instruction leaner to determinize — the hot path stays untouched.
                 const split_at = self.emit(.{ .split = .{ .a = 0, .b = 0 } });
                 const body = self.pc();
                 try self.compileNode(rep.child);
@@ -607,6 +628,31 @@ fn Builder(comptime mode: Mode) type {
                 const after = self.pc();
                 self.set(split_at, if (rep.greedy) .{ .split = .{ .a = body, .b = after } } else .{ .split = .{ .a = after, .b = body } });
             }
+        }
+
+        /// Whether the HIR subtree at `idx` can match the **empty string** (its minimum
+        /// length is zero). Used to pick the empty-width-loop-correct do-while shape for a
+        /// nullable `x*` body in `compileRepetition`; pure over the HIR, so both builder
+        /// passes agree. Mirrors `lenBounds(idx).min == 0` without depending on the analysis.
+        fn nodeNullable(self: *const Self, idx: u32) bool {
+            const node = self.h.nodes[idx];
+            return switch (node.tag) {
+                .empty, .anchor => true, // zero-width
+                .literal => node.data.run.len == 0,
+                .class, .any, .grapheme => false, // consume ≥ 1
+                .capture => self.nodeNullable(node.data.capture.child),
+                .repetition => node.data.repetition.min == 0 or self.nodeNullable(node.data.repetition.child),
+                .concat => blk: {
+                    const d = node.data.children;
+                    for (self.h.children[d.start .. d.start + d.len]) |c| if (!self.nodeNullable(c)) break :blk false;
+                    break :blk true; // empty matchable iff every child is
+                },
+                .alternation => blk: {
+                    const d = node.data.children;
+                    for (self.h.children[d.start .. d.start + d.len]) |c| if (self.nodeNullable(c)) break :blk true;
+                    break :blk false; // empty matchable iff some branch is
+                },
+            };
         }
     };
 }

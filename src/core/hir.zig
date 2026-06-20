@@ -505,16 +505,19 @@ pub const Analysis = struct {
     ///
     /// @stable-since: v0.5.0
     word_boundary_in_alternation: bool,
-    /// A repetition loops over an `alternation` that has a **nullable** branch
-    /// (one that can match the empty string, e.g. `(?:|.)+`, `(a*|b)+`). Like
-    /// `word_boundary_in_alternation`, the leftmost-*longest* byte DFA cannot
-    /// reproduce the engine's leftmost-*first* (JS-style) empty-loop priority — the
-    /// preferred empty branch makes no progress, so the consuming branch must win
-    /// the iteration (`(?:|.)+` on `"c"` is `"c"` `{0,1}`, what the Pike VM /
-    /// backtracker give, not `""` `{0,0}`). The DFA can't encode that, so the
-    /// pattern is declined to the Pike VM. Conservative: any nullable alternation
-    /// under any repetition trips it (capturing ones already route to the Pike VM
-    /// for capture-fill) — over-declining only forgoes the DFA fast path.
+    /// A repetition loops over an `alternation` that has a **nullable** branch (one that
+    /// can match the empty string, e.g. `(?:|.)+`, `(a*|b)+`, `(b{0}\n*|.{2}…)+`). The byte
+    /// DFA's priority-ordered determinization cannot reliably reproduce the engine's
+    /// leftmost-first **empty-width-loop** priority for this shape — when the preferred
+    /// (earlier) branch can match empty, the loop must terminate at that empty iteration
+    /// (`(?:|.)+` on `"c"` is `""`), but the DFA can let a later consuming branch win.
+    /// Declined to the Pike VM (leftmost-first correct + still O(input)). Conservative: any
+    /// nullable alternation under any repetition trips it — over-declining only forgoes the
+    /// DFA fast path, never trades correctness. (Pre-0.6.0 this carve-out also encoded ezi's
+    /// then-deliberate JS empty-loop divergence; 0.6.0 made the Pike VM uniformly RE2/Rust
+    /// leftmost-first, so the decline is now purely a routing detail — the answer is the same
+    /// RE2 span either way.) The non-alternation nullable-concat shape is handled directly on
+    /// every backend (the empty-width-loop guard) and is NOT declined.
     ///
     /// @stable-since: v0.5.0
     nullable_alternation_in_repetition: bool,
@@ -567,6 +570,34 @@ pub const Analysis = struct {
     ///
     /// @stable-since: v0.5.1
     word_boundary_with_adjacent_repetition: bool,
+    /// A `\b`/`\B` word boundary immediately **follows** an `alternation` whose branches
+    /// have **overlapping first code points** (so they can match the same start at
+    /// different lengths, e.g. `(b+|.+)\B`, `(?:b|baaa)\B`). Leftmost-first must try the
+    /// earlier branch first — `b+` matches `"b"`, the `\B` holds between `b` and `a`, so the
+    /// span is `"b"` and the longer `.+` branch is never used — but the **eager** byte DFA's
+    /// word-boundary determinization loses that branch priority once a boundary follows and
+    /// takes the longest boundary-valid end (`"baa"`). The `pikevm`/`backtrack` and the
+    /// **lazy `dfa`** (decode-hybrid boundary) are leftmost-first correct, so this is gated
+    /// only in `edfa.supports` (the eager arm). Branches with **disjoint** first code points
+    /// (`(?:b+|a+)\B`, `\b(foo|bar)\b`, `\bthe\b`, `\b\w+\b`) are unambiguous at the boundary
+    /// and are NOT flagged — they stay on the eager DFA fast path. Same eager-DFA
+    /// `\b`-priority family as [`word_boundary_with_adjacent_repetition`].
+    ///
+    /// @stable-since: v0.6.0
+    word_boundary_after_varying_alternation: bool,
+    /// A `\b`/`\B` word boundary sits **lexically inside a repetition** (`(b.{0,2}\B)+`,
+    /// `(?:\w\b)+`). The repeated body makes the boundary's position ambiguous across
+    /// iterations — it can hold at an earlier (leftmost-first) end and a later one — and the
+    /// **eager** byte DFA's word-boundary determinization takes the longer (`(b.{0,2}\B)+` on
+    /// `"bbbab…"` → `"bbbab"`, leftmost-first is `"bbb"`). The `pikevm`/`backtrack` and the
+    /// **lazy `dfa`** are leftmost-first correct, so this is gated only in `edfa.supports`. A
+    /// boundary at the **top level** (`\b\w+\b`, `\bthe\b`, `\w+\b` — the repetition `\w+` is
+    /// beside the boundary, the boundary itself not under a rep) is NOT flagged and stays on
+    /// the eager DFA fast path. Same eager-DFA `\b`-priority family as
+    /// [`word_boundary_with_adjacent_repetition`]. Found by the differential anchor fuzz.
+    ///
+    /// @stable-since: v0.6.0
+    word_boundary_in_repetition: bool,
     /// A `(?m)` line anchor (`line_start`/`line_end`) appears in a shape the eager
     /// byte DFA's line support cannot handle: a **non-leading** `(?m)^` (a consumer —
     /// or an earlier `line_end`, `$^` — precedes it), a **non-trailing** `(?m)$` (a
@@ -1516,6 +1547,8 @@ fn analyze(
             hasLazyRepetition(nodes, children, root),
         .word_boundary_with_adjacent_repetition = hasWordBoundary(nodes, children, root) and
             hasAdjacentRepetition(nodes, children, root),
+        .word_boundary_after_varying_alternation = wordBoundaryAfterVaryingAlternation(nodes, children, ranges, literals, root),
+        .word_boundary_in_repetition = wordBoundaryInRepetition(nodes, children, root, false),
         .complex_line_anchor = complexLineAnchor(nodes, children, root, false, false, false, false, false),
         .is_whole_literal = nodes[root].tag == .literal,
         .is_one_pass = false, // decided by the backend's NFA compiler; see Analysis
@@ -1690,11 +1723,11 @@ fn wordBoundaryInAlternation(nodes: []const Node, children: []const u32, idx: u3
 }
 
 /// Whether a repetition loops over an `alternation` with a nullable branch (see
-/// `Analysis.nullable_alternation_in_repetition`). `in_rep` becomes true once we
-/// descend through a `repetition` child; an alternation reached while it is set,
-/// with `lenBounds(alt).min == 0` (some branch matches empty), trips it.
-/// Conservative — it does not check that the alternation is the *immediate* loop
-/// body, only that it sits somewhere inside the looped subtree.
+/// `Analysis.nullable_alternation_in_repetition`). `in_rep` becomes true once we descend
+/// through a `repetition` child; an alternation reached while it is set, with
+/// `lenBounds(alt).min == 0` (some branch matches empty), trips it. Conservative — it does
+/// not check that the alternation is the *immediate* loop body, only that it sits somewhere
+/// inside the looped subtree.
 fn nullableAlternationInRepetition(nodes: []const Node, children: []const u32, idx: u32, in_rep: bool) bool {
     const node = nodes[idx];
     return switch (node.tag) {
@@ -1806,6 +1839,30 @@ fn hasAdjacentRepetition(nodes: []const Node, children: []const u32, idx: u32) b
     }
 }
 
+/// Whether a `\b`/`\B` appears **lexically inside a repetition** (see
+/// `Analysis.word_boundary_in_repetition`). `in_rep` latches true once we descend through a
+/// `repetition`; a word-boundary anchor reached while it is set trips it. Conservative — a
+/// boundary anywhere under any repetition flags it, which over-declines the eager DFA only
+/// (never trades correctness) and spares the top-level `\b\w+\b` / `\bthe\b` benchmarks.
+fn wordBoundaryInRepetition(nodes: []const Node, children: []const u32, idx: u32, in_rep: bool) bool {
+    const node = nodes[idx];
+    switch (node.tag) {
+        .anchor => return in_rep and switch (node.data.anchor.kind) {
+            .word_boundary, .not_word_boundary => true,
+            else => false,
+        },
+        .concat, .alternation => {
+            const d = node.data.children;
+            for (children[d.start .. d.start + d.len]) |ci|
+                if (wordBoundaryInRepetition(nodes, children, ci, in_rep)) return true;
+            return false;
+        },
+        .capture => return wordBoundaryInRepetition(nodes, children, node.data.capture.child, in_rep),
+        .repetition => return wordBoundaryInRepetition(nodes, children, node.data.repetition.child, true),
+        else => return false,
+    }
+}
+
 /// Whether `idx` is (or, through a capture, wraps) a repetition node — its match
 /// begins with a repeated atom.
 fn leadingRepetition(nodes: []const Node, children: []const u32, idx: u32) bool {
@@ -1820,6 +1877,176 @@ fn leadingRepetition(nodes: []const Node, children: []const u32, idx: u32) bool 
 /// `empty`, or a capture/alternation/concat built only from those.
 fn isZeroWidth(nodes: []const Node, children: []const u32, idx: u32) bool {
     return !canConsume(nodes, children, idx);
+}
+
+// ── `\b` after a length-varying alternation (see Analysis.word_boundary_after_varying_alternation) ──
+
+/// The code-point ranges a subtree can **begin** with — its FIRST set. `broad` means
+/// "overlaps everything" (`.`/`\X`, or more ranges than the small fixed buffer holds); it
+/// keeps the overlap test sound by over-approximating (over-declines the eager DFA, never
+/// mis-matches). Allocation-free so the analysis runs at comptime.
+const FirstSet = struct {
+    const CAP = 16;
+    ranges: [CAP]Range = undefined,
+    n: usize = 0,
+    broad: bool = false,
+
+    fn add(self: *FirstSet, r: Range) void {
+        if (self.broad) return;
+        if (self.n >= CAP) {
+            self.broad = true;
+            return;
+        }
+        self.ranges[self.n] = r;
+        self.n += 1;
+    }
+};
+
+/// Fill `out` with the FIRST set of the subtree at `idx`, following nullable prefixes (a
+/// nullable leading child contributes its first set and we continue to the next). Pure.
+fn firstSet(nodes: []const Node, children: []const u32, ranges: []const Range, literals: []const CodePoint, idx: u32, out: *FirstSet) void {
+    const node = nodes[idx];
+    switch (node.tag) {
+        .empty, .anchor => {}, // zero-width: contributes nothing
+        .any, .grapheme => out.broad = true, // matches (almost) any scalar
+        .literal => {
+            const r = node.data.run;
+            if (r.len > 0) {
+                const cp = literals[r.start];
+                out.add(.{ .lo = cp, .hi = cp });
+            }
+        },
+        .class => {
+            const c = node.data.class;
+            for (ranges[c.start .. c.start + c.len]) |rg| out.add(rg);
+        },
+        .capture => firstSet(nodes, children, ranges, literals, node.data.capture.child, out),
+        .repetition => firstSet(nodes, children, ranges, literals, node.data.repetition.child, out),
+        .concat => {
+            const d = node.data.children;
+            for (children[d.start .. d.start + d.len]) |ci| {
+                firstSet(nodes, children, ranges, literals, ci, out);
+                if (lenBounds(nodes, children, ci).min > 0) break; // first mandatory child ends the FIRST set
+            }
+        },
+        .alternation => {
+            const d = node.data.children;
+            for (children[d.start .. d.start + d.len]) |ci| firstSet(nodes, children, ranges, literals, ci, out);
+        },
+    }
+}
+
+fn firstSetsOverlap(a: *const FirstSet, b: *const FirstSet) bool {
+    if (a.broad or b.broad) return true;
+    for (a.ranges[0..a.n]) |ra| {
+        for (b.ranges[0..b.n]) |rb| {
+            if (ra.lo <= rb.hi and rb.lo <= ra.hi) return true;
+        }
+    }
+    return false;
+}
+
+/// Whether the `alternation` at `idx` has two branches whose FIRST sets overlap — i.e. they
+/// can both match some common starting code point (so they can match the same start at
+/// different lengths). Disjoint-first alternations (`b+|a+`, `foo|bar`) return false.
+fn alternationBranchesOverlapFirst(nodes: []const Node, children: []const u32, ranges: []const Range, literals: []const CodePoint, idx: u32) bool {
+    const d = nodes[idx].data.children;
+    const kids = children[d.start .. d.start + d.len];
+    var i: usize = 0;
+    while (i < kids.len) : (i += 1) {
+        var fi = FirstSet{};
+        firstSet(nodes, children, ranges, literals, kids[i], &fi);
+        var j = i + 1;
+        while (j < kids.len) : (j += 1) {
+            var fj = FirstSet{};
+            firstSet(nodes, children, ranges, literals, kids[j], &fj);
+            if (firstSetsOverlap(&fi, &fj)) return true;
+        }
+    }
+    return false;
+}
+
+/// The `alternation` node `idx` (or wraps via a capture), else null. Non-capturing groups
+/// have already been removed in HIR, so an alternation is either bare or capture-wrapped.
+fn alternationThroughWrap(nodes: []const Node, idx: u32) ?u32 {
+    return switch (nodes[idx].tag) {
+        .alternation => idx,
+        .capture => alternationThroughWrap(nodes, nodes[idx].data.capture.child),
+        else => null,
+    };
+}
+
+/// Whether matching the subtree at `idx` can reach a `\b`/`\B` with **zero** consumption
+/// first (the boundary is at the start of its match path). Used to test whether a boundary
+/// immediately follows the alternation.
+fn leadsToWordBoundary(nodes: []const Node, children: []const u32, idx: u32) bool {
+    const node = nodes[idx];
+    return switch (node.tag) {
+        .anchor => switch (node.data.anchor.kind) {
+            .word_boundary, .not_word_boundary => true,
+            else => false,
+        },
+        .capture => leadsToWordBoundary(nodes, children, node.data.capture.child),
+        .concat => blk: {
+            const d = node.data.children;
+            for (children[d.start .. d.start + d.len]) |ci| {
+                if (leadsToWordBoundary(nodes, children, ci)) break :blk true;
+                if (lenBounds(nodes, children, ci).min > 0) break :blk false; // a mandatory consumer first
+            }
+            break :blk false;
+        },
+        .alternation => blk: {
+            const d = node.data.children;
+            for (children[d.start .. d.start + d.len]) |ci| if (leadsToWordBoundary(nodes, children, ci)) break :blk true;
+            break :blk false;
+        },
+        .repetition => node.data.repetition.min > 0 and leadsToWordBoundary(nodes, children, node.data.repetition.child),
+        else => false,
+    };
+}
+
+/// Whether a `\b`/`\B` can immediately follow position `from` in the concat children `kids`
+/// — reached through any number of nullable / zero-width siblings, but stopped by the first
+/// MANDATORY consumer (which would pin the alternation's end, removing the ambiguity).
+fn boundaryFollowsInConcat(nodes: []const Node, children: []const u32, kids: []const u32, from: usize) bool {
+    var i = from;
+    while (i < kids.len) : (i += 1) {
+        if (leadsToWordBoundary(nodes, children, kids[i])) return true;
+        if (lenBounds(nodes, children, kids[i]).min > 0) return false; // mandatory consumer disambiguates
+    }
+    return false;
+}
+
+/// Whether the pattern has a `\b`/`\B` immediately following an `alternation` whose branches
+/// have overlapping FIRST sets (see `Analysis.word_boundary_after_varying_alternation`). The
+/// eager byte DFA loses the alternation's leftmost-first priority across the trailing
+/// boundary; the Pike VM / backtracker / lazy DFA are correct, so this gates only the eager
+/// DFA. Conservative (over-flagging only forgoes the eager arm, never trades correctness).
+fn wordBoundaryAfterVaryingAlternation(nodes: []const Node, children: []const u32, ranges: []const Range, literals: []const CodePoint, idx: u32) bool {
+    const node = nodes[idx];
+    switch (node.tag) {
+        .concat => {
+            const d = node.data.children;
+            const kids = children[d.start .. d.start + d.len];
+            for (kids, 0..) |ci, i| {
+                if (wordBoundaryAfterVaryingAlternation(nodes, children, ranges, literals, ci)) return true; // nested
+                if (alternationThroughWrap(nodes, ci)) |alt| {
+                    if (alternationBranchesOverlapFirst(nodes, children, ranges, literals, alt) and
+                        boundaryFollowsInConcat(nodes, children, kids, i + 1)) return true;
+                }
+            }
+            return false;
+        },
+        .alternation => {
+            const d = node.data.children;
+            for (children[d.start .. d.start + d.len]) |ci|
+                if (wordBoundaryAfterVaryingAlternation(nodes, children, ranges, literals, ci)) return true;
+            return false;
+        },
+        .capture => return wordBoundaryAfterVaryingAlternation(nodes, children, ranges, literals, node.data.capture.child),
+        .repetition => return wordBoundaryAfterVaryingAlternation(nodes, children, ranges, literals, node.data.repetition.child),
+        else => return false,
+    }
 }
 
 /// Whether a `text_end` anchor sits in a non-trailing position — i.e. a consuming

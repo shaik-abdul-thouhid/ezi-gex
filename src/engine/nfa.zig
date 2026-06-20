@@ -242,6 +242,12 @@ fn Builder(comptime mode: Mode) type {
                 const split_at = self.emit(.{ .split = .{ .a = 0, .b = 0 } });
                 const body = self.pc();
                 try self.compileNode(rep.child);
+                // This is the ONLY backward jmp the compiler ever emits (loop head
+                // `split_at < pc`); every alternation ender jmps FORWARD to a common end.
+                // Its loop EXIT is always the very next instruction (`after == this_jmp + 1`).
+                // The pikevm/backtrack empty-width-loop guards rely on both invariants: they
+                // detect a loop-back by `target < jmp_pc` and take the exit as `jmp_pc + 1`
+                // when the iteration matched empty. Keep them true if you change this lowering.
                 _ = self.emit(.{ .jmp = split_at });
                 const after = self.pc();
                 self.set(split_at, if (rep.greedy) .{ .split = .{ .a = body, .b = after } } else .{ .split = .{ .a = after, .b = body } });

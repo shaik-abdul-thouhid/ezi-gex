@@ -95,6 +95,16 @@ const freq: [256]u8 = blk: {
     break :blk f;
 };
 
+/// Heuristic byte-commonness, higher = more frequent in typical text. The same model the
+/// two-byte probe uses (`freq` above), exposed so other prefilters (the `auto` dispatcher's
+/// case-variant *window* selection) can rank candidate windows by estimated density. Steers
+/// prefilter choice only — never affects which matches are found.
+///
+/// @stable-since: v0.6.0
+pub fn byteFreq(b: u8) u8 {
+    return freq[b];
+}
+
 /// A precomputed two-byte filter for one needle (length ≥ `MIN_LEN`). `needle` aliases the
 /// caller's storage (the `literal` program's `needles` buffer) — it owns no memory, so there
 /// is nothing to free. `lo`/`hi` (with `lo < hi`) are the two probed needle offsets and

@@ -239,6 +239,22 @@ pub const Filter = struct {
     ///
     /// @stable-since: v0.4.0
     prefix_set_case_variant: bool = false,
+    /// Byte-offset RANGE of the `prefix_set` window from the **match start**: a Teddy hit at
+    /// input position `q` implies a candidate match start at `q - d` for some
+    /// `d ∈ [prefix_set_off_min, prefix_set_off_max]`. `0/0` for a leading set (the common
+    /// case). A case-variant set may instead sit at the **rarest** interior window of a bounded
+    /// phrase (`(?i)sherlock holmes` → the rare `[cC][kK] ` window, far fewer Teddy candidates
+    /// than the common leading `[sS][hH][eE]`); the per-occurrence confirm then anchors across
+    /// `q - off_max .. q - off_min`. The range (not a single offset) accounts for variable-length
+    /// case-fold variants of the **preceding** positions (`s` folds to the 2-byte `ſ`, so a
+    /// `ſherlock…` match shifts the window one byte right). Sound — the window is a necessary
+    /// substring of every match, and for non-overlapping matches the candidate starts stay
+    /// monotonic, so leftmost-first is preserved. Only set for a **bounded** pattern.
+    ///
+    /// @stable-since: v0.6.0
+    prefix_set_off_min: u32 = 0,
+    /// @stable-since: v0.6.0
+    prefix_set_off_max: u32 = 0,
 
     /// Inner-anchor byte: the first byte of a required literal that immediately follows a
     /// leading variable class run (`@` in `[\w.+-]+@…`), or null. Drives a sound *skip to
@@ -566,10 +582,19 @@ fn filterFromAnalysis(h: hir.Hir) Filter {
     //     leading positions' choices into a bounded byte-string set (every match begins with
     //     one of them → sound), feeding the same multi-prefix skip — but via Teddy.
     if (f.prefix_len == 0 and f.prefix_set_n == 0) {
-        const n = caseVariantSet(h, &f);
-        if (n >= 2) {
-            f.prefix_set_n = n;
-            f.prefix_set_case_variant = true;
+        // For a BOUNDED, all-ASCII case-variant phrase, place the Teddy set at the **rarest**
+        // interior window (`(?i)sherlock holmes` → `[oO][cC][kK]` at offset 5 instead of the
+        // common leading `[sS][hH][eE]`) — far fewer candidates to confirm. The per-occurrence
+        // confirm anchors at `hit - offset`. Falls back to the leading set otherwise.
+        if (f.bounded_confirm) {
+            if (caseVariantWindow(h, &f)) f.prefix_set_case_variant = true;
+        }
+        if (f.prefix_set_n == 0) {
+            const n = caseVariantSet(h, &f);
+            if (n >= 2) {
+                f.prefix_set_n = n;
+                f.prefix_set_case_variant = true;
+            }
         }
     }
 
@@ -752,6 +777,129 @@ fn caseVariantSet(h: hir.Hir, f: *Filter) u8 {
     for (0..n) |p| min_len = @min(min_len, f.prefix_set_len[p]);
     if (min_len < VARIANT_MIN_LEN) return 0; // not selective enough to be worth a prefilter
     return @intCast(n);
+}
+
+/// Longest window (in foldable positions) Teddy meaningfully fingerprints — its fingerprint is
+/// the first ≤ 3 bytes of each needle, so a 3-byte window is the selectivity sweet spot.
+const VARIANT_WINDOW_LEN: usize = 3;
+
+/// Largest offset-range (`off_max - off_min`) tolerated for a rare interior window: each unit is
+/// one extra per-hit confirm (a preceding position with a longer-byte case variant, e.g. `s`→`ſ`).
+/// Keep it tiny so the rarer window's confirm savings are not eaten by the extra confirms.
+const VARIANT_OFFSET_RANGE_MAX: u32 = 2;
+
+/// For a **bounded** case-variant phrase, seed the Teddy prefilter from the **rarest** length-2/3
+/// window of leading positions rather than the (often common) leading window — `(?i)sherlock
+/// holmes`'s leading `she` occurs ~2× more than the rarer `ck `. Fills `f.prefix_set*` and the
+/// `prefix_set_off_min/off_max` range (a Teddy hit at `q` ⇒ candidate start `q - d`, `d` in that
+/// range — the range covers variable-length case variants of the preceding positions, `s`→2-byte
+/// `ſ`). Returns true on success; false ⇒ the caller falls back to the leading `caseVariantSet`.
+/// Rarity is estimated from `memmem.byteFreq` (steers the probe only — every hit is fully
+/// confirmed, so the choice never affects which matches are found).
+fn caseVariantWindow(h: hir.Hir, f: *Filter) bool {
+    var choices: [MAX_PREFIX_LEN]Choice = undefined;
+    var nchoices: usize = 0;
+    var stop = false;
+    collectChoices(h, h.root, &choices, &nchoices, &stop);
+    if (nchoices < VARIANT_MIN_LEN) return false;
+
+    // Per-position encoded byte-length min/max (over case variants) and a first-byte frequency
+    // sum (Teddy fingerprints leading bytes). Cumulative min/max give each position's byte offset
+    // *range* from the match start (variable because a fold variant may be 1 or 2+ bytes).
+    var pmin: [MAX_PREFIX_LEN]u32 = undefined;
+    var pmax: [MAX_PREFIX_LEN]u32 = undefined;
+    var pscore: [MAX_PREFIX_LEN]u32 = undefined;
+    var cmin: [MAX_PREFIX_LEN + 1]u32 = undefined;
+    var cmax: [MAX_PREFIX_LEN + 1]u32 = undefined;
+    cmin[0] = 0;
+    cmax[0] = 0;
+    for (choices[0..nchoices], 0..) |ch, i| {
+        if (ch.len == 0) return false;
+        var mn: u32 = 99;
+        var mx: u32 = 0;
+        var sc: u32 = 0;
+        for (0..ch.len) |ci| {
+            if (!encoding.isValidCodePoint(ch.cps[ci])) return false;
+            var buf: [4]u8 = undefined;
+            const m = utf8.encodeCodePointUnchecked(ch.cps[ci], &buf);
+            if (m == 0) return false;
+            mn = @min(mn, m);
+            mx = @max(mx, m);
+            sc += memmem.byteFreq(buf[0]);
+        }
+        pmin[i] = mn;
+        pmax[i] = mx;
+        pscore[i] = sc;
+        cmin[i + 1] = cmin[i] + mn;
+        cmax[i + 1] = cmax[i] + mx;
+    }
+
+    // Pick the lowest-frequency feasible window: prefer length 3 (Teddy's fingerprint depth),
+    // else 2. Feasible = product of variant counts in `[2, MAX_PREFIX_BRANCHES]`, longest needle
+    // ≤ MAX_PREFIX_LEN, and the preceding-offset range ≤ VARIANT_OFFSET_RANGE_MAX.
+    var best_off: ?usize = null;
+    var best_len: usize = 0;
+    var best_score: u32 = std.math.maxInt(u32);
+    var L: usize = @min(VARIANT_WINDOW_LEN, nchoices);
+    while (L >= VARIANT_MIN_LEN) : (L -= 1) {
+        var i: usize = 0;
+        while (i + L <= nchoices) : (i += 1) {
+            if (cmax[i] - cmin[i] > VARIANT_OFFSET_RANGE_MAX) continue; // too many per-hit confirms
+            var product: usize = 1;
+            var maxneedle: u32 = 0;
+            var score: u32 = 0;
+            for (i..i + L) |k| {
+                product *= choices[k].len;
+                maxneedle += pmax[k];
+                score += pscore[k];
+            }
+            if (product < 2 or product > hir.MAX_PREFIX_BRANCHES) continue;
+            if (maxneedle > MAX_PREFIX_LEN) continue;
+            if (score < best_score) {
+                best_score = score;
+                best_off = i;
+                best_len = L;
+            }
+        }
+        if (best_off != null) break; // a window at this (longest tried) length wins
+    }
+    const off = best_off orelse return false;
+
+    // Build the cartesian product of the window's positions (each variant encoded to its bytes).
+    var n: usize = 1;
+    f.prefix_set[0] = @splat(0);
+    f.prefix_set_len[0] = 0;
+    for (choices[off .. off + best_len]) |ch| {
+        var enc: [VARIANT_CLASS_MAX][4]u8 = undefined;
+        var enc_len: [VARIANT_CLASS_MAX]u8 = undefined;
+        for (0..ch.len) |ci| enc_len[ci] = utf8.encodeCodePointUnchecked(ch.cps[ci], &enc[ci]);
+        var nb: [hir.MAX_PREFIX_BRANCHES][MAX_PREFIX_LEN]u8 = undefined;
+        var nl: [hir.MAX_PREFIX_BRANCHES]u8 = undefined;
+        var w: usize = 0;
+        for (0..n) |p| {
+            const plen = f.prefix_set_len[p];
+            for (0..ch.len) |ci| {
+                nb[w] = @splat(0);
+                @memcpy(nb[w][0..plen], f.prefix_set[p][0..plen]);
+                @memcpy(nb[w][plen .. plen + enc_len[ci]], enc[ci][0..enc_len[ci]]);
+                nl[w] = plen + enc_len[ci];
+                w += 1;
+            }
+        }
+        n = w;
+        for (0..n) |p| {
+            f.prefix_set[p] = nb[p];
+            f.prefix_set_len[p] = nl[p];
+        }
+    }
+    if (n < 2) return false;
+    var min_len: u8 = 255;
+    for (0..n) |p| min_len = @min(min_len, f.prefix_set_len[p]);
+    if (min_len < VARIANT_MIN_LEN) return false; // not selective enough
+    f.prefix_set_n = @intCast(n);
+    f.prefix_set_off_min = cmin[off];
+    f.prefix_set_off_max = cmax[off];
+    return true;
 }
 
 /// Whether a leading-class first-byte set is **selective** enough to drive the SIMD class
@@ -1303,13 +1451,22 @@ fn runNfa(p: *const nfa.Program, filter: *const Filter, tdy: ?*const teddy.Teddy
         if (filter.bounded_confirm) {
             var pos = o.start;
             while (nextPrefixHit(filter, tdy, input, pos)) |hit| {
-                if (input.len - hit < filter.min_bytes) return null;
-                if (confirmAt(p, s, input, hit, slots)) |m| return m;
                 pos = hit + 1;
+                var d = filter.prefix_set_off_max; // largest d = leftmost candidate, tried first
+                while (d + 1 > filter.prefix_set_off_min) : (d -= 1) {
+                    if (d <= hit) {
+                        const cand = hit - d;
+                        if (cand >= o.start and input.len - cand >= filter.min_bytes) {
+                            if (confirmAt(p, s, input, cand, slots)) |m| return m;
+                        }
+                    }
+                    if (d == 0) break;
+                }
             }
             return null;
         }
         o.start = nextPrefixHit(filter, tdy, input, o.start) orelse return null;
+        o.start -|= filter.prefix_set_off_max;
         if (input.len - o.start < filter.min_bytes) return null;
     } else if (filter.inner_byte != null) {
         // Interior-anchor skip (`[\w.+-]+@…`): leap to the next anchor byte, reverse-scan to
@@ -1389,13 +1546,22 @@ fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.
         if (filter.bounded_confirm) {
             var pos = opts.start;
             while (nextPrefixHit(filter, tdy, input, pos)) |hit| {
-                if (input.len - hit < filter.min_bytes) return null;
-                if (dfaConfirmAt(dp, d, input, hit, match_only)) |m| return m;
                 pos = hit + 1;
+                var dd = filter.prefix_set_off_max; // largest d = leftmost candidate, tried first
+                while (dd + 1 > filter.prefix_set_off_min) : (dd -= 1) {
+                    if (dd <= hit) {
+                        const cand = hit - dd;
+                        if (cand >= opts.start and input.len - cand >= filter.min_bytes) {
+                            if (dfaConfirmAt(dp, d, input, cand, match_only)) |m| return m;
+                        }
+                    }
+                    if (dd == 0) break;
+                }
             }
             return null;
         }
         o.start = nextPrefixHit(filter, tdy, input, o.start) orelse return null;
+        o.start -|= filter.prefix_set_off_max;
         if (input.len - o.start < filter.min_bytes) return null;
     } else if (filter.inner_byte) |anchor| {
         // Fixed-offset interior anchor on ASCII input (`\d{4}-…` too big for the eager DFA): jump
@@ -1497,14 +1663,25 @@ fn runEdfa(ep: *const edfa.Program, filter: *const Filter, tdy: ?*const teddy.Te
         if (filter.bounded_confirm and !ep.prone and !ep.end_anchored) {
             var pos = o.start;
             while (nextPrefixHit(filter, tdy, input, pos)) |hit| {
-                if (input.len - hit < filter.min_bytes) return null;
-                probes.* += 1; // ReDoS observable (bounded ⇒ stays linear)
-                if (edfaConfirmAt(ep, input, hit, match_only)) |m| return m;
                 pos = hit + 1;
+                // A window hit at `hit` implies a match start `hit - d`, d in the offset range
+                // (largest d = leftmost candidate, tried first). 0/0 for a leading set.
+                var d = filter.prefix_set_off_max;
+                while (d + 1 > filter.prefix_set_off_min) : (d -= 1) {
+                    if (d <= hit) {
+                        const cand = hit - d;
+                        if (cand >= o.start and input.len - cand >= filter.min_bytes) {
+                            probes.* += 1; // ReDoS observable (bounded ⇒ stays linear)
+                            if (edfaConfirmAt(ep, input, cand, match_only)) |m| return m;
+                        }
+                    }
+                    if (d == 0) break;
+                }
             }
             return null;
         }
         o.start = nextPrefixHit(filter, tdy, input, o.start) orelse return null;
+        o.start -|= filter.prefix_set_off_max; // interior window → step back to the earliest match start
         if (input.len - o.start < filter.min_bytes) return null;
     } else if (filter.inner_byte) |anchor| {
         // Fixed-offset interior anchor on ASCII input (`\d{4}-…`): jump anchor-to-anchor and
@@ -2216,6 +2393,16 @@ test "auto: case-variant + class-scan prefilters find/count correctly (functiona
     // conformance.zig). Leftmost-first, mixed case, multiple matches.
     try expectFind("(?i)the", "oh THE end", "THE");
     try expectFind("(?i)sherlock holmes", "she Sherlock Holmes!", "Sherlock Holmes");
+    // The rare-window prefilter places the Teddy set at an interior window (`ck `) reached past
+    // the leading `s`, whose fold includes the 2-byte `ſ` — so the offset is a RANGE. Both the
+    // plain and the `ſ`-shifted spellings must still match (the range covers the shift).
+    try expectFind("(?i)sherlock holmes", "x sherlock holmes y", "sherlock holmes");
+    try expectFind("(?i)sherlock holmes", "x \u{17F}herlock holmes y", "\u{17F}herlock holmes"); // long-s
+    try testing.expect(blk: {
+        var re2 = try Compiled.init("(?i)sherlock holmes");
+        defer re2.deinit();
+        break :blk E.count(&re2.program, &re2.scratch, "Sherlock Holmes and SHERLOCK HOLMES, not sherlock x", .{}) == 2;
+    });
     try expectFind("\\d+", "no nums .... 4567 yes", "4567");
     var re = try Compiled.init("(?i)the");
     defer re.deinit();

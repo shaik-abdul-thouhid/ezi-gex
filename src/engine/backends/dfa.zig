@@ -343,9 +343,9 @@ pub fn supports(h: hir.Hir) bool {
     // must be the empty match `{0,0}`, not `{0,1}`). Decline to the Pike VM. See
     // `hir.Analysis.word_boundary_in_alternation`.
     if (h.analysis.word_boundary_in_alternation) return false;
-    // A repetition over a nullable alternation (`(?:|.)+`) has the same leftmost-
-    // first-vs-longest mismatch in the empty-loop direction — decline to the Pike
-    // VM. See `hir.Analysis.nullable_alternation_in_repetition`.
+    // A repetition over a nullable alternation (`(?:|.)+`): the priority-ordered DFA can't
+    // reliably reproduce the leftmost-first empty-width-loop priority for this shape — decline
+    // to the Pike VM (correct + linear). See `hir.Analysis.nullable_alternation_in_repetition`.
     if (h.analysis.nullable_alternation_in_repetition) return false;
     // A non-trailing `text_end` (`$a`, `\z.\z`) wrongly matches via the reverse-end
     // path. Decline. See `hir.Analysis.interior_text_end`.

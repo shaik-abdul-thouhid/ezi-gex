@@ -92,8 +92,10 @@ Landed across `0.4.0-dev` (all on `main`):
   now wired on the **NFA/DFA arm** too (so a top-level alternation like `Holmes…|Watson…` gets
   Teddy as well). `(?i)the` ~4.6×, `(?i)sherlock holmes` ~17×, `(?i)что` ~15×, `near` ~1.6×.
 - **Leading-class SIMD scan** (`engine/classscan.zig`) — a selective digit/number-class lead
-  (`\d+`, `\p{N}+`) SIMD-skips the inter-match gaps to the next class byte. On sparse-match corpora
-  `\d+`/`\p{N}+` are now **~33–37× faster (ahead of Rust)**.
+  (`\d+`, `\p{N}+`) SIMD-skips the inter-match gaps to the next class byte, via a **shufti**
+  per-high-nibble classifier (exact for ≤8 distinct high nibbles, so a sparse scan over non-ASCII
+  text pays no false-positive confirms). On sparse-match ASCII corpora `\d+`/`\p{N}+` are
+  **~33–37× faster (ahead of Rust)**; `\p{N}+` over Cyrillic is **~1.7× faster** since 0.6.0.
 - **`(?m)^` line anchors on the lazy DFA** — a single leading `(?m)^` runs O(input) on the lazy DFA
   (line-gated forward re-seed + reverse line-accept), with no anchored restart, so a *prone*
   newline-crossing line pattern (`log_line`) is no longer stuck on the Pike VM — the quadratic-immune
@@ -782,11 +784,12 @@ zig build fuzz --fuzz=200000                # bounded coverage-guided session (K
 
 ## Known limitations
 
-A few deliberate semantic choices (JS-style empty-loop ties, `\X` on the backtracker only)
-and two deferred edge cases on pathological patterns — an empty-width loop over a nullable
-concat body (`pikevm`/`backtrack` only; `auto` correct), and `\b`/`\B` after a length-varying
-alternation (eager DFA / `auto`) — are documented, with repro tables and workarounds, in
-[`docs/limitations.md`](docs/limitations.md).
+A few deliberate semantic choices (`\X` on the backtracker only, bounded `{m,n}` counts) are
+documented in [`docs/limitations.md`](docs/limitations.md). As of v0.6.0 there are **no known
+cross-backend correctness gaps**: empty-width loops follow RE2/Rust leftmost-first uniformly
+(`(?:|.)+` → `""`, `(?:a?b??)+` → `"a"`), and the two former deferred edge cases — an empty
+loop over a nullable concat body, and a `\b`/`\B` after a length-varying alternation — are
+fixed (see the [CHANGELOG](CHANGELOG.md), v0.6.0).
 
 ## License
 

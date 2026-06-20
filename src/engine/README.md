@@ -11,7 +11,7 @@
 | `simd.zig` | the **only** arch-specific file: the quarantined dynamic in-vector byte shuffle (`shuffle16`/`shuffle32` → `pshufb`/`vpshufb`/`tbl`), scalar + comptime fallback. The engine of the SIMD prefilters below |
 | `teddy.zig` | **Teddy** SIMD multi-literal prefilter (not a backend; an accelerator) — finds any of ≤16 short literals at once via a nibble fingerprint shuffle. Backs the `literal` alternation scan AND `auto`'s multi-prefix / case-variant start-skip |
 | `memmem.zig` | portable two-byte SIMD single-substring search (no arch asm) — the single-literal accelerator (Teddy's lone-needle peer), used by `literal` and `auto`'s leading-literal skip |
-| `classscan.zig` | portable SIMD "next byte in a set" scan (one-bucket nibble classifier) — `auto`'s leading-class start-skip for a selective digit/number-class lead (`\d+`, `\p{N}+`) |
+| `classscan.zig` | portable SIMD "next byte in a set" scan (shufti per-high-nibble classifier — exact for ≤8 distinct high nibbles, so a sparse non-ASCII scan pays no false-positive confirms) — `auto`'s leading-class start-skip for a selective digit/number-class lead (`\d+`, `\p{N}+`) |
 | `conformance.zig` | cross-backend tests: every backend agrees, runtime + comptime |
 | `regex.zig` | the **front door** — `compileRuntime`/`compileComptime`(`With`) → `Compiled(Backend)`, the user-facing API |
 | `root.zig` | re-exports; `default_backend = auto` |

@@ -292,7 +292,16 @@ const Det = struct {
                         self.seen[pc] = true;
                         self.rec_mask[pc] = mask;
                         switch (self.insts[pc]) {
-                            .jmp => |t| pc = t,
+                            .jmp => |t| {
+                                // Empty-width-loop guard (mirrors pikevm/backtrack): the only
+                                // BACKWARD jmp is an unbounded repetition's loop-back, whose exit
+                                // is `pc + 1`. If the loop head `t` was already visited in THIS
+                                // closure (same position) the iteration matched empty, so route
+                                // to the exit (leftmost-first terminates the loop) instead of
+                                // looping. Keeps onepass consistent with the other backends on a
+                                // nullable lazy/concat body (`(?:a?b??)+` → "a"). See nfa.zig.
+                                if (t < pc and self.seen[t]) pc += 1 else pc = t;
+                            },
                             .split => |s| {
                                 try self.push(&top, .{ .visit = s.b }); // defer lower priority
                                 pc = s.a; // pursue higher priority now

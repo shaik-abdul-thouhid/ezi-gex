@@ -286,6 +286,16 @@ fn seen(ctx: *Ctx, pc: u32, sp: usize) bool {
     return (cur & bit) != 0;
 }
 
+/// Read-only test of the `(pc, sp)` memo bit — like `seen` but with **no** set and no
+/// `steps`/`touched` side effects. Used by the empty-width-loop guard to ask "did we
+/// enter this loop head at the current position?" without marking the state explored.
+fn peekSeen(ctx: *const Ctx, pc: u32, sp: usize) bool {
+    const idx = @as(usize, pc) * ctx.stride + sp;
+    const w = idx / WORD_BITS;
+    const bit = @as(usize, 1) << @intCast(idx % WORD_BITS);
+    return (ctx.visited[w].w & bit) != 0;
+}
+
 /// Depth-first match from `(pc0, sp0)`. Returns whether a match was found; on the
 /// first (highest-priority) match it snapshots captures into `match_slots`. The
 /// `seen` memo prunes already-explored states, giving linear *time* and termination
@@ -350,7 +360,21 @@ fn backtrack(ctx: *Ctx, pc0: u32, sp0: usize) bool {
                 pc += 1;
                 sp += nfa.graphemeLenAt(ctx.input, sp);
             },
-            .jmp => |t| pc = t,
+            .jmp => |t| {
+                // Empty-width-loop guard (mirrors the Pike VM closure). The only BACKWARD
+                // jmp the compiler emits is an unbounded repetition's loop-back, whose exit
+                // is always `pc + 1` (the `after` label); alternation enders jmp forward.
+                // If the loop head `t` was already entered at THIS position (`peekSeen`), the
+                // iteration matched empty — leftmost-first terminates the loop, so take the
+                // exit directly (at the empty path's depth-first priority) rather than looping
+                // back into the head (which the `seen` memo would dead-end, only then trying
+                // the exit *below* a lower-priority consuming sibling). A forward jmp, or a
+                // back-edge whose head is unseen at this sp (a real non-empty iteration),
+                // loops as before. Fixes `(?:a?b??)+` on "ab" → "a". See nfa.zig.
+                if (t < pc and peekSeen(ctx, t, sp)) {
+                    pc += 1; // empty iteration → loop exit (`after`)
+                } else pc = t;
+            },
             .assertion => |k| {
                 if (!nfa.assertionHolds(k, ctx.input, sp)) return false;
                 pc += 1;
@@ -522,6 +546,16 @@ test "alternation leftmost-first + quantifiers" {
     try expectFind("a.*?c", "abXcYc", "abXc"); // lazy
     try expectFind("a{2,4}", "aaaaaa", "aaaa");
     try expectFind("(ab){2,3}", "ababab", "ababab");
+}
+
+test "empty-width-loop guard: an empty iteration terminates the loop (leftmost-first)" {
+    // Mirrors the Pike VM: the depth-first backtracker takes the empty-iteration exit at the
+    // empty path's priority instead of looping into a consuming sibling.
+    try expectFind("(?:a?b??)+", "ab", "a");
+    try expectSpan("(?:a??b??)+", "ab", 0, 0);
+    try expectFind("(?:a?b??)+x", "abx", "abx"); // body still consumes when forced
+    try expectFind("(?:a?b?)+", "ab", "ab"); // greedy body consumes
+    try expectFind("(a|)+", "aa", "aa"); // consuming-first alternation branch
 }
 
 test "anchors and word boundaries" {

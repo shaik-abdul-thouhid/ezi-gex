@@ -365,34 +365,38 @@ test "word-boundary-in-alternation keeps leftmost-first on auto (v0.5.0 regressi
     }
 }
 
-// Regression (v0.5.0): a repetition over a nullable alternation (`(?:|.)+`). Found
-// by the differential fuzzer. The byte DFA's leftmost-*longest* merge produced the
-// empty `{0,0}` where the engine's leftmost-first (JS-style) empty-loop semantics —
-// shared by the Pike VM and backtracker, and ezi_gex's reference here — give the
-// consuming match: the preferred empty branch makes no progress, so the iteration
-// takes the consuming branch. (Verified against JS/V8; RE2/Python/Perl differ — they
-// return empty — but ezi_gex follows the JS interpretation consistently, see the
-// `(|a)*` → "aaa" case below.) Fixed by declining the shape to the Pike VM
-// (`hir.Analysis.nullable_alternation_in_repetition`, gated in `dfa`/`edfa.supports`).
+// A repetition over a nullable alternation (`(?:|.)+`). ezi_gex follows **RE2/Rust
+// leftmost-first** here (the empty-width-loop rule): when the highest-priority body path
+// matches empty, the loop terminates. So an **empty-first** branch (`(?:|.)+`, `(|a)*`)
+// wins the empty iteration and exits with `""`, while a **consuming-first** branch (`(a|)+`)
+// consumes greedily until it can't. (Through 0.5.1 ezi deliberately diverged here to JS/V8 —
+// the consuming branch won; 0.6.0 made every backend uniformly RE2/Rust leftmost-first.)
+// The shape stays routed off the byte DFA via `nullable_alternation_in_repetition`: the
+// priority-ordered DFA can't reliably reproduce this empty-loop priority — a fuzz repro is
+// `(b*)(?:b{0}(?:\n*)|.{2}(?:(){0}))+` on "\nba", where the eager DFA took `[0,3)` and the
+// Pike VM the correct `[0,1)` — so `auto` serves it on the leftmost-first-correct Pike VM.
 const nullable_alt_repetition_cases = [_]Case{
-    .{ .pat = "(?:|.)+", .input = "c", .expect = "c" }, // auto regressed to "" here
-    .{ .pat = "(?:|a)+", .input = "aa", .expect = "aa" }, // and here
-    .{ .pat = "(?:|.)*", .input = "c", .expect = "c" },
-    .{ .pat = "(|a)*", .input = "aaa", .expect = "aaa" }, // tiebreaker: ezi == JS, not RE2's ""
-    .{ .pat = "(|a)+", .input = "aa", .expect = "aa" },
-    .{ .pat = "(a|)+", .input = "aa", .expect = "aa" },
+    .{ .pat = "(?:|.)+", .input = "c", .expect = "" }, // empty-first branch → empty iteration exits
+    .{ .pat = "(?:|a)+", .input = "aa", .expect = "" },
+    .{ .pat = "(?:|.)*", .input = "c", .expect = "" },
+    .{ .pat = "(|a)*", .input = "aaa", .expect = "" }, // RE2/Rust tiebreaker (was JS "aaa")
+    .{ .pat = "(|a)+", .input = "aa", .expect = "" },
+    .{ .pat = "(a|)+", .input = "aa", .expect = "aa" }, // consuming-first branch → greedily consumes
     .{ .pat = "(?:a|)*b", .input = "aab", .expect = "aab" },
-    // Controls — an alternation under a repetition with NO nullable branch is NOT
-    // declined (stays DFA-eligible) and must still agree.
+    .{ .pat = "(b*)(?:b{0}(?:\n*)|.{2}(?:(){0}))+", .input = "\nba", .expect = "\n" }, // fuzz repro (0.6.0)
+    // Controls — an alternation under a repetition with NO nullable branch.
     .{ .pat = "(?:a|b)+", .input = "abab", .expect = "abab" },
     .{ .pat = "(cat|dog)+", .input = "catdog", .expect = "catdog" },
 };
 
-test "nullable-alternation-in-repetition agrees across backends (v0.5.0 regression)" {
+test "nullable-alternation-in-repetition agrees across backends (RE2/Rust leftmost-first, 0.6.0)" {
+    // Routed off the byte DFA (`nullable_alternation_in_repetition`), so `auto` runs the Pike
+    // VM here; the byte engines decline this shape and are not checked directly. The non-nullable
+    // controls below DO stay DFA-eligible and are checked via `auto`.
     for (nullable_alt_repetition_cases) |c| {
-        try checkRuntime(pikevm, c); // oracle (JS-aligned empty-loop semantics)
+        try checkRuntime(pikevm, c); // leftmost-first reference
         try checkRuntime(backtrack, c);
-        try checkRuntime(auto, c); // the one that regressed on `(?:|.)+`/`(?:|a)+`
+        try checkRuntime(auto, c);
     }
 }
 
@@ -593,62 +597,118 @@ test "empty-width-loop collapse: unbounded-over-nullable matches leftmost-first 
     }
 }
 
-// KNOWN LIMITATION (0.5.1): the empty-width-loop bug also affects an unbounded outer
-// over a nullable CONCAT body with a lazy part (`(?:a?b??)+`, `(?:a??b??)+`). The HIR
-// collapse above cannot reach these — a concat body is not a single repetition to
-// widen — so they would need the general empty-width-loop guard in the Pike VM closure
-// (a deep change deferred for now). The byte DFA handles them correctly, so the DEFAULT
-// `auto` (which runs the DFA on all but tiny inputs) yields the leftmost-first answer
-// that matches Rust `regex`; these cases pin that. The `pikevm`/`backtrack` backends
-// chosen *directly* still over-consume here — a documented gap, not a regression. The
-// expectations below are cross-checked against Rust.
-const empty_loop_concat_auto_cases = [_]Case{
-    .{ .pat = "(?:a?b??)+", .input = "ab", .expect = "a" }, // pikevm-direct gives "ab"
-    .{ .pat = "(?:a??b??)+", .input = "ab", .expect = "" }, // pikevm-direct gives "a"
+// Regression (0.6.0): the empty-width-loop guard fixes an unbounded outer over a nullable
+// CONCAT body with a lazy part (`(?:a?b??)+`, `(?:a??b??)+`) — the form the HIR collapse
+// could NOT reach (a concat body is not a single repetition to widen). The fix is the
+// empty-width-loop guard in the pikevm/backtrack/onepass `.jmp` handlers (a loop-back that
+// closes an empty iteration routes to the loop exit at the empty path's priority instead of
+// over-consuming) plus the do-while loop shape for nullable `x*` in `byte.zig` (the byte
+// DFAs / bytepike). All backends — pikevm, backtrack, AND auto — now agree on the
+// leftmost-first answer. Was a documented limitation through 0.5.1; the guard closes it.
+// (A nullable-*alternation* body, `(?:|.)+`, is a different shape: it stays routed to the
+// Pike VM via `nullable_alternation_in_repetition`; see that test above.)
+const empty_loop_concat_cases = [_]Case{
+    .{ .pat = "(?:a?b??)+", .input = "ab", .expect = "a" }, // was pikevm "ab"
+    .{ .pat = "(?:a??b??)+", .input = "ab", .expect = "" }, // was pikevm "a"
     .{ .pat = "(?:a?b?c??)+", .input = "abc", .expect = "ab" },
-    // Forced-consume controls (all engines already agree here):
+    .{ .pat = "(?:a?b??){2,}", .input = "ab", .expect = "a" }, // counted unbounded form
+    .{ .pat = "(a?b??)+", .input = "ab", .expect = "a" }, // capturing body
+    // Forced-consume controls (all engines already agreed here):
     .{ .pat = "(?:a?b??)+x", .input = "abx", .expect = "abx" },
     .{ .pat = "(?:a??b??)+b", .input = "ab", .expect = "ab" },
+    .{ .pat = "(?:a?b?)+", .input = "ab", .expect = "ab" }, // greedy body: consumes (unchanged)
 };
 
-test "empty-width-loop over a nullable concat body: auto (byte DFA) is leftmost-first correct (0.5.1)" {
-    // Only `auto` is asserted: the byte DFA gets these right, the Pike VM does not (a
-    // documented limitation — see the comment above). Do NOT add pikevm/backtrack here.
-    for (empty_loop_concat_auto_cases) |c| {
+test "empty-width-loop over a nullable concat body: all backends leftmost-first correct (0.6.0 regression)" {
+    // pikevm + backtrack now agree with the byte DFA (`auto`) thanks to the empty-loop guard.
+    for (empty_loop_concat_cases) |c| {
+        try checkRuntime(pikevm, c);
+        try checkRuntime(backtrack, c);
         try checkRuntime(auto, c);
     }
 }
 
-// KNOWN LIMITATION (0.5.1): a `\b`/`\B` trailing an alternation with length-varying,
-// OVERLAPPING branches loses leftmost-first priority on the EAGER byte DFA (`edfa`), and
-// therefore on `auto` (which routes ASCII `\b` to the eager arm). `(b+|.+)\B` on "baaa":
-// leftmost-first tries `b+` first → "b" `[0,1)` (`\B` holds between 'b' and 'a'); the
-// eager DFA takes the longer `.+` branch → `[0,3)`. The `pikevm`/`backtrack`/lazy-`dfa`
-// backends are leftmost-first correct. A correct fix needs the eager DFA to preserve
-// alternation priority across a trailing boundary (deferred — same eager-DFA `\b`-priority
-// theme as `word_boundary_with_adjacent_repetition`). Found by a differential anchor fuzz
-// campaign. See docs/limitations.md.
-const word_boundary_after_alt_ref_cases = [_]Case{
-    .{ .pat = "(b+|.+)\\B", .input = "baaa", .expect = "b" }, // edfa/auto give "baa"
-    .{ .pat = "(?:b|baaa)\\B", .input = "baaab", .expect = "b" }, // edfa/auto give "baaa"
+// Regression (0.6.0): a `\b`/`\B` trailing an alternation with length-varying, OVERLAPPING
+// branches used to lose leftmost-first priority on the EAGER byte DFA (`edfa`), and so on
+// `auto`. `(b+|.+)\B` on "baaa": leftmost-first tries `b+` first → "b" `[0,1)` (`\B` holds
+// between 'b' and 'a'); the eager DFA took the longer `.+` branch → `[0,3)`. Fixed by
+// declining the shape from the eager arm (`hir.Analysis.word_boundary_after_varying_alternation`,
+// gated in `edfa.supports`); `auto` then serves it on the leftmost-first-correct path and the
+// lazy `dfa` (decode-hybrid boundary) stays eligible. Found by a differential anchor fuzz campaign.
+const word_boundary_after_alt_cases = [_]Case{
+    .{ .pat = "(b+|.+)\\B", .input = "baaa", .expect = "b" }, // was edfa/auto "baa"
+    .{ .pat = "(?:b|baaa)\\B", .input = "baaab", .expect = "b" }, // was edfa/auto "baaa"
 };
 const word_boundary_after_alt_ok_cases = [_]Case{
-    // Control: non-overlapping branches → no priority conflict → ALL backends agree.
+    // Control: non-overlapping (disjoint-first) branches → no priority conflict → stays on the
+    // eager DFA fast path and ALL backends agree.
     .{ .pat = "(?:b+|a+)\\B", .input = "baaa", .expect = "b" },
+    .{ .pat = "\\b(foo|bar)\\b", .input = "a foo b", .expect = "foo" }, // disjoint-first: eager DFA
 };
 
-test "word boundary after a length-varying alternation: pikevm/backtrack stay leftmost-first (0.5.1, eager-DFA gap documented)" {
-    // Reference backends only on the diverging set; the eager DFA / `auto` take the longer
-    // match — a documented limitation (docs/limitations.md). Do NOT add auto/edfa here.
-    for (word_boundary_after_alt_ref_cases) |c| {
-        try checkRuntime(pikevm, c);
+test "word boundary after a length-varying alternation agrees across backends (0.6.0 regression)" {
+    // Previously a documented eager-DFA gap; now `auto` (and the lazy DFA) are leftmost-first
+    // correct. `edfa` declines the diverging shape (it is the eager arm), so it is not checked
+    // directly on the diverging set.
+    for (word_boundary_after_alt_cases) |c| {
+        try checkRuntime(pikevm, c); // leftmost-first reference
         try checkRuntime(backtrack, c);
+        try checkRuntime(dfa, c); // lazy DFA — leftmost-first correct
+        try checkRuntime(auto, c);
     }
-    // The non-overlapping control stays correct on every backend, incl. `auto`.
+    // The disjoint-first controls stay correct on every backend, incl. `auto`/`edfa`.
     for (word_boundary_after_alt_ok_cases) |c| {
         try checkRuntime(pikevm, c);
         try checkRuntime(backtrack, c);
         try checkRuntime(auto, c);
+    }
+}
+
+// Regression (0.6.0): a `\b`/`\B` lexically INSIDE a repetition (`(b.{0,2}\B)+`) — the repeated
+// body makes the boundary position ambiguous across iterations, and the eager byte DFA took the
+// longer end (`(b.{0,2}\B)+` on "bbbab…" → "bbbab"; leftmost-first is "bbb"). Fixed by declining
+// the shape from the eager arm (`hir.Analysis.word_boundary_in_repetition`, gated in
+// `edfa.supports`); `auto` then serves it on the leftmost-first-correct path (Pike VM / lazy DFA).
+// Found by the differential anchor fuzz. A top-level boundary (`\b\w+\b`) is NOT inside a rep and
+// stays on the eager DFA.
+const word_boundary_in_rep_cases = [_]Case{
+    .{ .pat = "((?m:b).{0,2}\\B)+", .input = "bbbabb\naababba\na", .expect = "bbb" }, // was edfa/auto "bbbab"
+    .{ .pat = "(b.{0,2}\\B)+", .input = "bbbab", .expect = "bbb" },
+};
+
+test "word boundary inside a repetition agrees across backends (0.6.0 regression)" {
+    for (word_boundary_in_rep_cases) |c| {
+        try checkRuntime(pikevm, c); // leftmost-first reference
+        try checkRuntime(backtrack, c);
+        try checkRuntime(dfa, c); // lazy DFA — correct
+        try checkRuntime(auto, c);
+    }
+    // Control: a top-level `\b\w+\b` is not inside a repetition → stays on the eager DFA fast path.
+    try checkRuntime(auto, .{ .pat = "\\b\\w+\\b", .input = "  hello  ", .expect = "hello" });
+    try checkRuntime(edfa, .{ .pat = "\\b\\w+\\b", .input = "  hello  ", .expect = "hello" });
+}
+
+// Regression (0.6.0): the leading-class first-byte SIMD scan (`classscan`, the `class_lead`
+// prefilter `auto` uses for `\p{N}+`, `\d+`, `\d{4}-…`) must find the SAME leftmost match as
+// the Pike VM over **non-ASCII** text. The shufti classifier rewrite (per-high-nibble buckets)
+// fixed a precision bug — the old single-bucket scheme let Cyrillic lead bytes (0xD0/0xD1) pass
+// the nibble filter for the broad `\p{N}` lead set, a false-positive storm that was correct but
+// slow (subtitles-ru 515µs → 308µs). These cases pin the end-to-end correctness of that scan
+// path over Cyrillic / mixed-script input — a soundness break in `classscan` would skip or
+// misplace a match here, diverging from the Pike VM oracle.
+const class_lead_nonascii_cases = [_]Case{
+    .{ .pat = "\\p{N}+", .input = "Привет 42 — мир 7", .expect = "42" }, // digits amid Cyrillic + em-dash
+    .{ .pat = "\\p{N}+", .input = "только буквы здесь", .expect = null }, // no number anywhere
+    .{ .pat = "\\p{N}+", .input = "год ٢٠٢٤ конец", .expect = "٢٠٢٤" }, // Arabic-Indic digits (lead 0xD9)
+    .{ .pat = "\\p{N}+", .input = "число 一二三 ⅩⅠⅤ 99", .expect = "ⅩⅠⅤ" }, // Roman numerals = \p{Nl}; CJK 一二三 = \p{Lo}, skipped (3-byte lead)
+    .{ .pat = "\\d+", .input = "абвгд123еёжз", .expect = "123" }, // ASCII digits inside 2-byte text
+};
+
+test "leading-class scan finds leftmost match over non-ASCII (0.6.0 shufti regression)" {
+    for (class_lead_nonascii_cases) |c| {
+        try checkRuntime(pikevm, c); // leftmost-first reference
+        try checkRuntime(backtrack, c);
+        try checkRuntime(auto, c); // exercises the class_lead / classscan prefilter
     }
 }
 

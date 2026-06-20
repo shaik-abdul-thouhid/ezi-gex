@@ -10,8 +10,8 @@ If you only want to *use* the library, the [README](../README.md) is enough, and
 [`usage-guide.md`](usage-guide.md) is its hands-on companion — copy-paste recipes for
 every op, the pipeline driven from lexing, and a runnable, step-by-step "write your own
 backend" walkthrough. [`limitations.md`](limitations.md) lists the deliberate semantic
-choices and the one deferred edge case. This document goes a layer down: the *why* behind
-that *how*.
+choices (there are no deferred correctness gaps as of v0.6.0). This document goes a layer
+down: the *why* behind that *how*.
 
 ---
 
@@ -464,6 +464,8 @@ match, so a prefilter or length gate built on them never yields a false negative
   `word_boundary_in_alternation` (`\b|.`), `word_boundary_with_nullable_alternation`
   (`\B(?:|.*)`), `word_boundary_with_lazy_repetition` (`a*?\b`, `[^a]+?\B *`),
   `word_boundary_with_adjacent_repetition` (`\n+(\n.*){0,2}\b`),
+  `word_boundary_after_varying_alternation` (`(b+|.+)\B` — **eager arm only**; the lazy DFA is
+  correct), `word_boundary_in_repetition` (`(b.{0,2}\B)+` — **eager arm only**),
   `nullable_alternation_in_repetition` (`(?:|.)+`), `interior_text_end` (a non-trailing
   `$`/`\z`, `$b$`), and `complex_line_anchor` (a `(?m)` anchor that is non-trailing /
   under a repetition / mixed with `\A`/`\z` / a `line_end` before a `line_start` `(?m:$^)` /
@@ -517,6 +519,15 @@ match, so a prefilter or length gate built on them never yields a false negative
 > (`EAGER_BYTE_INST_MAX`) so a big Unicode-class join (`\w+@\w+`, email) goes straight to the lazy
 > DFA instead of a multi-hundred-ms determinization that often only declines (email compile
 > ~0.88 s → ~6 ms).
+>
+> **Since 0.6.0 the case-variant Teddy set is seeded from the *rarest* window** of a bounded
+> `(?i)` phrase rather than always the leading positions: `(?i)sherlock holmes` probes the rare
+> `[cC][kK] ` window instead of the common leading `[sS][hH][eE]` (~2× fewer candidates to
+> confirm → ~1.13× on `ci_phrase`). The window sits at a byte-offset **range** from the match
+> start (`Filter.prefix_set_off_min/off_max`); the per-occurrence confirm tries `hit − d` for each
+> `d` in that range, which covers a variable-length fold variant of a preceding position
+> (`s`→2-byte `ſ` shifts the window one byte). Window rarity is ranked by `memmem.byteFreq`; the
+> prefilter is results-invariant (every hit is fully confirmed), pinned to the Pike VM.
 
 ---
 
@@ -616,7 +627,7 @@ The contract is the seam that makes these drop-in:
 | 1+ ✅ *(0.4.0)* | **Teddy SIMD multi-literal prefilter** (`engine/teddy.zig` + `engine/simd.zig`) — a dynamic in-vector byte shuffle (`pshufb`/`vpshufb`/`tbl`) fingerprints the first 1–3 bytes of every literal-alternation branch across a 16-byte chunk at once, then verifies; **slim** (≤8 buckets, 128-bit) + **fat** (16 buckets, AVX2 256-bit). The one arch-specific op is quarantined in `simd.zig` (portable scalar fallback at comptime / on other targets); gated by `strategy.simd`. Wired into the `literal` backend's alternation scan | done | closes the `foo\|bar\|baz\|qux` multi-substring gap (the single biggest one vs. Rust); validated by execution on NEON, SSSE3, and AVX2 |
 | ✅ *(0.4.0)* | **Inner-literal prefilter** — for a required literal that is *interior*, not a prefix (`[\w.+-]+@…`): `auto` memchr's the anchor (`@`, via `Analysis.inner_anchor`), reverse-scans the lead class to the earliest start, then dispatches once. Gated on the anchor being rare enough (`byteRarity`) | done | `email` ~411 MiB/s → ~4.5 GiB/s |
 | ✅ *(0.4.0)* | **Case-insensitive / small-class literals → case-variant Teddy** — `auto` synthesises a bounded case-variant set from a small-class / `(?i)` lead (`(?i)the` → `{THE…the}`) and drives the multi-prefix **Teddy** skip with it (`prefix_teddy`) | done | `(?i)the` ~4.6×, `(?i)sherlock holmes` ~17×, `(?i)что` ~15× |
-| ✅ *(0.4.0)* + ongoing | **Unicode-class throughput** — a **leading-class SIMD scan** (`engine/classscan.zig`) skips the inter-match gaps for a selective digit/number lead (`\d+`, `\p{N}+`). The raw determinized table walk on dense Unicode classes still lags Rust (`\p{L}+`, `\d{4}-\d{2}-\d{2}`) — a faster inner loop / structural prefilter is the next step | partial | `\d+`/`\p{N}+` on sparse corpora ~33–37× (now **faster than Rust**); `date_iso`/dense letter cells still behind |
+| ✅ *(0.4.0; shufti 0.6.0)* + ongoing | **Unicode-class throughput** — a **leading-class SIMD scan** (`engine/classscan.zig`) skips the inter-match gaps for a selective digit/number lead (`\d+`, `\p{N}+`). 0.6.0 upgraded its classifier from one bucket to **shufti** (per-high-nibble buckets — exact for ≤8 distinct high nibbles), so a sparse scan over **non-ASCII** text no longer pays false-positive confirms on shared lead bytes (`\p{N}` vs Cyrillic `0xD0`/`0xD1`). The raw determinized table walk on dense Unicode classes still lags Rust (`\p{L}+`, `\d{4}-\d{2}-\d{2}`) — a faster inner loop / structural prefilter is the next step | partial | `\d+`/`\p{N}+` on sparse ASCII ~33–37× (faster than Rust); `\p{N}+` on Cyrillic 0.6.0 ~1.7× faster (515→308µs, now ~0.6× Rust); `date_iso`/dense letter cells still behind |
 | ✅ *(0.4.0)* | **Teddy on the NFA/DFA arm** — the multi-prefix Teddy (`Program.prefix_teddy`) now serves any `prefix_set` ≥ 2 needles: a top-level alternation's leading literals (`near`'s `Holmes…\|Watson…`) AND the synthesised case-variant set above | done | `near` ~1.6× (3.4 → 5.4 GiB/s) |
 | ✅ *(0.4.0)* | **`(?m)^` line anchors on the lazy DFA** — a single leading `(?m)^` runs O(input) on the lazy DFA (line-gated forward re-seed + reverse line-accept), no anchored restart, so a *prone* / newline-crossing line pattern (`log_line`) is no longer stuck on the Pike VM | done | `log_line` ~1.3× (a 7-capture, complement-class, 2-pass-`find` pattern — the DFA per-byte win is largely offset by the forward+reverse passes; still ~6× behind Rust) |
 | ✅ *(0.5.0)* | **`\b`-wrapped pure-literal O(1) confirm** (`Filter.lit_wb_confirm`) — when the whole pattern is a literal in word-boundary assertions (`\bthe\b`, `the\b`), a `memmem` hit is confirmed by two O(1) boundary checks, not a per-occurrence anchored DFA walk (ASCII boundary on the eager arm; Unicode `nfa.assertionHolds` on the lazy arm, so accented prose is fast). The `memmem.Finder` is also hoisted out of the per-occurrence loop (it was rebuilt per "the" substring) | done | `\bthe\b` over prose ~490 MiB/s → **~3.7 GiB/s (≈8×)** |
