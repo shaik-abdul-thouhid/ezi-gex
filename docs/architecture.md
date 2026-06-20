@@ -542,6 +542,17 @@ match, so a prefilter or length gate built on them never yields a false negative
 > `redos.zig` guard). The interior-anchor jump is gated on a rare anchor (`memmem.byteFreq` ≤
 > `INNER_ANCHOR_RARE_MAX`): a common one (`.` in `ipv4`) keeps the single-skip path, never slower.
 > Results-invariant, pinned to the Pike VM (`jump_confirm_cases`).
+>
+> **Also since 0.6.0, a capitalized-word lead drives the class skip.** A class with a *sparse ASCII
+> lead but a broad Unicode tail* (`\p{Lu}`: `A–Z` plus uppercase across dozens of scripts) used to
+> be denied the leading-class scan — its high lead bytes blanket non-Latin text — so `\p{Lu}\p{Ll}+`
+> crawled byte-by-byte. `auto` now scans a **sound over-approximation**, `{the class's ASCII members}
+> ∪ {all high bytes}` (`asciiLeadDerived`): every match start is one of those, so no real start is
+> skipped. It engages **only when the input is ASCII-dominant** (high bytes < ⅛, `inputAsciiDominant`)
+> — on Latin prose it skips the lowercase gaps to the next capital (`\p{Lu}\p{Ll}+` on `sherlock`
+> ~1.7×, now faster than Rust `regex`), and on Cyrillic/CJK text (every byte high, the scan can't
+> help) it falls through to the native find on the **same code path as before**, so there is no
+> regression. Results-invariant, pinned to the Pike VM (`class_lead_derived_cases`).
 
 ---
 

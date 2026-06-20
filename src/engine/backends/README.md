@@ -94,6 +94,7 @@ search time (span / prefilter): input shorter than min_utf8_len ?         → no
                                 interior anchor after a fixed run (\d{4}-…)?  → jump to anchor, bounded-confirm at q−off
                                   ↳ rare interior anchor, variable run (…@…)?  → jump anchor-to-anchor, confirm (reach budget)
                                 leading selective class (\d+, \p{N}+) ?   → SIMD scan to next class byte
+                                  ↳ sparse-ASCII / broad-tail class (\p{Lu}…), input ASCII-dominant? → SIMD scan to next capital (derived set)
                                 rarest required byte absent from input ?  → no match (fast-reject)
 search time (NFA, by input):    no DFA arm, input ≤ 4096 B and fits ?     → backtrack : → pikevm
 ```

@@ -95,6 +95,20 @@ adopts **uniform RE2/Rust leftmost-first** empty-loop semantics across every bac
   exact, ~18 GiB/s on `sherlock`). Correctness is unchanged regardless (every survivor is confirmed
   against the exact bitset); pinned by white-box precision tests in `classscan.zig` and the
   end-to-end `class_lead_nonascii_cases` conformance differential.
+- **Leading-class start-skip for capitalized-word scans (`\p{Lu}…`).** A class whose first-byte
+  set has a **sparse ASCII lead but a broad Unicode tail** (`\p{Lu}`: `A–Z` plus uppercase across
+  dozens of scripts) used to be denied the `class_lead` SIMD skip — its high lead bytes blanket
+  non-Latin text — so a capitalized-word scan crawled byte-by-byte. `auto` now scans a **sound
+  over-approximation**, `{the class's ASCII members} ∪ {all high bytes}` (`asciiLeadDerived`): every
+  match start is one of those, so it never skips a real start. On Latin-script text (where high
+  bytes are rare) it skips the lowercase gaps to the next capital — **`\p{Lu}\p{Ll}+` ~1.7× faster**
+  on `sherlock` (`regex-bench`, ezi 1123µs → ~660µs, now *faster than* Rust `regex`). The derived
+  set engages **only when the input is ASCII-dominant** (high bytes < ⅛ of the input,
+  `inputAsciiDominant`); on Cyrillic/CJK text — where every byte is high and the scan can't help —
+  the arm falls through to the native find on the **identical code path as before**, so there is no
+  regression (`\p{Lu}\p{Ll}+` on `subtitles-ru` unchanged). Results-invariant (pinned by
+  `class_lead_derived_cases` in `conformance.zig` against the Pike VM oracle; the gate boundary and
+  the over-approximation are locked by `asciiLeadDerived` unit tests in `auto.zig`).
 - **Case-insensitive phrase search (`(?i)…`) — rarest-window Teddy prefilter.** For a bounded
   case-variant phrase the `auto` dispatcher now seeds its Teddy prefilter from the **rarest**
   2–3-position window instead of always the leading one (`(?i)sherlock holmes` probes the rare

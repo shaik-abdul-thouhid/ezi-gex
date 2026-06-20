@@ -744,6 +744,35 @@ test "lazy-arm jump-and-confirm (leading literal / rare interior anchor) is left
     }
 }
 
+// Regression (0.6.0): the leading-class SIMD skip now admits a **sparse-ASCII / broad-tail**
+// class (`\p{Lu}…`) via a sound over-approximating derived set — `{ASCII members} ∪ {all high
+// bytes}` (`auto.asciiLeadDerived`) — so capitalized-word scans (`\p{Lu}\p{Ll}+`) skip the
+// lowercase gaps to the next capital instead of stepping byte-by-byte (~2–3× on Latin prose). The
+// over-approximation must stay **leftmost-first**: the scan may not skip past any real start, and
+// a failing capital (a `\p{Lu}` not followed by `\p{Ll}`) must not drop the next match. These
+// inputs mix ASCII capitals, isolated capitals, non-ASCII uppercase (whose lead is a high byte),
+// and capitals at offset 0 / after a gap. `auto` (the derived class skip) must agree with the
+// Pike VM.
+const class_lead_derived_cases = [_]Case{
+    .{ .pat = "\\p{Lu}\\p{Ll}+", .input = "the Quick brown Fox", .expect = "Quick" }, // skip lowercase to first capital word
+    .{ .pat = "\\p{Lu}\\p{Ll}+", .input = "Hello world", .expect = "Hello" }, // capital at offset 0
+    .{ .pat = "\\p{Lu}\\p{Ll}+", .input = "A I X then Yes", .expect = "Yes" }, // isolated capitals (A,I,X) fail \p{Ll}+; leftmost real word wins
+    .{ .pat = "\\p{Lu}\\p{Ll}+", .input = "ALLCAPS shout Then", .expect = "Then" }, // run of capitals, no lowercase, until "Then"
+    .{ .pat = "\\p{Lu}\\p{Ll}+", .input = "café Über straße", .expect = "Über" }, // non-ASCII uppercase Ü (high lead byte) is a candidate
+    .{ .pat = "\\p{Lu}\\p{Ll}+", .input = "nothing here lowercase", .expect = null }, // no capital at all
+    .{ .pat = "\\p{Lu}\\p{Ll}+", .input = "Привет мир Слово", .expect = "Привет" }, // Cyrillic: every byte high → stops at once, native find (neutral path)
+    .{ .pat = "\\p{Lu}+", .input = "abcDEFghi", .expect = "DEF" }, // uppercase run, derived skip over abc
+    .{ .pat = "\\p{Lu}+", .input = "lower ONLY caps", .expect = "ONLY" },
+};
+
+test "leading-class derived skip (sparse-ASCII / broad-tail class) is leftmost-first (0.6.0 regression)" {
+    for (class_lead_derived_cases) |c| {
+        try checkRuntime(pikevm, c); // leftmost-first oracle
+        try checkRuntime(backtrack, c);
+        try checkRuntime(auto, c); // exercises auto.asciiLeadDerived's class skip on the eager/lazy arm
+    }
+}
+
 test "literal cases agree across all four backends (incl. literal)" {
     for (literal_cases) |c| {
         try checkRuntime(pikevm, c);

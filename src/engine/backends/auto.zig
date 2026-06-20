@@ -312,6 +312,18 @@ pub const Filter = struct {
     /// @stable-since: v0.4.0
     class_lead: ?hir.ByteSet = null,
 
+    /// True when `class_lead` is the **derived over-approximation** built by `asciiLeadDerived`
+    /// for a sparse-ASCII / broad-tail class (`\p{Lu}…`): `{ASCII members} ∪ {all high bytes}`.
+    /// Sound on every input, but only *useful* when the input is ASCII-dominant (where the high
+    /// bytes are rare, so the scan skips lowercase gaps to the next capital). On non-ASCII input
+    /// every byte is ≥ 0x80, so the scan would land on every byte and only add overhead — the
+    /// search-time arms therefore engage this class scan **only when the input is all-ASCII**
+    /// (and otherwise fall through to the native find, exactly as before this set existed). A
+    /// genuinely-selective `class_lead` (`\d+`, `\p{N}+`) leaves this false and always engages.
+    ///
+    /// @stable-since: v0.6.0
+    class_lead_ascii_only: bool = false,
+
     /// Fixed code-point distance from the match start to `inner_byte` when the leading run is
     /// fixed-length (`\d{4}-…` → 4; mirror of `hir.InnerAnchor.lead_fixed_cps`). On **ASCII
     /// input** the anchor sits exactly this many *bytes* into every match, so a hit at byte `q`
@@ -632,7 +644,20 @@ fn filterFromAnalysis(h: hir.Hir) Filter {
     //    member. Only when the set is selective (a near-universal set like `\p{L}+` is not).
     if (f.prefix_len == 0 and f.prefix_set_n == 0 and f.inner_byte == null) {
         if (an.leading_class_first) |bs| {
-            if (classLeadSelective(bs)) f.class_lead = bs;
+            if (classLeadSelective(bs)) {
+                f.class_lead = bs;
+            } else if (asciiLeadDerived(bs)) |derived| {
+                f.class_lead_ascii_only = true; // engage only on ASCII-dominant input (see field doc)
+                // A class with a **sparse ASCII lead but a broad Unicode tail** (`\p{Lu}`: A–Z
+                // plus uppercase across dozens of scripts). The full first-byte set is too broad
+                // (its high lead bytes blanket non-Latin text), but its ASCII members are rare in
+                // Latin prose. Scan a SOUND over-approximation — `{ASCII members} ∪ {all high
+                // bytes}` — which never skips a real first byte (every match start is one of
+                // those). On Latin text this skips the lowercase gaps to the next capital (the
+                // win); on non-Latin text every byte is high, so the scan stops at once and the
+                // native find runs unchanged (neutral). See `asciiLeadDerived`.
+                f.class_lead = derived;
+            }
         }
     }
 
@@ -942,6 +967,40 @@ fn classLeadSelective(bs: hir.ByteSet) bool {
     return high <= CLASS_HIGH_LEAD_MAX; // broad letter class (many script lead bytes) → decline
 }
 
+/// For a leading class that `classLeadSelective` **declined only for its broad high-byte tail**
+/// (`\p{Lu}`: A–Z plus uppercase across dozens of scripts), build a sound over-approximating
+/// first-byte set to scan instead: `{the class's ASCII members} ∪ {all bytes ≥ 0x80}`. Returns
+/// null when the class is not a fit. Every match begins with a code point in the class, whose
+/// first UTF-8 byte is therefore either an ASCII member (a single-byte cp) or a lead byte ≥ 0x80
+/// (a multi-byte cp) — both are in the derived set, so scanning to the next member **never skips
+/// a real match start** (sound). The payoff is corpus-shaped: on Latin-script text the high bytes
+/// are rare, so the scan skips lowercase gaps to the next capital; on non-Latin text every byte
+/// is ≥ 0x80, so the scan stops immediately and the caller's native find runs unchanged. Gated to
+/// classes whose ASCII portion is genuinely sparse — **non-empty** (an empty ASCII portion, e.g.
+/// `\p{Cyrillic}+`/`\p{Han}+`, can never skip and would only add scan overhead), no whitespace,
+/// and at most a few stray lowercase letters (a whole lowercase alphabet — `\p{L}+`, `\w+` — is
+/// letter-dense on every corpus and stays declined).
+fn asciiLeadDerived(bs: hir.ByteSet) ?hir.ByteSet {
+    if (bs.has(' ') or bs.has('\t') or bs.has('\n') or bs.has('\r')) return null;
+    var lower: u32 = 0;
+    var c: u8 = 'a';
+    while (c <= 'z') : (c += 1) if (bs.has(c)) {
+        lower += 1;
+    };
+    if (lower > 4) return null;
+    var ascii_n: u32 = 0;
+    var derived = hir.ByteSet{};
+    var b: u16 = 0;
+    while (b < 0x80) : (b += 1) if (bs.has(@intCast(b))) {
+        derived.set(@intCast(b));
+        ascii_n += 1;
+    };
+    if (ascii_n == 0) return null; // empty ASCII lead → nothing to skip to (pure non-ASCII script)
+    b = 0x80;
+    while (b < 0x100) : (b += 1) derived.set(@intCast(b)); // every high byte is a candidate (sound)
+    return derived;
+}
+
 /// A compiled program: either a literal program or the shared NFA program, plus the
 /// search-time `Filter` distilled from analysis (meaningful only on the NFA arm).
 /// The active arm is the analysis-time choice; the per-search engine choice (pikevm
@@ -1227,6 +1286,19 @@ pub const Scratch = struct {
     wb_input_len: usize = 0,
     wb_all_ascii: bool = false,
 
+    /// Cached **ASCII-dominant** verdict for the derived leading-class scan (`class_lead_ascii_only`):
+    /// true when fewer than `1/ASCII_DOMINANT_DIV` of the input's bytes are ≥ 0x80, i.e. high bytes
+    /// are rare enough that the `{ASCII members} ∪ {all high bytes}` scan still skips the long
+    /// ASCII gaps. Distinct from `wb_all_ascii` (strict, early-exit) because Latin prose is rarely
+    /// *pure* ASCII (a stray accent / curly quote) yet is overwhelmingly ASCII — a strict gate would
+    /// forfeit the skip on real text. O(n) to compute (a full count), so cached on the input slice
+    /// like `wb_*`; consulted only by a `class_lead_ascii_only` program. `reset` clears it.
+    ///
+    /// @stable-since: v0.6.0
+    ad_input_ptr: ?[*]const u8 = null,
+    ad_input_len: usize = 0,
+    ad_dominant: bool = false,
+
     /// @stable-since: v0.1.0
     pub fn bufferLen(program: *const Program) usize {
         return switch (program.inner) {
@@ -1283,6 +1355,7 @@ pub const Scratch = struct {
         self.confirm_probes = 0; // the ReDoS observable is per-reuse
         self.lazy_confirm_bytes = 0; // the lazy-arm jump-confirm observable, likewise per-reuse
         self.wb_input_ptr = null; // invalidate the input-ASCII cache (a new search may use a new input)
+        self.ad_input_ptr = null; // invalidate the ASCII-dominant cache (likewise input-keyed)
         switch (self.inner) {
             .literal => |*s| s.reset(),
             .nfa => |*s| {
@@ -1508,6 +1581,8 @@ fn runNfa(p: *const nfa.Program, filter: *const Filter, tdy: ?*const teddy.Teddy
         // match (a member of the leading class's first-byte set), then one linear dispatch. The
         // skipped-to byte starts a class run, so the unanchored scan finds the leftmost match at
         // or after it. Sound + O(input) (single skip, never a per-occurrence confirm loop).
+        // (A *derived* broad-tail `class_lead` never reaches the Pike VM arm — such patterns are
+        // DFA-eligible and route to `runEdfa`/`runByteDfa`, which gate it on ASCII input.)
         o.start = c.find(input, o.start) orelse return null;
         if (input.len - o.start < filter.min_bytes) return null;
     } else if (filter.rare_byte) |rb| {
@@ -1536,7 +1611,7 @@ fn dfaConfirmAt(dp: *const dfa.Program, d: *dfa.Scratch, input: []const u8, at: 
 /// is never slower than the default on prefix-literal / sparse-hit patterns. With no
 /// usable filter it runs one DFA pass (one-pass O(n) for `isMatch`, anchored-restart
 /// for `find`). Captures never come here — they always use the Pike VM (`runNfa`).
-fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.Teddy, cf: ?*const classscan.ClassFinder, d: *dfa.Scratch, input: []const u8, opts: SearchOptions, match_only: bool, input_ascii: bool, lazy_bytes: *u64) ?Match {
+fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.Teddy, cf: ?*const classscan.ClassFinder, d: *dfa.Scratch, input: []const u8, opts: SearchOptions, match_only: bool, input_ascii: bool, ascii_dominant: bool, lazy_bytes: *u64) ?Match {
     if (opts.start > input.len) return null;
     if (input.len - opts.start < filter.min_bytes) return null; // length gate
     if (opts.anchored) return dfaConfirmAt(dp, d, input, opts.start, match_only);
@@ -1678,8 +1753,11 @@ fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.
         }
     } else if (cf) |c| {
         // Leading-class SIMD skip → one native DFA find from the first candidate (sound; see runNfa).
-        o.start = c.find(input, o.start) orelse return null;
-        if (input.len - o.start < filter.min_bytes) return null;
+        // A *derived* (broad-tail) set engages only on ASCII-dominant input (see `runEdfa`).
+        if (!(filter.class_lead_ascii_only and !ascii_dominant)) {
+            o.start = c.find(input, o.start) orelse return null;
+            if (input.len - o.start < filter.min_bytes) return null;
+        }
     } else if (filter.rare_byte) |rb| {
         // Rarest-required-byte fast-reject (sound; see `runNfa`).
         if (memchrFrom(input, o.start, rb) == null) return null;
@@ -1705,7 +1783,7 @@ fn edfaConfirmAt(ep: *const edfa.Program, input: []const u8, at: usize, match_on
 /// rarest-required-byte fast-reject) in front of the frozen-table walk. The eager DFA is
 /// stateless; the only state is `probes`, the ReDoS observable (`Scratch.confirm_probes`)
 /// incremented per per-occurrence confirm. Captures never come here — they always use the Pike VM.
-fn runEdfa(ep: *const edfa.Program, filter: *const Filter, tdy: ?*const teddy.Teddy, cf: ?*const classscan.ClassFinder, input: []const u8, opts: SearchOptions, match_only: bool, input_ascii: bool, probes: *u64) ?Match {
+fn runEdfa(ep: *const edfa.Program, filter: *const Filter, tdy: ?*const teddy.Teddy, cf: ?*const classscan.ClassFinder, input: []const u8, opts: SearchOptions, match_only: bool, input_ascii: bool, ascii_dominant: bool, probes: *u64) ?Match {
     if (opts.start > input.len) return null;
     if (input.len - opts.start < filter.min_bytes) return null; // length gate
     if (opts.anchored) return edfaConfirmAt(ep, input, opts.start, match_only);
@@ -1805,8 +1883,13 @@ fn runEdfa(ep: *const edfa.Program, filter: *const Filter, tdy: ?*const teddy.Te
         // Leading-class SIMD skip → one native eager-DFA find from the first candidate
         // (sound; the skipped-to byte begins a class run, so the find lands on the leftmost
         // match). Single skip, never a per-occurrence confirm loop — no ReDoS observable.
-        o.start = c.find(input, o.start) orelse return null;
-        if (input.len - o.start < filter.min_bytes) return null;
+        // A *derived* (broad-tail) set engages only on ASCII-dominant input — on non-ASCII input
+        // every byte is a candidate, so the scan can't skip and would only add overhead; we then
+        // fall through to the native find unchanged (`class_lead_ascii_only`, see its field doc).
+        if (!(filter.class_lead_ascii_only and !ascii_dominant)) {
+            o.start = c.find(input, o.start) orelse return null;
+            if (input.len - o.start < filter.min_bytes) return null;
+        }
     } else if (filter.rare_byte) |rb| {
         if (memchrFrom(input, o.start, rb) == null) return null;
     }
@@ -1833,6 +1916,32 @@ fn inputAllAscii(scratch: *Scratch, input: []const u8) bool {
     scratch.wb_input_len = input.len;
     scratch.wb_all_ascii = a;
     return a;
+}
+
+/// The derived leading-class scan engages only when high (≥ 0x80) bytes are at most `1 / this` of
+/// the input — Latin prose is ~0% high, Cyrillic/CJK UTF-8 is 75–90% high, so 1/8 sits in a wide
+/// gap and separates them with large margin. Speed-only; never affects results.
+const ASCII_DOMINANT_DIV: usize = 8;
+
+/// Whether `input` is **ASCII-dominant** (high bytes < `1/ASCII_DOMINANT_DIV` of its length) — the
+/// gate for the derived `class_lead_ascii_only` scan. A full O(n) count (not an early-exit like
+/// `inputAllAscii`), cached on the input slice so a `count`/`findAll` pays it once.
+fn inputAsciiDominant(scratch: *Scratch, input: []const u8) bool {
+    if (scratch.ad_input_ptr == input.ptr and scratch.ad_input_len == input.len) return scratch.ad_dominant;
+    var high: usize = 0;
+    for (input) |b| high += @intFromBool(b >= 0x80);
+    const dominant = high *| ASCII_DOMINANT_DIV < input.len;
+    scratch.ad_input_ptr = input.ptr;
+    scratch.ad_input_len = input.len;
+    scratch.ad_dominant = dominant;
+    return dominant;
+}
+
+/// The `ascii_dominant` argument for the span arms: the O(n) dominance count runs **only** for a
+/// program whose `class_lead` is the derived (broad-tail) set — every other program leaves
+/// `class_lead_ascii_only` false and never consults it, so it pays nothing.
+inline fn asciiDominantArg(program: *const Program, scratch: *Scratch, input: []const u8) bool {
+    return program.filter.class_lead_ascii_only and inputAsciiDominant(scratch, input);
 }
 
 /// The eager-DFA span arm to use for this search, or `null` to fall through to the lazy DFA / NFA
@@ -1865,15 +1974,6 @@ inline fn teddyPtr(program: *const Program) ?*const teddy.Teddy {
 /// arms use for `class_lead`. Pointer into the program, valid for the call.
 inline fn classPtr(program: *const Program) ?*const classscan.ClassFinder {
     return if (program.class_finder) |*c| c else null;
-}
-
-/// Whether the fixed-offset interior-anchor confirm may engage for this search: the program has a
-/// fixed leading run (`inner_fixed_off`) **and** the input is all-ASCII (so each leading code point
-/// is one byte and the anchor sits at a fixed byte offset). Computed (and cached on the scratch)
-/// only for such programs, so a pattern without the feature never pays the O(n) ASCII scan. `false`
-/// keeps the sound reverse-scan + native-find path.
-inline fn fixedAscii(program: *const Program, scratch: *Scratch, input: []const u8) bool {
-    return program.filter.inner_fixed_off != null and inputAllAscii(scratch, input);
 }
 
 /// Line-anchored capture search (`(?m)^…` patterns, `filter.line_anchored`): every match begins at
@@ -1961,11 +2061,11 @@ pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, op
             // Eager DFA span scan (prefiltered, stateless) when built and usable — the fastest arm,
             // same result the NFA arm gives. A `\b` program's eager DFA is used only on ASCII input
             // (`edfaArm`); non-ASCII `\b` input falls through to the Pike VM (Unicode boundaries).
-            if (edfaArm(program, scratch, input)) |ep| return runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, true, fixedAscii(program, scratch, input), &scratch.confirm_probes) != null;
+            if (edfaArm(program, scratch, input)) |ep| return runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, true, inputAllAscii(scratch, input), asciiDominantArg(program, scratch, input), &scratch.confirm_probes) != null;
             // Lazy DFA fallback (prefiltered) when built and not disabled.
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
-                    const r = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, true, fixedAscii(program, scratch, input), &scratch.lazy_confirm_bytes);
+                    const r = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, true, inputAllAscii(scratch, input), asciiDominantArg(program, scratch, input), &scratch.lazy_confirm_bytes);
                     if (d.gave_up) scratch.dfa_disabled = true; // cache thrashed → stop using it
                     return r != null;
                 };
@@ -1983,10 +2083,10 @@ pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opt
             // Line-anchored span fast path (`(?m)^…`, no eager DFA — `log_line`): see `lineAnchoredSpan`.
             if (program.filter.line_anchored and !opts.anchored and program.edfa_prog == null)
                 return lineAnchoredSpan(program, scratch, p, input, opts, false);
-            if (edfaArm(program, scratch, input)) |ep| return runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, false, fixedAscii(program, scratch, input), &scratch.confirm_probes);
+            if (edfaArm(program, scratch, input)) |ep| return runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, false, inputAllAscii(scratch, input), asciiDominantArg(program, scratch, input), &scratch.confirm_probes);
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
-                    const r = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, false, fixedAscii(program, scratch, input), &scratch.lazy_confirm_bytes);
+                    const r = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, false, inputAllAscii(scratch, input), asciiDominantArg(program, scratch, input), &scratch.lazy_confirm_bytes);
                     if (d.gave_up) scratch.dfa_disabled = true;
                     return r;
                 };
@@ -2019,12 +2119,12 @@ pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const
             // A `\b` program's eager DFA is used only on ASCII input (`edfaArm`); otherwise the whole
             // capture search runs on the Pike VM (Unicode boundaries), via the NFA arm below.
             if (edfaArm(program, scratch, input)) |ep| {
-                const m = runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, false, fixedAscii(program, scratch, input), &scratch.confirm_probes) orelse return null;
+                const m = runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, false, inputAllAscii(scratch, input), asciiDominantArg(program, scratch, input), &scratch.confirm_probes) orelse return null;
                 return fillCapturesAnchored(program, &scratch.inner.nfa, p, input, slots, m, opts);
             }
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
-                    const span = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, false, fixedAscii(program, scratch, input), &scratch.lazy_confirm_bytes);
+                    const span = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, false, inputAllAscii(scratch, input), asciiDominantArg(program, scratch, input), &scratch.lazy_confirm_bytes);
                     if (d.gave_up) {
                         scratch.dfa_disabled = true; // cache thrashed → fall through to the NFA arm
                     } else {
@@ -2422,7 +2522,8 @@ test "auto: leading-class scan gate — digit/number classes yes, letter classes
         .{ .pat = "\\p{N}+", .want = true },
         .{ .pat = "[0-9]+", .want = true },
         .{ .pat = "\\d{4}", .want = true }, // counted rep of a class still leads with the class
-        .{ .pat = "\\p{Lu}\\p{Ll}+", .want = false }, // broad uppercase letter class (high lead bytes)
+        .{ .pat = "\\p{Lu}\\p{Ll}+", .want = true }, // sparse ASCII lead (A–Z) + broad tail → derived skip (`asciiLeadDerived`)
+        .{ .pat = "\\p{Lu}+", .want = true }, // uppercase run — same sparse-ASCII-lead admission
         .{ .pat = "[A-Za-z]+", .want = false }, // ASCII letters (lowercase present)
         .{ .pat = "\\p{L}+", .want = false }, // all letters
         .{ .pat = "\\w+", .want = false }, // word chars include a-z
@@ -2431,6 +2532,47 @@ test "auto: leading-class scan gate — digit/number classes yes, letter classes
     inline for (cases) |c| {
         const f = try filterOf(gpa, c.pat);
         try testing.expectEqual(c.want, f.class_lead != null);
+    }
+}
+
+test "auto: asciiLeadDerived — sparse-ASCII lead admitted (sound over-approx), empty/dense declined" {
+    // A sparse uppercase ASCII lead with a broad high-byte tail (the `\p{Lu}` shape) → derived
+    // set = {its ASCII members} ∪ {all high bytes}. The ASCII members are preserved exactly and
+    // every high byte is a candidate (sound: no real match start is ever skipped).
+    {
+        var bs = hir.ByteSet{};
+        var c: u8 = 'A';
+        while (c <= 'Z') : (c += 1) bs.set(c);
+        bs.set(0xC3); // Latin-1 uppercase lead (À…)
+        bs.set(0xD0); // Cyrillic uppercase lead
+        const d = asciiLeadDerived(bs) orelse return error.TestUnexpectedResult;
+        try testing.expect(d.has('A') and d.has('Z'));
+        try testing.expect(!d.has('a') and !d.has('5')); // ASCII non-members stay skippable
+        var b: u16 = 0x80; // every high byte is a candidate
+        while (b < 0x100) : (b += 1) try testing.expect(d.has(@intCast(b)));
+    }
+    // Empty ASCII portion (a pure non-ASCII set) → null: nothing to skip to, only overhead.
+    {
+        var bs = hir.ByteSet{};
+        bs.set(0xE4);
+        bs.set(0xE5);
+        try testing.expectEqual(@as(?hir.ByteSet, null), asciiLeadDerived(bs));
+    }
+    // A whole lowercase alphabet (letter-dense, the `\p{L}+`/`\w+` shape) → null.
+    {
+        var bs = hir.ByteSet{};
+        var c: u8 = 'a';
+        while (c <= 'z') : (c += 1) bs.set(c);
+        bs.set(0xD0);
+        try testing.expectEqual(@as(?hir.ByteSet, null), asciiLeadDerived(bs));
+    }
+    // Whitespace member (lands almost everywhere) → null.
+    {
+        var bs = hir.ByteSet{};
+        bs.set(' ');
+        bs.set('A');
+        bs.set(0xD0);
+        try testing.expectEqual(@as(?hir.ByteSet, null), asciiLeadDerived(bs));
     }
 }
 
