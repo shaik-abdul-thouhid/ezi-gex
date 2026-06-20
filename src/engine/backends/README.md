@@ -90,7 +90,9 @@ search time (span / prefilter): input shorter than min_utf8_len ?         → no
                                 (?m)^ & no eager DFA (line_anchored) ?     → attempt anchored at each line start
                                 leading fixed literal ?                   → SIMD memmem its whole run
                                   ↳ \b-wrapped pure literal (lit_wb_confirm)? → O(1) boundary check, no automaton
+                                  ↳ lazy-DFA arm (prone)?                   → jump-and-confirm per occurrence (reach budget → native find)
                                 interior anchor after a fixed run (\d{4}-…)?  → jump to anchor, bounded-confirm at q−off
+                                  ↳ rare interior anchor, variable run (…@…)?  → jump anchor-to-anchor, confirm (reach budget)
                                 leading selective class (\d+, \p{N}+) ?   → SIMD scan to next class byte
                                 rarest required byte absent from input ?  → no match (fast-reject)
 search time (NFA, by input):    no DFA arm, input ≤ 4096 B and fits ?     → backtrack : → pikevm

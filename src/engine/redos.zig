@@ -326,6 +326,53 @@ test "bounded-large-prefix a{N}b is linear (not Θ(n·k)) at scale" {
     }
 }
 
+test "lazy-arm jump-and-confirm stays linear under a reach budget (0.6.0 regression)" {
+    // The lazy-DFA arm's leading-literal jump-and-confirm loop (`auto.runByteDfa`) confirms anchored
+    // at every literal occurrence — a big win when the literal is selective (`the\s+\p{L}+`), but a
+    // Θ(n²) hazard on a *prone* pattern whose confirm can scan an unbounded run: `xy[^!]*z` on dense
+    // "xyxyxy…" finds "xy" at every other position, and each confirm consumes the whole tail seeking
+    // a 'z' that never comes. The `reach` budget (~2×input) caps cumulative confirm work and hands
+    // the rest to the O(input) native find, so `Scratch.lazy_confirm_bytes` grows LINEARLY in the
+    // input, not quadratically. Deterministic and machine-independent (a byte counter, no timing):
+    // revert the budget → confirms scan ~n² bytes → the ratio blows past the linear bound here.
+    const gpa = testing.allocator;
+    const LINEAR_SLACK: f64 = 3.0; // linear ≈ 2.0× per doubling; a Θ(n²) regression reads ~4.0×
+    const sizes = [_]usize{ 2048, 4096, 8192 };
+
+    var diag: regex.Diagnostic = .{};
+    var re = try regex.compileRuntimeWith(auto, gpa, "xy[^!]*z", &diag, .{});
+    defer re.deinit();
+    // The pattern must actually be on the jump-confirm path (lazy DFA, leading literal). If a future
+    // routing change moves it elsewhere this guard would silently pass vacuously — pin the route.
+    try testing.expectEqualStrings("nfa+dfa", auto.route(&re.program));
+    var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+    defer sc.deinit(gpa);
+
+    var scanned: [sizes.len]u64 = undefined;
+    for (sizes, 0..) |n, i| {
+        const input = try gpa.alloc(u8, n);
+        defer gpa.free(input);
+        var k: usize = 0;
+        while (k < n) : (k += 1) input[k] = if (k % 2 == 0) 'x' else 'y'; // "xyxy…", no 'z'/'!'
+        sc.reset();
+        try testing.expect(re.find(&sc, input) == null); // correct no-match
+        scanned[i] = sc.lazy_confirm_bytes;
+    }
+    // The loop must have actually run (else the ratio is meaningless): confirms scanned > input.
+    if (scanned[0] <= sizes[0]) return error.WorkTooSmall;
+    var i: usize = 1;
+    while (i < sizes.len) : (i += 1) {
+        const ratio = @as(f64, @floatFromInt(scanned[i])) / @as(f64, @floatFromInt(scanned[i - 1]));
+        if (ratio > LINEAR_SLACK) {
+            std.debug.print(
+                "/xy[^!]*z/: lazy-arm confirm bytes grew {d:.3}× from n={d} ({d}) to n={d} ({d}) — exceeds {d:.1}× (quadratic prefilter ReDoS)\n",
+                .{ ratio, sizes[i - 1], scanned[i - 1], sizes[i], scanned[i], LINEAR_SLACK },
+            );
+            return error.SuperLinearConfirmWork;
+        }
+    }
+}
+
 // ── 3. Cross-backend agreement on the catastrophic corpus (match + no-match) ───────
 
 const Diff = struct { pat: []const u8, input: []const u8, expect: ?[]const u8 };

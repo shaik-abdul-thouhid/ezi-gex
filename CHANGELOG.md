@@ -66,6 +66,22 @@ adopts **uniform RE2/Rust leftmost-first** empty-loop semantics across every bac
 
 ### Performance
 
+- **Lazy-DFA arm: leading-literal & rare interior-anchor *jump-and-confirm*.** When a prone
+  pattern (an unbounded non-accepting run before the first accept) lands on the lazy DFA, `auto`
+  used to take one prefilter skip and then a full O(input) native pass. It now **leaps
+  literal-to-literal (or rare-anchor-to-rare-anchor) with SIMD `memmem`/`memchr` and confirms
+  anchored at each occurrence**, touching far fewer bytes when the prefilter is selective. The win
+  shows where the native pass is expensive (a Unicode class to walk) and the prefilter is sparse:
+  **`the\s+\p{L}+` ~2.4× faster** on `sherlock` (`regex-bench`, 732µs → ~305µs, now within ~1.2× of
+  Rust) and **`[\w.+-]+@…` (email) ~2.1× faster** on `logs` (125µs → ~59µs, now *faster than* Rust
+  `regex`). Kept **provably linear** by a `reach` budget: a prone confirm can scan far, so once
+  cumulative confirm work overruns ~2×input the loop hands the rest to the native find — no Θ(n²)
+  on an adversarial begin-but-don't-complete input (`Scratch.lazy_confirm_bytes`, asserted to grow
+  linearly by a revert-failing `redos.zig` guard). The interior-anchor jump is gated on a **rare**
+  anchor (byte-frequency heuristic): a common one (`.` in `ipv4`) keeps the single-skip path, so it
+  is never slower. New `dfa.confirmReach` (anchored match + furthest offset scanned) backs the
+  budget. Results identical to the Pike VM oracle (pinned by `jump_confirm_cases` in
+  `conformance.zig`, runtime + the full differential).
 - **Leading-class SIMD scan (`classscan`) — shufti per-high-nibble classifier.** The `class_lead`
   prefilter `auto` uses for a class-led pattern (`\p{N}+`, `\d+`, `\d{4}-…`) replaces its
   single-bucket nibble classifier with a **shufti**-style one that gives each distinct UTF-8 high

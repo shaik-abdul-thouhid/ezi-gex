@@ -712,6 +712,38 @@ test "leading-class scan finds leftmost match over non-ASCII (0.6.0 shufti regre
     }
 }
 
+// Regression (0.6.0): the lazy-DFA arm's leading-literal and rare interior-anchor
+// jump-and-confirm loops (`auto.runByteDfa`) — the prefilter that replaced a single skip
+// + full native pass with a per-occurrence anchored confirm (~2× on `the\s+\p{L}+`, ~2× on
+// `[\w.+-]+@…`). These are *prone* patterns (an unbounded run before accept), so they route to
+// the lazy DFA; the loop confirms anchored at each occurrence under a `reach` budget. The crux
+// is leftmost-first correctness: the first confirmed occurrence must be the leftmost match, and
+// failed/overlapping confirms must not drop or shift a match. Each case below has a leading
+// literal ("the") or a rare anchor ('@') and exercises a mix of fast-fail, match, and
+// no-match-after-many-candidates inputs. `auto` (the jump-confirm) must agree with the Pike VM.
+const jump_confirm_cases = [_]Case{
+    // Leading literal "the" + `\s+\p{L}+`: many "the" candidates; most are inside other words.
+    .{ .pat = "the\\s+\\p{L}+", .input = "there then the cat sat", .expect = "the cat" }, // "there"/"then" fail \s+; leftmost real "the " wins
+    .{ .pat = "the\\s+\\p{L}+", .input = "the\tquick brown", .expect = "the\tquick" }, // tab counts as \s
+    .{ .pat = "the\\s+\\p{L}+", .input = "theatre theme thesis", .expect = null }, // every "the" fails \s+
+    .{ .pat = "the\\s+\\p{L}+", .input = "the   späte Stunde", .expect = "the   späte" }, // multi-space + non-ASCII letter
+    .{ .pat = "the\\s+\\p{L}+", .input = "xxx the end", .expect = "the end" }, // leftmost after a gap
+    .{ .pat = "the\\s+\\p{L}+", .input = "the the the the x", .expect = "the the" }, // dense; first wins
+    // Rare interior anchor '@' (email-shaped): the anchor leaps over non-'@' regions.
+    .{ .pat = "[\\w.+-]+@[\\w-]+\\.[\\w.-]+", .input = "log: a.b+c@mail.example.com end", .expect = "a.b+c@mail.example.com" },
+    .{ .pat = "[\\w.+-]+@[\\w-]+\\.[\\w.-]+", .input = "no at-sign here at all", .expect = null },
+    .{ .pat = "[\\w.+-]+@[\\w-]+\\.[\\w.-]+", .input = "bad@ then good@host.io rest", .expect = "good@host.io" }, // first '@' fails (no domain), second matches (greedy lead reverse-scan stops at the space)
+    .{ .pat = "[\\w.+-]+@[\\w-]+\\.[\\w.-]+", .input = "a@@@@@@b.c@d.e", .expect = "b.c@d.e" }, // adversarial '@' density; leftmost valid
+};
+
+test "lazy-arm jump-and-confirm (leading literal / rare interior anchor) is leftmost-first (0.6.0 regression)" {
+    for (jump_confirm_cases) |c| {
+        try checkRuntime(pikevm, c); // leftmost-first oracle
+        try checkRuntime(backtrack, c);
+        try checkRuntime(auto, c); // exercises runByteDfa's jump-confirm loops
+    }
+}
+
 test "literal cases agree across all four backends (incl. literal)" {
     for (literal_cases) |c| {
         try checkRuntime(pikevm, c);

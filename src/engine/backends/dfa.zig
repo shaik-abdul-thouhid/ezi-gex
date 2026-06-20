@@ -1155,13 +1155,16 @@ pub const Scratch = struct {
     /// `$`-free program `accept_eoi == accept`, so that extra term is a no-op. (Used for
     /// `$` patterns reached via the pinned/`anchored_start` paths, e.g. `^abc$`; a plain
     /// trailing `$` takes the reverse-from-end path instead.)
-    fn runAnchored(self: *Scratch, program: *const Program, input: []const u8, s: usize, earliest: bool, flushes: *u32) Err!?usize {
+    fn runAnchored(self: *Scratch, program: *const Program, input: []const u8, s: usize, earliest: bool, flushes: *u32, reach: ?*usize) Err!?usize {
         var state = self.startFor(program, input, s); // text_start@0; (?m)^ line start; else startN
         // A state accepts at `s` if it holds a `match`, or — only when `s` is end-of-input — a
         // pending `text_end` (`accept_eoi`). For a `$`-free program `accept_eoi == accept`.
         var match_end: ?usize = if (self.state_match.items[state] or
             (s == input.len and self.state_match_eoi.items[state])) s else null;
-        if (match_end != null and earliest) return match_end;
+        if (match_end != null and earliest) {
+            if (reach) |r| r.* = s;
+            return match_end;
+        }
 
         // ── Warm-path pointer cache ──
         // The per-byte loop is a tight array walk over raw `[*]` pointers, *not* the
@@ -1219,6 +1222,7 @@ pub const Scratch = struct {
                 accept_eoi = self.state_match_eoi.items.ptr;
             }
         }
+        if (reach) |r| r.* = pos;
         return match_end;
     }
 
@@ -1678,13 +1682,13 @@ fn searchImpl(program: *const Program, scratch: *Scratch, input: []const u8, opt
     if (program.anchored_start and !opts.anchored) {
         // Every match begins at offset 0 — try only there.
         if (opts.start != 0) return null;
-        if (try scratch.runAnchored(program, input, 0, earliest, &flushes)) |end|
+        if (try scratch.runAnchored(program, input, 0, earliest, &flushes, null)) |end|
             return Match{ .start = 0, .end = end };
         return null;
     }
     if (opts.anchored) {
         // Pinned start: one anchored run.
-        if (try scratch.runAnchored(program, input, opts.start, earliest, &flushes)) |end|
+        if (try scratch.runAnchored(program, input, opts.start, earliest, &flushes, null)) |end|
             return Match{ .start = opts.start, .end = end };
         return null;
     }
@@ -1711,7 +1715,7 @@ fn searchImpl(program: *const Program, scratch: *Scratch, input: []const u8, opt
 
     var s = opts.start;
     while (s <= input.len) : (s += 1) {
-        if (try scratch.runAnchored(program, input, s, earliest, &flushes)) |end|
+        if (try scratch.runAnchored(program, input, s, earliest, &flushes, null)) |end|
             return Match{ .start = s, .end = end };
     }
     return null;
@@ -1742,10 +1746,10 @@ fn isMatchImpl(program: *const Program, scratch: *Scratch, input: []const u8, op
     }
 
     if (opts.anchored)
-        return (try scratch.runAnchored(program, input, opts.start, true, &flushes)) != null;
+        return (try scratch.runAnchored(program, input, opts.start, true, &flushes, null)) != null;
     if (program.anchored_start) {
         if (opts.start != 0) return false;
-        return (try scratch.runAnchored(program, input, 0, true, &flushes)) != null;
+        return (try scratch.runAnchored(program, input, 0, true, &flushes, null)) != null;
     }
     // Trailing `$`: a single reverse pass from input.len — any start position reaching the
     // forward start ⇒ a match. O(input). (A `$` program has no mid-input `match`, so the
@@ -1772,6 +1776,29 @@ pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, op
 /// @stable-since: v0.3.0
 pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) ?Match {
     return searchImpl(program, scratch, input, opts, false) catch @panic(OOM_PANIC);
+}
+
+/// One **anchored** confirm at `at`, reporting both the match (if any) and `reach` — the
+/// furthest input offset the anchored walk examined before accepting/dying. `auto`'s
+/// leading-literal repeated-confirm loop (`runByteDfa`) uses `reach` to budget total confirm
+/// work: a prone pattern (an unbounded non-accepting run before accept) can make a single
+/// confirm walk far, so once the cumulative `reach` overruns a linear budget the loop abandons
+/// the per-occurrence confirm and hands off to the O(input) native `find`. That keeps the
+/// jump-and-confirm fast path (the win on a selective literal like `the`) **provably linear** —
+/// no Θ(n²) on an adversarial begin-but-don't-complete input. `earliest` selects the
+/// match-only (earliest-exit) vs. leftmost-span walk. `\b`/`\B` programs are not routed here
+/// (they use the decode-hybrid restart); callers gate on `!has_word_boundary`.
+///
+/// @stable-since: v0.6.0
+pub fn confirmReach(program: *const Program, scratch: *Scratch, input: []const u8, at: usize, earliest: bool) struct { end: ?usize, reach: usize } {
+    if (at > input.len) return .{ .end = null, .reach = at };
+    scratch.gave_up = false;
+    scratch.maybeEvict();
+    scratch.ensureStart(program) catch @panic(OOM_PANIC);
+    var flushes: u32 = 0;
+    var reach: usize = at;
+    const end = scratch.runAnchored(program, input, at, earliest, &flushes, &reach) catch @panic(OOM_PANIC);
+    return .{ .end = end, .reach = reach };
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -2305,6 +2332,41 @@ test "trailing $ is linear, not Θ(n²) (ReDoS immunity, reverse-from-end)" {
         @memset(buf, 'a'); // all [a-z]: [a-z]+$ matches the whole string; @/c shapes do not
         _ = re.find(buf);
         _ = re.isMatch(buf);
+    }
+}
+
+test "confirmReach reports the anchored match end and the furthest offset scanned" {
+    // `confirmReach` is what `auto`'s lazy-arm jump-and-confirm loop uses to budget confirm work:
+    // `end` is the leftmost-first anchored match end (or null), `reach` is how far the walk scanned
+    // before accepting or dying. The budget relies on `reach` reflecting a failed confirm's true
+    // cost, so pin both. `a\d+b` is prone (the `\d+` run before the `b` accept) → the lazy DFA.
+    const gpa = testing.allocator;
+    var program = try buildFrom(gpa, "a\\d+b");
+    defer freeProgram(gpa, &program);
+    var sc = try Scratch.init(gpa, &program);
+    defer sc.deinit(gpa);
+
+    // Match anchored at 0: "a123b" — end at 5, reach ≥ the consumed span.
+    {
+        const in = "a123b tail";
+        const c = confirmReach(&program, &sc, in, 0, false);
+        try testing.expectEqual(@as(?usize, 5), c.end);
+        try testing.expect(c.reach >= 5);
+    }
+    // No match at 0, but the walk scans the whole "a999…" run before dying at the non-digit/non-b:
+    // reach must reflect that long scan (the budget's whole point), not a 1-byte fast-out.
+    {
+        const in = "a99999999x"; // 'a', eight digits, then 'x' (not 'b') → fail at the 'x'
+        const c = confirmReach(&program, &sc, in, 0, false);
+        try testing.expectEqual(@as(?usize, null), c.end);
+        try testing.expect(c.reach >= 9); // scanned 'a' + 8 digits + the failing 'x'
+    }
+    // Anchored where no match can begin ('x' is not 'a'): dies immediately, reach near the start.
+    {
+        const in = "xa1b";
+        const c = confirmReach(&program, &sc, in, 0, false);
+        try testing.expectEqual(@as(?usize, null), c.end);
+        try testing.expect(c.reach <= 1);
     }
 }
 

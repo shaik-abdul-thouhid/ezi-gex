@@ -32,6 +32,12 @@
 //!         (variable run) or, when the leading run is **fixed-length** and the input is ASCII, a
 //!         bounded confirm at the pinned start `anchor − off` (`inner_fixed_off`, one confirm per
 //!         occurrence — the win on a dash-dense haystack);
+//!       - on the **lazy-DFA arm** specifically, a leading literal or a **rare** interior anchor
+//!         drives a *jump-and-confirm* loop (leap to each occurrence, confirm anchored there) rather
+//!         than one skip + a full native pass — the win on a prone pattern with a slow native walk
+//!         (`the\s+\p{L}+` ~2.4×, `[\w.+-]+@…` ~2.1×). A `reach` budget (`dfa.confirmReach` +
+//!         `Scratch.lazy_confirm_bytes`) keeps it linear: an overrun hands the rest to the native
+//!         find. A common anchor (`.`) stays on the single-skip path (byte-frequency gate);
 //!       - **line-anchored** — a `(?m)^…` pattern with no eager DFA (`log_line`) attempts the match
 //!         anchored at each line start (memchr the next `\n`), for span *and* captures, instead of a
 //!         lazy-DFA span pass plus a capture-fill pass (`line_anchored`);
@@ -100,6 +106,17 @@ const BACKTRACK_MAX_INPUT: usize = 4096;
 ///
 /// @stable-since: v0.5.0
 const EAGER_BYTE_INST_MAX: u32 = 8000;
+
+/// Byte-frequency ceiling (a `memmem.byteFreq` score) under which a variable interior anchor
+/// (`[\w.+-]+@…`) drives a **per-occurrence jump-and-confirm** in the lazy-DFA arm rather than one
+/// skip + a native pass. A rare anchor (`@`, freq 25) lets the `memchr` leap over most of the input
+/// and run few confirms — a large win; a common anchor (`.`, freq 90) recurs almost everywhere, so
+/// the jump loop would confirm at nearly every byte and lose to the single native pass. The cutoff
+/// admits clearly-selective punctuation (`@`/`#`/`&`/`|`) and excludes common separators
+/// (`.`/`-`/`/`/`:`). Heuristic — it steers speed only; the match is identical either way.
+///
+/// @stable-since: v0.6.0
+const INNER_ANCHOR_RARE_MAX: u8 = 40;
 
 /// Cheap, **measure-free** HIR check for whether `auto` should build the eager DFA span arm
 /// **at comptime** (the CTRE-lane). It must be cheap because it gates a `comptime` call: the
@@ -1185,6 +1202,18 @@ pub const Scratch = struct {
     /// @stable-since: v0.3.1
     confirm_probes: u64 = 0,
 
+    /// Total input bytes the **lazy-DFA arm's** leading-literal / interior-anchor jump-and-confirm
+    /// loop (`runByteDfa`) has scanned across its anchored confirms on this scratch. Unlike the
+    /// eager arm's `confirm_probes` (which is 0 for a prone program — it uses the native find), the
+    /// lazy arm *does* confirm per occurrence for a prone program, kept linear by a `reach` budget:
+    /// once cumulative confirm work overruns ~2×input the loop hands off to the O(input) native find,
+    /// so this counter is bounded **linearly** in input size. `engine/redos.zig` asserts that linear
+    /// scaling (revert the budget → a quadratic pattern's confirms scan ~n² bytes → the test fails).
+    /// Observational only — never affects a result. Accumulates across searches; `reset` zeroes it.
+    ///
+    /// @stable-since: v0.6.0
+    lazy_confirm_bytes: u64 = 0,
+
     /// Cached ASCII-ness of the current input, for `\b`/`\B` (word-boundary) programs. The byte DFA
     /// evaluates `\b` as an **ASCII** word boundary (exact for ASCII text); for **non-ASCII** input
     /// `auto` must instead use the code-point Pike VM (correct **Unicode** word boundaries). Scanning
@@ -1252,6 +1281,7 @@ pub const Scratch = struct {
     pub fn reset(self: *Scratch) void {
         if (self.dfa_sc) |*d| d.reset();
         self.confirm_probes = 0; // the ReDoS observable is per-reuse
+        self.lazy_confirm_bytes = 0; // the lazy-arm jump-confirm observable, likewise per-reuse
         self.wb_input_ptr = null; // invalidate the input-ASCII cache (a new search may use a new input)
         switch (self.inner) {
             .literal => |*s| s.reset(),
@@ -1506,7 +1536,7 @@ fn dfaConfirmAt(dp: *const dfa.Program, d: *dfa.Scratch, input: []const u8, at: 
 /// is never slower than the default on prefix-literal / sparse-hit patterns. With no
 /// usable filter it runs one DFA pass (one-pass O(n) for `isMatch`, anchored-restart
 /// for `find`). Captures never come here — they always use the Pike VM (`runNfa`).
-fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.Teddy, cf: ?*const classscan.ClassFinder, d: *dfa.Scratch, input: []const u8, opts: SearchOptions, match_only: bool, input_ascii: bool) ?Match {
+fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.Teddy, cf: ?*const classscan.ClassFinder, d: *dfa.Scratch, input: []const u8, opts: SearchOptions, match_only: bool, input_ascii: bool, lazy_bytes: *u64) ?Match {
     if (opts.start > input.len) return null;
     if (input.len - opts.start < filter.min_bytes) return null; // length gate
     if (opts.anchored) return dfaConfirmAt(dp, d, input, opts.start, match_only);
@@ -1538,8 +1568,39 @@ fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.
             }
             return null;
         }
-        o.start = memmemFrom(input, o.start, pfx) orelse return null;
-        if (input.len - o.start < filter.min_bytes) return null;
+        // Repeated jump-and-confirm: leap literal-to-literal (SIMD `memmem`) and confirm anchored
+        // at each occurrence, instead of one skip + a full native DFA pass. The win when the literal
+        // is selective (`the\s+\p{L}+` over prose: most hits either match or fail in a few bytes, so
+        // the confirms touch far fewer bytes than a whole-input forward+reverse pass). A `reach`
+        // budget keeps it **provably linear**: this arm serves *prone* patterns (an unbounded
+        // non-accepting run before accept, e.g. the `\s+` in `the\s+…`), where one confirm can walk
+        // far; once cumulative confirm work overruns ~2×input we abandon the loop and hand the
+        // remainder to the native `find` (already O(input): reverse-DFA two-pass). Sound: the pattern
+        // begins with `pfx`, so every match starts at a literal occurrence; all occurrences before
+        // `pos` were confirmed not to start a match, so a native find from `pos` is still leftmost.
+        // `\b` programs are excluded (the lazy `\b` arm needs the decode-hybrid restart, not the
+        // boundary-blind `confirmReach`); they keep the single-skip + native path below.
+        if (!dp.has_word_boundary) {
+            const finder: ?memmem.Finder = if (filter.prefix_len >= 2) memmem.Finder.init(pfx) else null;
+            var budget: isize = @intCast(2 *| input.len + 64);
+            var pos = o.start;
+            while (if (finder) |*fd| fd.find(input, pos) else memchrFrom(input, pos, pfx[0])) |hit| {
+                if (input.len - hit < filter.min_bytes) return null;
+                const c = dfa.confirmReach(dp, d, input, hit, match_only);
+                lazy_bytes.* += c.reach - hit + 1;
+                if (c.end) |end|
+                    return Match{ .start = if (match_only) opts.start else hit, .end = if (match_only) opts.start else end };
+                budget -= @as(isize, @intCast(c.reach - hit + 1));
+                pos = hit + 1;
+                if (budget < 0) {
+                    o.start = pos; // prefilter proved ineffective → one native O(input) find for the rest
+                    break;
+                }
+            } else return null; // no more literal occurrences ⇒ no match
+        } else {
+            o.start = memmemFrom(input, o.start, pfx) orelse return null;
+            if (input.len - o.start < filter.min_bytes) return null;
+        }
     } else if (filter.prefix_set_n > 0) {
         // Multi-prefix: per-occurrence anchored confirm when bounded (the real win), else one
         // skip + a single native DFA find. See `runNfa` for the bound's soundness.
@@ -1580,8 +1641,41 @@ fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.
                 return null;
             }
         }
-        o.start = innerSkipFrom(filter, input, o.start) orelse return null;
-        if (input.len - o.start < filter.min_bytes) return null;
+        // Variable / non-ASCII interior anchor (`[\w.+-]+@…`): jump anchor-to-anchor (`memchr`),
+        // reverse-scan each `@` to its `[\w.+-]` run start, and confirm anchored there — instead of
+        // one skip + a full native pass. The win when the anchor is rare (`@` in logs: the `memchr`
+        // leaps over most of the file, and few confirms run). Leftmost-first: a run start `cs` is
+        // strictly increasing across anchors (`@ ∉ [\w.+-]`, so each reverse-scan stays past the
+        // previous anchor), so the first confirmed anchor yields the leftmost match. The same `reach`
+        // budget as the leading-literal arm keeps it linear (a greedy variable run before the anchor
+        // can make one confirm walk far); on overrun, hand the rest to the native O(input) find.
+        // `\b` programs keep the single-skip + decode-hybrid path. Gated on a **rare** anchor: a
+        // common anchor (`.` in logs: IPs/decimals) recurs at nearly every byte, so jumping
+        // anchor-to-anchor would confirm almost everywhere — slower than one skip + a native pass.
+        // The byte-frequency heuristic (speed-only, never affects the result) admits only a selective
+        // anchor (`@`, freq 25); a common one (`.`, freq 90) keeps the single-skip path below.
+        if (!dp.has_word_boundary and memmem.byteFreq(anchor) <= INNER_ANCHOR_RARE_MAX) {
+            var budget: isize = @intCast(2 *| input.len + 64);
+            var pos = o.start;
+            while (memchrFrom(input, pos, anchor)) |q| {
+                pos = q + 1;
+                var cs = q;
+                while (cs > o.start and filter.inner_lead.has(input[cs - 1])) cs -= 1;
+                if (input.len - cs < filter.min_bytes) return null; // cs only grows ⇒ no later fit
+                const c = dfa.confirmReach(dp, d, input, cs, match_only);
+                lazy_bytes.* += c.reach - cs + 1;
+                if (c.end) |end|
+                    return Match{ .start = if (match_only) opts.start else cs, .end = if (match_only) opts.start else end };
+                budget -= @as(isize, @intCast(c.reach - cs + 1));
+                if (budget < 0) {
+                    o.start = pos; // prefilter proved ineffective → one native O(input) find for the rest
+                    break;
+                }
+            } else return null; // no more anchors ⇒ no match
+        } else {
+            o.start = innerSkipFrom(filter, input, o.start) orelse return null;
+            if (input.len - o.start < filter.min_bytes) return null;
+        }
     } else if (cf) |c| {
         // Leading-class SIMD skip → one native DFA find from the first candidate (sound; see runNfa).
         o.start = c.find(input, o.start) orelse return null;
@@ -1871,7 +1965,7 @@ pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, op
             // Lazy DFA fallback (prefiltered) when built and not disabled.
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
-                    const r = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, true, fixedAscii(program, scratch, input));
+                    const r = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, true, fixedAscii(program, scratch, input), &scratch.lazy_confirm_bytes);
                     if (d.gave_up) scratch.dfa_disabled = true; // cache thrashed → stop using it
                     return r != null;
                 };
@@ -1892,7 +1986,7 @@ pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opt
             if (edfaArm(program, scratch, input)) |ep| return runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, false, fixedAscii(program, scratch, input), &scratch.confirm_probes);
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
-                    const r = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, false, fixedAscii(program, scratch, input));
+                    const r = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, false, fixedAscii(program, scratch, input), &scratch.lazy_confirm_bytes);
                     if (d.gave_up) scratch.dfa_disabled = true;
                     return r;
                 };
@@ -1930,7 +2024,7 @@ pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const
             }
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
-                    const span = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, false, fixedAscii(program, scratch, input));
+                    const span = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, false, fixedAscii(program, scratch, input), &scratch.lazy_confirm_bytes);
                     if (d.gave_up) {
                         scratch.dfa_disabled = true; // cache thrashed → fall through to the NFA arm
                     } else {

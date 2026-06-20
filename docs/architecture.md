@@ -528,6 +528,20 @@ match, so a prefilter or length gate built on them never yields a false negative
 > `d` in that range, which covers a variable-length fold variant of a preceding position
 > (`s`→2-byte `ſ` shifts the window one byte). Window rarity is ranked by `memmem.byteFreq`; the
 > prefilter is results-invariant (every hit is fully confirmed), pinned to the Pike VM.
+>
+> **Also since 0.6.0, the lazy-DFA arm jump-and-confirms.** A *prone* pattern (an unbounded
+> non-accepting run before the first accept) lands on the lazy DFA, where the old path took one
+> prefilter skip + a full O(input) native pass. Now a leading literal — or a **rare** interior
+> anchor — drives a per-occurrence loop: leap to each occurrence (`memmem`/`memchr`) and confirm
+> anchored there (`dfa.confirmReach`, which returns the match end *and* the furthest offset
+> scanned). It touches far fewer bytes when the prefilter is selective and the native walk is
+> expensive: `the\s+\p{L}+` ~2.4× (its `\p{L}+` lazy walk is slow), `[\w.+-]+@…` (email) ~2.1×
+> (now faster than Rust `regex`). It stays **provably linear** via a `reach` budget — a prone
+> confirm can scan far, so once cumulative confirm work overruns ~2×input the loop hands off to the
+> native find (`Scratch.lazy_confirm_bytes`, asserted to grow linearly by a revert-failing
+> `redos.zig` guard). The interior-anchor jump is gated on a rare anchor (`memmem.byteFreq` ≤
+> `INNER_ANCHOR_RARE_MAX`): a common one (`.` in `ipv4`) keeps the single-skip path, never slower.
+> Results-invariant, pinned to the Pike VM (`jump_confirm_cases`).
 
 ---
 
