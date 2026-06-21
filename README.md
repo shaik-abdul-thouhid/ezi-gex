@@ -27,10 +27,16 @@ a **pluggable backend** architecture.
 
 ## Status
 
-**Latest release: `v0.5.1`.** `main` is the active development branch (`0.6.0-dev`); see
+**Latest release: `v0.6.0`.** `main` is the active development branch (`0.7.0-dev`); see
 [Installing](#installing) for pinning the tag vs. tracking `main`. Pre-1.0, so the API may still
 change, but everything in the public surface is annotated `@stable-since: vX.Y.Z` and is covered by
 SemVer. Tracks a recent Zig dev build (`0.17.0-dev`); it will not compile on stable 0.16.
+
+The default `auto` engine is **byte-DFA-first** (a Hopcroft-minimized **eager DFA** as the primary
+span engine, **lazy DFA** fallback), **O(input) on every pattern**, leftmost-first and
+conformance-proven against the Pike VM, and runs at **both comptime and runtime**. See
+[Backends](#backends) and [Performance](#performance) for how it works, and
+[CHANGELOG.md](CHANGELOG.md) for what landed in each release.
 
 **Benchmarked** three ways against **Rust `regex`** and **Go `regexp`** on real
 [rebar](https://github.com/BurntSushi/rebar) haystacks — reproducible harness (clone + `./run.sh`):
@@ -40,117 +46,6 @@ SemVer. Tracks a recent Zig dev build (`0.17.0-dev`); it will not compile on sta
 conformance, a wide differential corpus where every backend must agree with the Pike VM,
 runtime + comptime parity; and a dedicated **ReDoS-immunity suite**, `engine/redos.zig`,
 proving the engine is quadratic-immune).
-
-The default `auto` engine is **byte-DFA-first**, with the **eager DFA**
-(`engine/backends/edfa.zig`) as the primary span engine: it **fully determinizes the byte
-automaton at build time** into a frozen, **Hopcroft-minimized** `states × byte_classes`
-table, so the matcher is a bare table walk with **no per-search state** and runs at
-**comptime as well as runtime** (the genuine CTRE-lane — `auto` bakes a real frozen DFA into
-`ro_data` for tiny patterns at comptime, while a big Unicode class stays on the Pike VM at
-comptime but still gets the eager DFA at runtime). Its `find` is **O(input) on every
-pattern**, by a static build-time strategy (`program.prone`): an accepting consuming loop
-(`\w+`, `\d+`) gets a greedy **anchored restart**; a *prone* pattern (e.g. `\w+@\w+`'s pre-`@`
-run) gets the **reverse-DFA two-pass**. The **lazy DFA** (`engine/backends/dfa.zig`) is the
-**fallback** when the eager table overflows its state bound. Both are leftmost-first and
-conformance-proven against the Pike VM.
-
-Landed across `0.4.0-dev` (all on `main`):
-
-- **`\b`/`\B` word boundaries on the byte DFAs** — previously the worst benchmark outlier
-  (stuck on the Pike VM, ~10× behind). Distributed: the **eager DFA** bakes **ASCII** word
-  boundaries into the frozen table (zero match-time decode); the **lazy DFA** handles full
-  **Unicode** boundaries via a *decode-hybrid* (decode only at boundary positions). `auto`
-  routes by a cached whole-input ASCII check (ASCII → eager, non-ASCII → lazy), staying
-  correct for every input. (`\bthe\b` on Sherlock went from ~89 MiB/s to multi-GiB/s.)
-- **`(?m)` line anchors on the eager DFA** — `(?m)^`/`(?m)$` run on the DFA (anchored restart
-  with line context) for non-prone patterns; a prone `(?m)` falls to the linear Pike VM.
-- **One-pass capture fast path** (`backends.onepass`) — a single deterministic thread fills
-  captures in O(input) for provably one-pass patterns (`(\d{4})-(\d{2})-(\d{2})`,
-  `(\w+)@(\w+)`); `auto` uses it for the anchored capture fill after a DFA locates the span.
-- **Hopcroft/Moore minimization** of the eager DFA (results-invariant; shrinks the auxiliary
-  tables, e.g. `\w+@\w+`'s reverse DFA ~3× fewer states).
-- **`$`/`\z` (`text_end`) on the lazy DFA** — closing the last eager/lazy capability gap.
-- **Two-byte SIMD `memmem` for single literals** (`engine/memmem.zig`) — a single literal
-  (`Sherlock`, `Sherlock Holmes`) now scans with a portable two-byte filter (probe the two
-  *rarest* needle bytes, AND their SIMD equality masks, verify only where both coincide)
-  instead of a one-byte memchr. No arch asm (portable `@Vector` compare + movemask). On
-  Sherlock this is **17× faster than before and edges out Rust** (40.9 GiB/s). See *Performance*.
-- **Whole-run literal `memmem` prefilter** in `auto` — the leading-literal start-skip leaps on
-  the *whole* literal run (`\bthe\b` jumps "the"→"the", not 't'→'t'); a ≥2-byte run now rides the
-  same **two-byte** `memmem.Finder`, so every prefix-literal NFA/DFA pattern got the upgrade
-  (`\bthe\b` on logs **6×**). See *Performance*.
-- **Required interior/suffix-literal prefilter + structured reverse walk** — a pattern with no
-  leading literal but a selective literal *inside* or at the *end* (`\w+\s+Holmes`, `[a-zA-Z]+ing`,
-  `[\w.+-]+@gmail\.com`) leaps to that literal with `memmem`, then — when the atoms before it are
-  disjoint class-repetitions (`\w+\s+`) — walks them **backward to the exact match start** and runs
-  one anchored confirm per hit, so the automaton runs only at real candidate starts. On Sherlock,
-  `\w+\s+Holmes` and `\w+\s+Holmes\s+\w+` go from ~13×/~28× behind Rust to **~1.2×** (parity). See
-  *Performance*.
-- **Fixed-offset rare-byte confirm** — a bounded fixed-length pattern whose only selective feature
-  is a rare byte at a fixed offset (`[a-q][^u-z]{13}x`) `memchr`s that byte, steps back the fixed
-  code-point distance, and confirms once per hit instead of scanning a dense leading class —
-  turning Sherlock's worst cliff (~183× behind) into **~1.4× faster than Rust**. See *Performance*.
-- **Teddy SIMD multi-literal prefilter** — literal *alternations* (`cat|dog|fish`,
-  `foo|far|fizz`) now scan with the Teddy algorithm: a dynamic in-vector byte shuffle
-  (`pshufb`/`vpshufb`/`tbl`) fingerprints the first 1–3 bytes of all branches across a 16-byte
-  chunk at once, then verifies candidates. Slim (≤8 buckets, 128-bit) everywhere with a native
-  shuffle; **fat** (16 buckets, AVX2 256-bit) for large sets. The one piece of arch-specific
-  inline asm is quarantined in `engine/simd.zig` with a portable scalar fallback (comptime + any
-  unsupported target); the flag `strategy.simd` (`.auto`/`.off`) governs it. Results-invariant.
-- **Case-insensitive / small-class → Teddy multi-prefix skip** — a pattern that lowers to a short
-  run of small classes (`(?i)the` → `[Tt][Hh][Ee]`, `(?i)что`) gets a synthesised **case-variant
-  prefix set** (`(?i)the` → the 8 needles `{THE…the}`) that drives the multi-prefix Teddy skip,
-  now wired on the **NFA/DFA arm** too (so a top-level alternation like `Holmes…|Watson…` gets
-  Teddy as well). `(?i)the` ~4.6×, `(?i)sherlock holmes` ~17×, `(?i)что` ~15×, `near` ~1.6×.
-- **Case-insensitive alternation → ASCII-folding Teddy** — a top-level casei alternation
-  (`(?i:Sherlock|Holmes|Watson)`, `(?i:Sher[a-z]+|Hol[a-z]+)`) used to get **no** prefilter (folding
-  turns each branch's leading letters into classes, so the fixed-leading-literal set declined). The
-  Teddy masks now match **ASCII-case-insensitively**, so `auto` builds **one needle per branch**
-  (not the case-variant set's `2^k` product) and a casei alternation stays inside the needle budget.
-  Non-ASCII fold members (`s`→`ſ`) fan out so the set stays a sound necessary prefix; the automaton
-  confirm enforces full matching. `(?i:Sherlock|Holmes|Watson)` ~14×→**faster than Rust**,
-  `(?i:Sher[a-z]+|Hol[a-z]+)` ~15×→~6.4× (Sherlock geomean 1.64→1.50).
-- **Leading-class SIMD scan** (`engine/classscan.zig`) — a selective digit/number-class lead
-  (`\d+`, `\p{N}+`) SIMD-skips the inter-match gaps to the next class byte, via a **shufti**
-  per-high-nibble classifier (exact for ≤8 distinct high nibbles, so a sparse scan over non-ASCII
-  text pays no false-positive confirms). On sparse-match ASCII corpora `\d+`/`\p{N}+` are
-  **~33–37× faster (ahead of Rust)**; `\p{N}+` over Cyrillic is **~1.7× faster** since 0.6.0.
-- **`(?m)^` line anchors on the lazy DFA** — a single leading `(?m)^` runs O(input) on the lazy DFA
-  (line-gated forward re-seed + reverse line-accept), with no anchored restart, so a *prone*
-  newline-crossing line pattern (`log_line`) is no longer stuck on the Pike VM — the quadratic-immune
-  complement to the eager DFA's anchored-restart line support.
-
-**New in `0.5.0`** (all results-invariant — every path pinned to the Pike VM, runtime + comptime):
-
-- **`\b`-wrapped pure-literal O(1) confirm** — when the whole pattern is a literal in word-boundary
-  assertions (`\bthe\b`, `the\b`), a `memmem` hit is confirmed by two O(1) boundary checks instead of
-  a per-occurrence anchored DFA walk (ASCII on the eager arm, Unicode on the lazy arm, so accented
-  prose is fast too). `\bthe\b` over prose **~490 MiB/s → ~3.7 GiB/s (≈8×)**.
-- **Fixed-offset interior anchor** — when the leading run before an interior literal is fixed-length
-  (`\d{4}-…`) and the input is ASCII, the skip jumps anchor-to-anchor and bounded-confirms at the
-  pinned start, instead of crawling a dash-dense haystack. `date_iso` **~610 MiB/s → ~9.8 GiB/s (≈16×)**.
-- **Line-anchored capture/span dispatch** — a `(?m)^…` pattern with no eager DFA attempts the match
-  anchored at each line start (for span *and* captures), dropping the lazy DFA's reverse + capture-fill
-  passes. `log_line` span **~230 MiB/s → ~1.1 GiB/s (≈4.7×)**.
-- **Eager-DFA determinization budget** — a big Unicode-class join (`\w+@\w+`, `[\w.+-]+@…`) skips the
-  eager DFA (which would burn hundreds of ms, often only to decline) and uses the lazy DFA directly.
-  `email` **compile ~0.88 s → ~6 ms (≈140×)**, runtime unchanged.
-- **The `\p{…}`/`\w` compile-time cliff is gone** — the eager-DFA build is no longer quadratic in a
-  Unicode class's size. A class lowers to an `x+` loop over a fan-out split tree, so determinization
-  re-closed the loop-back split (re-walking the whole tree, re-interning the same big state) on every
-  char-completing edge, and the byte lowering's suffix cache scanned the byte-range DAG linearly per
-  tail — two independent `O(class²)` hot spots. Both are now linear: a **single-seed closure cache**
-  (memoizing `closure([pc])` by `(seed pc, context)`, forward *and* reverse) and a **hashed suffix
-  cache**. Compile, `auto` median: `\p{L}+` **31.9 ms → ~1.0 ms (≈32×)**, `\w+` **45 ms → ~0.8 ms
-  (≈54×)**, `\b\w+\b` **47.6 ms → ~1.3 ms (≈38×)**, `\p{Lu}\p{Ll}+` **10 ms → ~0.6 ms (≈17×)**. And a
-  *prone* pattern with a start-skip prefilter (`the\s+\p{L}+`) **cascades to the lazy DFA** — its
-  reverse table would be built-but-unused — so `the\s+\p{L}+` **compile ~107 ms → ~0.6 ms (≈188×)**.
-  Search throughput is unchanged (same automaton; the eager DFA already beats Rust on `\p{L}+`/`\w+`).
-
-`0.2.0`/`0.3.0` foundations still in place: full case folding, grapheme `\X`, a two-tier
-`Options` (semantic + results-invariant strategy), `(?x)` verbose mode, ASCII mode,
-dead-on-invalid UTF-8, and the **byte-NFA lowering + `ByteMap` equivalence classes**
-(`engine/byte.zig`) — the zero-decode UTF-8 automaton substrate the DFAs determinize.
 
 ## Installing
 
