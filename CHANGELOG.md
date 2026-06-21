@@ -5,14 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] - 2026-06-21
 
-`0.6.0-dev` on `main`.
-
-The empty-width-loop work below closes the two remaining **deferred** entries from
-`docs/limitations.md` (an empty loop over a nullable concat body, and a `\b`/`\B` after a
-length-varying alternation) — there are now **no known cross-backend correctness gaps** — and
-adopts **uniform RE2/Rust leftmost-first** empty-loop semantics across every backend.
+A throughput + correctness release. The **prefilter fast path** grew three sound, leftmost-first
+start-skips — a **required interior/suffix-literal** `memmem` + structured reverse walk, a
+**fixed-offset rare-byte** confirm for bounded patterns, and a **case-insensitive alternation**
+ASCII-folding Teddy — taking the rebar Sherlock geometric mean from **2.67 → 1.50** vs `rust/regex`
+(several patterns now *faster* than Rust). Correctness: the empty-width-loop work closes the two
+remaining **deferred** entries from `docs/limitations.md` (an empty loop over a nullable concat
+body, and a `\b`/`\B` after a length-varying alternation) — there are now **no known cross-backend
+correctness gaps** — and adopts **uniform RE2/Rust leftmost-first** empty-loop semantics across
+every backend. Also: leading-class start-skip for capitalized-word scans and a lazy-DFA
+jump-and-confirm for prone leading-literal / rare interior-anchor patterns. **No API changes** from
+`0.5.x`; results-invariant for real-world patterns.
 
 ### Changed
 
