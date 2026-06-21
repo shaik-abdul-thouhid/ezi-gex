@@ -5,9 +5,11 @@ expect, why, and what to do about it. For how the engine works see
 [`architecture.md`](architecture.md); for the public API see
 [`usage-guide.md`](usage-guide.md).
 
-Every entry below is **Deliberate** — a semantic choice ezi_gex makes on purpose. It will
-not "get fixed"; it is the defined behaviour. The cross-backend conformance suite and the
-fuzz differential (`fuzz/`) pin all of it so it cannot silently change.
+Every entry below is **deliberate** — a behaviour or a performance trade-off ezi_gex makes on
+purpose. None of it is on the roadmap to change. The semantic choices are pinned by the
+cross-backend conformance suite and the fuzz differential (`fuzz/`) so they cannot silently
+change; the performance limitations are accepted shapes where the engine is and will remain
+slower than Rust.
 
 > **No deferred bugs.** As of v0.6.0 there are no known correctness gaps where one backend
 > disagrees with another. The two former deferred entries — an empty-width loop over a
@@ -39,3 +41,34 @@ The scanner rejects a repetition whose count exceeds a configurable ceiling
 pattern like `a{999999999}` fails to compile rather than blowing up the program. Raise or
 lower it per-compile via `Options.max_repetition` (see `usage-guide.md`). This is a
 safeguard, not a matching limitation — within the ceiling, counted repetition is exact.
+
+### Performance shapes ezi_gex does not chase
+
+The benchmark harness ([regex-bench](https://github.com/shaik-abdul-thouhid/regex-bench), built
+on [rebar](https://github.com/BurntSushi/rebar)) surfaces a handful of pattern shapes where
+ezi_gex is meaningfully slower than Rust's `regex`. These are accepted: they are not bugs and not
+on the roadmap. Each would only improve by trading away something the engine will not give up —
+its linear-time guarantee, its portability (no hand-written per-architecture SIMD), or its
+simplicity. The multipliers are from the rebar Sherlock suite (how many times slower than Rust on
+that one benchmark).
+
+- **An unbounded gap between two required literals** — `Holmes(?:\s*.+\s*){0,10}Watson` and
+  similar (~20×). Both literals prefilter fine, but the `.+` between them still has to be walked;
+  nothing can skip an arbitrary-length span. This is inherent to the shape.
+- **A common single byte as the only distinctive feature** — `\b\w+n\b` (~8×). The one selective
+  thing is the trailing `n`, which is far too common to prefilter on and too short for the
+  literal skip. There is no rare anchor to jump to.
+- **A bounded run of a negated class** — `["'][^"']{0,30}[?!.]["']` (~6.5×). The `[^"']{0,30}`
+  span is scanned byte by byte. A specialized negated-class skip could shave this, but only on
+  this narrow shape and not without growing the DFA machinery.
+- **An unbounded case-insensitive alternation** — `(?i:Sher[a-z]+|Hol[a-z]+)` (~6.4×). It is
+  prefiltered, but because the branch is unbounded it cannot use the fast per-occurrence confirm
+  without risking quadratic time, so it falls back to a slower scan. Keeping the linear-time
+  guarantee is worth more than the throughput here. (The *bounded* form,
+  `(?i:Sherlock|Holmes|Watson)`, is faster than Rust.)
+- **A line anchor inside an alternation** — `(?m)^...|...` (~4.7×). This routes to the linear
+  Pike VM; the DFAs do not carry `(?m)` line context through an alternation. Correct, just not
+  the fast path.
+- **Pure-literal alternation throughput** — `Sherlock|Street` (~4×). The prefilter is the right
+  one (Teddy), but Rust's hand-tuned Teddy scans faster. Matching it would mean per-architecture
+  assembly, which ezi_gex deliberately avoids in favour of portable `@Vector` code.

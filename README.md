@@ -604,6 +604,15 @@ leftmost-first semantics on every backend, and the two edge cases deferred in 0.
 loop over a nullable concat body, and a `\b`/`\B` after a length-varying alternation — are now
 fixed.
 
+There are also a few **performance** shapes where ezi_gex is slower than Rust and that won't be
+optimized — each fix would cost the linear-time guarantee, portability, or simplicity. From the
+rebar Sherlock suite: an unbounded gap between two literals (`Holmes(?:…){0,10}Watson`, ~20×), a
+common single byte as the only distinctive feature (`\b\w+n\b`, ~8×), a bounded negated-class run
+(`["'][^"']{0,30}…`, ~6.5×), an unbounded case-insensitive alternation (`(?i:Sher[a-z]+|…)`,
+~6.4×), a line anchor inside an alternation (`(?m)^…|…`, ~4.7×), and pure-literal alternation
+throughput (`Sherlock|Street`, ~4×). These are spelled out in
+[`docs/limitations.md`](docs/limitations.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
