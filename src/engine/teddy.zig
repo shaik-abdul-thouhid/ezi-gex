@@ -59,13 +59,30 @@ pub const SLIM_BUCKETS = 8;
 /// **alternation (priority) order** so verification is leftmost-first like `literal.zig`.
 pub const Bound = struct { start: u32, len: u32, bucket: u8 };
 
+/// ASCII case fold of one byte: `A`–`Z` → `a`–`z`, everything else unchanged. UTF-8 lead /
+/// continuation bytes are all `>= 0x80`, so this never touches a multi-byte sequence — folding
+/// a haystack byte-by-byte cannot corrupt non-ASCII text (it only collapses ASCII letters).
+inline fn asciiLower(b: u8) u8 {
+    return if (b >= 'A' and b <= 'Z') b | 0x20 else b;
+}
+
+/// Whether two byte slices are equal, optionally under ASCII case folding (`fold`). The
+/// case-fold compare is the verify half of a **case-insensitive** Teddy: the needle bytes are
+/// stored in a canonical case and the haystack byte is folded to match.
+fn eqlFold(a: []const u8, b: []const u8, fold: bool) bool {
+    if (a.len != b.len) return false;
+    if (!fold) return std.mem.eql(u8, a, b);
+    for (a, b) |x, y| if (asciiLower(x) != asciiLower(y)) return false;
+    return true;
+}
+
 /// Leftmost-first match at exactly `pos`: the first literal (priority order) whose bytes
-/// occur at `pos`, or null. Shared by the slim and fat searchers; mirrors `literal.zig`'s
-/// `matchAtPos` so all three agree.
-fn verifyNeedles(needles: []const u8, bounds: []const Bound, input: []const u8, pos: usize) ?Match {
+/// occur at `pos` (ASCII-folded when `fold`), or null. Shared by the slim and fat searchers;
+/// mirrors `literal.zig`'s `matchAtPos` so all three agree.
+fn verifyNeedles(needles: []const u8, bounds: []const Bound, input: []const u8, pos: usize, fold: bool) ?Match {
     for (bounds) |b| {
         const needle = needles[b.start .. b.start + b.len];
-        if (pos + needle.len <= input.len and std.mem.eql(u8, input[pos .. pos + needle.len], needle))
+        if (pos + needle.len <= input.len and eqlFold(input[pos .. pos + needle.len], needle, fold))
             return .{ .start = pos, .end = pos + needle.len };
     }
     return null;
@@ -88,6 +105,10 @@ pub const Teddy = struct {
     /// Concatenated literal bytes; `bounds[k]` delimits literal `k` (priority order).
     needles: []const u8,
     bounds: []const Bound,
+    /// When true the fingerprint masks carry **both ASCII cases** of every letter and verify
+    /// folds ASCII case — a case-insensitive prefilter (`(?i:Sherlock|Holmes)`). The needle
+    /// bytes are stored in a canonical case; matching is ASCII-case-insensitive.
+    fold_ascii: bool = false,
 
     fn loVec(self: *const Teddy, p: usize) @Vector(16, u8) {
         return self.lo[p];
@@ -97,9 +118,9 @@ pub const Teddy = struct {
     }
 
     /// Leftmost-first match at exactly `pos`: the first literal (priority order) whose bytes
-    /// occur at `pos`, or null.
+    /// occur at `pos` (ASCII-folded when `fold_ascii`), or null.
     fn verifyAt(self: *const Teddy, input: []const u8, pos: usize) ?Match {
-        return verifyNeedles(self.needles, self.bounds, input, pos);
+        return verifyNeedles(self.needles, self.bounds, input, pos, self.fold_ascii);
     }
 
     /// First leftmost-first match at byte offset `>= start`, or null.
@@ -212,8 +233,10 @@ fn fingerprintLen(needles: []const []const u8) u8 {
 
 /// Fill the nibble mask tables (shared by the heap and comptime builders). `out_lo`/`out_hi`
 /// must be zero-initialised; sets, for each literal and each fingerprint position `p < n`,
-/// the literal's bucket bit in the low- and high-nibble rows.
-fn buildMasks(needles: []const []const u8, n: u8, lo: *[MAX_FINGERPRINT][16]u8, hi: *[MAX_FINGERPRINT][16]u8) void {
+/// the literal's bucket bit in the low- and high-nibble rows. When `fold` an ASCII letter
+/// also sets its **opposite-case** byte's bits (`c ^ 0x20`), so the masks accept either case —
+/// the build half of a case-insensitive Teddy (verify folds to match).
+fn buildMasks(needles: []const []const u8, n: u8, fold: bool, lo: *[MAX_FINGERPRINT][16]u8, hi: *[MAX_FINGERPRINT][16]u8) void {
     for (needles, 0..) |nd, idx| {
         const bit: u8 = @as(u8, 1) << @intCast(bucketOf(idx, needles.len));
         var p: usize = 0;
@@ -221,15 +244,29 @@ fn buildMasks(needles: []const []const u8, n: u8, lo: *[MAX_FINGERPRINT][16]u8, 
             const c = nd[p];
             lo[p][c & 0x0F] |= bit;
             hi[p][c >> 4] |= bit;
+            if (fold and ((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z'))) {
+                const o = c ^ 0x20; // flip ASCII case
+                lo[p][o & 0x0F] |= bit;
+                hi[p][o >> 4] |= bit;
+            }
         }
     }
 }
 
 /// Compile a literal set into a heap-backed `Teddy` (free with `free`). Caller must have
-/// checked `supports`. `needles` are copied, so the source may be freed after.
+/// checked `supports`. `needles` are copied, so the source may be freed after. Case-sensitive.
 ///
 /// @stable-since: v0.4.0
 pub fn compileAlloc(gpa: std.mem.Allocator, needles: []const []const u8) std.mem.Allocator.Error!Teddy {
+    return compileFoldAlloc(gpa, needles, false);
+}
+
+/// Compile a literal set into a heap-backed `Teddy` with optional **ASCII case folding**
+/// (`fold` ⇒ a case-insensitive prefilter, e.g. `(?i:Sherlock|Holmes)`). `compileAlloc` is the
+/// case-sensitive shorthand. Caller must have checked `supports`; `needles` are copied.
+///
+/// @stable-since: v0.6.0
+pub fn compileFoldAlloc(gpa: std.mem.Allocator, needles: []const []const u8, fold: bool) std.mem.Allocator.Error!Teddy {
     std.debug.assert(supports(needles));
     const n = fingerprintLen(needles);
 
@@ -252,7 +289,7 @@ pub fn compileAlloc(gpa: std.mem.Allocator, needles: []const []const u8) std.mem
 
     var lo = std.mem.zeroes([MAX_FINGERPRINT][16]u8);
     var hi = std.mem.zeroes([MAX_FINGERPRINT][16]u8);
-    buildMasks(needles, n, &lo, &hi);
+    buildMasks(needles, n, fold, &lo, &hi);
 
     return .{
         .n = n,
@@ -261,6 +298,7 @@ pub fn compileAlloc(gpa: std.mem.Allocator, needles: []const []const u8) std.mem
         .hi = hi,
         .needles = bytes,
         .bounds = bounds,
+        .fold_ascii = fold,
     };
 }
 
@@ -360,12 +398,12 @@ pub const FatTeddy = struct {
             mask &= lane_mask;
             while (mask != 0) {
                 const j = @ctz(mask);
-                if (verifyNeedles(self.needles, self.bounds, input, i + j)) |m| return m;
+                if (verifyNeedles(self.needles, self.bounds, input, i + j, false)) |m| return m;
                 mask &= mask - 1;
             }
         }
         while (i < input.len) : (i += 1) {
-            if (verifyNeedles(self.needles, self.bounds, input, i)) |m| return m;
+            if (verifyNeedles(self.needles, self.bounds, input, i, false)) |m| return m;
         }
         return null;
     }

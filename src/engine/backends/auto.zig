@@ -23,10 +23,14 @@
 //!         that leaps literal-to-literal (`\bthe\b` jumps "the"→"the"); when the whole pattern is a
 //!         literal wrapped in word-boundary assertions (`\bthe\b`, `the\b`), a hit is confirmed by an
 //!         **O(1) word-boundary check** (`lit_wb_confirm`), not an anchored automaton walk;
-//!       - **multi-prefix set** — a top-level alternation's leading literals (`Holmes…|Watson…`)
-//!         OR a synthesised **case-variant set** for a small-class / `(?i)` lead (`(?i)the` →
-//!         `{THE…the}`, `(?i)что`) — → the **Teddy** SIMD multi-literal scan (`prefix_teddy`),
-//!         scalar `multiPrefixFrom` as the comptime/non-native fallback;
+//!       - **multi-prefix set** — a top-level alternation's leading literals (`Holmes…|Watson…`),
+//!         a synthesised **case-variant set** for a small-class / `(?i)` lead (`(?i)the` →
+//!         `{THE…the}`, `(?i)что`), OR a **case-insensitive alternation set** — one ASCII-folded
+//!         needle per branch of `(?i:Sherlock|Holmes|Watson)` / `(?i:Sher[a-z]+|Hol[a-z]+)`
+//!         (`caseiAlternationSet`; the fold-aware Teddy masks match either case so casei branches
+//!         do not blow the needle budget) — → the **Teddy** SIMD multi-literal scan
+//!         (`prefix_teddy`, case-folding via `compileFoldAlloc`), scalar `multiPrefixFrom`
+//!         (`caseiFindFrom` when folded) as the comptime/non-native fallback;
 //!       - **required interior/suffix literal** — a selective literal anywhere on the mandatory
 //!         spine when no leading literal applies (`\w+\s+Holmes`, `[a-zA-Z]+ing`): `memmem` the
 //!         *whole* literal, then — when the atoms before it are **disjoint class-repetitions** — a
@@ -265,6 +269,17 @@ pub const Filter = struct {
     ///
     /// @stable-since: v0.4.0
     prefix_set_case_variant: bool = false,
+    /// True when the `prefix_set` needles match **ASCII-case-insensitively** — one needle per
+    /// branch of a top-level case-insensitive alternation (`(?i:Sherlock|Holmes|Watson)`,
+    /// `(?i:Sher[a-z]+|Hol[a-z]+)`). Unlike `prefix_set_case_variant` (which enumerates the
+    /// cartesian product of a single concat's case variants — `2^k` needles), this keeps **one
+    /// needle per branch** and folds ASCII case in the Teddy masks + verify, so an alternation
+    /// of casei branches stays within the `MAX_PREFIX_BRANCHES` budget. The needle bytes are
+    /// stored in their canonical (as-written) case; the per-position fold is applied at match
+    /// time. The automaton confirm at each hit enforces full Unicode-correct semantics.
+    ///
+    /// @stable-since: v0.6.0
+    prefix_set_fold_ascii: bool = false,
     /// Byte-offset RANGE of the `prefix_set` window from the **match start**: a Teddy hit at
     /// input position `q` implies a candidate match start at `q - d` for some
     /// `d ∈ [prefix_set_off_min, prefix_set_off_max]`. `0/0` for a leading set (the common
@@ -693,6 +708,19 @@ fn filterFromAnalysis(h: hir.Hir) Filter {
         }
     }
 
+    // 2c. Case-insensitive alternation set: a top-level `(?i:Sher[a-z]+|Hol[a-z]+)` /
+    //     `(?i:Sherlock|Holmes|Watson)`. Case folding turns each branch's leading letters into
+    //     classes (`S`→`[Ss]`/`[Ssſ]`), so step 2's `prefix_set` (which needs a fixed leading
+    //     literal per branch) declines and the cartesian case-variant set (step 2b, a single
+    //     concat) does not apply. Build ONE needle per branch — ASCII case pairs collapse into
+    //     the fold-aware Teddy masks, only non-ASCII fold members fan out — so an alternation of
+    //     casei branches stays within the needle budget. `caseiAlternationSet` sets
+    //     `prefix_set_fold_ascii`.
+    if (f.prefix_len == 0 and f.prefix_set_n == 0) {
+        const n = caseiAlternationSet(h, &f);
+        if (n >= 2) f.prefix_set_n = n;
+    }
+
     // 3. Interior anchor (no leading literal at all) → skip-to-anchor + reverse-scan, when
     //    the anchor byte is rare enough to pay off.
     if (f.prefix_len == 0 and f.prefix_set_n == 0) {
@@ -918,6 +946,145 @@ fn caseVariantSet(h: hir.Hir, f: *Filter) u8 {
     var min_len: u8 = 255;
     for (0..n) |p| min_len = @min(min_len, f.prefix_set_len[p]);
     if (min_len < VARIANT_MIN_LEN) return 0; // not selective enough to be worth a prefilter
+    return @intCast(n);
+}
+
+/// Leading positions of a casei alternation branch fingerprinted by `caseiAlternationSet`. Three
+/// is Teddy's selectivity sweet spot (it fingerprints ≤ 3 bytes) and keeps the per-branch needle
+/// fan-out small.
+const CASEI_WINDOW_LEN: usize = VARIANT_WINDOW_LEN;
+
+/// The byte-string alternatives one leading position may take, after **collapsing ASCII case
+/// pairs**: every ASCII letter is reduced to its lowercase canonical (a fold-aware Teddy mask
+/// then matches either case), while any non-ASCII / non-letter fold-orbit member (`s`→`ſ`,
+/// `k`→KELVIN under simple folding; a literal digit) is kept as its own exact byte sequence.
+const PosAlt = struct {
+    bytes: [VARIANT_CLASS_MAX][4]u8 = undefined,
+    len: [VARIANT_CLASS_MAX]u8 = undefined,
+    n: u8 = 0,
+    /// True when at least one member was an ASCII letter (so case folding is required to match).
+    fold: bool = false,
+};
+
+/// Reduce one position's choice set (`collectChoices` orbit) to its `PosAlt` alternatives, or
+/// null if a member is unencodable or the dedup'd set would overflow `VARIANT_CLASS_MAX`.
+fn positionAlternatives(ch: Choice) ?PosAlt {
+    var pa = PosAlt{};
+    for (ch.cps[0..ch.len]) |cp| {
+        var b: [4]u8 = undefined;
+        var blen: u8 = undefined;
+        if (cp < 0x80 and ((cp >= 'A' and cp <= 'Z') or (cp >= 'a' and cp <= 'z'))) {
+            b[0] = @as(u8, @intCast(cp)) | 0x20; // lowercase canonical; fold covers the other case
+            blen = 1;
+            pa.fold = true;
+        } else {
+            if (!encoding.isValidCodePoint(cp)) return null;
+            const m = utf8.encodeCodePointUnchecked(cp, &b);
+            if (m == 0) return null;
+            blen = m;
+        }
+        // Dedup (the lowercase canonical collapses `X`/`x` to one entry).
+        var dup = false;
+        for (0..pa.n) |i| {
+            if (pa.len[i] == blen and std.mem.eql(u8, pa.bytes[i][0..blen], b[0..blen])) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            if (pa.n >= VARIANT_CLASS_MAX) return null;
+            @memcpy(pa.bytes[pa.n][0..blen], b[0..blen]);
+            pa.len[pa.n] = blen;
+            pa.n += 1;
+        }
+    }
+    if (pa.n == 0) return null;
+    return pa;
+}
+
+/// Build a **case-insensitive alternation** prefix set: one (or a few) needle(s) per branch of a
+/// top-level `(?i:Sher[a-z]+|Hol[a-z]+)` / `(?i:Sherlock|Holmes|Watson)`, written to
+/// `f.prefix_set*` with `f.prefix_set_fold_ascii` set when any branch needs ASCII folding.
+///
+/// Each branch contributes the canonical bytes of its first ≤ `CASEI_WINDOW_LEN` mandatory
+/// positions (`collectChoices` stops at a repetition / optional / alternation / `.`): ASCII
+/// letter case-pairs collapse to ONE needle (the fold-aware Teddy masks + verify match either
+/// case), and any **non-ASCII** fold-orbit member of a window position (`s`→`ſ`, `k`→KELVIN under
+/// simple folding) fans out into an extra needle so the set stays a sound necessary prefix of
+/// every match. Returns the total needle count, or 0 to decline (not a casei-ish alternation, a
+/// branch shorter than `VARIANT_MIN_LEN`, an unencodable member, or the union exceeds
+/// `MAX_PREFIX_BRANCHES`). Only the leading window is stored; the automaton confirm at each Teddy
+/// hit enforces the full (Unicode-correct) match — Teddy is purely a candidate generator.
+fn caseiAlternationSet(h: hir.Hir, f: *Filter) u8 {
+    // Descend a capture wrapper to the alternation (a `(?i:…)` non-capturing group leaves the
+    // alternation at the spine; a capturing group wraps it).
+    var idx = h.root;
+    while (h.nodes[idx].tag == .capture) idx = h.nodes[idx].data.capture.child;
+    if (h.nodes[idx].tag != .alternation) return 0;
+    const branches = h.nodes[idx].data.children;
+    if (branches.len < 2 or branches.len > hir.MAX_PREFIX_BRANCHES) return 0;
+
+    var n: usize = 0; // needles written to f.prefix_set so far
+    var any_fold = false;
+    for (h.children[branches.start .. branches.start + branches.len]) |ci| {
+        // The branch's leading mandatory positions and their fold orbits.
+        var choices: [CASEI_WINDOW_LEN]Choice = undefined;
+        var nchoices: usize = 0;
+        var stop = false;
+        collectChoices(h, ci, choices[0..], &nchoices, &stop);
+        if (nchoices < VARIANT_MIN_LEN) return 0; // window too short → no selective sound prefix
+
+        // Cartesian product of this branch's per-position alternatives, seeded with one empty
+        // needle. ASCII case pairs do not multiply (fold); only non-ASCII members do.
+        var bn: [hir.MAX_PREFIX_BRANCHES][MAX_PREFIX_LEN]u8 = undefined;
+        var bl: [hir.MAX_PREFIX_BRANCHES]u8 = undefined;
+        var bcount: usize = 1;
+        bn[0] = @splat(0);
+        bl[0] = 0;
+        for (choices[0..nchoices]) |ch| {
+            const pa = positionAlternatives(ch) orelse return 0;
+            any_fold = any_fold or pa.fold;
+            if (bcount * pa.n > hir.MAX_PREFIX_BRANCHES) return 0; // branch fan-out over budget
+            // Longest current needle + longest alternative must fit MAX_PREFIX_LEN.
+            var max_cur: u8 = 0;
+            for (0..bcount) |p| max_cur = @max(max_cur, bl[p]);
+            var max_add: u8 = 0;
+            for (0..pa.n) |a| max_add = @max(max_add, pa.len[a]);
+            if (@as(usize, max_cur) + max_add > MAX_PREFIX_LEN) return 0;
+
+            var nb: [hir.MAX_PREFIX_BRANCHES][MAX_PREFIX_LEN]u8 = undefined;
+            var nl: [hir.MAX_PREFIX_BRANCHES]u8 = undefined;
+            var w: usize = 0;
+            for (0..bcount) |p| {
+                for (0..pa.n) |a| {
+                    nb[w] = @splat(0);
+                    @memcpy(nb[w][0..bl[p]], bn[p][0..bl[p]]);
+                    @memcpy(nb[w][bl[p] .. bl[p] + pa.len[a]], pa.bytes[a][0..pa.len[a]]);
+                    nl[w] = bl[p] + pa.len[a];
+                    w += 1;
+                }
+            }
+            bcount = w;
+            for (0..bcount) |p| {
+                bn[p] = nb[p];
+                bl[p] = nl[p];
+            }
+        }
+
+        // Append this branch's needles to the global set (declining if the union overflows).
+        if (n + bcount > hir.MAX_PREFIX_BRANCHES) return 0;
+        for (0..bcount) |p| {
+            f.prefix_set[n] = bn[p];
+            f.prefix_set_len[n] = bl[p];
+            n += 1;
+        }
+    }
+
+    if (n < 2) return 0;
+    var min_len: u8 = 255;
+    for (0..n) |p| min_len = @min(min_len, f.prefix_set_len[p]);
+    if (min_len < VARIANT_MIN_LEN) return 0; // not selective enough to be worth a prefilter
+    f.prefix_set_fold_ascii = any_fold;
     return @intCast(n);
 }
 
@@ -1180,7 +1347,7 @@ fn buildPrefixTeddy(gpa: std.mem.Allocator, f: *const Filter, opts: Options) Bui
         if (f.prefix_set_len[k] == 0) return null; // an empty needle matches everywhere — decline
         slices[k] = f.prefix_set[k][0..f.prefix_set_len[k]];
     }
-    return try teddy.compileAlloc(gpa, slices[0..f.prefix_set_n]);
+    return try teddy.compileFoldAlloc(gpa, slices[0..f.prefix_set_n], f.prefix_set_fold_ascii);
 }
 
 /// @stable-since: v0.1.0
@@ -1522,6 +1689,28 @@ fn memmemFrom(input: []const u8, start: usize, needle: []const u8) ?usize {
     return f.find(input, start);
 }
 
+/// ASCII case fold of one byte (`A`–`Z` → `a`–`z`); leaves every other byte — including all
+/// UTF-8 lead/continuation bytes (`>= 0x80`) — untouched.
+inline fn asciiLower(b: u8) u8 {
+    return if (b >= 'A' and b <= 'Z') b | 0x20 else b;
+}
+
+/// Leftmost offset `≥ start` at which `needle` occurs under **ASCII case folding**, or null.
+/// The scalar fallback for a case-insensitive multi-prefix set when no native Teddy was built
+/// (comptime / non-native target). Plain O(input × needle); the needles are short and few.
+fn caseiFindFrom(input: []const u8, start: usize, needle: []const u8) ?usize {
+    if (needle.len == 0) return if (start <= input.len) start else null;
+    if (input.len < needle.len) return null;
+    var i = start;
+    const last = input.len - needle.len;
+    while (i <= last) : (i += 1) {
+        var k: usize = 0;
+        while (k < needle.len and asciiLower(input[i + k]) == asciiLower(needle[k])) : (k += 1) {}
+        if (k == needle.len) return i;
+    }
+    return null;
+}
+
 /// Leftmost offset `≥ start` at which **any** of the multi-prefix needles occurs, or null.
 /// The sound multi-prefix start-skip (`Holmes…|Watson…`): every match begins with one of the
 /// branches' leading literals, so no match can begin before the earliest occurrence of any of
@@ -1532,7 +1721,10 @@ fn multiPrefixFrom(filter: *const Filter, input: []const u8, start: usize) ?usiz
     var i: usize = 0;
     while (i < filter.prefix_set_n) : (i += 1) {
         const needle = filter.prefix_set[i][0..filter.prefix_set_len[i]];
-        const at = memmemFrom(input, start, needle) orelse continue;
+        const at = (if (filter.prefix_set_fold_ascii)
+            caseiFindFrom(input, start, needle)
+        else
+            memmemFrom(input, start, needle)) orelse continue;
         if (best == null or at < best.?) best = at;
         if (best == start) break; // nothing can be earlier than the search start
     }
@@ -2980,6 +3172,104 @@ test "auto: case-variant prefix set is synthesised for a small-class-led concat 
         try testing.expect(f.prefix_len > 0);
         try testing.expectEqual(@as(u8, 0), f.prefix_set_n);
         try testing.expect(!f.prefix_set_case_variant);
+    }
+}
+
+test "auto: case-insensitive alternation set is synthesised one needle per branch (revert-failing)" {
+    // `(?i:Sher[a-z]+|Hol[a-z]+)` / `(?i:Sherlock|Holmes|Watson)` — case folding turns each
+    // branch's leading letters into classes, so step 2's `prefix_set` (needs a fixed leading
+    // literal) declines and the single-concat case-variant set (step 2b) does not apply. The new
+    // casei-alternation set must produce a folded multi-prefix. Reverting `caseiAlternationSet`
+    // collapses `prefix_set_n` to 0 here.
+    const gpa = testing.allocator;
+
+    // Helper: is `needle` (ASCII-folded) among the prefix set?
+    const has = struct {
+        fn f(flt: *const Filter, want: []const u8) bool {
+            var i: usize = 0;
+            while (i < flt.prefix_set_n) : (i += 1) {
+                if (caseiFindFrom(flt.prefix_set[i][0..flt.prefix_set_len[i]], 0, want)) |at| {
+                    if (at == 0 and flt.prefix_set_len[i] == want.len) return true;
+                }
+            }
+            return false;
+        }
+    }.f;
+
+    {
+        const f = try filterOf(gpa, "(?i:Sher[a-z]+|Hol[a-z]+)");
+        try testing.expect(f.prefix_set_n >= 2);
+        try testing.expect(f.prefix_set_fold_ascii);
+        try testing.expect(!f.prefix_set_case_variant); // a leading set, not the rare-window variant
+        try testing.expectEqual(@as(u8, 0), f.prefix_len);
+        try testing.expect(has(&f, "she")); // Sherlock window (ASCII case pair collapsed)
+        try testing.expect(has(&f, "hol")); // Holmes window
+        // The non-ASCII `s`→`ſ` simple-fold member fans the Sher branch into a second needle.
+        try testing.expect(has(&f, "\u{017F}he"));
+    }
+    {
+        const f = try filterOf(gpa, "(?i:Sherlock|Holmes|Watson)");
+        try testing.expect(f.prefix_set_n >= 3);
+        try testing.expect(f.prefix_set_fold_ascii);
+        try testing.expect(has(&f, "she"));
+        try testing.expect(has(&f, "hol"));
+        try testing.expect(has(&f, "wat"));
+    }
+    {
+        // A non-casei alternation keeps a *case-sensitive* set via step 2 (no fold flag).
+        const f = try filterOf(gpa, "Sherlock|Holmes");
+        try testing.expect(f.prefix_set_n >= 2);
+        try testing.expect(!f.prefix_set_fold_ascii);
+    }
+    {
+        // A single casei branch (no alternation) is the case-variant set's job, not this path.
+        const f = try filterOf(gpa, "(?i:Holmes)");
+        try testing.expect(!f.prefix_set_fold_ascii); // would only be set by caseiAlternationSet
+    }
+}
+
+test "auto: case-insensitive alternation Teddy matches the Pike VM oracle over prose (differential)" {
+    // The fold-aware multi-prefix skip must agree with the unfiltered Pike VM on real text that
+    // mixes cases (and a long-s `ſ`), proving the prefilter drops no real match and the per-hit
+    // confirm stays leftmost-first.
+    const gpa = testing.allocator;
+    const corpus =
+        "Sherlock and SHERLOCK met holmes; HOLMES greeted Watson and watson. " ++
+        "A ſherlock spelling, sHeRlOcK casing, and plain text with no names at all. " ++
+        "Holmes, holmes, HoLmEs — and Sheraton (not a match for Sher[a-z]+? it is). " ++
+        "watsons, WATSONing, and a lone Wat. The end.";
+    const pats = [_][]const u8{
+        "(?i:Sherlock|Holmes|Watson)",
+        "(?i:Sher[a-z]+|Hol[a-z]+)",
+        "(?i:sherlock|holmes|watson)",
+    };
+    for (pats) |pat| {
+        var re = try Compiled.init(pat);
+        defer re.deinit();
+
+        // Oracle: a plain leftmost-first unanchored Pike VM scan, no prefilter.
+        var diag: compile.Diagnostic = .{};
+        const ast = try compile.parse(gpa, pat, &diag);
+        defer ast.deinit(gpa);
+        const ph = try hir.buildAlloc(gpa, ast, .{});
+        defer hir.deinitHir(gpa, ph);
+        var pp = try pikevm.buildAlloc(gpa, ph, .{});
+        defer pikevm.freeProgram(gpa, &pp);
+        var ps = try pikevm.Scratch.init(gpa, &pp);
+        defer ps.deinit(gpa);
+
+        var pos: usize = 0;
+        while (true) {
+            const am = E.find(&re.program, &re.scratch, corpus, .{ .start = pos });
+            const om = pikevm.search(&pp, &ps, corpus, .{ .start = pos });
+            if (am == null or om == null) {
+                try testing.expect(am == null and om == null);
+                break;
+            }
+            try testing.expectEqual(om.?.start, am.?.start);
+            try testing.expectEqual(om.?.end, am.?.end);
+            pos = if (am.?.end > am.?.start) am.?.end else am.?.end + 1;
+        }
     }
 }
 

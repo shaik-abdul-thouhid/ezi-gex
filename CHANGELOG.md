@@ -66,6 +66,23 @@ adopts **uniform RE2/Rust leftmost-first** empty-loop semantics across every bac
 
 ### Performance
 
+- **Case-insensitive alternation Teddy prefilter.** A top-level case-insensitive alternation
+  (`(?i:Sherlock|Holmes|Watson)`, `(?i:Sher[a-z]+|Hol[a-z]+)`) previously got **no prefilter at
+  all**: case folding turns each branch's leading letters into classes (`S`→`[Ss]`, with `ſ` under
+  simple folding), so the fixed-leading-literal `prefix_set` declined and every match fell to a
+  case-expanded DFA scanning every byte. The Teddy SIMD prefilter now matches **ASCII-case-
+  insensitively** — its nibble masks carry both cases of each letter and verify folds case
+  (`teddy.compileFoldAlloc`) — so `auto` synthesises **one needle per branch** of a casei
+  alternation (`caseiAlternationSet`) instead of the case-variant set's `2^k` cartesian product,
+  keeping an alternation of casei branches inside the `MAX_PREFIX_BRANCHES` budget. Non-ASCII fold
+  members of the leading window (`s`→`ſ`, `k`→KELVIN) fan out into extra needles so the set stays a
+  sound necessary prefix; the automaton confirm at each hit enforces full Unicode-correct matching
+  (Teddy is purely a candidate generator). On `sherlock` (rebar): **`(?i:Sherlock|Holmes|Watson)`
+  ~14× → ~1× *faster* than Rust**, **`(?i:Sher[a-z]+|Hol[a-z]+)` ~15× → ~6.4×** (the residual is the
+  *unbounded* branch, which still takes the single-skip + native-find arm rather than a per-
+  occurrence confirm); overall Sherlock geomean **1.64 → 1.50** vs Rust ~1.16. Leftmost-first
+  preserved; O(input). White-box tested (needle sets, fold flag) and differential-tested vs the
+  Pike VM oracle over mixed-case prose including a long-s `ſ`.
 - **Required-literal prefilter — whole-literal `memmem` skip + structured reverse walk.** A pattern
   with no leading literal but a selective literal in its **interior or suffix** (`\w+\s+Holmes`,
   `[a-zA-Z]+ing`, `[\w.+-]+@gmail\.com`) now drives a prefilter off that literal. New HIR analysis

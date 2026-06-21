@@ -36,7 +36,7 @@ SemVer. Tracks a recent Zig dev build (`0.17.0-dev`); it will not compile on sta
 [rebar](https://github.com/BurntSushi/rebar) haystacks — reproducible harness (clone + `./run.sh`):
 **[github.com/shaik-abdul-thouhid/regex-bench](https://github.com/shaik-abdul-thouhid/regex-bench)**.
 
-**What works is tested** — **400+ tests** pass (per-module behaviour; cross-backend
+**What works is tested** — **460+ tests** pass (per-module behaviour; cross-backend
 conformance, a wide differential corpus where every backend must agree with the Pike VM,
 runtime + comptime parity; and a dedicated **ReDoS-immunity suite**, `engine/redos.zig`,
 proving the engine is quadratic-immune).
@@ -102,6 +102,14 @@ Landed across `0.4.0-dev` (all on `main`):
   prefix set** (`(?i)the` → the 8 needles `{THE…the}`) that drives the multi-prefix Teddy skip,
   now wired on the **NFA/DFA arm** too (so a top-level alternation like `Holmes…|Watson…` gets
   Teddy as well). `(?i)the` ~4.6×, `(?i)sherlock holmes` ~17×, `(?i)что` ~15×, `near` ~1.6×.
+- **Case-insensitive alternation → ASCII-folding Teddy** — a top-level casei alternation
+  (`(?i:Sherlock|Holmes|Watson)`, `(?i:Sher[a-z]+|Hol[a-z]+)`) used to get **no** prefilter (folding
+  turns each branch's leading letters into classes, so the fixed-leading-literal set declined). The
+  Teddy masks now match **ASCII-case-insensitively**, so `auto` builds **one needle per branch**
+  (not the case-variant set's `2^k` product) and a casei alternation stays inside the needle budget.
+  Non-ASCII fold members (`s`→`ſ`) fan out so the set stays a sound necessary prefix; the automaton
+  confirm enforces full matching. `(?i:Sherlock|Holmes|Watson)` ~14×→**faster than Rust**,
+  `(?i:Sher[a-z]+|Hol[a-z]+)` ~15×→~6.4× (Sherlock geomean 1.64→1.50).
 - **Leading-class SIMD scan** (`engine/classscan.zig`) — a selective digit/number-class lead
   (`\d+`, `\p{N}+`) SIMD-skips the inter-match gaps to the next class byte, via a **shufti**
   per-high-nibble classifier (exact for ≤8 distinct high nibbles, so a sparse scan over non-ASCII
