@@ -412,6 +412,13 @@ pub const ByteSet = struct {
         for (self.bits) |w| c += @popCount(w);
         return @intCast(c);
     }
+    /// In-place set union (OR every member of `other` into `self`). Used to accumulate the
+    /// reverse-scan alphabet of a required-literal skip over the atoms preceding the literal.
+    ///
+    /// @stable-since: v0.6.0
+    pub fn unionWith(self: *ByteSet, other: ByteSet) void {
+        for (0..4) |i| self.bits[i] |= other.bits[i];
+    }
 };
 
 /// Largest number of top-level alternation branches the multi-prefix prefilter
@@ -464,6 +471,84 @@ pub const InnerAnchor = struct {
     ///
     /// @stable-since: v0.5.0
     lead_fixed_cps: ?u32 = null,
+};
+
+/// A **required interior/suffix literal** with the alphabet of everything that may precede it
+/// within a match — the general form of `InnerAnchor`. Where `InnerAnchor` keys off a single
+/// *byte* immediately after one leading class run, this carries the **whole literal run** (the
+/// memmem needle, far more selective than a first-byte memchr) and works for a literal sitting
+/// anywhere on the mandatory concat spine — after several class/literal runs, or at the very end
+/// (`\w+\s+Holmes`, `[a-zA-Z]+ing`, `[\w.+-]+@gmail\.com`).
+///
+/// The skip: memmem to the next occurrence of `run`'s bytes at `q ≥ start`; walk **back** over
+/// `lead_class` to the earliest position a match could begin; run the engine unanchored from
+/// there. Sound because (1) `run` appears in *every* match (it is on the mandatory spine), so its
+/// first occurrence `≥ start` lower-bounds where the leftmost match's literal can sit, and (2)
+/// `lead_class` is a **superset** of every byte that can appear between a match's start and the
+/// literal, so the reverse scan never stops *after* the true start — it only ever over-reaches
+/// (still leftmost-correct, never missing a match). Linear: one memmem + one bounded reverse scan
+/// + one unanchored pass.
+///
+/// Largest number of leading class-repetition atoms (`\w+`, `\s+`, `[a-z]*`, a bare class) before
+/// the required literal that the **structured reverse walk** tracks. A pattern with more declines
+/// the walk (it falls back to the flat reverse-scan + unanchored find — slower but still correct).
+///
+/// @stable-since: v0.6.0
+pub const MAX_PRE_ATOMS = 4;
+
+/// One leading class-repetition atom before the required literal, for the structured reverse walk:
+/// its byte alphabet plus the repetition bounds. `max == maxInt(u32)` encodes an unbounded `+`/`*`.
+///
+/// @stable-since: v0.6.0
+pub const PreAtom = struct { bits: ByteSet, min: u32, max: u32 };
+
+/// @stable-since: v0.6.0
+pub const RequiredLiteralSkip = struct {
+    /// The required literal run (index pair into `Hir.literals`); its UTF-8 bytes are the memmem
+    /// needle. Always `len ≥ 1` here; the dispatcher additionally requires it to encode to ≥ 2
+    /// bytes (a one-byte needle degrades to a memchr already covered by `InnerAnchor`).
+    run: Node.Run,
+    /// Superset of the bytes that may appear before the literal in any match — the reverse-scan
+    /// alphabet. ASCII members exact; if any preceding atom has a code point ≥ 0x80, all high
+    /// bytes are set conservatively (see `classBytes`). Never the full 256 (the builder declines
+    /// a universal alphabet — `.`/`\X` before the literal — since the reverse scan would never
+    /// advance).
+    lead_class: ByteSet,
+    /// Fixed code-point distance from the match start to the literal when **every** atom before it
+    /// on the spine is fixed-length (`[a-q][^u-z]{13}x` → 14), else null. When non-null **and the
+    /// input is all-ASCII**, the literal sits exactly this many *bytes* into every match, so a
+    /// rare-byte memchr to the literal at `q` pins the start to `q - lead_fixed_cps`: a single
+    /// bounded anchored confirm there (one per occurrence) replaces a dense leading-class scan —
+    /// the win for a fixed-length negated-class pattern whose only selective feature is a rare
+    /// suffix byte. Null keeps the reverse-scan + unanchored-find path (`lead_class`).
+    ///
+    /// @stable-since: v0.6.0
+    lead_fixed_cps: ?u32 = null,
+    /// True when the literal is the **last consuming atom** — the match ends exactly at the literal
+    /// (`\w+\s+Holmes`, `[a-zA-Z]+ing`); only trailing zero-width anchors may follow. Lets the lazy
+    /// DFA arm confirm a memmem hit by a single **reverse-DFA pass** from the hit's end (precise
+    /// match start, no flat-reverse over-reach, no forward re-seed) instead of a reverse-scan +
+    /// unanchored find. False when a consuming atom follows the literal (`…Holmes\s+\w+`).
+    ///
+    /// @stable-since: v0.6.0
+    is_suffix: bool = false,
+    /// The leading class-repetition atoms **before** the literal (`\w+`, `\s+` in `\w+\s+Holmes`),
+    /// in spine order, when there are 1..`MAX_PRE_ATOMS` of them, each a single-class repetition,
+    /// and **adjacent classes are pairwise disjoint** — else `pre_n == 0`. When set, a matcher finds
+    /// the *exact* match start from a literal hit by a **structured reverse walk** (consume each
+    /// atom's class backward, in reverse spine order, greedily within `[min, max]`): disjoint
+    /// adjacency forces the split, so the walk lands on the true start with no over-reach. One
+    /// anchored confirm there per literal occurrence then validates the *whole* pattern (including
+    /// any atoms after the literal), so this drives both suffix (`\w+\s+Holmes`) and non-suffix
+    /// (`\w+\s+Holmes\s+\w+`) patterns — the win is running the automaton only at real candidate
+    /// starts instead of scanning the gaps. `pre_n == 0` keeps the flat reverse-scan path.
+    ///
+    /// @stable-since: v0.6.0
+    pre: [MAX_PRE_ATOMS]PreAtom = @splat(.{ .bits = .{}, .min = 0, .max = 0 }),
+    /// Number of valid entries in `pre` (0 = structured reverse walk unavailable).
+    ///
+    /// @stable-since: v0.6.0
+    pre_n: u8 = 0,
 };
 
 /// Cheap, precomputed facts a dispatcher/backend can consult without rewalking the
@@ -660,6 +745,13 @@ pub const Analysis = struct {
     ///
     /// @stable-since: v0.4.0
     inner_anchor: ?InnerAnchor,
+    /// A required interior/suffix literal with the alphabet of everything that may precede it,
+    /// or null (see `RequiredLiteralSkip`). Drives the general required-literal memmem skip for
+    /// `\w+\s+Holmes`-, `[a-zA-Z]+ing`-shaped patterns (a prefilter where neither a leading
+    /// literal nor a leading-class scan applies but a selective literal sits in the interior).
+    ///
+    /// @stable-since: v0.6.0
+    required_literal_skip: ?RequiredLiteralSkip,
     /// The possible **first UTF-8 bytes** of a match whose leading mandatory atom is a
     /// **class** with no fixed leading literal (`\d+`, `\d{4}-…`, `\p{N}+`, `\p{Lu}\p{Ll}+`),
     /// or null. Every match begins with a byte in this set, so a SIMD scan for the next
@@ -1558,6 +1650,7 @@ fn analyze(
         .line_anchored_start = startsLineAnchored(nodes, children, root),
         .prefix_set = prefixSet(nodes, children, root),
         .inner_anchor = innerAnchor(nodes, children, ranges, literals, root),
+        .required_literal_skip = requiredLiteralSkip(nodes, children, ranges, literals, root),
         .leading_class_first = leadingClassFirst(nodes, children, ranges, root),
     };
 }
@@ -2313,6 +2406,217 @@ fn innerAnchor(nodes: []const Node, children: []const u32, ranges: []const Range
     return .{ .byte = buf[0], .lead_class = lead, .lead_fixed_cps = leadFixedCps(nodes, children[d.start]) };
 }
 
+/// The general required-literal skip (see `RequiredLiteralSkip`), or null. Descends a capture to
+/// reach the top-level **concat**, then walks its children left to right accumulating `lead` —
+/// the union of every preceding atom's possible bytes (`atomByteSet`) — and records the **longest**
+/// mandatory `.literal` child preceded by at least one consuming atom, paired with the `lead`
+/// accumulated up to it. Stops extending at the first atom whose byte set is not computable (`.`,
+/// `\X`) — no literal past such an atom can have a bounded preceding alphabet. Returns null when
+/// no qualifying literal exists, or when the accumulated alphabet is the full 256 bytes (a reverse
+/// scan over which never advances). The longest literal is chosen for memmem selectivity.
+fn requiredLiteralSkip(nodes: []const Node, children: []const u32, ranges: []const Range, literals: []const CodePoint, idx: u32) ?RequiredLiteralSkip {
+    var root_idx = idx;
+    if (nodes[root_idx].tag == .capture) root_idx = nodes[root_idx].data.capture.child;
+    if (nodes[root_idx].tag != .concat) return null;
+    const d = nodes[root_idx].data.children;
+
+    var lead = ByteSet{};
+    var seen_consuming = false; // a prior atom that contributes bytes (else a leading literal — `prefixLiteral`'s job)
+    var fixed: ?u32 = 0; // running fixed cp-offset from match start; null once a variable atom is seen
+    var best: ?Node.Run = null;
+    var best_lead = ByteSet{};
+    var best_fixed: ?u32 = null;
+    var best_len: u32 = 0;
+    var best_pos: usize = 0; // index in `children` of the chosen literal (to test the suffix property)
+
+    var i = d.start;
+    while (i < d.start + d.len) : (i += 1) {
+        const ci = children[i];
+        const node = nodes[ci];
+        if (node.tag == .literal and seen_consuming and node.data.run.len > best_len) {
+            best = node.data.run;
+            best_lead = lead;
+            best_fixed = fixed;
+            best_len = node.data.run.len;
+            best_pos = i;
+        }
+        // Fold this atom's bytes into the running alphabet for any later literal. An
+        // uncomputable atom (`.`/`\X`) bounds how far we can extend — stop here.
+        const bs = atomByteSet(nodes, children, ranges, literals, ci) orelse break;
+        if (!bs.isEmpty()) seen_consuming = true;
+        lead.unionWith(bs);
+        // Track the fixed cp-offset (for the fixed-offset confirm); a variable atom latches null.
+        if (fixed) |fx| {
+            fixed = if (atomFixedCps(nodes, children, ci)) |a| fx + a else null;
+        }
+    }
+
+    const run = best orelse return null;
+    if (best_lead.count() >= 256) return null; // universal alphabet — the reverse scan can't advance
+
+    // Suffix property: every consuming atom is at or before the literal — the match ends exactly at
+    // the literal end (`\w+\s+Holmes`, `[a-zA-Z]+ing`), which lets a matcher reverse-confirm from a
+    // memmem hit's end with no forward extension. False when a consuming atom follows it
+    // (`\w+\s+Holmes\s+\w+`); only trailing zero-width anchors/empties are allowed after.
+    var is_suffix = true;
+    var j = best_pos + 1;
+    while (j < d.start + d.len) : (j += 1) {
+        switch (nodes[children[j]].tag) {
+            .anchor, .empty => {},
+            else => {
+                is_suffix = false;
+                break;
+            },
+        }
+    }
+
+    // Structured reverse-walk atoms: the class-repetition atoms before the literal, in spine order,
+    // when each is a single-class repetition and adjacent classes are pairwise disjoint (so a greedy
+    // reverse consume per atom lands on the exact start). Zero-width atoms are skipped. Any other
+    // atom (a literal, `.`, an alternation, an overlapping-class neighbour, or > MAX) disables it.
+    var pre: [MAX_PRE_ATOMS]PreAtom = @splat(.{ .bits = .{}, .min = 0, .max = 0 });
+    var pre_n: u8 = 0;
+    var pre_ok = true;
+    {
+        var k = d.start;
+        while (k < best_pos) : (k += 1) {
+            switch (nodes[children[k]].tag) {
+                .anchor, .empty => continue, // zero-width: consumes nothing
+                else => {},
+            }
+            const cr = classRepInfo(nodes, children, ranges, children[k]) orelse {
+                pre_ok = false;
+                break;
+            };
+            if (pre_n >= MAX_PRE_ATOMS) {
+                pre_ok = false;
+                break;
+            }
+            pre[pre_n] = cr;
+            pre_n += 1;
+        }
+    }
+    if (pre_ok and pre_n > 0) {
+        // Adjacent spine classes must be disjoint so the greedy reverse split is forced (and exact).
+        var a: usize = 1;
+        while (a < pre_n) : (a += 1) {
+            if (!bytesDisjoint(pre[a - 1].bits, pre[a].bits)) {
+                pre_ok = false;
+                break;
+            }
+        }
+    } else pre_ok = false;
+    if (!pre_ok) pre_n = 0;
+
+    return .{
+        .run = run,
+        .lead_class = best_lead,
+        .lead_fixed_cps = best_fixed,
+        .is_suffix = is_suffix,
+        .pre = pre,
+        .pre_n = pre_n,
+    };
+}
+
+/// Byte alphabet + repetition bounds of a single-class-repetition atom (`\w+`, `[a-z]{2,5}`, a bare
+/// class), or null when `idx` is not such an atom (a literal, `.`, an alternation, a multi-atom
+/// group). A bare class is `[1,1]`; an unbounded repetition reports `max = maxInt`. Descends a
+/// capture. Used to build the structured reverse-walk atoms (`RequiredLiteralSkip.pre`).
+fn classRepInfo(nodes: []const Node, children: []const u32, ranges: []const Range, idx: u32) ?PreAtom {
+    const node = nodes[idx];
+    return switch (node.tag) {
+        .class => .{ .bits = classBytes(ranges[node.data.class.start .. node.data.class.start + node.data.class.len]), .min = 1, .max = 1 },
+        .capture => classRepInfo(nodes, children, ranges, node.data.capture.child),
+        .repetition => blk: {
+            const r = node.data.repetition;
+            if (nodes[r.child].tag != .class) break :blk null; // only a direct class body
+            const c = nodes[r.child].data.class;
+            break :blk .{ .bits = classBytes(ranges[c.start .. c.start + c.len]), .min = r.min, .max = r.max orelse std.math.maxInt(u32) };
+        },
+        else => null,
+    };
+}
+
+/// Whether two byte sets share no **ASCII** (`< 0x80`) member — the condition that makes a greedy
+/// reverse consume of adjacent structured-walk atoms unambiguous. Only ASCII matters: the
+/// structured walk's fast path runs on pure-ASCII windows (high bytes, which `classBytes` sets
+/// conservatively for every Unicode class, fall to the dispatcher's flat-scan fallback), so the
+/// shared high bytes of `\w`/`\s` must not spuriously fail the disjointness gate.
+fn bytesDisjoint(a: ByteSet, b: ByteSet) bool {
+    return (a.bits[0] & b.bits[0]) == 0 and (a.bits[1] & b.bits[1]) == 0; // bytes 0..127
+}
+
+/// Fixed code-point length of an atom, or null when it is variable-length. Like `leadFixedCps`
+/// but over the general atom set used by `requiredLiteralSkip`: a class / `.` is one code point,
+/// a literal run its length, a fixed (`min==max`) repetition `count × body`, a concat the sum,
+/// an alternation the common length only when every branch agrees, zero-width atoms contribute 0.
+fn atomFixedCps(nodes: []const Node, children: []const u32, idx: u32) ?u32 {
+    const node = nodes[idx];
+    return switch (node.tag) {
+        .empty, .anchor => 0,
+        .literal => node.data.run.len,
+        .class, .any => 1,
+        .grapheme => null, // a grapheme cluster is a variable number of code points
+        .capture => atomFixedCps(nodes, children, node.data.capture.child),
+        .repetition => blk: {
+            const r = node.data.repetition;
+            const mx = r.max orelse break :blk null;
+            if (mx != r.min) break :blk null;
+            const body = atomFixedCps(nodes, children, r.child) orelse break :blk null;
+            break :blk r.min * body;
+        },
+        .concat => blk: {
+            const d = node.data.children;
+            var sum: u32 = 0;
+            for (children[d.start .. d.start + d.len]) |ci| sum += atomFixedCps(nodes, children, ci) orelse break :blk null;
+            break :blk sum;
+        },
+        .alternation => blk: {
+            const d = node.data.children;
+            var common: ?u32 = null;
+            for (children[d.start .. d.start + d.len]) |ci| {
+                const c = atomFixedCps(nodes, children, ci) orelse break :blk null;
+                if (common) |cm| {
+                    if (cm != c) break :blk null; // branches differ in length → variable
+                } else common = c;
+            }
+            break :blk common;
+        },
+    };
+}
+
+/// The superset of UTF-8 bytes an atom can contribute to a match, or null when that set is the
+/// whole byte space / not statically computable (`.` `any`, `\X` grapheme). Literals contribute
+/// their code points' bytes; a class its `classBytes` (ASCII exact, high conservative); a
+/// repetition/capture descends to the child; a concat/alternation unions its members (a sound
+/// superset — every branch's bytes may appear). Used to accumulate a required literal's
+/// reverse-scan alphabet (`requiredLiteralSkip`).
+fn atomByteSet(nodes: []const Node, children: []const u32, ranges: []const Range, literals: []const CodePoint, idx: u32) ?ByteSet {
+    const node = nodes[idx];
+    switch (node.tag) {
+        .empty, .anchor => return ByteSet{}, // zero-width: no bytes
+        .literal => {
+            var bs = ByteSet{};
+            const r = node.data.run;
+            for (literals[r.start .. r.start + r.len]) |c| addCpBytes(&bs, c);
+            return bs;
+        },
+        .class => return classBytes(ranges[node.data.class.start .. node.data.class.start + node.data.class.len]),
+        .capture => return atomByteSet(nodes, children, ranges, literals, node.data.capture.child),
+        .repetition => return atomByteSet(nodes, children, ranges, literals, node.data.repetition.child),
+        .concat, .alternation => {
+            var bs = ByteSet{};
+            const d = node.data.children;
+            for (children[d.start .. d.start + d.len]) |ci| {
+                const child = atomByteSet(nodes, children, ranges, literals, ci) orelse return null;
+                bs.unionWith(child);
+            }
+            return bs;
+        },
+        .any, .grapheme => return null, // universal / unbounded alphabet
+    }
+}
+
 /// Code-point length of a leading run when it is **fixed**, else null (see
 /// `InnerAnchor.lead_fixed_cps`). A bare class is one code point; a counted repetition of a
 /// fixed-length body (`\d{4}`) is `min × body` when `min == max`; a capture descends to its
@@ -3039,6 +3343,105 @@ test "analysis: prefilter + feasibility facts" {
         try testing.expectEqual(@as(?u32, null), h.analysis.max_len);
         try testing.expectEqual(@as(?u32, null), h.analysis.max_utf8_len);
         try testing.expectEqual(@as(u32, 1), h.analysis.min_utf8_len); // just the leading 'a'
+    }
+}
+
+test "analysis: required_literal_skip — interior/suffix literal with preceding alphabet" {
+    var diag: compile.Diagnostic = .{};
+
+    // `\w+\s+Holmes`: suffix literal "Holmes" after two class runs. The skip needle is the
+    // literal run; the reverse-scan alphabet is word ∪ space (∪ all high bytes, since \w/\s
+    // include non-ASCII), and excludes ASCII punctuation.
+    {
+        const a = try compile.parse(testing.allocator, "\\w+\\s+Holmes", &diag);
+        defer a.deinit(testing.allocator);
+        const h = try buildAlloc(testing.allocator, a, .{});
+        defer deinitHir(testing.allocator, h);
+        const rl = h.analysis.required_literal_skip.?;
+        try testing.expectEqual(@as(u32, 6), rl.run.len);
+        try testing.expectEqual(@as(CodePoint, 'H'), h.literals[rl.run.start]);
+        for ("abcXYZ0_9 \t") |b| try testing.expect(rl.lead_class.has(b)); // word + space members
+        try testing.expect(!rl.lead_class.has('!')); // ASCII punctuation excluded → scan stops there
+        try testing.expect(!rl.lead_class.has('@'));
+        try testing.expect(rl.is_suffix); // "Holmes" is the last consuming atom
+        try testing.expectEqual(@as(?u32, null), rl.lead_fixed_cps); // \w+ is variable-length
+        // Structured reverse walk: two disjoint class-reps (\w+, \s+) precede the literal.
+        try testing.expectEqual(@as(u8, 2), rl.pre_n);
+        try testing.expect(rl.pre[0].bits.has('a') and rl.pre[0].min == 1); // \w+
+        try testing.expect(rl.pre[1].bits.has(' ') and !rl.pre[1].bits.has('a')); // \s+ (disjoint from \w)
+    }
+
+    // `[a-q][^u-z]{13}x`: fixed-length (15 cp), literal "x" at fixed cp-offset 14, suffix.
+    {
+        const a = try compile.parse(testing.allocator, "[a-q][^u-z]{13}x", &diag);
+        defer a.deinit(testing.allocator);
+        const h = try buildAlloc(testing.allocator, a, .{});
+        defer deinitHir(testing.allocator, h);
+        const rl = h.analysis.required_literal_skip.?;
+        try testing.expectEqual(@as(CodePoint, 'x'), h.literals[rl.run.start]);
+        try testing.expectEqual(@as(?u32, 14), rl.lead_fixed_cps); // 1 ([a-q]) + 13 ([^u-z]{13})
+        try testing.expect(rl.is_suffix);
+    }
+
+    // `[a-zA-Z]+ing`: the first-byte memchr ('i') is common, but the whole "ing" needle is
+    // selective. Alphabet is the ASCII letters only (no high bytes — class is ASCII-only).
+    {
+        const a = try compile.parse(testing.allocator, "[a-zA-Z]+ing", &diag);
+        defer a.deinit(testing.allocator);
+        const h = try buildAlloc(testing.allocator, a, .{});
+        defer deinitHir(testing.allocator, h);
+        const rl = h.analysis.required_literal_skip.?;
+        try testing.expectEqual(@as(u32, 3), rl.run.len);
+        try testing.expectEqual(@as(CodePoint, 'i'), h.literals[rl.run.start]);
+        try testing.expect(rl.lead_class.has('a') and rl.lead_class.has('Z'));
+        try testing.expect(!rl.lead_class.has('0') and !rl.lead_class.has(' '));
+        try testing.expect(!rl.lead_class.has(0x80)); // ASCII-only class — no high bytes
+    }
+
+    // A leading literal (`abc[0-9]+xy`) is the `prefix_literal`'s job; the skip is still offered
+    // for the longest *interior/suffix* required literal, but the dispatcher only consults it when
+    // there is no leading literal. Here the longest interior literal preceded by a consuming atom
+    // is "xy" (after "abc" and the class run).
+    {
+        const a = try compile.parse(testing.allocator, "abc[0-9]+xy", &diag);
+        defer a.deinit(testing.allocator);
+        const h = try buildAlloc(testing.allocator, a, .{});
+        defer deinitHir(testing.allocator, h);
+        const rl = h.analysis.required_literal_skip.?;
+        try testing.expectEqual(@as(CodePoint, 'x'), h.literals[rl.run.start]);
+        try testing.expect(rl.lead_class.has('a') and rl.lead_class.has('0')); // "abc" ∪ [0-9]
+        try testing.expect(rl.is_suffix); // "xy" is the last consuming atom
+        try testing.expectEqual(@as(?u32, null), rl.lead_fixed_cps); // [0-9]+ is variable
+    }
+
+    // Interior (non-suffix) literal: a consuming atom follows it.
+    {
+        const a = try compile.parse(testing.allocator, "\\w+\\s+Holmes\\s+\\w+", &diag);
+        defer a.deinit(testing.allocator);
+        const h = try buildAlloc(testing.allocator, a, .{});
+        defer deinitHir(testing.allocator, h);
+        const rl = h.analysis.required_literal_skip.?;
+        try testing.expectEqual(@as(CodePoint, 'H'), h.literals[rl.run.start]);
+        try testing.expect(!rl.is_suffix); // trailing \s+\w+ follows "Holmes"
+        try testing.expectEqual(@as(u8, 2), rl.pre_n); // \w+ \s+ before "Holmes" — structured walk applies
+    }
+
+    // A `.`/`.*` before any interior literal makes the preceding alphabet universal → declined.
+    {
+        const a = try compile.parse(testing.allocator, ".*Holmes", &diag);
+        defer a.deinit(testing.allocator);
+        const h = try buildAlloc(testing.allocator, a, .{});
+        defer deinitHir(testing.allocator, h);
+        try testing.expect(h.analysis.required_literal_skip == null);
+    }
+
+    // A top-level alternation has no mandatory spine literal → declined.
+    {
+        const a = try compile.parse(testing.allocator, "cat|dog", &diag);
+        defer a.deinit(testing.allocator);
+        const h = try buildAlloc(testing.allocator, a, .{});
+        defer deinitHir(testing.allocator, h);
+        try testing.expect(h.analysis.required_literal_skip == null);
     }
 }
 

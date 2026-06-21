@@ -635,6 +635,12 @@ _ = an.inner_anchor;        // a required literal right after a leading class ru
 _ = an.inner_anchor.?.lead_fixed_cps; // 0.5.0: code-point length of the leading run when FIXED (\d{4}- → 4)
 _ = an.leading_class_first; // first-byte set of a leading class with no fixed literal (\d+ → {0-9,…})
 _ = an.line_anchored_start; // every match begins at a line start ((?m)^ / ^)
+// 0.6.0 prefilter fact:
+_ = an.required_literal_skip; // a required interior/suffix literal (\w+\s+Holmes, [a-zA-Z]+ing):
+                              //   .run (the memmem needle), .lead_class (preceding alphabet),
+                              //   .lead_fixed_cps (fixed cp-offset, e.g. [a-q][^u-z]{13}x → 14),
+                              //   .is_suffix, and .pre/.pre_n (disjoint class-rep pre-atoms for the
+                              //   structured reverse walk to the exact start)
 ```
 
 Since **0.5.0** `auto` consumes three more facts (all results-invariant): a `\b`-wrapped pure
@@ -645,6 +651,17 @@ pinned start on ASCII input; and a `(?m)^…` pattern with no eager DFA (`line_a
 attempts the match anchored at each **line start** for span and captures. `auto` also gates the
 eager-DFA build attempt on byte-NFA size, so a big Unicode-class join (`\w+@\w+`, email) uses the
 lazy DFA directly instead of a multi-hundred-ms determinization (email compile ~0.88 s → ~6 ms).
+
+Since **0.6.0** `auto` consumes `required_literal_skip` (results-invariant): a pattern with no
+leading literal but a selective literal in its **interior or suffix** (`\w+\s+Holmes`,
+`[a-zA-Z]+ing`) leaps to that literal with `memmem`, then — when the atoms before it are **disjoint
+class-repetitions** — does a **structured reverse walk** backward to the *exact* match start and
+runs one anchored confirm per hit (the automaton runs only at real candidate starts, not over the
+gaps; ASCII-exact, with a sound flat-scan fallback for non-ASCII windows). A bounded fixed-length
+pattern with a **rare byte at a fixed code-point offset** (`[a-q][^u-z]{13}x`) instead `memchr`s the
+byte and confirms at the pinned start. On Sherlock these take `\w+\s+Holmes`/`\w+\s+Holmes\s+\w+`
+from ~13×/~28× behind Rust to ~1.2× (parity), and `[a-q][^u-z]{13}x` from ~183× behind to faster
+than Rust.
 
 A couple more, illustrating soundness:
 

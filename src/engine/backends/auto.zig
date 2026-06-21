@@ -27,6 +27,15 @@
 //!         OR a synthesised **case-variant set** for a small-class / `(?i)` lead (`(?i)the` →
 //!         `{THE…the}`, `(?i)что`) — → the **Teddy** SIMD multi-literal scan (`prefix_teddy`),
 //!         scalar `multiPrefixFrom` as the comptime/non-native fallback;
+//!       - **required interior/suffix literal** — a selective literal anywhere on the mandatory
+//!         spine when no leading literal applies (`\w+\s+Holmes`, `[a-zA-Z]+ing`): `memmem` the
+//!         *whole* literal, then — when the atoms before it are **disjoint class-repetitions** — a
+//!         **structured reverse walk** to the EXACT match start + one anchored confirm per hit
+//!         (`req_pre`, the automaton runs only at real candidate starts, not over the gaps; ASCII-
+//!         exact, with a flat-scan fallback for non-ASCII windows). A bounded fixed-length pattern
+//!         with a **rare byte at a fixed code-point offset** (`[a-q][^u-z]{13}x`) instead `memchr`s
+//!         that byte and confirms at `cpBack(q, off)` (`req_lit_fixed_off`). Otherwise a `memmem`
+//!         skip + reverse-scan over the preceding alphabet + one unanchored find;
 //!       - **interior anchor** — a required literal after a leading class run (`[\w.+-]+@…`,
 //!         `\d{4}-…`): memchr to the anchor, then either a bounded reverse-scan + native find
 //!         (variable run) or, when the leading run is **fixed-length** and the input is ASCII, a
@@ -288,6 +297,63 @@ pub const Filter = struct {
     ///
     /// @stable-since: v0.4.0
     inner_lead: hir.ByteSet = .{},
+
+    /// UTF-8 bytes of a **required interior/suffix literal** (`analysis.required_literal_skip`),
+    /// truncated to `MAX_PREFIX_LEN` at a code-point boundary — the **memmem** start-skip needle
+    /// for a pattern with no leading literal but a selective literal in its interior or at its end
+    /// (`\w+\s+Holmes`, `[a-zA-Z]+ing`, `[\w.+-]+@gmail\.com`). The general form of `inner_byte`:
+    /// it leaps on the *whole literal* (far fewer candidates than a single common byte like the
+    /// `i` of "ing"), then walks back over `req_lead` to the earliest match start and runs one
+    /// unanchored pass. `req_lit_len == 0` means unused. Set only when no `prefix`/`prefix_set`
+    /// applies, and only when the needle is ≥ 2 bytes (a 1-byte needle is `inner_byte`'s memchr).
+    ///
+    /// @stable-since: v0.6.0
+    req_lit: [MAX_PREFIX_LEN]u8 = @splat(0),
+    /// Number of valid bytes in `req_lit` (0 = unused; otherwise ≥ 2).
+    ///
+    /// @stable-since: v0.6.0
+    req_lit_len: u8 = 0,
+    /// Reverse-scan alphabet for `req_lit`: the bytes that may precede the literal in any match
+    /// (a sound superset). The skip walks back over these from a needle hit to the earliest
+    /// possible match start. Meaningful only when `req_lit_len > 0` (see `hir.RequiredLiteralSkip`).
+    ///
+    /// @stable-since: v0.6.0
+    req_lead: hir.ByteSet = .{},
+    /// Fixed cp-distance from the match start to `req_lit` when the leading spine is fixed-length
+    /// (`hir.RequiredLiteralSkip.lead_fixed_cps`), else null. On ASCII input this is the byte
+    /// distance, so a memchr to the (rare) literal byte at `q` pins the start to `q - off`: a single
+    /// anchored confirm there per occurrence — the **Pass 2** fixed-offset rare-byte confirm for a
+    /// bounded fixed-length pattern (`[a-q][^u-z]{13}x`). Set only when the needle is a single byte
+    /// rare enough (`byteFreq ≤ INNER_ANCHOR_RARE_MAX`) and the match is bounded; otherwise the
+    /// (≥2-byte) memmem variable path is used instead.
+    ///
+    /// @stable-since: v0.6.0
+    req_lit_fixed_off: ?u32 = null,
+    /// True when `req_lit` is the match's **suffix** (last consuming atom) — the match ends exactly
+    /// at the literal (`hir.RequiredLiteralSkip.is_suffix`). On the lazy-DFA arm this lets a memmem
+    /// hit be confirmed by a precise reverse-DFA pass from the hit's end (no flat-reverse over-reach,
+    /// no forward re-seed) rather than reverse-scan + unanchored find.
+    ///
+    /// @stable-since: v0.6.0
+    req_lit_suffix: bool = false,
+
+    /// Structured reverse-walk atoms (`hir.RequiredLiteralSkip.pre`): the disjoint class-repetition
+    /// atoms before the literal, in spine order. When `req_pre_n > 0`, the DFA arms find the **exact**
+    /// match start from a memmem hit by walking these backward (reverse spine order, greedy within
+    /// `[min,max]`) — no over-reach — then run ONE anchored confirm per occurrence (the win for
+    /// `\w+\s+Holmes`/`\w+\s+Holmes\s+\w+`: the automaton runs only at real candidate starts, not over
+    /// the gaps). The walk is exact only over ASCII (the classes' high bytes are conservative), so the
+    /// arm engages on ASCII-dominant input and per occurrence verifies the window is pure-ASCII;
+    /// the rare non-ASCII window falls back to a flat reverse-scan + bounded confirm sweep.
+    ///
+    /// @stable-since: v0.6.0
+    req_pre: [hir.MAX_PRE_ATOMS]hir.ByteSet = @splat(.{}),
+    /// @stable-since: v0.6.0
+    req_pre_min: [hir.MAX_PRE_ATOMS]u32 = @splat(0),
+    /// @stable-since: v0.6.0
+    req_pre_max: [hir.MAX_PRE_ATOMS]u32 = @splat(0),
+    /// Number of valid `req_pre` atoms (0 = structured walk unavailable). @stable-since: v0.6.0
+    req_pre_n: u8 = 0,
 
     /// The match has a **bounded** maximum length (`max_utf8_len ≤ CONFIRM_MAX`), so an
     /// anchored confirm reads at most that many bytes. This makes a **per-occurrence**
@@ -639,10 +705,44 @@ fn filterFromAnalysis(h: hir.Hir) Filter {
         }
     }
 
+    // 3b. General required interior/suffix literal (`\w+\s+Holmes`, `[a-zA-Z]+ing`,
+    //     `[\w.+-]+@gmail\.com`): memmem the *whole* literal — selective even when its first byte
+    //     is common (the `i` of "ing") — then reverse-scan over the preceding alphabet to the
+    //     earliest match start. The general form of `inner_byte` (which only fires for a literal
+    //     immediately after one leading class run, and only via a first-byte memchr); the search
+    //     arms prefer this whenever it is set (≥ 2-byte needle). Only when no leading literal/set.
+    if (f.prefix_len == 0 and f.prefix_set_n == 0) {
+        if (an.required_literal_skip) |rl| {
+            const n = encodeRun(h, rl.run, &f.req_lit);
+            if (n >= 2) {
+                // Variable path: memmem the whole (≥ 2-byte) literal, reverse-scan to the start.
+                f.req_lit_len = n;
+                f.req_lead = rl.lead_class;
+                f.req_lit_suffix = rl.is_suffix;
+                // Structured reverse-walk atoms (the precise-start fast path; see `Filter.req_pre`).
+                f.req_pre_n = rl.pre_n;
+                for (0..rl.pre_n) |i| {
+                    f.req_pre[i] = rl.pre[i].bits;
+                    f.req_pre_min[i] = rl.pre[i].min;
+                    f.req_pre_max[i] = rl.pre[i].max;
+                }
+            } else if (n == 1 and f.bounded_confirm and rl.lead_fixed_cps != null and
+                memmem.byteFreq(f.req_lit[0]) <= INNER_ANCHOR_RARE_MAX)
+            {
+                // Pass 2 fixed-offset path: a single RARE byte at a fixed cp-offset in a bounded
+                // fixed-length pattern (`[a-q][^u-z]{13}x`). memchr the byte, confirm at `q - off`.
+                f.req_lit_len = 1;
+                f.req_lead = rl.lead_class; // used by the runNfa variable fallback
+                f.req_lit_fixed_off = rl.lead_fixed_cps;
+                f.req_lit_suffix = rl.is_suffix;
+            }
+        }
+    }
+
     // 4. Leading-class first-byte scan (`\d+`, `\p{N}+`, `\d{4}-…`): no literal / set / inner
     //    anchor applies, but the match begins with a class byte — SIMD-scan to the next
     //    member. Only when the set is selective (a near-universal set like `\p{L}+` is not).
-    if (f.prefix_len == 0 and f.prefix_set_n == 0 and f.inner_byte == null) {
+    if (f.prefix_len == 0 and f.prefix_set_n == 0 and f.inner_byte == null and f.req_lit_len == 0) {
         if (an.leading_class_first) |bs| {
             if (classLeadSelective(bs)) {
                 f.class_lead = bs;
@@ -663,7 +763,7 @@ fn filterFromAnalysis(h: hir.Hir) Filter {
 
     // 5. Rarest required byte for a presence fast-reject — only when nothing above gives an
     //    actual skip (with a skip the byte is already implied present).
-    if (f.prefix_byte == null and f.prefix_set_n == 0 and f.inner_byte == null and f.class_lead == null and !an.required_bytes.isEmpty()) {
+    if (f.prefix_byte == null and f.prefix_set_n == 0 and f.inner_byte == null and f.req_lit_len == 0 and f.class_lead == null and !an.required_bytes.isEmpty()) {
         var best: ?u8 = null;
         var best_score: u8 = 255;
         var b: u16 = 0;
@@ -1398,6 +1498,23 @@ fn memchrFrom(input: []const u8, start: usize, b: u8) ?usize {
 /// fallback (`Finder.find` handles `@inComptime()` internally — no `@Vector` in const-eval).
 ///
 /// @stable-since: v0.4.0
+/// Byte offset `n` **code points** before `q` in (valid-UTF-8) `input`, or null when fewer than
+/// `n` code points precede `q`. Steps back over UTF-8 continuation bytes (`0x80..0xBF`) so each
+/// iteration lands on a code-point boundary — exact for ASCII (`q - n`) and multi-byte alike. Used
+/// by the fixed-offset required-literal confirm to pin a match start a fixed *code-point* distance
+/// before a literal hit without assuming the leading run is ASCII (the byte distance varies).
+/// Comptime-safe (plain scalar loop).
+fn cpBack(input: []const u8, q: usize, n: u32) ?usize {
+    var p = q;
+    var k: u32 = 0;
+    while (k < n) : (k += 1) {
+        if (p == 0) return null;
+        p -= 1;
+        while (p > 0 and (input[p] & 0xC0) == 0x80) p -= 1; // step into the lead byte of this cp
+    }
+    return p;
+}
+
 fn memmemFrom(input: []const u8, start: usize, needle: []const u8) ?usize {
     if (needle.len == 0) return if (start <= input.len) start else null;
     if (needle.len == 1) return memchrFrom(input, start, needle[0]);
@@ -1442,6 +1559,70 @@ fn innerSkipFrom(filter: *const Filter, input: []const u8, start: usize) ?usize 
     const p = memchrFrom(input, start, anchor) orelse return null;
     var cs = p;
     while (cs > start and filter.inner_lead.has(input[cs - 1])) cs -= 1;
+    return cs;
+}
+
+/// Required-literal start-skip (the general `\w+\s+Holmes` / `[a-zA-Z]+ing` form of
+/// `innerSkipFrom`): memmem to the next occurrence of the whole required literal `≥ start`, then
+/// walk **back** over `req_lead` to the earliest position a match could begin, and return that.
+/// Null when the literal is absent (no match can exist). Sound: every match contains the literal
+/// (it is on the mandatory spine), and `req_lead` is a superset of the bytes that may precede it,
+/// so no match begins before the reverse-scanned start. Linear: the memmem leaps literal-to-
+/// literal, the reverse scan is bounded by the run it walks, then one unanchored pass follows.
+fn reqLitSkipFrom(filter: *const Filter, input: []const u8, start: usize) ?usize {
+    const needle = filter.req_lit[0..filter.req_lit_len];
+    const p = memmemFrom(input, start, needle) orelse return null;
+    var cs = p;
+    while (cs > start and filter.req_lead.has(input[cs - 1])) cs -= 1;
+    return cs;
+}
+
+/// Outcome of the structured reverse walk at a literal hit `q` (see `structuredStart`).
+const WalkResult = union(enum) {
+    /// The pre-atom structure cannot be satisfied before `q` (a real ASCII boundary) — no match
+    /// can use this occurrence; skip it.
+    skip,
+    /// The exact match start (the walk stayed within pure ASCII, so it is precise).
+    exact: usize,
+    /// A non-ASCII byte was hit inside the pre-region, so the byte walk cannot be trusted (a
+    /// multi-byte code point may belong to a class) — the caller must fall back to a sound scan.
+    impure,
+};
+
+/// Structured reverse walk: from a literal hit at `q`, consume each pre-atom's class backward in
+/// **reverse spine order**, greedily within `[min, max]`. Disjoint adjacency (guaranteed by the
+/// builder over ASCII) makes the split unambiguous, so the walk lands on the **exact** match start.
+/// Returns `.exact` on a clean ASCII walk, `.skip` when an atom's `min` cannot be met (no match
+/// here), or `.impure` when a byte `≥ 0x80` is met (the walk would be unsound — fall back).
+fn structuredStart(filter: *const Filter, input: []const u8, q: usize, lo: usize) WalkResult {
+    var p = q;
+    var i: usize = filter.req_pre_n;
+    while (i > 0) {
+        i -= 1;
+        const cls = filter.req_pre[i];
+        const mn = filter.req_pre_min[i];
+        const mx = filter.req_pre_max[i];
+        var cnt: u32 = 0;
+        while (p > lo and cnt < mx) {
+            const bb = input[p - 1];
+            if (bb >= 0x80) return .impure; // multi-byte cp may belong to this class — can't byte-walk
+            if (!cls.has(bb)) break; // ASCII boundary: this atom is done
+            p -= 1;
+            cnt += 1;
+        }
+        if (cnt < mn) return .skip; // atom's min unmet → no match uses this occurrence
+    }
+    // The leading atom may still extend into a preceding high byte (a multi-byte word char) — impure.
+    if (p > lo and input[p - 1] >= 0x80) return .impure;
+    return .{ .exact = p };
+}
+
+/// Flat reverse-scan lower bound for the impure fallback: walk back over `req_lead` (the sound
+/// superset alphabet) from `q` to the earliest position a match could begin. A sound lower bound
+/// (`≤` the true start), so a bounded confirm sweep `[lb, q]` cannot miss the match.
+fn reqFlatLowerBound(filter: *const Filter, input: []const u8, q: usize, lo: usize) usize {
+    var cs = q;
+    while (cs > lo and filter.req_lead.has(input[cs - 1])) cs -= 1;
     return cs;
 }
 
@@ -1571,6 +1752,13 @@ fn runNfa(p: *const nfa.Program, filter: *const Filter, tdy: ?*const teddy.Teddy
         o.start = nextPrefixHit(filter, tdy, input, o.start) orelse return null;
         o.start -|= filter.prefix_set_off_max;
         if (input.len - o.start < filter.min_bytes) return null;
+    } else if (filter.req_lit_len > 0) {
+        // Required interior/suffix-literal skip (`\w+\s+Holmes`, `[a-zA-Z]+ing`): leap to the next
+        // occurrence of the whole literal via memmem, reverse-scan over the preceding alphabet to
+        // the earliest match start, then one linear dispatch from there. Sound + O(input) (single
+        // skip, never a per-occurrence confirm loop — same Θ(n²) hazard avoidance as the prefix arm).
+        o.start = reqLitSkipFrom(filter, input, o.start) orelse return null;
+        if (input.len - o.start < filter.min_bytes) return null;
     } else if (filter.inner_byte != null) {
         // Interior-anchor skip (`[\w.+-]+@…`): leap to the next anchor byte, reverse-scan to
         // the earliest run start, then one linear dispatch from there. Sound + O(input).
@@ -1698,6 +1886,61 @@ fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.
         }
         o.start = nextPrefixHit(filter, tdy, input, o.start) orelse return null;
         o.start -|= filter.prefix_set_off_max;
+        if (input.len - o.start < filter.min_bytes) return null;
+    } else if (filter.req_lit_len > 0) {
+        // Structured reverse-walk fast path (`\w+\s+Holmes`, `\w+\s+Holmes\s+\w+`): per memmem hit,
+        // walk the disjoint pre-atom classes backward to the EXACT start, then one anchored confirm —
+        // the automaton runs only at real candidate starts, not over the gaps. Exact only over ASCII;
+        // engage on ASCII-dominant input and verify each window is pure-ASCII, with a sound flat-scan
+        // sweep fallback for the rare non-ASCII window. See `Filter.req_pre`.
+        if (filter.req_pre_n > 0 and ascii_dominant) {
+            const needle = filter.req_lit[0..filter.req_lit_len];
+            var pos = o.start;
+            while (memmemFrom(input, pos, needle)) |q| {
+                pos = q + 1;
+                switch (structuredStart(filter, input, q, o.start)) {
+                    .skip => {},
+                    .exact => |cand| {
+                        if (input.len - cand >= filter.min_bytes)
+                            if (dfaConfirmAt(dp, d, input, cand, match_only)) |m| return m;
+                    },
+                    .impure => {
+                        var s = reqFlatLowerBound(filter, input, q, o.start);
+                        while (s <= q) : (s += 1) {
+                            if (input.len - s < filter.min_bytes) break;
+                            if (dfaConfirmAt(dp, d, input, s, match_only)) |m| return m;
+                        }
+                    },
+                }
+            }
+            return null;
+        }
+        // Required interior/suffix-literal skip (`\w+\s+Holmes`, `[a-zA-Z]+ing`): memmem to the
+        // literal, reverse-scan over the preceding alphabet to the earliest match start, then ONE
+        // native (unanchored) DFA find from there. We deliberately do NOT do a per-occurrence
+        // *anchored* confirm here (unlike the `inner_byte`/`prefix_set` arms): `req_lead` is only a
+        // superset of the preceding alphabet, so the reverse scan can over-reach to a position the
+        // match does not start at (`\w+\s+Holmes` over "ab cd Holmes" → cs='a', but the match is
+        // "cd Holmes"); only an unanchored forward find from cs is leftmost-correct. Sound + O(input)
+        // (single skip + the lazy DFA's O(input) reverse find).
+        if (filter.req_lit_fixed_off) |off| {
+            // Pass 2 — fixed-offset rare-byte confirm (`[a-q][^u-z]{13}x`): the rare literal byte sits
+            // a fixed *code-point* distance `off` from the match start in a bounded fixed-length match.
+            // memchr the byte at `q`, walk back `off` code points (UTF-8 aware — exact on any input),
+            // and confirm anchored at that pinned start, one confirm per occurrence — far fewer than
+            // scanning the dense leading class. Leftmost-first (q ascending) + O(input).
+            const b = filter.req_lit[0];
+            var pos = o.start;
+            while (memchrFrom(input, pos, b)) |q| {
+                pos = q + 1;
+                const cand = cpBack(input, q, off) orelse continue;
+                if (cand < o.start) continue;
+                if (input.len - cand < filter.min_bytes) return null;
+                if (dfaConfirmAt(dp, d, input, cand, match_only)) |m| return m;
+            }
+            return null;
+        }
+        o.start = reqLitSkipFrom(filter, input, o.start) orelse return null;
         if (input.len - o.start < filter.min_bytes) return null;
     } else if (filter.inner_byte) |anchor| {
         // Fixed-offset interior anchor on ASCII input (`\d{4}-…` too big for the eager DFA): jump
@@ -1855,6 +2098,61 @@ fn runEdfa(ep: *const edfa.Program, filter: *const Filter, tdy: ?*const teddy.Te
         o.start = nextPrefixHit(filter, tdy, input, o.start) orelse return null;
         o.start -|= filter.prefix_set_off_max; // interior window → step back to the earliest match start
         if (input.len - o.start < filter.min_bytes) return null;
+    } else if (filter.req_lit_len > 0) {
+        // Structured reverse-walk fast path (`\w+\s+Holmes`, `\w+\s+Holmes\s+\w+`): per memmem hit,
+        // walk the disjoint pre-atom classes backward to the EXACT start, then one anchored confirm —
+        // the eager DFA runs only at real candidate starts, not over the gaps. ASCII-exact; engage on
+        // ASCII-dominant input with a per-window pure-ASCII check and a sound flat-scan sweep fallback.
+        if (filter.req_pre_n > 0 and ascii_dominant) {
+            const needle = filter.req_lit[0..filter.req_lit_len];
+            var pos = o.start;
+            while (memmemFrom(input, pos, needle)) |q| {
+                pos = q + 1;
+                switch (structuredStart(filter, input, q, o.start)) {
+                    .skip => {},
+                    .exact => |cand| {
+                        if (input.len - cand >= filter.min_bytes) {
+                            probes.* += 1; // ReDoS observable (one confirm per occurrence)
+                            if (edfaConfirmAt(ep, input, cand, match_only)) |m| return m;
+                        }
+                    },
+                    .impure => {
+                        var s = reqFlatLowerBound(filter, input, q, o.start);
+                        while (s <= q) : (s += 1) {
+                            if (input.len - s < filter.min_bytes) break;
+                            probes.* += 1;
+                            if (edfaConfirmAt(ep, input, s, match_only)) |m| return m;
+                        }
+                    },
+                }
+            }
+            return null;
+        }
+        // Required interior/suffix-literal skip (`\w+\s+Holmes`, `[a-zA-Z]+ing`): memmem to the
+        // literal, reverse-scan to the earliest match start, then ONE native (unanchored) eager-DFA
+        // find. As in `runByteDfa`, NOT a per-occurrence anchored confirm — `req_lead` is a superset,
+        // so the reverse scan can over-reach to a non-start position; only an unanchored find from cs
+        // is leftmost-correct. Sound + O(input).
+        if (filter.req_lit_fixed_off) |off| {
+            // Pass 2 — fixed-offset rare-byte confirm (`[a-q][^u-z]{13}x`): the rare literal byte sits
+            // a fixed *code-point* distance `off` from the match start. memchr the byte at `q`, walk
+            // back `off` code points (UTF-8 aware — exact on any input), confirm anchored at that
+            // pinned start, one confirm per occurrence instead of scanning the dense leading class.
+            // Leftmost-first (q ascending) + O(input).
+            const b = filter.req_lit[0];
+            var pos = o.start;
+            while (memchrFrom(input, pos, b)) |q| {
+                pos = q + 1;
+                const cand = cpBack(input, q, off) orelse continue;
+                if (cand < o.start) continue;
+                if (input.len - cand < filter.min_bytes) return null;
+                probes.* += 1; // ReDoS observable (bounded ⇒ stays linear)
+                if (edfaConfirmAt(ep, input, cand, match_only)) |m| return m;
+            }
+            return null;
+        }
+        o.start = reqLitSkipFrom(filter, input, o.start) orelse return null;
+        if (input.len - o.start < filter.min_bytes) return null;
     } else if (filter.inner_byte) |anchor| {
         // Fixed-offset interior anchor on ASCII input (`\d{4}-…`): jump anchor-to-anchor and
         // bounded-confirm at the pinned start `q - off` — one confirm per occurrence, the win when
@@ -1938,10 +2236,12 @@ fn inputAsciiDominant(scratch: *Scratch, input: []const u8) bool {
 }
 
 /// The `ascii_dominant` argument for the span arms: the O(n) dominance count runs **only** for a
-/// program whose `class_lead` is the derived (broad-tail) set — every other program leaves
-/// `class_lead_ascii_only` false and never consults it, so it pays nothing.
+/// program that consults it — a derived (broad-tail) `class_lead` (`class_lead_ascii_only`) or a
+/// structured reverse-walk required-literal (`req_pre_n > 0`). Every other program never reads the
+/// flag, so it pays nothing. The count is cached per input in the scratch.
 inline fn asciiDominantArg(program: *const Program, scratch: *Scratch, input: []const u8) bool {
-    return program.filter.class_lead_ascii_only and inputAsciiDominant(scratch, input);
+    if (!program.filter.class_lead_ascii_only and program.filter.req_pre_n == 0) return false;
+    return inputAsciiDominant(scratch, input);
 }
 
 /// The eager-DFA span arm to use for this search, or `null` to fall through to the lazy DFA / NFA
@@ -2470,6 +2770,178 @@ fn filterOf(gpa: std.mem.Allocator, pat: []const u8) !Filter {
     const h = try hir.buildAlloc(gpa, ast, .{});
     defer hir.deinitHir(gpa, h);
     return filterFromAnalysis(h);
+}
+
+test "auto: required-literal skip is distilled for interior/suffix literals (revert-failing)" {
+    // Reverting the `required_literal_skip` analysis or its filter distillation drops `req_lit_len`
+    // to 0 here. These are patterns with NO leading literal and NO selective leading-class scan, so
+    // the whole-literal memmem skip is the only good prefilter.
+    const gpa = testing.allocator;
+    {
+        const f = try filterOf(gpa, "\\w+\\s+Holmes"); // suffix literal after two class runs
+        try testing.expectEqual(@as(u8, 6), f.req_lit_len);
+        try testing.expectEqualStrings("Holmes", f.req_lit[0..f.req_lit_len]);
+        try testing.expect(f.req_lead.has('a') and f.req_lead.has(' ')); // word ∪ space
+        try testing.expect(!f.req_lead.has('!')); // punctuation excluded → reverse scan stops there
+        try testing.expectEqual(@as(u8, 0), f.prefix_len);
+    }
+    {
+        const f = try filterOf(gpa, "[a-zA-Z]+ing"); // common first byte ('i'), selective whole needle
+        try testing.expectEqual(@as(u8, 3), f.req_lit_len);
+        try testing.expectEqualStrings("ing", f.req_lit[0..f.req_lit_len]);
+        try testing.expect(f.req_lead.has('Z') and !f.req_lead.has('0'));
+    }
+    {
+        // A leading literal takes priority — `req_lit` is not used even if an interior literal exists.
+        const f = try filterOf(gpa, "abc\\d+xyz");
+        try testing.expect(f.prefix_len > 0);
+        try testing.expectEqual(@as(u8, 0), f.req_lit_len);
+    }
+    {
+        // A 1-byte interior literal is left to `inner_byte`'s memchr (needle must be ≥ 2 bytes).
+        const f = try filterOf(gpa, "\\w+\\s+x");
+        try testing.expectEqual(@as(u8, 0), f.req_lit_len);
+    }
+}
+
+test "auto: structured reverse-walk atoms are distilled for disjoint class-rep prefixes (revert-failing)" {
+    // The structured reverse walk (the precise per-occurrence confirm that closes before-holmes /
+    // before-after-holmes) needs the disjoint class-rep pre-atoms. Reverting the `pre`/`pre_n`
+    // analysis or its distillation drops `req_pre_n` to 0 → back to the slow flat-scan path.
+    const gpa = testing.allocator;
+    {
+        const f = try filterOf(gpa, "\\w+\\s+Holmes"); // \w+ \s+ (disjoint) before "Holmes"
+        try testing.expectEqual(@as(u8, 2), f.req_pre_n);
+        try testing.expectEqual(@as(u8, 6), f.req_lit_len);
+    }
+    {
+        const f = try filterOf(gpa, "\\w+\\s+Holmes\\s+\\w+"); // non-suffix: trailing \s+\w+
+        try testing.expectEqual(@as(u8, 2), f.req_pre_n); // walk still applies (confirm validates the tail)
+    }
+    {
+        const f = try filterOf(gpa, "[a-zA-Z]+ing"); // one pre-atom
+        try testing.expectEqual(@as(u8, 1), f.req_pre_n);
+    }
+}
+
+test "auto: required-literal skip stays leftmost-correct when the reverse scan over-reaches (revert-failing)" {
+    // THE soundness regression for the required-literal skip. `req_lead` is a *superset* of the
+    // preceding alphabet, so the reverse scan from a literal hit can land before the true match
+    // start. The arm MUST therefore run an *unanchored* forward find from that position — NOT a
+    // per-occurrence anchored confirm. With an anchored confirm, `\w+\s+Holmes` over "ab cd Holmes"
+    // confirms at 'a' (fails: `\w+` can't span the space) and wrongly reports no match, missing
+    // "cd Holmes". Reverting the arm to an anchored confirm fails the first case below.
+    try expectFind("\\w+\\s+Holmes", "ab cd Holmes", "cd Holmes");
+    try expectFind("\\w+\\s+Holmes", "xx   Holmes", "xx   Holmes");
+    try expectFind("\\w+\\s+Holmes", "!!! word Holmes rest", "word Holmes");
+    try expectNoMatch("\\w+\\s+Holmes", "Holmes alone"); // single Holmes, nothing before
+    try expectNoMatch("\\w+\\s+Holmes", "no name here");
+
+    // The `[a-zA-Z]+ing` shape (needle first byte is itself in the lead alphabet).
+    try expectFind("[a-zA-Z]+ing", "running", "running");
+    try expectFind("[a-zA-Z]+ing", "  the morning sun", "morning");
+    try expectNoMatch("[a-zA-Z]+ing", "ing"); // needs ≥ 1 letter before "ing"
+}
+
+test "auto: required-literal skip matches the Pike VM oracle over prose (differential)" {
+    // Differential vs the Pike VM (the leftmost-first reference): `count` over a Sherlock-shaped
+    // haystack must agree for the required-literal-skip patterns. A wrong skip (mis-ordered or
+    // dropped matches) diverges from the oracle here.
+    const gpa = testing.allocator;
+    const hay =
+        "When Holmes spoke, John Watson and the morning visitor stood. " ++
+        "Inspector Lestrade Holmes greeted, then mister Holmes again. " ++
+        // accented words before "Holmes" exercise the structured walk's non-ASCII (impure) fallback:
+        "caf\u{e9} Holmes and na\u{ef}ve\u{2014}Holmes plus r\u{e9}sum\u{e9}  Holmes here. " ++
+        "Nothing was happening in the evening; the ring was missing. Mr Holmes!";
+    const pats = [_][]const u8{ "\\w+\\s+Holmes", "[a-zA-Z]+ing", "\\w+\\s+Holmes\\s+\\w+" };
+    for (pats) |pat| {
+        var re = try Compiled.init(pat);
+        defer re.deinit();
+
+        // Oracle: a plain leftmost-first unanchored Pike VM scan, no prefilter.
+        var diag: compile.Diagnostic = .{};
+        const ast = try compile.parse(gpa, pat, &diag);
+        defer ast.deinit(gpa);
+        const ph = try hir.buildAlloc(gpa, ast, .{});
+        defer hir.deinitHir(gpa, ph);
+        var pp = try pikevm.buildAlloc(gpa, ph, .{});
+        defer pikevm.freeProgram(gpa, &pp);
+        var ps = try pikevm.Scratch.init(gpa, &pp);
+        defer ps.deinit(gpa);
+
+        var pos: usize = 0;
+        while (true) {
+            const am = E.find(&re.program, &re.scratch, hay, .{ .start = pos });
+            const om = pikevm.search(&pp, &ps, hay, .{ .start = pos });
+            if (am == null or om == null) {
+                try testing.expect(am == null and om == null);
+                break;
+            }
+            try testing.expectEqual(om.?.start, am.?.start);
+            try testing.expectEqual(om.?.end, am.?.end);
+            pos = if (am.?.end > am.?.start) am.?.end else am.?.end + 1;
+        }
+    }
+}
+
+test "auto: fixed-offset rare-byte confirm for a bounded negated-class pattern (Pass 2, revert-failing)" {
+    // `[a-q][^u-z]{13}x` is fixed-length (15) with the rare literal 'x' at fixed cp-offset 14. The
+    // dispatcher must take the fixed-offset memchr+confirm path (`req_lit_fixed_off`), not the dense
+    // `[a-q]` leading-class scan. Reverting `lead_fixed_cps` / the distiller gate drops the fixed
+    // path. Correctness is the priority; these pin the matches.
+    const gpa = testing.allocator;
+    {
+        const f = try filterOf(gpa, "[a-q][^u-z]{13}x");
+        try testing.expectEqual(@as(u8, 1), f.req_lit_len);
+        try testing.expectEqual(@as(u8, 'x'), f.req_lit[0]);
+        try testing.expectEqual(@as(?u32, 14), f.req_lit_fixed_off);
+        try testing.expect(f.class_lead == null); // the dense [a-q] scan is dropped in favour of 'x'
+        try testing.expect(f.rare_byte == null); // and the presence-only reject too
+    }
+    // A valid 15-char window: 'a' + 13 bytes none in u-z + 'x'.
+    try expectFind("[a-q][^u-z]{13}x", "  abcdefghijklmnx  ", "abcdefghijklmnx");
+    // Near-miss: a 'u' inside the 13-window breaks it; the next 'x' has no valid window → no match.
+    try expectNoMatch("[a-q][^u-z]{13}x", "abcdefghijkuvwx");
+    // The leading char must be [a-q]: 'r' is not, so no match even with a clean window + 'x'.
+    try expectNoMatch("[a-q][^u-z]{13}x", "rbcdefghijklmnx");
+}
+
+test "auto: Pass 2 fixed-offset confirm matches the Pike VM oracle (differential)" {
+    const gpa = testing.allocator;
+    // Build inputs with valid and near-miss windows for `[a-q][^u-z]{13}x`.
+    const hay =
+        "the quick brown fox jumps; a_______note_x and another aQQQQQQQQQQQQx here " ++
+        "plus abcdefghijklmnx tail, and zzz a1234567890!?x end, noise xxxxxxxxxxxxxx done. " ++
+        // multi-byte code points inside a candidate window: cpBack must count CODE POINTS, not bytes,
+        // so the fixed-offset confirm pins the right start (or correctly finds none) past the é/ü/—.
+        "a\u{e9}\u{fc}cd\u{2014}fghijklmx and aééüü\u{2014}\u{2014}klmnx done b\u{e9}\u{e9}x";
+    const pats = [_][]const u8{ "[a-q][^u-z]{13}x", "[a-q][^u-z]{13}x", "\\d[^/]{5}/" };
+    for (pats) |pat| {
+        var re = try Compiled.init(pat);
+        defer re.deinit();
+        var diag: compile.Diagnostic = .{};
+        const ast = try compile.parse(gpa, pat, &diag);
+        defer ast.deinit(gpa);
+        const ph = try hir.buildAlloc(gpa, ast, .{});
+        defer hir.deinitHir(gpa, ph);
+        var pp = try pikevm.buildAlloc(gpa, ph, .{});
+        defer pikevm.freeProgram(gpa, &pp);
+        var ps = try pikevm.Scratch.init(gpa, &pp);
+        defer ps.deinit(gpa);
+        var pos: usize = 0;
+        while (true) {
+            const am = E.find(&re.program, &re.scratch, hay, .{ .start = pos });
+            const om = pikevm.search(&pp, &ps, hay, .{ .start = pos });
+            if (am == null or om == null) {
+                try testing.expect(am == null and om == null);
+                break;
+            }
+            try testing.expectEqual(om.?.start, am.?.start);
+            try testing.expectEqual(om.?.end, am.?.end);
+            pos = if (am.?.end > am.?.start) am.?.end else am.?.end + 1;
+        }
+    }
 }
 
 test "auto: case-variant prefix set is synthesised for a small-class-led concat (revert-failing)" {

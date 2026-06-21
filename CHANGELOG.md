@@ -66,6 +66,30 @@ adopts **uniform RE2/Rust leftmost-first** empty-loop semantics across every bac
 
 ### Performance
 
+- **Required-literal prefilter — whole-literal `memmem` skip + structured reverse walk.** A pattern
+  with no leading literal but a selective literal in its **interior or suffix** (`\w+\s+Holmes`,
+  `[a-zA-Z]+ing`, `[\w.+-]+@gmail\.com`) now drives a prefilter off that literal. New HIR analysis
+  `Analysis.required_literal_skip` carries the longest required literal on the mandatory spine, the
+  alphabet that may precede it, and — when the atoms before it are **disjoint class-repetitions**
+  (`\w+\s+`) — those pre-atoms. `auto` then (a) leaps to the whole literal with SIMD `memmem`
+  (selective even when the first byte is common — the `i` of `ing`), and (b) walks the pre-atoms
+  **backward to the exact match start** per hit and runs **one anchored confirm there**, so the
+  automaton runs only at real candidate starts instead of scanning the gaps. Wins on `sherlock`
+  (rebar): **`\w+\s+Holmes` ~13.5×→1.18×** vs the prior build (now ~Rust parity), **`\w+\s+Holmes\s+\w+`
+  ~28×→1.27×**, **`[a-zA-Z]+ing` →1.0×**, **`\s[a-zA-Z]{0,12}ing\s` ~10×→1.0×**. The reverse walk is
+  ASCII-exact (a Unicode class's high bytes are conservative), so it engages on ASCII-dominant input
+  with a per-occurrence pure-window check and a sound flat-reverse-scan fallback for the rare
+  non-ASCII window. Leftmost-first preserved (the automaton confirms every candidate); O(input)
+  (single `memmem` + bounded reverse walk, no per-occurrence rescan). Differential-tested vs the
+  Pike VM oracle over ASCII and accented prose.
+- **Fixed-offset rare-byte confirm for bounded fixed-length patterns.** A bounded pattern whose
+  match length is fixed and whose only selective feature is a **rare required byte at a fixed offset**
+  (`[a-q][^u-z]{13}x` — the `x` 14 code points in) now `memchr`s that byte, walks back the fixed
+  number of **code points** (`cpBack`, UTF-8 aware — correct on non-ASCII without an ASCII gate), and
+  confirms anchored at the pinned start, one confirm per occurrence, instead of scanning the dense
+  leading `[a-q]` class. `repeated-class-negation` on `sherlock` goes from the suite's worst cliff
+  (~183× slower) to **~1.4× *faster* than Rust** (`regex`). Gated to a single ≤-`byteFreq`-threshold
+  byte in a bounded match; leftmost-first + O(input).
 - **Lazy-DFA arm: leading-literal & rare interior-anchor *jump-and-confirm*.** When a prone
   pattern (an unbounded non-accepting run before the first accept) lands on the lazy DFA, `auto`
   used to take one prefilter skip and then a full O(input) native pass. It now **leaps

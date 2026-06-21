@@ -501,9 +501,9 @@ match, so a prefilter or length gate built on them never yields a false negative
 > (`prefix_set` — `(foo|bar)\d+`, `near`) and a synthesised **case-variant set** for a small-class
 > / `(?i)` lead (`(?i)the` → `{THE…the}`), and a selective digit/number lead drives the
 > **leading-class SIMD scan** (`engine/classscan.zig`, `Analysis.leading_class_first`). The plain
-> `required_literal` (longest *interior* required run) and `is_one_pass` remain unconsumed *as
-> Analysis fields* — any backend is free to read them today. Toggle the whole prefilter with
-> `strategy.prefilter`.
+> `required_literal` (longest required run) drives the 0.6.0 required-literal skip (below); `is_one_pass`
+> remains unconsumed *as an Analysis field* — any backend is free to read it today. Toggle the whole
+> prefilter with `strategy.prefilter`.
 >
 > **Since 0.5.0 three more facts are consumed** (all results-invariant, pinned to the Pike VM):
 > (1) when the whole pattern is a literal in word-boundary assertions (`\bthe\b`, `the\b`), a
@@ -553,6 +553,28 @@ match, so a prefilter or length gate built on them never yields a false negative
 > ~1.7×, now faster than Rust `regex`), and on Cyrillic/CJK text (every byte high, the scan can't
 > help) it falls through to the native find on the **same code path as before**, so there is no
 > regression. Results-invariant, pinned to the Pike VM (`class_lead_derived_cases`).
+>
+> **Also since 0.6.0, a required interior/suffix literal drives a prefilter** (`Analysis.required_literal_skip`,
+> `Filter.req_lit*`). A pattern with no leading literal but a selective literal **anywhere on the
+> mandatory spine** (`\w+\s+Holmes`, `[a-zA-Z]+ing`, `[\w.+-]+@gmail\.com`) leaps to it with SIMD
+> `memmem` on the *whole* run (selective even when the first byte is common — the `i` of `ing`). When
+> the atoms before it are **disjoint class-repetitions** (`req_pre`/`pre_n` — `\w+\s+`), a **structured
+> reverse walk** consumes those atoms backward (reverse spine order, greedy within `[min,max]`;
+> disjoint adjacency forces the split) to the **exact** match start, then runs *one* anchored confirm
+> per hit — the automaton touches only real candidate starts, not the gaps. The walk is ASCII-exact
+> (a Unicode class's high bytes are conservative in `classBytes`), so it engages on ASCII-dominant
+> input, verifies each window is pure-ASCII, and falls back to a sound flat-reverse-scan +
+> bounded-confirm sweep for the rare non-ASCII window. Otherwise (no usable pre-atoms) it does a
+> `memmem` skip + reverse-scan over the preceding alphabet + one unanchored find. A separate
+> **fixed-offset rare-byte** path handles a bounded fixed-length pattern whose discriminator is a
+> rare byte at a fixed *code-point* offset (`[a-q][^u-z]{13}x`, `lead_fixed_cps` = 14): `memchr` the
+> byte and confirm at `cpBack(q, off)` (UTF-8-aware step-back, correct on non-ASCII without an ASCII
+> gate). On `sherlock` these take `\w+\s+Holmes` / `\w+\s+Holmes\s+\w+` from ~13× / ~28× behind Rust
+> to ~1.2× (parity), `[a-zA-Z]+ing` and `\s[a-zA-Z]{0,12}ing\s` to parity, and `[a-q][^u-z]{13}x`
+> from the suite's worst cliff (~183× behind) to ~1.4× *faster* than Rust `regex` — moving the full
+> Sherlock geomean from ezi 2.67 to **1.65**. Leftmost-first preserved (the automaton confirms every
+> candidate), O(input) (single `memmem`/`memchr` + bounded reverse walk, no per-occurrence rescan);
+> differential-tested vs the Pike VM over ASCII and accented prose.
 
 ---
 

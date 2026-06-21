@@ -79,6 +79,17 @@ Landed across `0.4.0-dev` (all on `main`):
   the *whole* literal run (`\bthe\b` jumps "the"→"the", not 't'→'t'); a ≥2-byte run now rides the
   same **two-byte** `memmem.Finder`, so every prefix-literal NFA/DFA pattern got the upgrade
   (`\bthe\b` on logs **6×**). See *Performance*.
+- **Required interior/suffix-literal prefilter + structured reverse walk** — a pattern with no
+  leading literal but a selective literal *inside* or at the *end* (`\w+\s+Holmes`, `[a-zA-Z]+ing`,
+  `[\w.+-]+@gmail\.com`) leaps to that literal with `memmem`, then — when the atoms before it are
+  disjoint class-repetitions (`\w+\s+`) — walks them **backward to the exact match start** and runs
+  one anchored confirm per hit, so the automaton runs only at real candidate starts. On Sherlock,
+  `\w+\s+Holmes` and `\w+\s+Holmes\s+\w+` go from ~13×/~28× behind Rust to **~1.2×** (parity). See
+  *Performance*.
+- **Fixed-offset rare-byte confirm** — a bounded fixed-length pattern whose only selective feature
+  is a rare byte at a fixed offset (`[a-q][^u-z]{13}x`) `memchr`s that byte, steps back the fixed
+  code-point distance, and confirms once per hit instead of scanning a dense leading class —
+  turning Sherlock's worst cliff (~183× behind) into **~1.4× faster than Rust**. See *Performance*.
 - **Teddy SIMD multi-literal prefilter** — literal *alternations* (`cat|dog|fish`,
   `foo|far|fizz`) now scan with the Teddy algorithm: a dynamic in-vector byte shuffle
   (`pshufb`/`vpshufb`/`tbl`) fingerprints the first 1–3 bytes of all branches across a 16-byte
@@ -599,9 +610,15 @@ wired:**
    candidate is confirmed with an *anchored* run; a `^`/`\A` pattern
    skips the leftward scan entirely; the **rarest required byte** drives a sound
    fast-reject (no `@` in the input ⇒ no `\w+@\w+` match, return at once); and a
-   min-length gate rejects inputs too short to hold any match. Every `Analysis` fact is a
-   sound one-sided bound, so the prefilter never drops a real match — it only avoids
-   running the engine where one cannot start. Toggle with `strategy.prefilter`.
+   min-length gate rejects inputs too short to hold any match. When there is **no** leading literal
+   but a selective literal sits in the **interior or suffix** (`\w+\s+Holmes`, `[a-zA-Z]+ing`),
+   `auto` `memmem`s the *whole* required literal and — when the atoms before it are disjoint
+   class-repetitions — does a **structured reverse walk** to the exact match start, then one anchored
+   confirm per hit (the automaton runs only at real candidate starts, not over the gaps). And a
+   bounded fixed-length pattern with a **rare byte at a fixed offset** (`[a-q][^u-z]{13}x`) `memchr`s
+   that byte and confirms at the pinned start (stepping back a fixed *code-point* distance). Every
+   `Analysis` fact is a sound one-sided bound, so the prefilter never drops a real match — it only
+   avoids running the engine where one cannot start. Toggle with `strategy.prefilter`.
 
 **Tier 3 — the byte DFA — is wired and now ON BY DEFAULT, with the *eager* DFA as the
 primary span engine** (`backends/edfa.zig`, reached through `auto`). `auto` builds the eager
