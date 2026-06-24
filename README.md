@@ -37,9 +37,10 @@ agrees byte-for-byte with the reference Pike VM, and works at both comptime and 
 
 It is benchmarked against Rust's `regex` and Go's `regexp` on real
 [rebar](https://github.com/BurntSushi/rebar) haystacks. The harness is a separate, reproducible
-repo: [regex-bench](https://github.com/shaik-abdul-thouhid/regex-bench). Around 460 tests cover
+repo: [regex-bench](https://github.com/shaik-abdul-thouhid/regex-bench). Around 470 tests cover
 per-module behaviour, cross-backend conformance (every backend has to agree with the Pike VM, at
-runtime and comptime), and ReDoS immunity (`engine/redos.zig`).
+runtime and comptime), and ReDoS immunity (`engine/redos.zig`), plus a hardened, parallel
+**fuzz** suite (`fuzz/` — every backend differenced against the Pike VM; `zig build fuzz --fuzz=N`).
 
 ## Installing
 
@@ -599,10 +600,13 @@ repetition counts are capped (default 100,000, set via `Options.max_repetition`)
 `a{999999999}` fails to compile instead of blowing up. Both are written up in
 [`docs/limitations.md`](docs/limitations.md).
 
-There are no known cross-backend correctness gaps as of v0.6.0. Empty-width loops follow RE2/Rust
-leftmost-first semantics on every backend, and the two edge cases deferred in 0.5.x — an empty
-loop over a nullable concat body, and a `\b`/`\B` after a length-varying alternation — are now
-fixed.
+Empty-width loops follow RE2/Rust leftmost-first semantics on every backend, and the two edge
+cases deferred in 0.5.x — an empty loop over a nullable concat body, and a `\b`/`\B` after a
+length-varying alternation — are fixed. A hardened, parallel fuzz suite (`fuzz/`) differences the
+full backend matrix against the Pike VM and has since closed several more cross-backend
+divergences (DFA `isMatch` routing for trailing/interior anchors, code-point-aligned unanchored
+scanning); it currently tracks **two narrow open cases** in the `\b`/`\B`-combined-with-`(?m)`
+family — see *Findings* in [`fuzz/README.md`](fuzz/README.md).
 
 There are also a few **performance** shapes where ezi_gex is slower than Rust and that won't be
 optimized — each fix would cost the linear-time guarantee, portability, or simplicity. From the

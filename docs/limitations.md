@@ -11,11 +11,13 @@ cross-backend conformance suite and the fuzz differential (`fuzz/`) so they cann
 change; the performance limitations are accepted shapes where the engine is and will remain
 slower than Rust.
 
-> **No deferred bugs.** As of v0.6.0 there are no known correctness gaps where one backend
-> disagrees with another. The two former deferred entries — an empty-width loop over a
-> nullable concat body (`(?:a?b??)+`), and a `\b`/`\B` after a length-varying alternation
-> (`(b+|.+)\B`) — are both **fixed** and every backend now agrees on the leftmost-first
-> span. See the [CHANGELOG](../CHANGELOG.md) (v0.6.0).
+> **Deferred bugs.** The two former deferred entries — an empty-width loop over a nullable concat
+> body (`(?:a?b??)+`), and a `\b`/`\B` after a length-varying alternation (`(b+|.+)\B`) — are both
+> **fixed** as of v0.6.0 (every backend agrees on the leftmost-first span; see the
+> [CHANGELOG](../CHANGELOG.md)). A hardened parallel fuzz suite has since fixed several more
+> cross-backend divergences and currently tracks **two narrow open cases** in the
+> `\b`/`\B`-combined-with-`(?m)` family — logged under *Findings* in
+> [`../fuzz/README.md`](../fuzz/README.md), to be addressed in a later round.
 
 ---
 

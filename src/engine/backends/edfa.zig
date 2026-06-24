@@ -131,6 +131,7 @@ const std = @import("std");
 const backend = @import("engine_base").backend;
 const hir = @import("core").hir;
 const byte = @import("engine_base").byte;
+const nfa = @import("engine_base").nfa; // code-point length for the unanchored start scan
 const dfa = @import("dfa");
 
 const Match = backend.Match;
@@ -2506,7 +2507,7 @@ fn searchImpl(program: *const Program, input: []const u8, opts: SearchOptions, e
             return if (runAnchoredWord(program, input, 0, earliest)) |end| Match{ .start = 0, .end = end } else null;
         }
         var s = opts.start;
-        while (s <= input.len) : (s += 1) {
+        while (s <= input.len) : (s += nfa.decodeAt(input, s).len) { // code-point-aligned scan (no mid-code-point start)
             if (runAnchoredWord(program, input, s, earliest)) |end| return Match{ .start = s, .end = end };
         }
         return null;
@@ -2537,7 +2538,7 @@ fn searchImpl(program: *const Program, input: []const u8, opts: SearchOptions, e
 
     // Not prone (or no reverse table) → anchored restart, O(input) and cache-tight.
     var s = opts.start;
-    while (s <= input.len) : (s += 1) {
+    while (s <= input.len) : (s += nfa.decodeAt(input, s).len) { // code-point-aligned scan (no mid-code-point start)
         if (runAnchored(program, input, s, earliest)) |end| return Match{ .start = s, .end = end };
     }
     return null;
@@ -2560,7 +2561,7 @@ pub fn isMatch(program: *const Program, _: *Scratch, input: []const u8, opts: Se
             return runAnchoredWord(program, input, 0, true) != null;
         }
         var s = opts.start;
-        while (s <= input.len) : (s += 1) {
+        while (s <= input.len) : (s += nfa.decodeAt(input, s).len) { // code-point-aligned scan (no mid-code-point start)
             if (runAnchoredWord(program, input, s, true) != null) return true;
         }
         return false;
@@ -2575,9 +2576,15 @@ pub fn isMatch(program: *const Program, _: *Scratch, input: []const u8, opts: Se
     // Prone → one-pass over `utrans` (O(input), no Θ(n²)). Non-prone, non-`$` → anchored
     // restart, earliest-exit (O(input): with no non-accepting cycle and no `$`, no start can
     // scan far without hitting an accepting state), and it has no `utrans` table to consult.
-    if (program.prone) return runUnanchoredOnePass(program, input, opts.start);
+    // BUT the one-pass `utrans` table cannot carry an **interior** `text_start` (`\A`/`^` after a
+    // consuming prefix) — it seeds mid-input positions with `text_start=false`, so a
+    // `has_text_start` program must use the anchored restart instead (it evaluates `text_start`
+    // per start position), exactly as `searchImpl` does. Without this gate `a*^$` / `a*\A$` over
+    // "" wrongly report no match here while `find` (via the same anchored restart) matches the
+    // empty span — an `isMatch` ≠ `find` divergence.
+    if (program.prone and !program.has_text_start) return runUnanchoredOnePass(program, input, opts.start);
     var s = opts.start;
-    while (s <= input.len) : (s += 1) {
+    while (s <= input.len) : (s += nfa.decodeAt(input, s).len) { // code-point-aligned scan (no mid-code-point start)
         if (runAnchored(program, input, s, true) != null) return true;
     }
     return false;

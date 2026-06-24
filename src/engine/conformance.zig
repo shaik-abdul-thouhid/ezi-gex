@@ -1390,6 +1390,189 @@ test "identical class blocks are interned into one range-block in the program" {
     try testing.expect(mixed.program.ranges.len > n);
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// Regressions for bugs surfaced by the hardened fuzz harness (fuzz/groups)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Assert `isMatch == (find != null) == want` for backend `B` (a declining backend is skipped).
+fn expectIsMatchEqFind(comptime B: type, gpa: std.mem.Allocator, pattern: []const u8, input: []const u8, want: bool) !void {
+    var diag: regex.Diagnostic = .{};
+    var re = regex.compileRuntimeWith(B, gpa, pattern, &diag, .{}) catch return; // backend declined → skip
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+    defer sc.deinit(gpa);
+    const found = re.find(&sc, input) != null;
+    var sc2 = try @TypeOf(re).Scratch.init(gpa, &re.program);
+    defer sc2.deinit(gpa);
+    const im = re.isMatch(&sc2, input);
+    if (found != im or found != want) {
+        std.debug.print("{s} /{s}/ over \"{s}\": find={} isMatch={} want={}\n", .{ @typeName(B), pattern, input, found, im, want });
+        return error.IsMatchFindMismatch;
+    }
+}
+
+// Fixed: the eager/lazy DFA's `isMatch` disagreed with its own `find` for a `text_end`
+// (`$`/`\z`) program that is **not** `end_anchored` — `^?\z` and friends, where an *optional*
+// line-start `^?` keeps the program `has_text_end` but not `end_anchored`. `isMatchImpl` only
+// routed `end_anchored` text_end programs through the reverse automaton and otherwise fell to
+// `runUnanchored`, which can never accept a text_end program (no mid-input `match` state) →
+// wrong `false`, while `find` correctly matched the empty span at the end anchor. Surfaced by
+// the fuzz `isMatch == (find != null)` invariant (anchors group). See `dfa.isMatchImpl`.
+test "regression: dfa isMatch agrees with find for optional-^ end anchors (^?\\z family)" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { p: []const u8, i: []const u8 }{
+        .{ .p = "^?\\z", .i = "" },     .{ .p = "^?\\z", .i = "x" },
+        .{ .p = "^?\\z", .i = "ab" },   .{ .p = "(?:^)?\\z", .i = "" },
+        .{ .p = "^?$", .i = "" },       .{ .p = "^?$", .i = "ab" },
+        .{ .p = "\\z", .i = "" },       .{ .p = "a?\\z", .i = "" },
+    };
+    inline for (.{ pikevm, dfa, edfa, bytepike, backtrack, auto }) |B| {
+        for (cases) |c| try expectIsMatchEqFind(B, gpa, c.p, c.i, true); // each matches the empty span at the anchor
+    }
+}
+
+/// Collect every `findAll` span of `pattern`/`input` on backend `B` into `out`; returns the count.
+fn collectFindAll(comptime B: type, gpa: std.mem.Allocator, pattern: []const u8, input: []const u8, out: [][2]usize) !usize {
+    var diag: regex.Diagnostic = .{};
+    var re = try regex.compileRuntimeWith(B, gpa, pattern, &diag, .{});
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+    defer sc.deinit(gpa);
+    var n: usize = 0;
+    var it = re.findAll(&sc, input);
+    while (it.next()) |m| : (n += 1) {
+        if (n < out.len) out[n] = .{ m.start, m.end };
+    }
+    return n;
+}
+
+// Documented contract surfaced by the fuzz replace/iter differential: the byte engines
+// (`bytepike`, eager/lazy DFA) evaluate `\b`/`\B` as **ASCII** word boundaries, so over a
+// NON-ASCII byte they can legitimately pick a different match than the code-point engines'
+// Unicode `\b`. Minimal trigger: `…|\b.|…` over `{0xBA, 'l'}` — the byte engine sees a boundary
+// at offset 1 (`0xBA` is a non-word *byte*) and matches `\b.` → `(1,2)`, while the code-point
+// engines decode `0xBA` → U+FFFD (non-word) and, taking the leftmost-first empty branch,
+// match `(1,1)`. This is BY DESIGN — `auto` routes a non-ASCII `\b` to the code-point engines
+// — so the fuzz harness gates the byte engines on such cases (`byteEnginesSafe`). The pin: the
+// CODE-POINT engines (and `auto`, which routes correctly) must all agree on the full sequence.
+test "regression: non-ASCII \\b — code-point engines agree; byte engines may differ (by design)" {
+    const gpa = testing.allocator;
+    const pat = "^\\S?a[^c\\p{L}b\\d]+.+|\\b.|| +";
+    const input = [_]u8{ 0xBA, 'l' };
+    var ref: [16][2]usize = undefined;
+    const nref = try collectFindAll(pikevm, gpa, pat, &input, &ref);
+    inline for (.{ backtrack, auto }) |B| {
+        var got: [16][2]usize = undefined;
+        const n = try collectFindAll(B, gpa, pat, &input, &got);
+        try testing.expectEqual(nref, n);
+        try testing.expectEqualSlices([2]usize, ref[0..nref], got[0..n]);
+    }
+    // And the byte engine genuinely takes the ASCII-\b path here (documents *why* it is gated):
+    // it matches `\b.` at offset 1 where the code-point engines match empty.
+    var bp: [16][2]usize = undefined;
+    const nbp = try collectFindAll(bytepike, gpa, pat, &input, &bp);
+    try testing.expect(nbp != nref or !std.mem.eql([2]usize, ref[0..nref], bp[0..nbp]));
+}
+
+fn faSeqEq(a: []const [2]usize, b: []const [2]usize) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (x[0] != y[0] or x[1] != y[1]) return false;
+    return true;
+}
+
+// Fixed: the bounded backtracker's unanchored scan advanced start positions byte-by-byte
+// (`start += 1`), so over **valid multi-byte UTF-8** it attempted matches at interior bytes of
+// a code point and reported a spurious **zero-width** match there — e.g. `\B{4}` over U+AAE9
+// (`ea ab a9`) matched `(2,2)` (mid-code-point), where the Pike VM (and `auto`) correctly find
+// nothing (the input is one code point; positions 0 and 3 are both word boundaries). Surfaced as
+// a pikevm-vs-backtrack `findAll` divergence (iter group). **Fixed** by advancing the scan to the
+// next code-point boundary (`start += decodeAt(input, start).len`), mirroring the Pike VM's
+// `sp += cp_len`. (ASCII / invalid leads advance 1, so byte-level scanning of invalid UTF-8 is
+// unchanged.) See `backtrack.run`.
+fn expectFindAllAllAgree(gpa: std.mem.Allocator, pattern: []const u8, input: []const u8) !void {
+    var ref: [64][2]usize = undefined;
+    const nref = try collectFindAll(pikevm, gpa, pattern, input, &ref);
+    inline for (.{ backtrack, auto }) |B| {
+        var got: [64][2]usize = undefined;
+        const n = try collectFindAll(B, gpa, pattern, input, &got);
+        if (!faSeqEq(ref[0..nref], got[0..n])) {
+            std.debug.print("findAll mismatch {s} on /{s}/ over {x}: pike={d} other={d}\n", .{ @typeName(B), pattern, input, nref, n });
+            return error.FindAllMismatch;
+        }
+    }
+}
+
+test "regression: backtracker unanchored scan is code-point-aligned (no mid-code-point \\B match)" {
+    const gpa = testing.allocator;
+    const u_aae9 = [_]u8{ 0xea, 0xab, 0xa9 }; // one valid 3-byte code point, U+AAE9
+    // The minimized repro and the bare construct: no spurious mid-code-point empty match.
+    try expectFindAllAllAgree(gpa, "\\B{4}", &u_aae9);
+    try expectFindAllAllAgree(gpa, "()1|(A|\\B{4}())", &u_aae9);
+    // A few more zero-width / empty-matchable shapes over multi-byte input.
+    try expectFindAllAllAgree(gpa, "\\B", "\xC3\xA9\xC3\xA9"); // éé
+    try expectFindAllAllAgree(gpa, "()", "\xE6\x97\xA5"); // 日 — empty matches only at code-point boundaries
+    try expectFindAllAllAgree(gpa, "\\b|\\B", &u_aae9);
+    // Control: on ASCII the boundary still matches where it should.
+    try expectFindAllAllAgree(gpa, "\\B{4}", "ab");
+}
+
+fn checkFindAllVsPike(comptime B: type, gpa: std.mem.Allocator, pattern: []const u8, input: []const u8, ref: []const [2]usize) !void {
+    var diag: regex.Diagnostic = .{};
+    var re = regex.compileRuntimeWith(B, gpa, pattern, &diag, .{}) catch return; // backend declined → skip
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+    defer sc.deinit(gpa);
+    var got: [64][2]usize = undefined;
+    var n: usize = 0;
+    var it = re.findAll(&sc, input);
+    while (it.next()) |m| : (n += 1) {
+        if (n < got.len) got[n] = .{ m.start, m.end };
+    }
+    if (!faSeqEq(ref, got[0..n])) {
+        std.debug.print("mid-cp findAll mismatch {s} on /{s}/ over {x}: pike.len={d} other.len={d}\n", .{ @typeName(B), pattern, input, ref.len, n });
+        return error.MidCodePointScan;
+    }
+}
+
+// Fixed (systemic): the lazy DFA (`dfa`), eager DFA (`edfa`), and `bytepike` advanced their
+// unanchored start scan byte-by-byte, so over valid multi-byte UTF-8 they attempted a match at an
+// interior byte of a code point and a zero-width pattern matched there — disagreeing with the Pike
+// VM. Fixed by advancing each scan to the next code-point boundary (`+= nfa.decodeAt(input,s).len`,
+// like `onepass`/`pikevm`); `bytepike` seeds its thread-set start only at code-point offsets. The
+// `\b`/`\B` byte-engine semantics stay ASCII (gated elsewhere), so these cases are deliberately
+// **non-`\b`** zero-width / empty-matchable shapes, where every backend must agree over multibyte.
+test "regression: byte engines' unanchored scan is code-point-aligned over multibyte" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { p: []const u8, i: []const u8 }{
+        .{ .p = "()", .i = "\xE6\x97\xA5" }, // 日 — empty match only at offsets 0 and 3
+        .{ .p = "a*", .i = "\xC3\xA9\xC3\xA9" }, // éé
+        .{ .p = "\\z{0,2}", .i = "\xCE\xB1" }, // α — quantified end anchor
+        .{ .p = "x?", .i = "\xF0\x9F\x98\x80" }, // 😀 (4-byte)
+        .{ .p = "(?:a{0,2}|\\z{0,2}\\n?)+", .i = "\xE6\x97\xA5" }, // a fuzz repro shape
+    };
+    for (cases) |c| {
+        var ref: [64][2]usize = undefined;
+        const nref = try collectFindAll(pikevm, gpa, c.p, c.i, &ref);
+        inline for (.{ backtrack, auto, bytepike, dfa, edfa, onepass }) |B| {
+            try checkFindAllVsPike(B, gpa, c.p, c.i, ref[0..nref]);
+        }
+    }
+}
+
+// Fixed: the EAGER DFA's `isMatch` used the one-pass `utrans` scan for a `prone` program, but that
+// table cannot carry an **interior** `text_start` (`\A`/`^` after a consuming prefix) — so `a*^$`,
+// `a*\A$`, `b*^\z`, `(?:a*)^$` over "" reported `isMatch=false` while `find` matched the empty span
+// (same class as the lazy-DFA `^?\z` fix, different code path / backend). Fixed by gating the
+// one-pass path on `!has_text_start`, so such programs use the anchored restart (which evaluates
+// `text_start` per start position), mirroring `searchImpl`. See `edfa.isMatch`.
+test "regression: eager-DFA isMatch agrees with find for interior text_start + end anchor" {
+    const gpa = testing.allocator;
+    const cases = [_][]const u8{ "a*^$", "(?:a*)^$", "a*\\A$", "b*^\\z", "a*^\\z", "a*$", "^$", "a*^" };
+    inline for (.{ pikevm, dfa, edfa, bytepike, backtrack, auto }) |B| {
+        for (cases) |p| try expectIsMatchEqFind(B, gpa, p, "", true); // each matches the empty span at ""
+    }
+}
+
 test {
     testing.refAllDecls(@This());
 }

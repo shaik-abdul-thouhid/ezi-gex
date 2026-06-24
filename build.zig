@@ -305,11 +305,32 @@ pub fn build(b: *std.Build) void {
         if (selected(include_tests, u.tag)) test_step.dependOn(u.run);
     }
 
-    // Alias: `zig build fuzz` runs the fuzz unit (finite smoke run). Add `--fuzz=N`
-    // for a bounded coverage-guided session — see fuzz/root.zig. (Bare `--fuzz`
-    // soaks forever by design; always bound it with `=N`.)
-    const fuzz_step = b.step("fuzz", "Run the fuzz targets (add --fuzz=N to fuzz; bare run is a finite smoke test)");
-    fuzz_step.dependOn(&run_fuzz_tests.step);
+    // ── fuzzing: one binary per group, run in PARALLEL by the build scheduler ───
+    // Each file under `fuzz/groups/` compiles into its OWN test binary (its targets
+    // share the differential bodies in `fuzz/groups/harness.zig`). The `fuzz` step
+    // depends on all of them, and the build scheduler runs independent run-steps
+    // concurrently — exactly like `zig build test` runs the 15 unit binaries at once
+    // — so `zig build fuzz --fuzz=N` fuzzes every group in parallel, N iters EACH
+    // (7 groups × N). Bare `zig build fuzz` is a finite seed-replay smoke of all.
+    // Each group also gets a `zig build fuzz-<group>` step for a single session.
+    // (The aggregate `fuzz` UNIT — fuzz/root.zig, run via `test-fuzz` and folded
+    // into `zig build test` — still bundles every group into one binary for the
+    // finite regression pass.)
+    const fuzz_step = b.step("fuzz", "Fuzz every group in parallel (add --fuzz=N for N iters/group)");
+    const fuzz_groups = [_][]const u8{ "scanner", "diff", "anchors", "unicode", "captures", "iter", "search" };
+    for (fuzz_groups) |g| {
+        const gmod = b.createModule(.{
+            .root_source_file = b.path(b.fmt("fuzz/groups/{s}.zig", .{g})),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "ezi_gex", .module = mod }},
+        });
+        const gtest = b.addTest(.{ .root_module = gmod });
+        const grun = b.addRunArtifact(gtest);
+        const gstep = b.step(b.fmt("fuzz-{s}", .{g}), b.fmt("Fuzz only the {s} group (add --fuzz=N)", .{g}));
+        gstep.dependOn(&grun.step);
+        fuzz_step.dependOn(&grun.step); // `zig build fuzz` → every group, in parallel
+    }
 
     // ── Benchmarks ────────────────────────────────────────────────────────────
     // Built against an `ezi_gex` module in ReleaseFast by default so the engine is

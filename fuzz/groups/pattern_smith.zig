@@ -10,21 +10,26 @@
 //! occasional malformed shape cleanly), but it is valid *far* more often than
 //! random bytes.
 //!
-//! Two knobs keep generated patterns cheap to run so the fuzzer iterates fast:
+//! The generators only emit syntax the scanner actually supports, so the
+//! differential targets spend their budget *matching* rather than on the reject
+//! path. Constructs the scanner declines on purpose (atomic `(?>…)`, lookaround,
+//! backreferences `\1`/`\k<n>`, `\Q…\E`, POSIX `[[:…:]]`) are deliberately NOT
+//! generated here — they are exercised by the random-byte scanner-robustness
+//! target instead.
+//!
+//! Three knobs keep generated patterns cheap to run so the fuzzer iterates fast:
 //!   * a small repetition ceiling (`max_rep_bound`) — backends expand `{m,n}`
 //!     into program states, so an unbounded count would dominate wall-clock;
-//!   * a bounded recursion `depth` and a fixed output buffer.
-//!
-//! The alphabet (`a b c` + a digit + a space + newline) is shared with the input
-//! generator in `root.zig`, so generated patterns and haystacks overlap and
-//! matches actually happen.
+//!   * a bounded recursion `depth` and a fixed output buffer;
+//!   * a small alphabet shared with the input generator in the harness, so
+//!     generated patterns and haystacks overlap and matches actually happen.
 
 const std = @import("std");
 const Smith = std.testing.Smith;
 
 /// Upper bound on a generated pattern's byte length. Fits comfortably in the
 /// scanner's O(n) buffers and keeps compiled programs small.
-pub const max_pattern_len = 96;
+pub const max_pattern_len = 112;
 
 /// Largest bound a generated `{m,n}` quantifier uses. Kept tiny because each
 /// backend expands counted repetition into states; large counts would make the
@@ -34,8 +39,10 @@ pub const max_rep_bound = 6;
 /// Deepest group nesting the generator will produce.
 const max_depth = 4;
 
-/// The shared literal alphabet. Patterns and haystacks both draw from it.
-pub const alphabet = "abc1 \n";
+/// The shared literal alphabet. Patterns and haystacks both draw from it. Mixed
+/// case (so `(?i)` folding actually changes the match set) plus a digit, space,
+/// tab and newline (so `\s`/`\d`/`(?m)` boundaries fire over real input).
+pub const alphabet = "abABc1 \t\n";
 
 /// A bounded pattern builder. Build with `gen`, then use `slice()`.
 pub const PatternSmith = struct {
@@ -61,9 +68,13 @@ pub const PatternSmith = struct {
     /// True when the buffer is nearly full; callers stop emitting to leave room
     /// for closing brackets/parens so the result stays balanced.
     fn nearlyFull(self: *const PatternSmith) bool {
-        return self.len + 8 >= self.buf.len;
+        return self.len + 10 >= self.buf.len;
     }
 };
+
+// ══════════════════════════════════════════════════════════════════════════════
+// General generator
+// ══════════════════════════════════════════════════════════════════════════════
 
 /// Generate one pattern from `smith`. Always terminates: every loop is bounded by
 /// `eosWeightedSimple` (guaranteed to eventually stop), by buffer capacity, and
@@ -127,32 +138,42 @@ fn genBraceQuant(p: *PatternSmith, smith: *Smith) void {
 /// One repeatable atom.
 fn genAtom(p: *PatternSmith, smith: *Smith, depth: u8) void {
     // At max depth, never open a group — only leaf atoms — so recursion ends.
-    const kind_max: u8 = if (depth >= max_depth or p.nearlyFull()) 4 else 6;
+    const kind_max: u8 = if (depth >= max_depth or p.nearlyFull()) 5 else 8;
     switch (smith.valueRangeAtMost(u8, 0, kind_max)) {
         0, 1 => p.put(litByte(smith)), // weight literals heaviest
         2 => p.put('.'),
         3 => genShorthand(p, smith),
         4 => genClass(p, smith),
-        5 => { // capturing group
-            p.put('(');
-            genAlternation(p, smith, depth + 1);
-            p.put(')');
-        },
-        else => { // non-capturing or flagged group
-            if (smith.boolWeighted(1, 1)) {
-                p.puts("(?:");
-            } else {
-                p.puts("(?i:");
+        5 => genEscape(p, smith), // \x.. \u.. \cX literal escapes
+        6 => { // capturing group — plain or named
+            switch (smith.valueRangeAtMost(u8, 0, 2)) {
+                0 => p.put('('),
+                1 => p.puts("(?<g>"),
+                else => p.puts("(?P<h>"),
             }
             genAlternation(p, smith, depth + 1);
             p.put(')');
         },
+        7 => { // non-capturing or flagged group
+            switch (smith.valueRangeAtMost(u8, 0, 3)) {
+                0 => p.puts("(?:"),
+                1 => p.puts("(?i:"),
+                2 => p.puts("(?m:"),
+                else => p.puts("(?s:"),
+            }
+            genAlternation(p, smith, depth + 1);
+            p.put(')');
+        },
+        else => { // bare inline flag toggle: (?i) (?-i) (?ms) …
+            genInlineFlags(p, smith);
+            genConcat(p, smith, depth);
+        },
     }
 }
 
-/// `\d \w \s \D \W \S` or an anchor `^ $ \b \B`.
+/// `\d \w \s \D \W \S` or an anchor `^ $ \b \B \A \z`.
 fn genShorthand(p: *PatternSmith, smith: *Smith) void {
-    switch (smith.valueRangeAtMost(u8, 0, 9)) {
+    switch (smith.valueRangeAtMost(u8, 0, 11)) {
         0 => p.puts("\\d"),
         1 => p.puts("\\w"),
         2 => p.puts("\\s"),
@@ -162,23 +183,63 @@ fn genShorthand(p: *PatternSmith, smith: *Smith) void {
         6 => p.put('^'),
         7 => p.put('$'),
         8 => p.puts("\\b"),
-        else => p.puts("\\B"),
+        9 => p.puts("\\B"),
+        10 => p.puts("\\A"),
+        else => p.puts("\\z"),
     }
 }
 
-/// `[...]` / `[^...]` over the alphabet, with the odd range.
+/// A literal-yielding escape the scanner accepts: `\xHH`, `\x{…}`, `\u{…}`,
+/// `\cX`, or an escaped punctuation char.
+fn genEscape(p: *PatternSmith, smith: *Smith) void {
+    switch (smith.valueRangeAtMost(u8, 0, 5)) {
+        0 => p.puts("\\x61"), // 'a'
+        1 => p.puts("\\x{42}"), // 'B'
+        2 => p.puts("\\u{0063}"), // 'c'
+        3 => p.puts("\\u0031"), // '1'
+        4 => p.puts("\\cA"), // control-A
+        else => { // escaped metachar → literal
+            const metas = ".*+?()[]{}|^$\\-";
+            p.put('\\');
+            p.put(metas[smith.index(metas.len)]);
+        },
+    }
+}
+
+/// `(?flags)` / `(?flags-flags)` bare inline toggle (no group).
+fn genInlineFlags(p: *PatternSmith, smith: *Smith) void {
+    const flags = "imsx";
+    p.puts("(?");
+    // 1..2 added flags.
+    var added: u8 = 0;
+    const want = smith.valueRangeAtMost(u8, 1, 2);
+    while (added < want) : (added += 1) p.put(flags[smith.index(flags.len)]);
+    // Optionally a removal clause.
+    if (smith.boolWeighted(2, 1)) {
+        p.put('-');
+        p.put(flags[smith.index(flags.len)]);
+    }
+    p.put(')');
+}
+
+/// `[...]` / `[^...]` over the alphabet, with ranges and shorthands.
 fn genClass(p: *PatternSmith, smith: *Smith) void {
     p.put('[');
     if (smith.boolWeighted(3, 1)) p.put('^');
+    // A leading ']' is a literal ']' (not the close) — exercise that edge.
+    if (smith.boolWeighted(6, 1)) p.put(']');
     var n: u8 = 0;
     while (n < 4 and !smith.eosWeightedSimple(2, 1)) : (n += 1) {
-        if (smith.boolWeighted(3, 1)) {
-            // a-c style range from the letter sub-alphabet
-            p.put('a');
-            p.put('-');
-            p.put('c');
-        } else {
-            p.put(litByte(smith));
+        switch (smith.valueRangeAtMost(u8, 0, 4)) {
+            0 => { // a-c style range from the letter sub-alphabet
+                p.put('a');
+                p.put('-');
+                p.put('c');
+            },
+            1 => p.puts("\\d"), // shorthand inside a class
+            2 => p.puts("\\w"),
+            3 => p.puts("\\p{L}"), // property inside a class
+            else => p.put(litByte(smith)),
         }
     }
     p.put(']');
@@ -207,7 +268,7 @@ fn putUint(p: *PatternSmith, v: u8) void {
 // occasionally produces these in interesting combinations; `genAnchors` produces
 // little else. It always emits balanced groups (it recurses for `(` / `(?:` /
 // `(?m:`), so it stays parseable far more often than random bytes. This is the
-// generator behind the focused supports-gate fuzz target in `root.zig`.
+// generator behind the focused supports-gate fuzz target in the harness.
 
 const max_anchor_depth = 3;
 
@@ -285,14 +346,14 @@ fn anchorUnit(p: *PatternSmith, smith: *Smith, depth: u8) void {
 // ══════════════════════════════════════════════════════════════════════════════
 //
 // A third generator that leans into ezi_gex's reason to exist: Unicode. It emits
-// `\p{…}` properties + scripts, the Unicode shorthand classes, literal multi-byte
-// code points (é α 日 😀, written as raw UTF-8), case-insensitive groups, and
-// classes with non-ASCII ranges — none of which the ASCII-only `gen`/`genAnchors`
-// produce. The matching target feeds it both valid multi-byte UTF-8 and raw
-// (possibly invalid) bytes, so the engines' Unicode decode + dead-on-invalid
-// handling is differenced too. `\X` (grapheme) is deliberately excluded — it is
-// backtrack-only, so it has no differential partner (it is fuzzed for no-crash
-// separately).
+// `\p{…}` / `\P{…}` properties + scripts, the Unicode shorthand classes, literal
+// multi-byte code points (é α 日 😀, written as raw UTF-8), `\x{…}`/`\u{…}` escapes,
+// case-insensitive groups, and classes with non-ASCII ranges — none of which the
+// ASCII-only `gen`/`genAnchors` produce. The matching target feeds it both valid
+// multi-byte UTF-8 and raw (possibly invalid) bytes, so the engines' Unicode
+// decode + dead-on-invalid handling is differenced too. `\X` (grapheme) is
+// deliberately excluded — it is backtrack-only, so it has no differential partner
+// (it is fuzzed for no-crash separately).
 
 const max_uni_depth = 3;
 
@@ -302,6 +363,14 @@ const uni_literals = [_][]const u8{
     "\xCE\xB1", // α  U+03B1 (2-byte)
     "\xE6\x97\xA5", // 日 U+65E5 (3-byte)
     "\xF0\x9F\x98\x80", // 😀 U+1F600 (4-byte)
+};
+
+/// Property names known to `token.resolveProperty`. (Unknown names reject
+/// cleanly and consistently across backends, so a stray one is harmless — but a
+/// curated list keeps the budget on matching.)
+const uni_props = [_][]const u8{
+    "L",    "Lu",     "Ll",  "Nd",     "N",
+    "P",    "Greek",  "Latin", "Cyrillic", "White_Space",
 };
 
 /// Generate a Unicode-heavy pattern from `smith`.
@@ -340,7 +409,7 @@ fn uniUnitQuant(p: *PatternSmith, smith: *Smith, depth: u8) void {
 }
 
 fn uniUnit(p: *PatternSmith, smith: *Smith, depth: u8) void {
-    const max: u8 = if (depth == 0 or p.nearlyFull()) 11 else 13;
+    const max: u8 = if (depth == 0 or p.nearlyFull()) 12 else 14;
     switch (smith.valueRangeAtMost(u8, 0, max)) {
         0 => p.put('a'),
         1 => p.put('.'),
@@ -348,10 +417,18 @@ fn uniUnit(p: *PatternSmith, smith: *Smith, depth: u8) void {
         3 => p.puts("\\d"),
         4 => p.puts("\\w"),
         5 => p.puts("\\s"),
-        6 => p.puts("\\p{L}"),
-        7 => p.puts("\\p{Nd}"),
-        8 => p.puts("\\p{Lu}"),
-        9 => p.puts("\\p{Greek}"),
+        6 => { // \p{Name}
+            p.puts("\\p{");
+            p.puts(uni_props[smith.index(uni_props.len)]);
+            p.put('}');
+        },
+        7 => { // \P{Name} negated
+            p.puts("\\P{");
+            p.puts(uni_props[smith.index(uni_props.len)]);
+            p.put('}');
+        },
+        8 => p.puts("\\x{e9}"), // é via hex
+        9 => p.puts("\\u{03b1}"), // α via unicode escape
         10 => p.puts("[a-z\\p{L}]"),
         11 => p.puts("[\xCE\xB1-\xCF\x89]"), // [α-ω]
         12 => {
@@ -359,8 +436,13 @@ fn uniUnit(p: *PatternSmith, smith: *Smith, depth: u8) void {
             uniSeq(p, smith, depth - 1);
             p.put(')');
         },
-        else => {
+        13 => {
             p.put('(');
+            uniSeq(p, smith, depth - 1);
+            p.put(')');
+        },
+        else => {
+            p.puts("(?:");
             uniSeq(p, smith, depth - 1);
             p.put(')');
         },
@@ -371,7 +453,7 @@ fn uniUnit(p: *PatternSmith, smith: *Smith, depth: u8) void {
 /// code points (so the bytes are never split mid-sequence). Returns the length.
 pub fn unicodeInput(smith: *Smith, out: []u8) usize {
     @disableInstrumentation();
-    const cps = [_][]const u8{ "a", "b", "1", " ", "\n", "\xC3\xA9", "\xCE\xB1", "\xE6\x97\xA5", "\xF0\x9F\x98\x80" };
+    const cps = [_][]const u8{ "a", "A", "b", "1", " ", "\n", "\xC3\xA9", "\xCE\xB1", "\xCF\x89", "\xE6\x97\xA5", "\xF0\x9F\x98\x80" };
     var len: usize = 0;
     var guard: u8 = 0;
     while (guard < 24 and !smith.eosWeightedSimple(3, 1)) : (guard += 1) {

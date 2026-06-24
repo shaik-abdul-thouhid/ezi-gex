@@ -28,6 +28,7 @@ const std = @import("std");
 const backend = @import("engine_base").backend;
 const hir = @import("core").hir;
 const byte = @import("engine_base").byte;
+const nfa = @import("engine_base").nfa; // code-point length, to seed start threads only at code-point boundaries
 
 const Match = backend.Match;
 const SearchOptions = backend.SearchOptions;
@@ -262,11 +263,17 @@ fn run(program: *const Program, sc: *Scratch, input: []const u8, opts: SearchOpt
 
     var matched = false;
     var sp = opts.start;
+    // Seed a fresh start thread only at code-point-aligned offsets — the byte program steps one
+    // byte per iteration, but an unanchored match must not *begin* at an interior byte of a valid
+    // multi-byte code point (a zero-width pattern like `\b`/`()` would otherwise report a spurious
+    // mid-code-point match, disagreeing with the Pike VM). `next_seed` tracks the next boundary.
+    var next_seed = opts.start;
 
     while (true) {
-        if (!matched and (!opts.anchored or sp == opts.start)) {
+        if (!matched and (!opts.anchored or sp == opts.start) and sp == next_seed) {
             addThread(program, c_list, 0, sc.entry_slots, sp, input, sc.stack);
         }
+        if (sp == next_seed) next_seed += nfa.decodeAt(input, sp).len;
         const at_end = sp >= input.len;
         // Keep scanning even with an empty list mid-input on an unanchored search —
         // the next byte seeds a fresh start thread (needed when a leading assertion

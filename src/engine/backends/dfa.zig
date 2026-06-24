@@ -1673,7 +1673,7 @@ fn searchImpl(program: *const Program, scratch: *Scratch, input: []const u8, opt
             return if (try scratch.runAnchoredWb(program, input, 0, earliest, &flushes)) |e| Match{ .start = 0, .end = e } else null;
         }
         var s = opts.start;
-        while (s <= input.len) : (s += 1) {
+        while (s <= input.len) : (s += nfa.decodeAt(input, s).len) { // code-point-aligned scan (no mid-code-point start)
             if (try scratch.runAnchoredWb(program, input, s, earliest, &flushes)) |e| return Match{ .start = s, .end = e };
         }
         return null;
@@ -1714,7 +1714,7 @@ fn searchImpl(program: *const Program, scratch: *Scratch, input: []const u8, opt
     }
 
     var s = opts.start;
-    while (s <= input.len) : (s += 1) {
+    while (s <= input.len) : (s += nfa.decodeAt(input, s).len) { // code-point-aligned scan (no mid-code-point start)
         if (try scratch.runAnchored(program, input, s, earliest, &flushes, null)) |end|
             return Match{ .start = s, .end = end };
     }
@@ -1739,7 +1739,7 @@ fn isMatchImpl(program: *const Program, scratch: *Scratch, input: []const u8, op
             return (try scratch.runAnchoredWb(program, input, 0, true, &flushes)) != null;
         }
         var s = opts.start;
-        while (s <= input.len) : (s += 1) {
+        while (s <= input.len) : (s += nfa.decodeAt(input, s).len) { // code-point-aligned scan (no mid-code-point start)
             if ((try scratch.runAnchoredWb(program, input, s, true, &flushes)) != null) return true;
         }
         return false;
@@ -1751,11 +1751,24 @@ fn isMatchImpl(program: *const Program, scratch: *Scratch, input: []const u8, op
         if (opts.start != 0) return false;
         return (try scratch.runAnchored(program, input, 0, true, &flushes, null)) != null;
     }
-    // Trailing `$`: a single reverse pass from input.len — any start position reaching the
-    // forward start ⇒ a match. O(input). (A `$` program has no mid-input `match`, so the
-    // one-pass `runUnanchored` over `utrans` would wrongly never accept — route to the
-    // reverse pass instead.)
-    if (program.end_anchored) return (try scratch.revFindEnd(program, input, opts.start)) != null;
+    // A `text_end` (`$`/`\z`) program has NO mid-input forward `match` state — the trailing
+    // assertion is woven into the *reverse* automaton — so the one-pass `runUnanchored` over
+    // `utrans` can never accept it. Route through the reverse automaton exactly as `search`
+    // does (every arm O(input)): `end_anchored` ⇒ one reverse pass from the end; otherwise a
+    // forward find of the leftmost match end (a found end implies a start ≥ `opts.start`, so a
+    // match exists); and, when no reverse automaton was built, a per-position anchored confirm.
+    // `end_anchored` ⊆ `has_text_end`: the old `end_anchored`-only guard missed `^?\z`
+    // (`has_text_end` yet not `end_anchored`, via an optional `^?`) and fell through to
+    // `runUnanchored` → wrong `false`, disagreeing with `find`.
+    if (program.has_text_end) {
+        if (program.end_anchored) return (try scratch.revFindEnd(program, input, opts.start)) != null;
+        if (program.rev.built) return (try scratch.findEndForward(program, input, opts.start, &flushes)) != null;
+        var s = opts.start;
+        while (s <= input.len) : (s += nfa.decodeAt(input, s).len) { // code-point-aligned scan (no mid-code-point start)
+            if ((try scratch.runAnchored(program, input, s, true, &flushes, null)) != null) return true;
+        }
+        return false;
+    }
     return scratch.runUnanchored(program, input, opts.start, &flushes);
 }
 

@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 `0.7.0-dev` on `main`.
 
+### Fixed
+
+- **Spurious zero-width match mid-code-point over valid UTF-8 (`backtrack`, `dfa`, `edfa`,
+  `bytepike`).** Each backend's unanchored scan advanced start positions **byte-by-byte**, so over
+  a valid multi-byte code point it attempted a match at an *interior* byte and a zero-width pattern
+  could match there — e.g. `\B{4}` over U+AAE9 (`ea ab a9`) matched `(2,2)`, and `\b`/`()`/`\z{0,2}`
+  over multibyte input started mid-code-point — where the Pike VM correctly only considers
+  code-point boundaries (offsets 0 and 3, both word boundaries here, so no match). Fixed by
+  advancing every unanchored scan to the next **code-point boundary**
+  (`+= nfa.decodeAt(input, s).len`, as `pikevm`/`onepass` already do; `bytepike` seeds its thread-set
+  start only at code-point offsets). ASCII and invalid lead bytes still advance one byte, so
+  byte-level scanning of invalid UTF-8 is unchanged. Surfaced as `pikevm`≠`backtrack`/`auto`
+  `find`/`findAll`/`captures`/`replace` divergences by the hardened fuzz suite; pinned by two
+  `conformance.zig` regressions (the bare backtracker case and the byte-engine multibyte sweep).
+- **Byte DFA `isMatch` disagreed with its own `find` on two anchored-program shapes.** In both,
+  `find` matched the empty span at the anchor but `isMatch` returned `false`. Surfaced by the new
+  fuzz `isMatch == (find != null)` invariant; each pinned by a `conformance.zig` regression.
+  - **Lazy DFA, a non-`end_anchored` trailing assertion** — a `text_end` (`$`/`\z`) program
+    reached via an *optional* line-start `^?` is `has_text_end` but not `end_anchored` (e.g.
+    `^?\z`, `(?:^)?\z`, `^?$`). `dfa.isMatchImpl` only routed `end_anchored` programs through the
+    reverse automaton and otherwise fell to `runUnanchored`, which can never accept a text-end
+    program (no mid-input `match` state). Fixed by routing **every** `has_text_end` program through
+    the reverse automaton, mirroring `searchImpl`.
+  - **Eager DFA, an interior `text_start`** — `a*^$`, `a*\A$`, `b*^\z`, `(?:a*)^$` over `""`.
+    `edfa.isMatch` used the one-pass `utrans` scan for a `prone` program, but that table can't
+    carry an interior `text_start` (`\A`/`^` after a consuming prefix — it seeds mid-input
+    positions with `text_start=false`). Fixed by gating the one-pass path on `!has_text_start`, so
+    such programs use the anchored restart (which evaluates `text_start` per start), mirroring
+    `searchImpl`.
+
+### Internal
+
+- **Hardened, parallel fuzz suite** (`fuzz/`). Split into independent per-group binaries that the
+  build scheduler runs concurrently (`zig build fuzz --fuzz=N` → every group in parallel, N
+  iterations each; plus `zig build fuzz-<group>`). Coverage is broadened to the **full backend
+  matrix** — the differential now diffs the Pike VM oracle against `backtrack`, `auto`, `bytepike`,
+  **`dfa`, `edfa`**, `onepass`, and `literal` (the DFA family was previously unfuzzed) — with new
+  `isMatch == (find != null)`, `findAt` offset/anchored/`span_end`, and `$`-template `replaceAll`
+  differentials, an ASCII-`\b` byte-engine gate mirroring `conformance.byteEngineCanRunCase`, and
+  richer generators (named groups, inline flags, `\x{}`/`\u{}` escapes, broad-byte inputs). This
+  is what surfaced the two fixes above.
+
 ## [0.6.0] - 2026-06-21
 
 A throughput + correctness release. The **prefilter fast path** grew three sound, leftmost-first

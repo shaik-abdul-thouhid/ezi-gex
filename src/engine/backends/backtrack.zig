@@ -444,7 +444,7 @@ fn run(program: *const Program, scratch: *Scratch, input: []const u8, opts: Sear
     // O(program × input), not O(program × input²). The touched-words list accumulates
     // across starts for the same reason — it is cleared only between separate `run`s.
     var start = opts.start;
-    while (start <= input.len) : (start += 1) {
+    while (start <= input.len) {
         @memset(scratch.slots, .{ .slot = null });
         if (backtrack(&ctx, 0, start)) {
             scratch.touched_count = ctx.touched_count; // persist for the next clear
@@ -452,6 +452,12 @@ fn run(program: *const Program, scratch: *Scratch, input: []const u8, opts: Sear
             return true;
         }
         if (opts.anchored) break;
+        // Advance to the next code-point boundary — 1 byte for ASCII / an invalid lead,
+        // the full sequence length for a valid multi-byte lead — so an unanchored scan never
+        // *starts* a match mid-code-point over valid UTF-8. This mirrors the Pike VM's
+        // `sp += cp_len` monotonic scan; a byte-by-byte `start += 1` would otherwise report a
+        // spurious zero-width match (e.g. `\B`) at an interior byte of a multi-byte code point.
+        start += if (start < input.len) nfa.decodeAt(input, start).len else 1;
     }
     scratch.touched_count = ctx.touched_count; // persist for the next clear
     scratch.steps = ctx.steps; // persist the work count (ReDoS observable)
