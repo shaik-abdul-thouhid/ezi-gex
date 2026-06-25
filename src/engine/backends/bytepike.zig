@@ -50,20 +50,40 @@ pub const Options = struct {};
 pub const Inst = byte.Inst;
 pub const Program = byte.Program;
 
+/// A repetition over a **nullable alternation** (`(?:|.)+`, `(?:z*b*$?|.{2})+`): the byte
+/// program's split-based loop shapes (the `plus_loop` loop-back split and the do-while shape in
+/// `byte.zig`) cannot encode the leftmost-first **empty-width-loop** priority for this shape — when
+/// the preferred (earlier) branch matches empty, the loop must terminate at that empty iteration
+/// (`(?:z*b*$?|.{2})+` on `"baa"` is `"b"`, not `"baa"`), but the loop-back arm outranks the exit
+/// and a later *consuming* branch wins. This is a structural limit of the byte lowering — the same
+/// reason `dfa`/`edfa` decline it via `hir.Analysis.nullable_alternation_in_repetition` — and
+/// `bytepike` executes the *same* byte program, so it must decline it too (the code-point engines —
+/// `pikevm`/`backtrack`/`onepass`, via `nfa.zig`'s empty-loop `.jmp` guard — are leftmost-first
+/// correct, and `auto` routes here). A nullable *concat* body (`(?:a?b??)+`) is NOT this shape and
+/// is handled correctly by the do-while loop (the empty-width-loop guard), so it is not declined.
+fn byteLoweringSupports(h: hir.Hir) bool {
+    return !h.analysis.nullable_alternation_in_repetition;
+}
+
 /// Compile a HIR into a heap-allocated byte `Program` (free with `freeProgram`).
 /// `\X` (grapheme) is refused with `error.Unsupported`; `\b`/`\B` lower to byte
-/// assertions (evaluated as ASCII word boundaries — see the module header).
+/// assertions (evaluated as ASCII word boundaries — see the module header). A
+/// nullable-alternation-in-repetition pattern is also declined (`byteLoweringSupports`).
 ///
 /// @stable-since: v0.2.0
 pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Program {
+    if (!byteLoweringSupports(h)) return error.Unsupported;
     return byte.buildAlloc(gpa, h);
 }
 
 /// Compile a HIR into a ro_data byte `Program` at comptime. A non-byte-lowerable HIR
-/// (`\X`/`\b`) becomes a `@compileError`.
+/// (`\X`/`\b`), or a nullable-alternation-in-repetition shape (`byteLoweringSupports`),
+/// becomes a `@compileError`.
 ///
 /// @stable-since: v0.2.0
 pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
+    if (!byteLoweringSupports(h))
+        @compileError("bytepike: a repetition over a nullable alternation cannot preserve leftmost-first empty-width-loop priority in the byte program — use auto/pikevm");
     return byte.buildComptime(h);
 }
 

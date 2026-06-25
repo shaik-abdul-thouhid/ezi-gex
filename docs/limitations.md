@@ -11,13 +11,16 @@ cross-backend conformance suite and the fuzz differential (`fuzz/`) so they cann
 change; the performance limitations are accepted shapes where the engine is and will remain
 slower than Rust.
 
-> **Deferred bugs.** The two former deferred entries — an empty-width loop over a nullable concat
+> **No deferred bugs.** The two former deferred entries — an empty-width loop over a nullable concat
 > body (`(?:a?b??)+`), and a `\b`/`\B` after a length-varying alternation (`(b+|.+)\B`) — are both
 > **fixed** as of v0.6.0 (every backend agrees on the leftmost-first span; see the
-> [CHANGELOG](../CHANGELOG.md)). A hardened parallel fuzz suite has since fixed several more
-> cross-backend divergences and currently tracks **two narrow open cases** in the
-> `\b`/`\B`-combined-with-`(?m)` family — logged under *Findings* in
-> [`../fuzz/README.md`](../fuzz/README.md), to be addressed in a later round.
+> [CHANGELOG](../CHANGELOG.md)). A hardened parallel fuzz suite has since fixed every cross-backend
+> divergence it surfaced, including an `auto` line-anchored-capture false match (`(?m)^\b`) and a
+> `bytepike` nullable-alternation empty-loop — each pinned by a `conformance.zig` regression. So no
+> cross-backend divergence is **currently open under the suite ezi_gex ships** — which is a statement
+> about the suite's reach, not a proof of correctness: fuzzing finds bugs, it cannot certify their
+> absence, the budget is bounded, and the in-process differential can't see a bug in the shared front
+> end (see *Findings* in [`../fuzz/README.md`](../fuzz/README.md)).
 
 ---
 

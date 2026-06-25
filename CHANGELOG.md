@@ -11,6 +11,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`auto` line-anchored capture path reported a false match (`(?m)^\b` over `""`).** For a
+  `(?m)^…` pattern with no eager-DFA span arm (one bearing `\b`, say), `auto`'s capture search
+  (`lineAnchoredCaptures`) seeded the capture-fill helper with an **unconfirmed** `{pos,pos}`
+  candidate at each line start; for a **group-less** pattern that helper trusts the seed as the
+  match and never runs the engine, so a trailing assertion that *fails* at the line start (the `\b`
+  in `(?m)^\b` over `""`/`"\n\n"`) was never checked — `captures`/`find` reported a match where
+  `isMatch`/`search` (which do confirm) correctly found none. Fixed by confirming the match at each
+  candidate line start with an anchored capturing run (`confirmCapturesAnchored`). Surfaced by the
+  fuzz full-backend capture differential; pinned by a `conformance.zig` regression (with positive
+  controls — `(?m)^\bx`, `(?m)^\b\w` — that exercise the same path and must still match).
+- **`bytepike` mismatched the Pike VM on a repetition over a nullable alternation.** The byte
+  Thompson NFA executes the **same byte program** as the byte DFAs, so it shares their structural
+  limit (`hir.Analysis.nullable_alternation_in_repetition`): the split-based loop shapes in
+  `byte.zig` cannot encode the leftmost-first **empty-width-loop** priority when the preferred
+  (earlier) branch matches empty and a later branch consumes — `(?:z*b*$?|.{2})+` over `"baa"` is
+  `"b"` (leftmost-first), but `bytepike` returned `"baa"`. `dfa`/`edfa` already decline this class
+  in `supports`; `bytepike` was missing the gate. Fixed by declining it in
+  `bytepike.buildAlloc`/`buildComptime` (`byteLoweringSupports`) — `auto` and the code-point engines
+  (`pikevm`/`backtrack`/`onepass`, via `nfa.zig`'s empty-loop `.jmp` guard) are leftmost-first
+  correct and `auto` routes there. A nullable *concat* body (`(?:a?b??)+`) is a different shape that
+  the do-while loop handles correctly and is **not** declined. Surfaced by the fuzz span
+  differential; pinned by a `conformance.zig` regression (with the `(?:a?b??)+` accept control).
 - **Spurious zero-width match mid-code-point over valid UTF-8 (`backtrack`, `dfa`, `edfa`,
   `bytepike`).** Each backend's unanchored scan advanced start positions **byte-by-byte**, so over
   a valid multi-byte code point it attempted a match at an *interior* byte and a zero-width pattern

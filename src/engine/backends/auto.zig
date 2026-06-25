@@ -2486,14 +2486,33 @@ fn lineAnchoredCaptures(program: *const Program, scratch: *Scratch, p: *const nf
             continue;
         }
         if (input.len - pos >= program.filter.min_bytes) {
-            const seed = Match{ .start = pos, .end = pos };
-            if (fillCapturesAnchored(program, &scratch.inner.nfa, p, input, slots, seed, opts)) |m| return m;
+            // A line start is only a *candidate*, not a confirmed match — run the capturing engine
+            // anchored here to both confirm a match begins at `pos` and fill its slots. (Must not use
+            // `fillCapturesAnchored` with a `{pos,pos}` seed: for a group-less pattern that trusts the
+            // seed as the match and never checks a trailing assertion like `\b`, so `(?m)^\b` over ""
+            // would falsely "match" at the line start.)
+            if (confirmCapturesAnchored(program, &scratch.inner.nfa, p, input, slots, pos, opts)) |m| return m;
         }
         if (pos == input.len) break;
         const nl = memchrFrom(input, pos, '\n') orelse return null;
         pos = nl + 1;
     }
     return null;
+}
+
+/// Confirm-and-fill captures for a match anchored at `at`, where `at` is a **candidate** start
+/// (a line start) not yet known to match — runs the capturing engine (one-pass table when built,
+/// else the Pike VM), returning `null` when nothing matches at `at`. Unlike `fillCapturesAnchored`
+/// it never trusts a group-less seed span, because here the span is not a located match.
+fn confirmCapturesAnchored(program: *const Program, s: *Scratch.NfaScratch, p: *const nfa.Program, input: []const u8, slots: []?usize, at: usize, opts: SearchOptions) ?Match {
+    var o = opts;
+    o.start = at;
+    o.anchored = true;
+    if (program.onepass_prog) |*op| {
+        var os = onepass.Scratch{};
+        return onepass.searchCaptures(op, &os, input, slots, o);
+    }
+    return pikevm.searchCaptures(p, &s.pike, input, slots, o);
 }
 
 /// Line-anchored **span** search (`(?m)^…`, `filter.line_anchored`): attempt the span engine

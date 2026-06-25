@@ -1573,6 +1573,105 @@ test "regression: eager-DFA isMatch agrees with find for interior text_start + e
     }
 }
 
+/// Assert `captures(...) != null` equals `find(...) != null` (and `isMatch`) on backend `B` — the
+/// internal-consistency invariant across the three entry points. Skips a declining backend.
+fn expectCapturesEqFind(comptime B: type, gpa: std.mem.Allocator, pattern: []const u8, input: []const u8, want: bool) !void {
+    var diag: regex.Diagnostic = .{};
+    var re = regex.compileRuntimeWith(B, gpa, pattern, &diag, .{}) catch return;
+    defer re.deinit();
+    var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+    defer sc.deinit(gpa);
+    const found = re.find(&sc, input) != null;
+    const im = re.isMatch(&sc, input);
+    const n = re.slotCount();
+    var buf: [32]?usize = undefined;
+    const cap = re.captures(&sc, buf[0..n], input) != null;
+    if (found != cap or found != im or found != want) {
+        std.debug.print("{s} /{s}/ over \"{s}\": find={} isMatch={} captures={} want={}\n", .{ @typeName(B), pattern, input, found, im, cap, want });
+        return error.CaptureFindMismatch;
+    }
+}
+
+// Fixed: `auto`'s line-anchored **capture** path (`lineAnchoredCaptures`, taken for a `(?m)^…`
+// pattern with no eager-DFA span arm — e.g. one bearing `\b`) seeded `fillCapturesAnchored` with an
+// UNCONFIRMED `{pos,pos}` candidate at each line start, and for a **group-less** pattern that helper
+// trusts the seed as the match and never runs the engine — so a trailing assertion like `\b` that
+// FAILS at the line start was never checked. `(?m)^\b` over "" then reported a `captures`/`find`
+// match where `search`/`isMatch` (which DO confirm, via `lineAnchoredSpan`) correctly found none.
+// Surfaced by the fuzz full-backend capture differential. **Fixed** by confirming the match at each
+// line start with an anchored capturing run (`confirmCapturesAnchored`). See `auto.lineAnchoredCaptures`.
+test "regression: auto line-anchored captures confirm the match (no false (?m)^\\b)" {
+    const gpa = testing.allocator;
+    // Group-less `(?m)^\b…` over input where every line start is a non-word boundary failure → NO match.
+    const no_match = [_]struct { p: []const u8, i: []const u8 }{
+        .{ .p = "(?m)^\\b", .i = "" }, // the minimized fuzz repro
+        .{ .p = "(?m)^\\b", .i = "\n\n" }, // every line start (0,1,2) is empty → \b fails
+        .{ .p = "(?m)^\\b\\B", .i = "" },
+        .{ .p = "(?m)^\\b", .i = "\n \n" }, // line start at 2 is ' ' (non-word) → \b fails
+    };
+    inline for (.{ pikevm, backtrack, auto }) |B| {
+        for (no_match) |c| {
+            try expectIsMatchEqFind(B, gpa, c.p, c.i, false);
+            try expectCapturesEqFind(B, gpa, c.p, c.i, false);
+        }
+    }
+    // Controls — the SAME line-anchored-captures path must still find a real match where `\b` holds.
+    const yes = [_]struct { p: []const u8, i: []const u8 }{
+        .{ .p = "(?m)^\\bx", .i = "x\ny" }, // line start 0, \b holds (x is word), matches "x"
+        .{ .p = "(?m)^\\b\\w", .i = "ab\ncd" }, // matches at offset 0 and (via findAll) line 2
+    };
+    inline for (.{ pikevm, backtrack, auto }) |B| {
+        for (yes) |c| {
+            try expectIsMatchEqFind(B, gpa, c.p, c.i, true);
+            try expectCapturesEqFind(B, gpa, c.p, c.i, true);
+        }
+    }
+}
+
+// Fixed: `bytepike` (the byte Thompson NFA) executes the **same byte program** as the byte DFAs, so
+// it shares their structural limit on a repetition over a **nullable alternation**
+// (`hir.Analysis.nullable_alternation_in_repetition`): the split-based loop shapes in `byte.zig`
+// cannot encode the leftmost-first **empty-width-loop** priority — when the preferred (earlier)
+// branch matches empty the loop must terminate there, but the loop-back arm outranks the exit and a
+// later *consuming* branch wins. `(?:z*b*$?|.{2})+` on `"baa"` is `"b"` (leftmost-first), but
+// `bytepike` returned `"baa"`. `dfa`/`edfa` already decline this class in `supports`; `bytepike` was
+// missing the decline. **Fixed** by declining it in `bytepike.buildAlloc`/`buildComptime`
+// (`byteLoweringSupports`) — the code-point engines (`pikevm`/`backtrack`/`onepass`, via `nfa.zig`'s
+// empty-loop `.jmp` guard) are correct and `auto` routes here. Surfaced by the fuzz span differential.
+test "regression: bytepike declines nullable-alternation-in-repetition (leftmost-first empty loop)" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { p: []const u8, i: []const u8 }{
+        .{ .p = "(())(?:z{,}b*$?|.{2}(?:(?:)(?:)))+", .i = "baa" }, // minimized fuzz repro
+        .{ .p = "(?:z*b*$?|.{2})+", .i = "baa" }, // the essence: nullable branch | 2-consume branch
+        .{ .p = "(?:|.)+", .i = "c" }, // canonical empty-branch alternation under `+`
+        .{ .p = "(a*|b)+", .i = "ab" }, // leftmost-first is "a", not "ab"
+    };
+    // bytepike must DECLINE every case (so a downstream user / the differential never runs it here).
+    for (cases) |c| {
+        var diag: regex.Diagnostic = .{};
+        if (regex.compileRuntimeWith(bytepike, gpa, c.p, &diag, .{})) |re_| {
+            var re2 = re_;
+            re2.deinit();
+            std.debug.print("bytepike should have declined /{s}/\n", .{c.p});
+            return error.BytepikeShouldDecline;
+        } else |_| {}
+    }
+    // The code-point engines and `auto` agree on the leftmost-first span sequence (the oracle).
+    for (cases) |c| {
+        var ref: [16][2]usize = undefined;
+        const nref = try collectFindAll(pikevm, gpa, c.p, c.i, &ref);
+        inline for (.{ backtrack, auto, onepass }) |B|
+            try checkFindAllVsPike(B, gpa, c.p, c.i, ref[0..nref]);
+    }
+    // Control: a nullable *concat* body (`(?:a?b??)+`) is NOT this shape — bytepike still accepts it
+    // (the do-while empty-width-loop guard is correct there) and agrees with the Pike VM.
+    {
+        var ref: [16][2]usize = undefined;
+        const nref = try collectFindAll(pikevm, gpa, "(?:a?b??)+", "ab", &ref);
+        try checkFindAllVsPike(bytepike, gpa, "(?:a?b??)+", "ab", ref[0..nref]);
+    }
+}
+
 test {
     testing.refAllDecls(@This());
 }

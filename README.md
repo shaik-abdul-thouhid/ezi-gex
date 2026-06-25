@@ -600,13 +600,14 @@ repetition counts are capped (default 100,000, set via `Options.max_repetition`)
 `a{999999999}` fails to compile instead of blowing up. Both are written up in
 [`docs/limitations.md`](docs/limitations.md).
 
-Empty-width loops follow RE2/Rust leftmost-first semantics on every backend, and the two edge
-cases deferred in 0.5.x — an empty loop over a nullable concat body, and a `\b`/`\B` after a
-length-varying alternation — are fixed. A hardened, parallel fuzz suite (`fuzz/`) differences the
-full backend matrix against the Pike VM and has since closed several more cross-backend
-divergences (DFA `isMatch` routing for trailing/interior anchors, code-point-aligned unanchored
-scanning); it currently tracks **two narrow open cases** in the `\b`/`\B`-combined-with-`(?m)`
-family — see *Findings* in [`fuzz/README.md`](fuzz/README.md).
+Empty-width loops follow RE2/Rust leftmost-first semantics on every backend. A hardened, parallel
+fuzz suite (`fuzz/`) differences the full backend matrix against the Pike VM oracle, and every
+divergence it has surfaced is fixed and pinned by a `conformance.zig` regression. That is the bar
+ezi_gex holds itself to — **no cross-backend divergence is open under the test and fuzz suite it
+ships**. It is *not* a proof of correctness: fuzzing shows the presence of bugs, never their absence,
+the budget is bounded, and an in-process differential is structurally blind to a bug in the shared
+front end (an external Rust oracle, in the sibling `regex-bench`, is what catches that class). The
+fix history lives in the [CHANGELOG](CHANGELOG.md), not here.
 
 There are also a few **performance** shapes where ezi_gex is slower than Rust and that won't be
 optimized — each fix would cost the linear-time guarantee, portability, or simplicity. From the
