@@ -409,7 +409,10 @@ fn uniUnitQuant(p: *PatternSmith, smith: *Smith, depth: u8) void {
 }
 
 fn uniUnit(p: *PatternSmith, smith: *Smith, depth: u8) void {
-    const max: u8 = if (depth == 0 or p.nearlyFull()) 12 else 14;
+    // Cases 0..11 are non-recursing leaves; 12 `(?i:…)`, 13 `(…)`, and the `else` `(?:…)` all recurse
+    // with `depth - 1`. At `depth == 0` the cap must therefore be 11 — capping at 12 still admitted the
+    // recursing `(?i:…)`, whose `depth - 1` underflowed the `u8` and aborted the unicode fuzz group.
+    const max: u8 = if (depth == 0 or p.nearlyFull()) 11 else 14;
     switch (smith.valueRangeAtMost(u8, 0, max)) {
         0 => p.put('a'),
         1 => p.put('.'),

@@ -2164,7 +2164,18 @@ fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.
         // anchor-to-anchor would confirm almost everywhere — slower than one skip + a native pass.
         // The byte-frequency heuristic (speed-only, never affects the result) admits only a selective
         // anchor (`@`, freq 25); a common one (`.`, freq 90) keeps the single-skip path below.
-        if (!dp.has_word_boundary and memmem.byteFreq(anchor) <= INNER_ANCHOR_RARE_MAX) {
+        //
+        // **`input_ascii` gate (soundness, not speed):** the reverse-walk over `inner_lead` is a
+        // BYTE test, and `inner_lead` is only EXACT on ASCII — bytes ≥ 0x80 are set conservatively
+        // (a superset). On non-ASCII input the walk can therefore over-reach to a `cs` BEFORE the
+        // true match start (an invalid/multi-byte lead the leading class can't actually consume),
+        // and the per-anchor confirm here is **anchored at that single `cs`** — so when the real
+        // match starts LATER than `cs` (e.g. `[^]]+\}` / `\s*\|+` over invalid UTF-8, where the
+        // run breaks at an invalid byte) the anchored confirm fails and the loop wrongly gives up.
+        // (The `bounded_confirm` sibling above is `input_ascii`-gated for the same reason.) On
+        // non-ASCII fall to the `else` arm — one skip to `cs` then an UNANCHORED native find, which
+        // re-seeds every start in `[cs, …]` and is leftmost-correct regardless of over-reach.
+        if (input_ascii and !dp.has_word_boundary and memmem.byteFreq(anchor) <= INNER_ANCHOR_RARE_MAX) {
             var budget: isize = @intCast(2 *| input.len + 64);
             var pos = o.start;
             while (memchrFrom(input, pos, anchor)) |q| {

@@ -601,13 +601,16 @@ repetition counts are capped (default 100,000, set via `Options.max_repetition`)
 [`docs/limitations.md`](docs/limitations.md).
 
 Empty-width loops follow RE2/Rust leftmost-first semantics on every backend. A hardened, parallel
-fuzz suite (`fuzz/`) differences the full backend matrix against the Pike VM oracle, and every
-divergence it has surfaced is fixed and pinned by a `conformance.zig` regression. That is the bar
-ezi_gex holds itself to — **no cross-backend divergence is open under the test and fuzz suite it
-ships**. It is *not* a proof of correctness: fuzzing shows the presence of bugs, never their absence,
-the budget is bounded, and an in-process differential is structurally blind to a bug in the shared
-front end (an external Rust oracle, in the sibling `regex-bench`, is what catches that class). The
-fix history lives in the [CHANGELOG](CHANGELOG.md), not here.
+fuzz suite (`fuzz/`) differences the full backend matrix against the Pike VM oracle, and nearly every
+divergence it has surfaced is fixed and pinned by a `conformance.zig` regression. One `edfa`-only
+leftmost-first span divergence (`(?:ba()|b+)*.\B`) is **currently open and documented** — the
+code-point engines and the lazy DFA are correct, so it is reachable through `auto` only on that exact
+eager-DFA-eligible shape (see [*Known open divergence*](fuzz/README.md#known-open-divergence)). That is
+the bar ezi_gex holds itself to: divergences are tracked, pinned when fixed, and written down when not.
+It is *not* a proof of correctness — fuzzing shows the presence of bugs, never their absence, the
+budget is bounded, and an in-process differential is structurally blind to a bug in the shared front
+end (an external Rust oracle, in the sibling `regex-bench`, is what catches that class). The fix
+history lives in the [CHANGELOG](CHANGELOG.md), not here.
 
 There are also a few **performance** shapes where ezi_gex is slower than Rust and that won't be
 optimized — each fix would cost the linear-time guarantee, portability, or simplicity. From the

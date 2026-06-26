@@ -657,7 +657,9 @@ pub const Analysis = struct {
     word_boundary_with_adjacent_repetition: bool,
     /// A `\b`/`\B` word boundary immediately **follows** an `alternation` whose branches
     /// have **overlapping first code points** (so they can match the same start at
-    /// different lengths, e.g. `(b+|.+)\B`, `(?:b|baaa)\B`). Leftmost-first must try the
+    /// different lengths, e.g. `(b+|.+)\B`, `(?:b|baaa)\B`) — **directly, or through a
+    /// repetition wrapping** such an alternation (`(?:.|b\n)*\b`, `(?:b+|.+)*\B`), which only
+    /// adds match-end ambiguity. Leftmost-first must try the
     /// earlier branch first — `b+` matches `"b"`, the `\B` holds between `b` and `a`, so the
     /// span is `"b"` and the longer `.+` branch is never used — but the **eager** byte DFA's
     /// word-boundary determinization loses that branch priority once a boundary follows and
@@ -2059,12 +2061,18 @@ fn alternationBranchesOverlapFirst(nodes: []const Node, children: []const u32, r
     return false;
 }
 
-/// The `alternation` node `idx` (or wraps via a capture), else null. Non-capturing groups
-/// have already been removed in HIR, so an alternation is either bare or capture-wrapped.
+/// The `alternation` node `idx` wraps (directly, or via a capture and/or a **repetition**),
+/// else null. Non-capturing groups are already removed in HIR, so an alternation is bare,
+/// capture-wrapped, or repetition-wrapped. Seeing through a repetition catches a varying
+/// alternation under a quantifier immediately before a `\b` (`(?:.|b\n)*\b`, `(?:b+|.+)*\B`):
+/// the repetition only ADDS match-end ambiguity, so the same eager-DFA leftmost-first loss
+/// applies. (Found by the differential anchor fuzz; the body-overlap + boundary-follows gate
+/// at the call site keeps it tight, and over-flagging only forgoes the eager arm.)
 fn alternationThroughWrap(nodes: []const Node, idx: u32) ?u32 {
     return switch (nodes[idx].tag) {
         .alternation => idx,
         .capture => alternationThroughWrap(nodes, nodes[idx].data.capture.child),
+        .repetition => alternationThroughWrap(nodes, nodes[idx].data.repetition.child),
         else => null,
     };
 }

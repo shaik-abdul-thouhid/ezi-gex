@@ -11,6 +11,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`edfa` lost leftmost-first priority for a `\b`/`\B` after a repetition over a varying
+  alternation (`(?:.|b\n)*\b`).** When a word boundary immediately follows a repetition whose body is
+  a length-varying, overlapping-first alternation, the body can end at several offsets and the
+  boundary holds at more than one; leftmost-first takes the earliest (branch-priority) end, but the
+  eager longest-match DFA took the latest — `(?:.|b\n)*\b` over `"b\na"` is `"b"` (`{0,1}`) yet `edfa`
+  returned `{0,3}`. This is the same eager-DFA loss the `word_boundary_after_varying_alternation` gate
+  already covers when the boundary follows the alternation *directly*; the alternation under a `*`/`+`
+  slipped past because the detector (`alternationThroughWrap`) saw through a capture but not a
+  repetition. Fixed by having it see through a repetition too, so `edfa.supports` declines and `auto`
+  routes to the lazy `dfa`/Pike VM (both leftmost-first correct). Over-declining only forgoes the
+  eager arm, never correctness. Surfaced by the fuzz anchors differential; pinned by a
+  `conformance.zig` regression (with a disjoint-first `(?:a+|b+)*\b` accept control).
+- **`auto`'s rare interior-anchor prefilter missed matches over non-ASCII / invalid-UTF-8 input
+  (`[^]]+\}`, `\s*\|+`).** The lazy-DFA arm's rare single-byte-anchor fast path (`runByteDfa`'s
+  `confirmReach` loop) reverse-walked the match start over `inner_lead`, a byte-level alphabet that is
+  only *exact on ASCII* (bytes ≥ 0x80 are a conservative superset), then confirmed **anchored** at
+  that single position. Over non-ASCII input the walk over-reaches past the true start to a byte the
+  leading class cannot actually consume, the anchored confirm fails, and the loop gave up — `[^]]+\}`
+  over `"\x80a}"` is `{1,3}` and `\s*\|+` over `"\x80|"` is `{1,2}`, but `auto` returned **no match**
+  (every backend run *directly* was correct; only `auto`'s pre-backend fast path missed). The sibling
+  `bounded_confirm` arm was already `input_ascii`-gated for this reason; the rare-anchor arm wasn't.
+  Fixed by adding the `input_ascii` gate — non-ASCII falls to one skip + an **unanchored** native find
+  (leftmost-correct regardless of over-reach). Surfaced by the fuzz iter/diff differentials over
+  invalid UTF-8; pinned by a `conformance.zig` regression (with an all-ASCII control that keeps the
+  fast anchored-confirm path).
 - **`auto` line-anchored capture path reported a false match (`(?m)^\b` over `""`).** For a
   `(?m)^…` pattern with no eager-DFA span arm (one bearing `\b`, say), `auto`'s capture search
   (`lineAnchoredCaptures`) seeded the capture-fill helper with an **unconfirmed** `{pos,pos}`
@@ -71,7 +96,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `isMatch == (find != null)`, `findAt` offset/anchored/`span_end`, and `$`-template `replaceAll`
   differentials, an ASCII-`\b` byte-engine gate mirroring `conformance.byteEngineCanRunCase`, and
   richer generators (named groups, inline flags, `\x{}`/`\u{}` escapes, broad-byte inputs). This
-  is what surfaced the two fixes above.
+  is what surfaced the fixes above.
+- **Fuzz generator no longer aborts the `unicode` group.** `pattern_smith.genUnicode`'s depth-0 cap
+  still admitted the recursing `(?i:…)` alternative, whose `depth - 1` underflowed a `u8` and panicked
+  the group mid-run (a false crash in the harness, not an engine finding). Capped the depth-0 unit
+  choice at the non-recursing leaves.
 
 ## [0.6.0] - 2026-06-21
 

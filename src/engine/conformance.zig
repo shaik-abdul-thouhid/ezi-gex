@@ -1672,6 +1672,87 @@ test "regression: bytepike declines nullable-alternation-in-repetition (leftmost
     }
 }
 
+// Fixed: the EAGER DFA (`edfa`) lost leftmost-first priority when a `\b`/`\B` immediately follows a
+// **repetition over** a length-varying, overlapping-first alternation (`(?:.|b\n)*\b`, `A{0}(?:\n{0}.|b\n)*\b`).
+// The repetition lets the body end at several offsets and the trailing boundary holds at more than one;
+// leftmost-first takes the earliest (branch-priority) end, the longest-match eager DFA the latest —
+// `(?:.|b\n)*\b` over "b\na" is "b" (`{0,1}`) but `edfa` returned `{0,3}`. The same eager-DFA loss the
+// `word_boundary_after_varying_alternation` gate already covers when the boundary follows the alternation
+// DIRECTLY; the alternation under a `*`/`+` slipped past because `alternationThroughWrap` saw through a
+// capture but not a repetition. **Fixed** by having it see through a repetition too, so the gate fires and
+// `edfa.supports` declines — `auto` routes to the lazy `dfa`/Pike VM (both leftmost-first correct).
+// Surfaced by the fuzz anchors differential (`auto` vs the Pike VM oracle).
+test "regression: edfa declines a boundary after a repetition over a varying alternation" {
+    const gpa = testing.allocator;
+    // edfa must DECLINE (so the eager longest-match arm never serves these) …
+    const decline = [_][]const u8{
+        "(?:.|b\n)*\\b", // minimized fuzz repro
+        "A{0}(?:\n{0}.|b\n)*\\b", // the raw minimized form (leading `A{0}`/inner `\n{0}` empties)
+        "(?:b+|.+)*\\B", // the documented varying-alternation example, now under a `*`
+    };
+    for (decline) |p| {
+        var diag: regex.Diagnostic = .{};
+        if (regex.compileRuntimeWith(edfa, gpa, p, &diag, .{})) |re_| {
+            var re2 = re_;
+            re2.deinit();
+            std.debug.print("edfa should have declined /{s}/\n", .{p});
+            return error.EdfaShouldDecline;
+        } else |_| {}
+    }
+    // … and every other backend agrees with the Pike-VM oracle on the leftmost-first spans.
+    const i = "b\na";
+    inline for (.{ "(?:.|b\n)*\\b", "A{0}(?:\n{0}.|b\n)*\\b" }) |p| {
+        var ref: [16][2]usize = undefined;
+        const nref = try collectFindAll(pikevm, gpa, p, i, &ref);
+        try testing.expect(std.meta.eql(ref[0], [2]usize{ 0, 1 })); // leftmost-first is "b", not "b\na"
+        inline for (.{ backtrack, auto, dfa, bytepike }) |B|
+            try checkFindAllVsPike(B, gpa, p, i, ref[0..nref]);
+    }
+    // Control: a boundary after a DISJOINT-first alternation under a `*` is unambiguous — edfa keeps it.
+    {
+        var diag: regex.Diagnostic = .{};
+        var re = try regex.compileRuntimeWith(edfa, gpa, "(?:a+|b+)*\\b", &diag, .{}); // a vs b: disjoint first
+        re.deinit();
+    }
+}
+
+// Fixed: `auto`'s lazy-DFA **rare interior-anchor** prefilter (`runByteDfa`, the `confirmReach` loop for a
+// single-byte `inner_byte` whose `byteFreq` is rare) reverse-walked `cs` over `inner_lead` — a BYTE-level
+// superset that is only EXACT on ASCII (bytes ≥ 0x80 are set conservatively) — then confirmed ANCHORED at
+// that single `cs`. Over non-ASCII / invalid-UTF-8 input the walk over-reaches PAST the true start to a byte
+// the leading class can't actually consume, the anchored confirm at `cs` fails, and the loop wrongly gave up:
+// `[^]]+\}` over "\x80a}" is `{1,3}` and `\s*\|+` over "\x80|" is `{1,2}`, but `auto` returned NO match (the
+// individual `dfa`/`edfa`/`bytepike` backends, run directly, were all correct — only `auto`'s pre-backend
+// fast path missed). The sibling `bounded_confirm` arm is `input_ascii`-gated for the same reason; the
+// rare-anchor arm wasn't. **Fixed** by adding the `input_ascii` gate — non-ASCII falls to one skip + an
+// UNANCHORED native find (leftmost-correct regardless of over-reach). Surfaced by the fuzz iter/diff
+// differentials over invalid UTF-8.
+test "regression: auto rare interior-anchor prefilter is sound over non-ASCII input" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { p: []const u8, i: []const u8, want: [2]usize }{
+        .{ .p = "[^]]+\\}", .i = "\x80a}", .want = .{ 1, 3 } }, // finding C (minimized)
+        .{ .p = "\\s*\\|+", .i = "\x80|", .want = .{ 1, 2 } }, // finding D (minimized)
+        // a couple of variations around the over-reach boundary
+        .{ .p = "[^]]+\\}", .i = "\xff\xfe-x}", .want = .{ 2, 5 } }, // two invalid bytes, then the run
+        .{ .p = "\\s*\\|+", .i = "ab\xc3|", .want = .{ 3, 4 } }, // ASCII then a lone lead byte, then `|`
+    };
+    for (cases) |c| {
+        var ref: [8][2]usize = undefined;
+        const nref = try collectFindAll(pikevm, gpa, c.p, c.i, &ref);
+        try testing.expect(nref >= 1 and std.meta.eql(ref[0], c.want));
+        // Every backend (and crucially `auto`, where the bug lived) must agree with the Pike VM.
+        inline for (.{ backtrack, auto, dfa, edfa, bytepike }) |B|
+            try checkFindAllVsPike(B, gpa, c.p, c.i, ref[0..nref]);
+    }
+    // Control: the SAME shape over ALL-ASCII input keeps the fast anchored-confirm path and stays correct.
+    {
+        var ref: [8][2]usize = undefined;
+        const nref = try collectFindAll(pikevm, gpa, "[^]]+\\}", "  -f}", &ref);
+        inline for (.{ backtrack, auto, dfa, edfa, bytepike }) |B|
+            try checkFindAllVsPike(B, gpa, "[^]]+\\}", "  -f}", ref[0..nref]);
+    }
+}
+
 test {
     testing.refAllDecls(@This());
 }
