@@ -464,9 +464,13 @@ match, so a prefilter or length gate built on them never yields a false negative
   `word_boundary_in_alternation` (`\b|.`), `word_boundary_with_nullable_alternation`
   (`\B(?:|.*)`), `word_boundary_with_lazy_repetition` (`a*?\b`, `[^a]+?\B *`),
   `word_boundary_with_adjacent_repetition` (`\n+(\n.*){0,2}\b`),
-  `word_boundary_after_varying_alternation` (`(b+|.+)\B` — **eager arm only**; the lazy DFA is
+  `word_boundary_after_varying_alternation` (`(b+|.+)\B`, also under a quantifier and reached
+  *through* an intervening consumer — `(?:ba()|b+)*.\B` — **eager arm only**; the lazy DFA is
   correct), `word_boundary_in_repetition` (`(b.{0,2}\B)+` — **eager arm only**),
-  `nullable_alternation_in_repetition` (`(?:|.)+`), `interior_text_end` (a non-trailing
+  `nullable_alternation_in_repetition` (`(?:|.)+`, `(?:a||b*)+` — also when behind a leading
+  `(?m)^`), `line_end_after_nullable_alternation` (a `(?m)$` after a nullable alternation,
+  `(?:|\n)$` — **eager arm only**; the line analogue of `word_boundary_with_nullable_alternation`),
+  `interior_text_end` (a non-trailing
   `$`/`\z`, `$b$`), and `complex_line_anchor` (a `(?m)` anchor that is non-trailing /
   under a repetition / mixed with `\A`/`\z` / a `line_end` before a `line_start` `(?m:$^)` /
   inside an alternation branch `(?m:$)|.`). All were surfaced by the fuzz suite

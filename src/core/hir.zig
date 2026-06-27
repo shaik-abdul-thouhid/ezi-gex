@@ -704,6 +704,17 @@ pub const Analysis = struct {
     ///
     /// @stable-since: v0.5.0
     complex_line_anchor: bool,
+    /// A `(?m)$` `line_end` immediately preceded — on the concat path, with no MANDATORY
+    /// consumer between — by a **nullable alternation** (`(?:|\n)$`). The alternation's
+    /// leftmost-FIRST branch order prefers the shorter (empty) match, but a `(?m)$` holds at
+    /// BOTH the short end and the longer branch's end (a `\n` consumed by a branch lands on the
+    /// next line end), so the leftmost-LONGEST eager DFA takes the long branch — `(?m:(?:|\n)$)`
+    /// over `"aaa\n\n"` is the empty `{3,3}`, the eager DFA returned `{3,4}`. This is the line
+    /// analogue of `word_boundary_with_nullable_alternation`; it gates the **eager DFA only**
+    /// (the lazy DFA already declines every `line_end`; the code-point engines are correct). A
+    /// *greedy* optional/repetition before `$` (`\n?$`, `.*$`, `[\n ]*$`) does NOT trip it —
+    /// greedy prefers the longer match too, so it agrees with the DFA.
+    line_end_after_nullable_alternation: bool,
     /// The whole pattern is a single literal run (no anchors, classes, …) — route
     /// straight to a memmem/substring backend.
     is_whole_literal: bool,
@@ -1644,6 +1655,7 @@ fn analyze(
         .word_boundary_after_varying_alternation = wordBoundaryAfterVaryingAlternation(nodes, children, ranges, literals, root),
         .word_boundary_in_repetition = wordBoundaryInRepetition(nodes, children, root, false),
         .complex_line_anchor = complexLineAnchor(nodes, children, root, false, false, false, false, false),
+        .line_end_after_nullable_alternation = lineEndAfterNullableAlternation(nodes, children, root),
         .is_whole_literal = nodes[root].tag == .literal,
         .is_one_pass = false, // decided by the backend's NFA compiler; see Analysis
         .prefix_literal = prefixLiteral(nodes, children, root),
@@ -2106,14 +2118,24 @@ fn leadsToWordBoundary(nodes: []const Node, children: []const u32, idx: u32) boo
     };
 }
 
-/// Whether a `\b`/`\B` can immediately follow position `from` in the concat children `kids`
-/// — reached through any number of nullable / zero-width siblings, but stopped by the first
-/// MANDATORY consumer (which would pin the alternation's end, removing the ambiguity).
+/// Whether a `\b`/`\B` appears anywhere after position `from` in the concat children `kids`.
+///
+/// The earlier version stopped at the first MANDATORY consumer on the assumption that it
+/// "pins the alternation's end and removes the ambiguity". The fuzz differential disproved
+/// that: `(?:ba()|b+)*.\B` over "bbabb" — the `.` between the repetition and `\B` is exactly
+/// one code point, so leftmost-first (a later `{3,4}` span) and the eager DFA's
+/// leftmost-longest (`{0,4}`) still diverge. A consumer between the alternation and the
+/// boundary only *shifts* where the boundary lands; it does not collapse the overlapping-first
+/// alternation's end ambiguity. So the scan sees through any consumer — fixed or varying.
+///
+/// This is only ever reached behind the call site's overlapping-first-alternation gate
+/// (`alternationBranchesOverlapFirst`), a rare pathological shape, and it gates ONLY the eager
+/// DFA arm (`auto` falls back to the equally-linear lazy DFA / Pike VM), so over-flagging here
+/// costs at most that fast path, never correctness.
 fn boundaryFollowsInConcat(nodes: []const Node, children: []const u32, kids: []const u32, from: usize) bool {
     var i = from;
     while (i < kids.len) : (i += 1) {
         if (leadsToWordBoundary(nodes, children, kids[i])) return true;
-        if (lenBounds(nodes, children, kids[i]).min > 0) return false; // mandatory consumer disambiguates
     }
     return false;
 }
@@ -2309,6 +2331,55 @@ fn subtreeHasLineEnd(nodes: []const Node, children: []const u32, idx: u32) bool 
         .repetition => subtreeHasLineEnd(nodes, children, node.data.repetition.child),
         else => false,
     };
+}
+
+/// Whether the node (directly or through a capture) is an `alternation` with a **nullable**
+/// branch (`lenBounds.min == 0`). The head-of-branch test for `lineEndAfterNullableAlternation`.
+fn nullableAlternationHead(nodes: []const Node, children: []const u32, idx: u32) bool {
+    return switch (nodes[idx].tag) {
+        .alternation => lenBounds(nodes, children, idx).min == 0,
+        .capture => nullableAlternationHead(nodes, children, nodes[idx].data.capture.child),
+        else => false,
+    };
+}
+
+/// Whether a `(?m)$` `line_end` sits in a concat with a **nullable alternation** before it and no
+/// MANDATORY consumer in between (see `Analysis.line_end_after_nullable_alternation`). The eager
+/// DFA loses leftmost-first there: the alternation's empty branch is preferred (shorter), but the
+/// line_end also holds after a consuming branch (`\n`), so the longest-match DFA takes the longer
+/// end. Gates the eager DFA only. Conservative — a nullable alternation anywhere before the
+/// line_end with only nullable/zero-width siblings between trips it (over-flagging just forgoes the
+/// eager arm).
+fn lineEndAfterNullableAlternation(nodes: []const Node, children: []const u32, idx: u32) bool {
+    const node = nodes[idx];
+    switch (node.tag) {
+        .concat => {
+            const d = node.data.children;
+            const kids = children[d.start .. d.start + d.len];
+            var nullable_alt_pending = false;
+            for (kids) |ci| {
+                if (lineEndAfterNullableAlternation(nodes, children, ci)) return true; // nested concat
+                const cn = nodes[ci];
+                if (cn.tag == .anchor and cn.data.anchor.kind == .line_end and nullable_alt_pending) return true;
+                if (nullableAlternationHead(nodes, children, ci)) {
+                    nullable_alt_pending = true;
+                } else if (lenBounds(nodes, children, ci).min > 0) {
+                    nullable_alt_pending = false; // a mandatory consumer pins the position — ambiguity gone
+                }
+            }
+            return false;
+        },
+        .alternation => {
+            const d = node.data.children;
+            for (children[d.start .. d.start + d.len]) |ci| {
+                if (lineEndAfterNullableAlternation(nodes, children, ci)) return true;
+            }
+            return false;
+        },
+        .capture => return lineEndAfterNullableAlternation(nodes, children, node.data.capture.child),
+        .repetition => return lineEndAfterNullableAlternation(nodes, children, node.data.repetition.child),
+        else => return false,
+    }
 }
 
 /// The literal run every match must begin with, or null. Follows the mandatory

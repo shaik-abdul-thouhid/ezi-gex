@@ -1363,6 +1363,30 @@ test "byte Pike VM matches at comptime too (small ASCII subset)" {
     }
 }
 
+// The leftmost-first decline gates live in shared code — `hir.analyze` (one analysis, used by
+// both `buildAlloc` and `buildComptime`) and each backend's `supports` — so the comptime build
+// path (`compileComptimeWith`) inherits every fix the runtime path gets. Before they were fixed,
+// the comptime path carried the SAME divergences (the differential fuzzer only drives runtime, so
+// it never caught them there). This pins comptime parity for the two gate fixes whose runtime
+// regressions are above: `auto`'s comptime match must equal the Pike-VM oracle's. (At comptime
+// `auto` has no lazy-DFA handoff, so the declined shapes route to the Pike VM / eager DFA; either
+// way the answer must be leftmost-first.)
+test "regression: (?m)^ nullable-alt-in-rep and consumer-through boundary gates hold at comptime" {
+    inline for (.{
+        .{ "(?m:^)b*(?m:a||b*)+", "ab\n" }, // dfa `(?m)^` bypass — leftmost-first first match is "a"
+        .{ "(?:ba()|b+)*.\\B", "bbabb" }, // edfa consumer-through — first match is "bba"
+        .{ "(?m:(?:|\n)$)", "aaa\n\n" }, // edfa line-end after nullable alternation — empty {3,3}
+    }) |c| {
+        const want = comptime regex.compileComptimeWith(pikevm, c[0], .{}).findComptime(c[1]);
+        const got = comptime regex.compileComptimeWith(auto, c[0], .{}).findComptime(c[1]);
+        try testing.expect((want == null) == (got == null));
+        if (want) |w| {
+            try testing.expectEqual(w.start, got.?.start);
+            try testing.expectEqual(w.end, got.?.end);
+        }
+    }
+}
+
 // ── program range interning ───────────────────────────────────────────────────────
 
 test "identical class blocks are interned into one range-block in the program" {
@@ -1689,6 +1713,11 @@ test "regression: edfa declines a boundary after a repetition over a varying alt
         "(?:.|b\n)*\\b", // minimized fuzz repro
         "A{0}(?:\n{0}.|b\n)*\\b", // the raw minimized form (leading `A{0}`/inner `\n{0}` empties)
         "(?:b+|.+)*\\B", // the documented varying-alternation example, now under a `*`
+        // The boundary reached *through a consumer*: a fixed-length `.` between the repetition
+        // and `\B` only shifts where the boundary lands, so the overlapping-first ambiguity
+        // survives it. `boundaryFollowsInConcat` now sees through any mandatory consumer.
+        "(?:ba()|b+)*.\\B", // second fuzz finding (was an open, edfa-only divergence)
+        "(?:.|b\n)*ab\\b", // overlapping-first alternation, then a fixed literal, then `\b`
     };
     for (decline) |p| {
         var diag: regex.Diagnostic = .{};
@@ -1708,10 +1737,22 @@ test "regression: edfa declines a boundary after a repetition over a varying alt
         inline for (.{ backtrack, auto, dfa, bytepike }) |B|
             try checkFindAllVsPike(B, gpa, p, i, ref[0..nref]);
     }
-    // Control: a boundary after a DISJOINT-first alternation under a `*` is unambiguous — edfa keeps it.
+    // The consumer-through finding over its own repro input.
     {
+        const p = "(?:ba()|b+)*.\\B";
+        const in = "bbabb";
+        var ref: [16][2]usize = undefined;
+        const nref = try collectFindAll(pikevm, gpa, p, in, &ref);
+        try testing.expect(nref == 2 and std.meta.eql(ref[1], [2]usize{ 3, 4 })); // leftmost-first second span is {3,4}, not {0,4}
+        inline for (.{ backtrack, auto, dfa, bytepike }) |B|
+            try checkFindAllVsPike(B, gpa, p, in, ref[0..nref]);
+    }
+    // Control: a boundary after a DISJOINT-first alternation stays unambiguous — edfa keeps it,
+    // even with a consumer between (`(?:a+|c+)*.\B`): the gate is on overlapping FIRST sets, not
+    // on "any alternation before a boundary".
+    inline for (.{ "(?:a+|b+)*\\b", "(?:a+|c+)*.\\B" }) |p| {
         var diag: regex.Diagnostic = .{};
-        var re = try regex.compileRuntimeWith(edfa, gpa, "(?:a+|b+)*\\b", &diag, .{}); // a vs b: disjoint first
+        var re = try regex.compileRuntimeWith(edfa, gpa, p, &diag, .{});
         re.deinit();
     }
 }
@@ -1750,6 +1791,95 @@ test "regression: auto rare interior-anchor prefilter is sound over non-ASCII in
         const nref = try collectFindAll(pikevm, gpa, "[^]]+\\}", "  -f}", &ref);
         inline for (.{ backtrack, auto, dfa, edfa, bytepike }) |B|
             try checkFindAllVsPike(B, gpa, "[^]]+\\}", "  -f}", ref[0..nref]);
+    }
+}
+
+// Fixed: `dfa.supports` checked its leftmost-first decline flags (nullable-alternation-in-rep,
+// `\b`-in-alternation, …) only on the FALL-THROUGH path — the `(?m)^` line-anchored fast-path
+// (`line_start_count == 1 …`) and the trailing-anchored `$` path return earlier and bypassed
+// them. So `(?m:^)b*(?m:a||b*)+` over "ab\n" took the line arm and the lazy DFA returned the
+// leftmost-LONGEST `{0,2}` for the nullable alternation in the `+`, where leftmost-first (Pike
+// VM) is `{0,1}`. **Fixed** by hoisting the priority-correctness flags above every anchor-shape
+// early-return in `dfa.supports`. Surfaced by the fuzz anchors differential.
+fn dfaDeclines(gpa: std.mem.Allocator, pattern: []const u8) !bool {
+    var diag: regex.Diagnostic = .{};
+    if (regex.compileRuntimeWith(dfa, gpa, pattern, &diag, .{})) |re_| {
+        var re2 = re_;
+        re2.deinit();
+        return false;
+    } else |_| return true;
+}
+
+test "regression: dfa declines priority-sensitive shapes even behind a leading (?m)^" {
+    const gpa = testing.allocator;
+    // A nullable alternation inside a `+`, behind a leading `(?m:^)`: the lazy DFA cannot keep
+    // leftmost-first here, so it must DECLINE (the `(?m)^` fast path used to let it through).
+    try testing.expect(try dfaDeclines(gpa, "(?m:^)b*(?m:a||b*)+"));
+    try testing.expect(try dfaDeclines(gpa, "(?m:^)(?:|a)+")); // bare nullable-alt loop under (?m)^
+    // And every accepting backend agrees with the Pike-VM oracle on the leftmost-first spans.
+    inline for (.{ "(?m:^)b*(?m:a||b*)+", "(?m:^)(?:|a)+" }) |p| {
+        inline for (.{ "ab\n", "aXa\nbb", "" }) |in| {
+            var ref: [16][2]usize = undefined;
+            const nref = try collectFindAll(pikevm, gpa, p, in, &ref);
+            inline for (.{ backtrack, auto, dfa, edfa, bytepike }) |B|
+                try checkFindAllVsPike(B, gpa, p, in, ref[0..nref]);
+        }
+    }
+    // Control: a leading `(?m:^)` with NO priority-sensitive shape keeps the line-anchored fast
+    // path — the hoist must not have disabled it. `(?m:^)\w+[^"]*` is the `log_line`-style shape
+    // the fast path exists for; assert the lazy DFA still accepts it.
+    inline for (.{ "(?m:^)\\w+", "(?m:^)a[^\"]*" }) |p| {
+        try testing.expect(!(try dfaDeclines(gpa, p)));
+    }
+}
+
+// Fixed: the eager DFA (`edfa`, and `auto` routing to it) lost leftmost-first for a `(?m)$`
+// `line_end` immediately preceded by a NULLABLE ALTERNATION (`(?m:(?:|\n)$)`). The alternation's
+// leftmost-first empty branch is preferred (a shorter match), but a `(?m)$` also holds after a
+// consuming branch's `\n` (which lands on the next line end), so the leftmost-LONGEST eager DFA
+// took the longer branch — `(?m:(?:|\n)$)` over "aaa\n\n" is the empty `{3,3}` but `edfa`/`auto`
+// returned `{3,4}`. `complex_line_anchor` didn't cover it (the line_end is trailing and outside the
+// alternation; the nullable alternation sits *before* it). Fixed with a dedicated gate,
+// `hir.Analysis.line_end_after_nullable_alternation`, declined by `edfa.supports`. The line analogue
+// of `word_boundary_with_nullable_alternation`. A *greedy* optional/repetition before `$` (`\n?$`,
+// `.*$`, `[\n ]*$`) does NOT trip it — greedy prefers the long match too, so it agrees with the DFA.
+// Surfaced by the fuzz anchors differential.
+fn edfaSupportsPattern(gpa: std.mem.Allocator, pattern: []const u8) !bool {
+    var diag: regex.Diagnostic = .{};
+    const a = try ccompile.parse(gpa, pattern, &diag);
+    defer a.deinit(gpa);
+    const h = try hir.buildAlloc(gpa, a, .{});
+    defer hir.deinitHir(gpa, h);
+    return edfa.supports(h);
+}
+
+test "regression: edfa declines a (?m)$ line-end after a nullable alternation" {
+    const gpa = testing.allocator;
+    // `edfa.supports` must DECLINE these — the eager longest-match arm would lose leftmost-first.
+    // (Assert the gate directly, not `compileRuntimeWith`: the eager DFA *also* declines unrelated
+    // "prone" shapes for performance, which would mask what this regression pins.)
+    inline for (.{
+        "(?m:(?:|\n)$)", // minimized fuzz repro
+        "(?m:(?:\n|)$)", // newline-branch-first form — also nullable, still declined (conservative)
+        "(?:|\n)(?m:$)", // alternation and the line_end as separate concat siblings
+    }) |p| {
+        try testing.expect(!(try edfaSupportsPattern(gpa, p)));
+    }
+    // … and every accepting backend agrees with the Pike-VM oracle on the leftmost-first spans.
+    {
+        const p = "(?m:(?:|\n)$)";
+        const in = "aaa\n\n";
+        var ref: [16][2]usize = undefined;
+        const nref = try collectFindAll(pikevm, gpa, p, in, &ref);
+        try testing.expect(nref >= 1 and std.meta.eql(ref[0], [2]usize{ 3, 3 })); // empty match, not {3,4}
+        inline for (.{ backtrack, auto, dfa, edfa, bytepike }) |B|
+            try checkFindAllVsPike(B, gpa, p, in, ref[0..nref]);
+    }
+    // Controls: a GREEDY optional/repetition or a MANDATORY run before `(?m)$` is unambiguous
+    // (greedy prefers the long match, matching the DFA), so the gate must NOT flag them — `edfa`
+    // keeps these benchmarked line-end fast paths eligible.
+    inline for (.{ "(?m:\n?$)", "(?m:\\w+$)", "(?m:foo$)", "(?m:[\\n a]*$)" }) |p| {
+        try testing.expect(try edfaSupportsPattern(gpa, p));
     }
 }
 

@@ -111,24 +111,8 @@ priority over nullable bodies. Every fix is permanent — pinned by a `conforman
 controls that keep the benchmarked fast paths eligible — and the smoke run (`zig build test`) stays
 green throughout (it replays only simple seeds).
 
-### Known open divergence
-
-One `edfa`-only span divergence is currently open (`pikevm`/`backtrack`/`dfa`/`bytepike` are all
-leftmost-first correct; `auto` reproduces it because it routes the shape to the eager DFA):
-
-| Minimal repro | Input | Pike VM (correct) | `edfa`/`auto` |
-|---|---|---|---|
-| `(?:ba()\|b+)*.\B` | `"bbabb"` | `{0,3}` then `{3,4}` | `{0,4}` |
-
-It is the same eager-DFA leftmost-first loss as the `word_boundary_after_varying_alternation` gate,
-but with a **fixed-length consumer between the repetition and the boundary** (`…)*.\B`). The gate's
-detector (`boundaryFollowsInConcat`) stops at the first mandatory consumer on the assumption it pins
-the alternation's end and removes the ambiguity; the intervening `.` only shifts the boundary by one,
-so the ambiguity survives and the eager DFA takes the longer end. Closing it means extending the gate
-to see a boundary reachable *through* a fixed-length consumer (and re-checking the over-decline
-surface), which is a larger change than the adjacent fixes here. The code-point engines and the lazy
-DFA are correct, so the contract a downstream user gets through `auto` is wrong only for this exact
-eager-DFA-eligible shape.
+No known cross-backend divergence is currently open — every one the suite has surfaced is fixed and
+pinned by a `conformance.zig` regression (the per-fix log is in the [CHANGELOG](../CHANGELOG.md)).
 
 Two lessons worth keeping:
 

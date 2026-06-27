@@ -7,10 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-`0.7.0-dev` on `main`.
+`0.7.0-dev` on `main`. Nothing yet.
+
+## [0.6.1] - 2026-06-27
+
+A correctness patch. The hardened, parallel fuzz suite (`fuzz/`) and its full-backend differential
+surfaced a family of cross-backend divergences — almost all in the byte-DFA span path and the `auto`
+dispatcher, none in the shared NFA core — each now fixed and pinned by a `conformance.zig` regression
+whose controls keep the benchmarked fast paths eligible. The comptime build path shares the same
+`hir.analyze` flags and backend `supports` gates, so it inherits every fix (pinned by comptime parity
+regressions); none of these divergences was reachable through the comptime path in the first place
+(no lazy DFA at comptime; `auto` routes the priority-sensitive shapes to the Pike VM there).
 
 ### Fixed
 
+- **`edfa` lost leftmost-first for a `(?m)$` line-end after a nullable alternation
+  (`(?m:(?:|\n)$)`).** A `(?m)$` `line_end` immediately preceded by a nullable alternation is a
+  leftmost-first priority inversion the eager longest-match DFA can't hold: the alternation prefers
+  its empty branch (shorter), but a `(?m)$` *also* holds after a consuming branch's `\n` (which lands
+  on the next line end), so the DFA took the longer branch — `(?m:(?:|\n)$)` over `"aaa\n\n"` is the
+  empty `{3,3}` yet `edfa`/`auto` returned `{3,4}`. The existing `complex_line_anchor` gate didn't
+  cover it (the `line_end` is trailing and outside the alternation; the nullable alternation sits
+  *before* it). Fixed with a dedicated gate, `hir.Analysis.line_end_after_nullable_alternation`,
+  declined by `edfa.supports` — the line analogue of `word_boundary_with_nullable_alternation`; the
+  lazy `dfa` already declines every `line_end` and the code-point engines are correct, so `auto`
+  routes the shape to the Pike VM. A *greedy* optional/repetition before `$` (`\n?$`, `.*$`,
+  `[\n ]*$`) is unaffected — greedy prefers the long match too, matching the DFA. This shape also
+  reached the **comptime** path (`edfa` runs at comptime); the shared `hir.analyze`/`supports` fix
+  corrects it there too. Surfaced by the fuzz anchors differential; pinned by a `conformance.zig`
+  regression (runtime + comptime, with greedy/mandatory accept controls).
+- **Lazy `dfa` bypassed its leftmost-first decline gates behind a leading `(?m)^`
+  (`(?m:^)b*(?m:a||b*)+`).** `dfa.supports` checks a family of priority-correctness flags
+  (nullable-alternation-in-repetition, `\b`-in-alternation, …) that the leftmost-**longest** byte
+  DFA cannot encode — but only on its fall-through path. The `(?m)^` line-anchored fast path (a
+  single leading `line_start`) and the trailing-anchored `$` path `return` earlier and never
+  reached them, so a priority-sensitive body slipped through: `(?m:^)b*(?m:a||b*)+` over `"ab\n"`
+  is `"a"` (`{0,1}`, leftmost-first) but the lazy DFA took the line arm and returned `{0,2}` for
+  the nullable alternation in the `+`. Fixed by hoisting the priority-correctness flags above every
+  anchor-shape early-return in `dfa.supports`; `auto` then routes the shape to the Pike VM
+  (correct + linear). Over-declining only forgoes the fast path — the `log_line`-style
+  `(?m:^)\w+[^"]*` shape it exists for has no such flag and stays eligible. Surfaced by the fuzz
+  anchors differential; pinned by a `conformance.zig` regression (with a `(?m:^)\w+` accept
+  control).
+- **`edfa` lost leftmost-first priority for a `\b`/`\B` reached *through a consumer* after a
+  varying alternation (`(?:ba()|b+)*.\B`).** The `word_boundary_after_varying_alternation` gate's
+  "boundary follows" detector (`boundaryFollowsInConcat`) stopped at the first mandatory consumer
+  between the alternation and the boundary, on the assumption that the consumer pins the
+  alternation's end and removes the ambiguity. The fuzz differential disproved that: a fixed-length
+  `.` only *shifts* where the boundary lands, so the overlapping-first ambiguity survives —
+  `(?:ba()|b+)*.\B` over `"bbabb"` has a leftmost-first second span of `{3,4}`, but `edfa` returned
+  `{0,4}`. Fixed by having the detector see through **any** mandatory consumer (fixed or varying);
+  the gate is reached only behind a rare overlapping-first alternation and forgoes only the eager
+  arm, so over-declining costs no correctness. This was previously logged as a known open
+  divergence; it is now closed. Surfaced by the fuzz anchors differential; pinned by a
+  `conformance.zig` regression (with a disjoint-first `(?:a+|c+)*.\B` accept control).
 - **`edfa` lost leftmost-first priority for a `\b`/`\B` after a repetition over a varying
   alternation (`(?:.|b\n)*\b`).** When a word boundary immediately follows a repetition whose body is
   a length-varying, overlapping-first alternation, the body can end at several offsets and the

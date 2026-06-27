@@ -24,7 +24,7 @@ backend architecture.
 
 ## Status
 
-The latest release is `v0.6.0`; `main` is the development branch (`0.7.0-dev`). See
+The latest release is `v0.6.1`; `main` is the development branch (`0.7.0-dev`). See
 [Installing](#installing) for pinning the tag versus tracking `main`. It is pre-1.0, so the API
 can still change, though everything public is annotated `@stable-since: vX.Y.Z` and follows
 SemVer. It needs a recent Zig dev build (`0.17.0-dev`) and will not compile on stable 0.16.
@@ -37,24 +37,24 @@ agrees byte-for-byte with the reference Pike VM, and works at both comptime and 
 
 It is benchmarked against Rust's `regex` and Go's `regexp` on real
 [rebar](https://github.com/BurntSushi/rebar) haystacks. The harness is a separate, reproducible
-repo: [regex-bench](https://github.com/shaik-abdul-thouhid/regex-bench). Around 470 tests cover
+repo: [regex-bench](https://github.com/shaik-abdul-thouhid/regex-bench). Around 490 tests cover
 per-module behaviour, cross-backend conformance (every backend has to agree with the Pike VM, at
 runtime and comptime), and ReDoS immunity (`engine/redos.zig`), plus a hardened, parallel
 **fuzz** suite (`fuzz/` — every backend differenced against the Pike VM; `zig build fuzz --fuzz=N`).
 
 ## Installing
 
-The latest **tagged** release is **`v0.6.0`** — the recommended choice for reproducible
+The latest **tagged** release is **`v0.6.1`** — the recommended choice for reproducible
 builds. Via git ref (resolves the tag and pins its content hash in `build.zig.zon`):
 
 ```sh
-zig fetch --save git+https://github.com/shaik-abdul-thouhid/ezi-gex.git#v0.6.0
+zig fetch --save git+https://github.com/shaik-abdul-thouhid/ezi-gex.git#v0.6.1
 ```
 
 Or via plain HTTP tarball (also pins the content hash):
 
 ```sh
-zig fetch --save https://github.com/shaik-abdul-thouhid/ezi-gex/archive/refs/tags/v0.6.0.tar.gz
+zig fetch --save https://github.com/shaik-abdul-thouhid/ezi-gex/archive/refs/tags/v0.6.1.tar.gz
 ```
 
 **Tracking `main` (unreleased `0.7.0-dev`)** — if you want the latest in-development surface
@@ -66,7 +66,7 @@ zig fetch --save git+https://github.com/shaik-abdul-thouhid/ezi-gex.git#main
 ```
 
 `main` is the development branch: it builds and is tested, but APIs there are not yet covered
-by a tag, so they can still change before `0.7.0`. For reproducible builds prefer the `v0.6.0`
+by a tag, so they can still change before `0.7.0`. For reproducible builds prefer the `v0.6.1`
 tag; reach for `main` only when you specifically need unreleased work.
 
 Then in `build.zig` (the `ezi_code` dependency is resolved transitively — you only
@@ -600,17 +600,10 @@ repetition counts are capped (default 100,000, set via `Options.max_repetition`)
 `a{999999999}` fails to compile instead of blowing up. Both are written up in
 [`docs/limitations.md`](docs/limitations.md).
 
-Empty-width loops follow RE2/Rust leftmost-first semantics on every backend. A hardened, parallel
-fuzz suite (`fuzz/`) differences the full backend matrix against the Pike VM oracle, and nearly every
-divergence it has surfaced is fixed and pinned by a `conformance.zig` regression. One `edfa`-only
-leftmost-first span divergence (`(?:ba()|b+)*.\B`) is **currently open and documented** — the
-code-point engines and the lazy DFA are correct, so it is reachable through `auto` only on that exact
-eager-DFA-eligible shape (see [*Known open divergence*](fuzz/README.md#known-open-divergence)). That is
-the bar ezi_gex holds itself to: divergences are tracked, pinned when fixed, and written down when not.
-It is *not* a proof of correctness — fuzzing shows the presence of bugs, never their absence, the
-budget is bounded, and an in-process differential is structurally blind to a bug in the shared front
-end (an external Rust oracle, in the sibling `regex-bench`, is what catches that class). The fix
-history lives in the [CHANGELOG](CHANGELOG.md), not here.
+Empty-width loops follow RE2/Rust leftmost-first semantics on every backend, at runtime and
+comptime — a deliberate semantic choice, pinned by the cross-backend conformance suite and the
+parallel fuzz differential (`fuzz/`, the full backend matrix against the Pike VM oracle) so it
+can't silently drift.
 
 There are also a few **performance** shapes where ezi_gex is slower than Rust and that won't be
 optimized — each fix would cost the linear-time guarantee, portability, or simplicity. From the

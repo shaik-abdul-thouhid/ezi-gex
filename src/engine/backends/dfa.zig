@@ -303,6 +303,35 @@ pub const Program = struct {
 /// @stable-since: v0.3.0
 pub fn supports(h: hir.Hir) bool {
     if (!byte.byteLowerable(h)) return false; // excludes \X (grapheme)
+
+    // ── Leftmost-first priority shapes the leftmost-longest DFA cannot encode ──
+    // These decline REGARDLESS of the pattern's anchor shape, so they must be checked
+    // BEFORE the `(?m)^` / `text_end` fast-path early-returns below — otherwise a leading
+    // `(?m)^` (or a trailing anchored `$`) short-circuits to `true` and silently bypasses
+    // them. The fuzz differential found exactly that: `(?m:^)b*(?m:a||b*)+` over "ab\n" took
+    // the `line_start` arm and returned the leftmost-LONGEST `{0,2}` for the nullable
+    // alternation in the `+`, where leftmost-first (Pike VM) is `{0,1}`. Over-declining only
+    // forgoes this fast path; `auto` routes to the lazy decode-hybrid / Pike VM (both correct).
+    //
+    // A `\b`/`\B` inside an alternation needs leftmost-FIRST branch priority across the
+    // assertion (`\b|.` on `"b"` must be `{0,0}`, not `{0,1}`). See
+    // `hir.Analysis.word_boundary_in_alternation`.
+    if (h.analysis.word_boundary_in_alternation) return false;
+    // A repetition over a nullable alternation (`(?:|.)+`, `(?:a||b*)+`): the priority-ordered
+    // DFA can't reproduce the leftmost-first empty-width-loop priority. See
+    // `hir.Analysis.nullable_alternation_in_repetition`.
+    if (h.analysis.nullable_alternation_in_repetition) return false;
+    // A `\b`/`\B` adjacent to a nullable alternation (`\B(?:|.*)`). See
+    // `hir.Analysis.word_boundary_with_nullable_alternation`.
+    if (h.analysis.word_boundary_with_nullable_alternation) return false;
+    // A `\b`/`\B` with a lazy repetition (`a*?\b`, `[^a]+?\B *`). See
+    // `hir.Analysis.word_boundary_with_lazy_repetition`.
+    if (h.analysis.word_boundary_with_lazy_repetition) return false;
+    // A `\b`/`\B` with two adjacent consuming repetitions (`\n+(\n.*){0,2}\b`): their
+    // ambiguous split + the boundary defeats leftmost-first. See
+    // `hir.Analysis.word_boundary_with_adjacent_repetition`.
+    if (h.analysis.word_boundary_with_adjacent_repetition) return false;
+
     var has_text_start = false;
     var has_text_end = false;
     var has_word = false;
@@ -338,28 +367,9 @@ pub fn supports(h: hir.Hir) bool {
     // non-prone, pattern; a direct `backends.dfa` user on a prone `\b` like `\b.*x` should prefer
     // `auto`.)
     if (has_word and has_text_end) return false;
-    // A `\b`/`\B` inside an alternation needs leftmost-FIRST branch priority across
-    // the assertion, which the leftmost-longest DFA cannot encode (`\b|.` on `"b"`
-    // must be the empty match `{0,0}`, not `{0,1}`). Decline to the Pike VM. See
-    // `hir.Analysis.word_boundary_in_alternation`.
-    if (h.analysis.word_boundary_in_alternation) return false;
-    // A repetition over a nullable alternation (`(?:|.)+`): the priority-ordered DFA can't
-    // reliably reproduce the leftmost-first empty-width-loop priority for this shape — decline
-    // to the Pike VM (correct + linear). See `hir.Analysis.nullable_alternation_in_repetition`.
-    if (h.analysis.nullable_alternation_in_repetition) return false;
     // A non-trailing `text_end` (`$a`, `\z.\z`) wrongly matches via the reverse-end
     // path. Decline. See `hir.Analysis.interior_text_end`.
     if (h.analysis.interior_text_end) return false;
-    // A `\b`/`\B` adjacent to a nullable alternation (`\B(?:|.*)`). Decline. See
-    // `hir.Analysis.word_boundary_with_nullable_alternation`.
-    if (h.analysis.word_boundary_with_nullable_alternation) return false;
-    // A `\b`/`\B` with a lazy repetition (`a*?\b`, `[^a]+?\B *`). Decline. See
-    // `hir.Analysis.word_boundary_with_lazy_repetition`.
-    if (h.analysis.word_boundary_with_lazy_repetition) return false;
-    // A `\b`/`\B` with two adjacent consuming repetitions (`\n+(\n.*){0,2}\b`): their
-    // ambiguous split + the boundary defeats leftmost-first on the DFA. Decline. See
-    // `hir.Analysis.word_boundary_with_adjacent_repetition`.
-    if (h.analysis.word_boundary_with_adjacent_repetition) return false;
     return true;
 }
 

@@ -445,6 +445,12 @@ pub fn supports(h: hir.Hir) bool {
     // priority-order against a consuming sibling), is outside what the lookahead model
     // covers — decline. See `hir.Analysis.complex_line_anchor`.
     if (h.analysis.complex_line_anchor) return false;
+    // A `(?m)$` line_end immediately preceded by a nullable alternation (`(?:|\n)$`): the
+    // alternation's leftmost-first empty branch is preferred, but the line_end also holds after a
+    // consuming branch's `\n`, so the longest-match DFA takes the long end. The line analogue of
+    // `word_boundary_with_nullable_alternation`; lazy `dfa` already declines every line_end and the
+    // code-point engines are correct. See `hir.Analysis.line_end_after_nullable_alternation`.
+    if (h.analysis.line_end_after_nullable_alternation) return false;
     return true;
 }
 
