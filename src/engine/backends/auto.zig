@@ -2076,9 +2076,37 @@ fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.
             }
             return null;
         }
-        o.start = nextPrefixHit(filter, tdy, input, o.start) orelse return null;
-        o.start -|= filter.prefix_set_off_max;
-        if (input.len - o.start < filter.min_bytes) return null;
+        // Unbounded **leading** multi-prefix (`Holmes(?:\s*.+\s*){0,10}Watson|Watson…`): every match
+        // begins at a prefix-literal occurrence (`off==0`), so jump prefix-to-prefix (Teddy) and
+        // confirm anchored at each with a `reach` budget — the same provably-linear jump-and-confirm
+        // the single-`prefix` arm uses above — instead of one skip + a full native DFA pass over the
+        // whole input. The win is large when the literals are sparse: a confirm at a non-completing
+        // occurrence fails within the budget, so the automaton touches far fewer bytes than an
+        // O(input) forward+reverse pass (`holmes-coword-watson` ~24× → ~1×). Sound + leftmost-first:
+        // `cand == hit` ascends with the scan, and every match starts at one of these hits. Excludes
+        // `\b` programs (need the decode-hybrid restart) and non-leading sets (`off_max>0`, where
+        // `hit-d` is not monotonic in `hit`) — those keep the single-skip + native pass below.
+        if (!dp.has_word_boundary and filter.prefix_set_off_max == 0) {
+            var budget: isize = @intCast(2 *| input.len + 64);
+            var pos = o.start;
+            while (nextPrefixHit(filter, tdy, input, pos)) |hit| {
+                pos = hit + 1;
+                if (input.len - hit < filter.min_bytes) return null;
+                const c = dfa.confirmReach(dp, d, input, hit, match_only);
+                lazy_bytes.* += c.reach - hit + 1;
+                if (c.end) |end|
+                    return Match{ .start = if (match_only) opts.start else hit, .end = if (match_only) opts.start else end };
+                budget -= @as(isize, @intCast(c.reach - hit + 1));
+                if (budget < 0) {
+                    o.start = pos; // prefilter proved ineffective → one native O(input) find for the rest
+                    break;
+                }
+            } else return null; // no more prefix occurrences ⇒ no match
+        } else {
+            o.start = nextPrefixHit(filter, tdy, input, o.start) orelse return null;
+            o.start -|= filter.prefix_set_off_max;
+            if (input.len - o.start < filter.min_bytes) return null;
+        }
     } else if (filter.req_lit_len > 0) {
         // Structured reverse-walk fast path (`\w+\s+Holmes`, `\w+\s+Holmes\s+\w+`): per memmem hit,
         // walk the disjoint pre-atom classes backward to the EXACT start, then one anchored confirm —

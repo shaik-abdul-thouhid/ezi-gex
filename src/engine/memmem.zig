@@ -37,6 +37,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const simd = @import("simd.zig");
 
 /// Portable vector width: 256-bit on AVX2 (one `vpcmpeqb`/`vpmovmskb` over 32 starts),
 /// else 128-bit. Wider on AVX2 only — NEON has no 256-bit register and no cheap 32-lane
@@ -169,9 +170,17 @@ pub const Finder = struct {
             while (i <= max_i) : (i += W) {
                 const wa: V = input[i + lo ..][0..W].*;
                 const wb: V = input[i + hi ..][0..W].*;
-                const ma: Mask = @bitCast(wa == vlo);
-                const mb: Mask = @bitCast(wb == vhi);
-                var bits = ma & mb;
+                // Candidate lanes: both probe bytes coincide. AND in the bool-vector domain
+                // so we take a **single** movemask below (not two ANDed together).
+                const both = @select(bool, wa == vlo, wb == vhi, @as(@Vector(W, bool), @splat(false)));
+                // On a target without a cheap movemask (NEON), the `@bitCast` below is an
+                // emulated shift-narrow-reduce — skip it on the common empty chunk via a cheap
+                // `umaxv` (`@reduce(.Or, …)`). On x86 the movemask is one instruction, so the
+                // comptime branch drops this test entirely. Speed-only; the verify is unchanged.
+                if (comptime !simd.cheap_movemask) {
+                    if (!@reduce(.Or, both)) continue;
+                }
+                var bits: Mask = @bitCast(both);
                 while (bits != 0) {
                     const j: usize = @ctz(bits);
                     const cand = i + j;
@@ -261,6 +270,20 @@ test "memmem: no-match and start-offset past matches" {
     try testing.expectEqual(@as(?usize, 3), g.find("ab ab", 1));
     try testing.expectEqual(@as(?usize, null), g.find("ab ab", 4));
     try testing.expectEqual(@as(?usize, null), g.find("ab", 5)); // start past end
+}
+
+test "memmem: sparse matches over many full vector chunks (empty-chunk gate branch)" {
+    // A long haystack of empty (no-probe-hit) chunks with the needle only at the very end,
+    // and a wholly-no-match variant. On NEON targets these drive the `@reduce(.Or) == false`
+    // continue branch added to skip the emulated movemask; on x86 they take the direct path.
+    // Either way the result must equal the scalar oracle at every start offset.
+    // ~130 B of prose containing neither 'Q' nor 'z' (the two probe bytes of "Quartz"),
+    // so every 16-byte chunk over it is empty and takes the gate's skip branch.
+    const filler = "the brown fox jumps over the idle dog, the cat sat on the mat by the river bank as the sun set behind the far green hills late today";
+    try expectAgreesEverywhere("Quartz", filler ++ "Quartz" ++ filler);
+    try expectAgreesEverywhere("Quartz", filler ++ filler); // never matches: all chunks empty
+    // dense-then-sparse seam: many hits then a long empty tail
+    try expectAgreesEverywhere(" in", "in in in in in in in in in in in in" ++ filler);
 }
 
 test "memmem: comptime evaluates via the scalar fallback (no @Vector in const-eval)" {

@@ -120,7 +120,15 @@ pub const ClassFinder = struct {
         while (i + 16 <= input.len) : (i += 16) {
             const v: @Vector(16, u8) = input[i..][0..16].*;
             const a = simd.shuffle16(lo_tab, v & lomask) & simd.shuffle16(hi_tab, v >> shift4);
-            var mask: u16 = @bitCast(a != zero);
+            const hit = a != zero;
+            // For a **sparse** class (digits/`\p{N}` in prose, a leading capital) most chunks have
+            // no member; NEON has no movemask, so the `@bitCast` below is an emulated reduction —
+            // skip it on an empty chunk via a cheap `umaxv` (`@reduce(.Or, …)`). On x86 (`pmovmskb`)
+            // the comptime branch drops this test. Speed-only; membership is still confirmed below.
+            if (comptime !simd.cheap_movemask) {
+                if (!@reduce(.Or, hit)) continue;
+            }
+            var mask: u16 = @bitCast(hit);
             while (mask != 0) {
                 const j = @ctz(mask);
                 if (self.has(input[i + j])) return i + j; // exact confirm (superset → exact)
@@ -189,6 +197,18 @@ test "classscan: digits (nibble-aligned, exact classifier)" {
     try expectAgreesEverywhere(digits, "0000000000000000000000000000"); // dense, > 1 chunk
     try expectAgreesEverywhere(digits, "...............7"); // member exactly at offset 16
     try expectAgreesEverywhere(digits, "trailing digit at the very end 9");
+}
+
+test "classscan: sparse member over many empty chunks (empty-chunk gate branch)" {
+    // A long stretch with NO class member drives the `@reduce(.Or) == false` continue added to
+    // skip the emulated NEON movemask (the hot case for `\d+`/`\p{N}+` scanning prose); the
+    // member, when present, must still be found and agree with the scalar oracle everywhere.
+    const digits = rangeSet('0', '9');
+    const empty = "the quick brown fox jumps over the lazy dog, and then some more prose with no digits anywhere in this whole long line at all";
+    try expectAgreesEverywhere(digits, empty ++ "7" ++ empty);
+    try expectAgreesEverywhere(digits, empty ++ empty); // all chunks empty: never matches
+    const caps = rangeSet('A', 'Z');
+    try expectAgreesEverywhere(caps, empty ++ "Sherlock"); // sparse capital after a long gap
 }
 
 test "classscan: scattered set stresses the superset+verify path" {

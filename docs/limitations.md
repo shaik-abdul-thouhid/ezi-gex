@@ -50,8 +50,12 @@ simplicity. The multipliers are from the rebar Sherlock suite (how many times sl
 that one benchmark).
 
 - **An unbounded gap between two required literals** — `Holmes(?:\s*.+\s*){0,10}Watson` and
-  similar (~20×). Both literals prefilter fine, but the `.+` between them still has to be walked;
-  nothing can skip an arbitrary-length span. This is inherent to the shape.
+  similar. Both literals prefilter fine, but the `.+` between them still has to be walked; nothing
+  can skip an arbitrary-length span. The common **leading-alternation** form (rebar
+  `holmes-coword-watson`, `Holmes…Watson|Watson…Holmes`) is no longer slow — as of 0.7.0 it
+  jump-and-confirms prefix-to-prefix with a reach budget (~1.7× vs Rust, down from ~20×). The
+  residual gap is only on shapes where neither literal is a sound leading prefix (the match can
+  begin mid-span), where the engine must fall back to walking the span.
 - **A common single byte as the only distinctive feature** — `\b\w+n\b` (~8×). The one selective
   thing is the trailing `n`, which is far too common to prefilter on and too short for the
   literal skip. There is no rare anchor to jump to.

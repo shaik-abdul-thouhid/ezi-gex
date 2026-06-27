@@ -84,6 +84,24 @@ pub const has_native_shuffle16 = has_pshufb or has_tbl;
 /// @stable-since: v0.4.0
 pub const has_native_shuffle32 = has_vpshufb;
 
+/// Whether `@bitCast`-ing an N-lane `@Vector(N, bool)` to an N-bit movemask integer lowers
+/// to a single cheap instruction on this target.
+///
+/// **x86-64** has `pmovmskb`/`vpmovmskb` — one instruction, ~3-cycle latency — so a SIMD
+/// scan loop can compute the movemask unconditionally and branch on it. **aarch64 NEON has
+/// no movemask**: LLVM emulates the bool-vector→integer bitcast with a shift-narrow-reduce
+/// sequence (several instructions) that it pays on *every* chunk. On such targets a scan
+/// that only needs "is there a hit, and where?" should first ask the cheap question — "did
+/// **any** lane match?" via `@reduce(.Or, …)` (one `umaxv`) — and pay the emulated movemask
+/// only on the rare chunk that actually hit. For a sparse needle (most chunks empty) that
+/// turns a per-chunk emulated movemask into a per-chunk `umaxv`, a multiple-x speedup.
+///
+/// Speed-only: every surviving candidate is still fully verified, so this never changes
+/// which matches are found — it only steers *how* a hot loop locates them per target.
+///
+/// @stable-since: v0.7.0
+pub const cheap_movemask = arch == .x86_64;
+
 // ── 128-bit dynamic byte shuffle (slim Teddy's engine) ────────────────────────────
 
 /// Dynamic 16-byte in-vector shuffle: `out[i] = (idx[i] < 16) ? table[idx[i]] : 0`.

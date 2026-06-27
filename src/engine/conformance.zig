@@ -744,6 +744,33 @@ test "lazy-arm jump-and-confirm (leading literal / rare interior anchor) is left
     }
 }
 
+// Regression (0.7.0): an **unbounded leading multi-prefix** alternation (`Holmes…|Watson…` with a
+// `.+`-bearing, hence unbounded, gap) now jumps prefix-to-prefix (Teddy) and confirms anchored at
+// each hit with a `reach` budget on the lazy-DFA arm — the multi-prefix analogue of the single-
+// `prefix` jump-and-confirm — instead of one skip + a full native pass over the whole input
+// (`holmes-coword-watson` ~24× → ~1×). Every match begins at a prefix occurrence (`off==0`), so the
+// skip is sound and `cand==hit` keeps it leftmost-first. These pin agreement with the Pike VM oracle
+// across both branch orders, a leftmost-across-order case (a `Watson` left of a `Holmes`), greedy
+// span, and no-match. Reverting the new arm (falling back to the native pass) keeps these green but
+// loses the speed; a *wrong* confirm/skip would break them here.
+const multi_prefix_jump_cases = [_]Case{
+    .{ .pat = "Holmes(?:\\s*.+\\s*){0,3}Watson|Watson(?:\\s*.+\\s*){0,3}Holmes", .input = "Holmes saw Watson", .expect = "Holmes saw Watson" },
+    .{ .pat = "Holmes(?:\\s*.+\\s*){0,3}Watson|Watson(?:\\s*.+\\s*){0,3}Holmes", .input = "Watson met Holmes", .expect = "Watson met Holmes" },
+    .{ .pat = "Holmes(?:\\s*.+\\s*){0,3}Watson|Watson(?:\\s*.+\\s*){0,3}Holmes", .input = "Holmes alone here", .expect = null },
+    .{ .pat = "Holmes(?:\\s*.+\\s*){0,3}Watson|Watson(?:\\s*.+\\s*){0,3}Holmes", .input = "no names at all here", .expect = null },
+    .{ .pat = "Holmes(?:\\s*.+\\s*){0,3}Watson|Watson(?:\\s*.+\\s*){0,3}Holmes", .input = "x Watson y Holmes z", .expect = "Watson y Holmes" }, // leftmost prefix hit is Watson → branch 2
+    // a "Watson" anywhere after the first "Holmes" completes branch 1 (greedy spans to the last Watson)
+    .{ .pat = "Holmes(?:\\s*.+\\s*){0,3}Watson|Watson(?:\\s*.+\\s*){0,3}Holmes", .input = "Holmes a Watson b Watson", .expect = "Holmes a Watson b Watson" },
+};
+
+test "unbounded leading multi-prefix jump-and-confirm is leftmost-first (0.7.0 regression)" {
+    for (multi_prefix_jump_cases) |c| {
+        try checkRuntime(pikevm, c); // leftmost-first oracle
+        try checkRuntime(backtrack, c);
+        try checkRuntime(auto, c); // exercises runByteDfa's multi-prefix unbounded jump-confirm
+    }
+}
+
 // Regression (0.6.0): the leading-class SIMD skip now admits a **sparse-ASCII / broad-tail**
 // class (`\p{Lu}…`) via a sound over-approximating derived set — `{ASCII members} ∪ {all high
 // bytes}` (`auto.asciiLeadDerived`) — so capitalized-word scans (`\p{Lu}\p{Ll}+`) skip the

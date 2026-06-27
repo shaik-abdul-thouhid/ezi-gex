@@ -174,7 +174,14 @@ pub const Teddy = struct {
                 const a_p = simd.shuffle16(rows_lo[p], vlo) & simd.shuffle16(rows_hi[p], vhi);
                 res &= shiftLo(p, a_p);
             }
-            var mask: u16 = @as(u16, @bitCast(res != zero)) & lane_mask;
+            const hit = res != zero;
+            // NEON has no movemask, so the `@bitCast` is an emulated reduction — skip it on
+            // the common chunk with no fingerprint hit via a cheap `umaxv` (`@reduce(.Or, …)`).
+            // On x86 (`pmovmskb`) the comptime branch drops this test. Speed-only.
+            if (comptime !simd.cheap_movemask) {
+                if (!@reduce(.Or, hit)) continue;
+            }
+            var mask: u16 = @as(u16, @bitCast(hit)) & lane_mask;
             while (mask != 0) {
                 const j = @ctz(mask);
                 if (self.verifyAt(input, i + j)) |m| return m;
@@ -589,6 +596,18 @@ test "teddy: no false negatives on a dense near-miss input" {
     const set = [_][]const u8{"abcd"};
     try expectAgreesEverywhere(&set, "aaaaaaaaaaaaaaaaaaaaaaaaabcdaaaaaaaaaaaaaaaa");
     try expectAgreesEverywhere(&set, "abababababababababababababababababcdabababab");
+}
+
+test "teddy: sparse matches over many empty chunks (empty-chunk gate branch)" {
+    // Long stretches with NO fingerprint hit drive the `@reduce(.Or) == false` continue
+    // added to skip the emulated NEON movemask; the match (if any) must still be found and
+    // agree with the scalar oracle at every start offset. On x86 these take the direct path.
+    const set = [_][]const u8{ "Quartz", "Xylophone" };
+    // ~130 B with no 'Q'/'X' (the needle lead bytes), so every chunk is a fingerprint miss.
+    const empty = "the brown fox over the idle dog, the cat sat on the mat by the river as the sun set behind the far green hills late in the evening";
+    try expectAgreesEverywhere(&set, empty ++ "Quartz" ++ empty);
+    try expectAgreesEverywhere(&set, empty ++ empty); // all chunks empty: never matches
+    try expectAgreesEverywhere(&set, empty ++ "Xylophone");
 }
 
 // ── Fat Teddy tests (validate the lane-split algorithm; on arm64 these exercise the ──
