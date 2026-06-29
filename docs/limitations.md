@@ -52,7 +52,7 @@ that one benchmark).
 - **An unbounded gap between two required literals** — `Holmes(?:\s*.+\s*){0,10}Watson` and
   similar. Both literals prefilter fine, but the `.+` between them still has to be walked; nothing
   can skip an arbitrary-length span. The common **leading-alternation** form (rebar
-  `holmes-coword-watson`, `Holmes…Watson|Watson…Holmes`) is no longer slow — as of 0.7.0 it
+  `holmes-coword-watson`, `Holmes…Watson|Watson…Holmes`) is no longer slow — as of 0.6.2 it
   jump-and-confirms prefix-to-prefix with a reach budget (~1.7× vs Rust, down from ~20×). The
   residual gap is only on shapes where neither literal is a sound leading prefix (the match can
   begin mid-span), where the engine must fall back to walking the span.
@@ -67,9 +67,9 @@ that one benchmark).
   without risking quadratic time, so it falls back to a slower scan. Keeping the linear-time
   guarantee is worth more than the throughput here. (The *bounded* form,
   `(?i:Sherlock|Holmes|Watson)`, is faster than Rust.)
-- **A line anchor inside an alternation** — `(?m)^...|...` (~4.7×). This routes to the linear
+- **A line anchor inside an alternation** — `(?m)^...|...` (~4×). This routes to the linear
   Pike VM; the DFAs do not carry `(?m)` line context through an alternation. Correct, just not
   the fast path.
-- **Pure-literal alternation throughput** — `Sherlock|Street` (~4×). The prefilter is the right
+- **Pure-literal alternation throughput** — `Sherlock|Street` (~3.3×). The prefilter is the right
   one (Teddy), but Rust's hand-tuned Teddy scans faster. Matching it would mean per-architecture
   assembly, which ezi_gex deliberately avoids in favour of portable `@Vector` code.

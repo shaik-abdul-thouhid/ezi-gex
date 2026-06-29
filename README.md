@@ -24,7 +24,7 @@ backend architecture.
 
 ## Status
 
-The latest release is `v0.6.1`; `main` is the development branch (`0.7.0-dev`). See
+The latest release is `v0.6.2`; `main` is the development branch (`0.7.0-dev`). See
 [Installing](#installing) for pinning the tag versus tracking `main`. It is pre-1.0, so the API
 can still change, though everything public is annotated `@stable-since: vX.Y.Z` and follows
 SemVer. It needs a recent Zig dev build (`0.17.0-dev`) and will not compile on stable 0.16.
@@ -44,17 +44,17 @@ runtime and comptime), and ReDoS immunity (`engine/redos.zig`), plus a hardened,
 
 ## Installing
 
-The latest **tagged** release is **`v0.6.1`** — the recommended choice for reproducible
+The latest **tagged** release is **`v0.6.2`** — the recommended choice for reproducible
 builds. Via git ref (resolves the tag and pins its content hash in `build.zig.zon`):
 
 ```sh
-zig fetch --save git+https://github.com/shaik-abdul-thouhid/ezi-gex.git#v0.6.1
+zig fetch --save git+https://github.com/shaik-abdul-thouhid/ezi-gex.git#v0.6.2
 ```
 
 Or via plain HTTP tarball (also pins the content hash):
 
 ```sh
-zig fetch --save https://github.com/shaik-abdul-thouhid/ezi-gex/archive/refs/tags/v0.6.1.tar.gz
+zig fetch --save https://github.com/shaik-abdul-thouhid/ezi-gex/archive/refs/tags/v0.6.2.tar.gz
 ```
 
 **Tracking `main` (unreleased `0.7.0-dev`)** — if you want the latest in-development surface
@@ -66,7 +66,7 @@ zig fetch --save git+https://github.com/shaik-abdul-thouhid/ezi-gex.git#main
 ```
 
 `main` is the development branch: it builds and is tested, but APIs there are not yet covered
-by a tag, so they can still change before `0.7.0`. For reproducible builds prefer the `v0.6.1`
+by a tag, so they can still change before `0.7.0`. For reproducible builds prefer the `v0.6.2`
 tag; reach for `main` only when you specifically need unreleased work.
 
 Then in `build.zig` (the `ezi_code` dependency is resolved transitively — you only
@@ -377,10 +377,12 @@ is correct for every pattern and input: ASCII `\b` and non-prone `(?m)` ride the
 `.enabled`); `.disabled` opts back to the NFA-only program. Force a specific backend with the
 `*With` variants: `gex.compileRuntimeWith(gex.backends.pikevm, gpa, pat, &diag, .{})`.
 
-A **single** literal (`Sherlock`) routed to `literal` is scanned with a portable two-byte SIMD
-**`memmem`** (`engine/memmem.zig`): probe the two rarest needle bytes, AND their `@Vector` equality
-masks across a 16/32-byte chunk, verify only where both coincide — no arch asm (lowers to SSE2/NEON
-everywhere). A literal **alternation** (`cat|dog|fish`) instead uses the **Teddy** SIMD prefilter on
+A **single** literal (`Sherlock`) routed to `literal` is scanned with a portable SIMD **`memmem`**
+(`engine/memmem.zig`): probe the rarest needle bytes, AND their `@Vector` equality masks across a
+16/32-byte chunk, verify only where they coincide — no arch asm (lowers to SSE2/NEON everywhere). The
+scan processes four chunks per iteration (after a short single-chunk warm-up so dense matches return
+at once), and adds a third probe byte for short all-common needles so most candidates are rejected
+without a comparison — which brings plain literal scans to `rust/regex` parity on ARM64. A literal **alternation** (`cat|dog|fish`) instead uses the **Teddy** SIMD prefilter on
 a target with a native dynamic shuffle (x86-64 SSSE3/AVX2, aarch64 NEON) — fingerprint all branches
 across a 16-byte chunk at once, then verify. Slim (≤8 buckets) by default; **fat** (16 buckets) on
 AVX2 for larger sets; portable scalar fallback at comptime and on other targets. Both are governed by
@@ -483,8 +485,9 @@ Full details in [`docs/architecture.md`](docs/architecture.md) §11 and the usag
 > (it fetches this engine from GitHub, so anyone can reproduce the comparison).
 
 ezi_gex is competitive with Rust's `regex`, and it never goes quadratic. On the rebar Sherlock
-suite its throughput is within a small factor of Rust overall (geometric mean about 1.5×, against
-Rust's 1.16×), it matches Rust on most character-class scans, and it beats Rust on a number of
+suite its throughput is within a small factor of Rust overall (geometric mean about 1.45×, against
+Rust's 1.15×). As of 0.6.2, plain single-literal scans run at or near Rust parity on ARM64 (and a
+few run faster); it matches Rust on most character-class scans, and beats Rust on a number of
 literal and case-insensitive patterns. Against its own simple reference engine it is several times
 faster across the board.
 
@@ -607,12 +610,13 @@ can't silently drift.
 
 There are also a few **performance** shapes where ezi_gex is slower than Rust and that won't be
 optimized — each fix would cost the linear-time guarantee, portability, or simplicity. From the
-rebar Sherlock suite: an unbounded gap between two literals (`Holmes(?:…){0,10}Watson`, ~20×), a
-common single byte as the only distinctive feature (`\b\w+n\b`, ~8×), a bounded negated-class run
-(`["'][^"']{0,30}…`, ~6.5×), an unbounded case-insensitive alternation (`(?i:Sher[a-z]+|…)`,
-~6.4×), a line anchor inside an alternation (`(?m)^…|…`, ~4.7×), and pure-literal alternation
-throughput (`Sherlock|Street`, ~4×). These are spelled out in
-[`docs/limitations.md`](docs/limitations.md).
+rebar Sherlock suite: a common single byte as the only distinctive feature (`\b\w+n\b`, ~8×), a
+bounded negated-class run (`["'][^"']{0,30}…`, ~6.5×), an unbounded case-insensitive alternation
+(`(?i:Sher[a-z]+|…)`, ~6.4×), a line anchor inside an alternation (`(?m)^…|…`, ~4×), pure-literal
+alternation throughput (`Sherlock|Street`, ~3.3×), and an unbounded gap between two *interior*
+literals where neither is a sound leading prefix (the leading-alternation form,
+`Holmes…Watson|Watson…Holmes`, is now ~1.7× after the 0.6.2 jump-and-confirm). These are spelled
+out in [`docs/limitations.md`](docs/limitations.md).
 
 ## License
 

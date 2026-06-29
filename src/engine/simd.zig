@@ -99,7 +99,7 @@ pub const has_native_shuffle32 = has_vpshufb;
 /// Speed-only: every surviving candidate is still fully verified, so this never changes
 /// which matches are found — it only steers *how* a hot loop locates them per target.
 ///
-/// @stable-since: v0.7.0
+/// @stable-since: v0.6.2
 pub const cheap_movemask = arch == .x86_64;
 
 // ── 128-bit dynamic byte shuffle (slim Teddy's engine) ────────────────────────────

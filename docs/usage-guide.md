@@ -345,11 +345,13 @@ _ = try gex.compileRuntime(gpa, "cat|dog|fish", &diag, .{ .strategy = .{ .simd =
 > DFA** — `gex.backends.edfa` — above / in `architecture.md`.)
 
 > **The SIMD prefilter (`simd`) accelerates literals, transparently.** A **single** literal
-> (`Sherlock`, `Sherlock Holmes`) is scanned by a portable two-byte **`memmem`**
-> (`engine/memmem.zig`): probe the two *rarest* needle bytes, AND their `@Vector` equality masks
-> across a 16/32-byte chunk, and verify only where both coincide — far fewer candidates than a
-> one-byte memchr on a common lead byte. It is **fully portable** (SSE2 `pcmpeqb`/NEON via
-> `@Vector`, no arch asm), so it runs everywhere; on Sherlock it edges out Rust (~41 GiB/s). A
+> (`Sherlock`, `Sherlock Holmes`) is scanned by a portable **`memmem`** (`engine/memmem.zig`):
+> probe the *rarest* needle bytes, AND their `@Vector` equality masks across a 16/32-byte chunk, and
+> verify only where they coincide — far fewer candidates than a one-byte memchr on a common lead
+> byte. It scans four chunks per iteration (after a short single-chunk warm-up so dense matches
+> return at once) and adds a third probe byte for short all-common needles like `the`. It is **fully
+> portable** (SSE2 `pcmpeqb`/NEON via `@Vector`, no arch asm), so it runs everywhere; on Sherlock it
+> runs at `rust/regex` parity (and the non-matching scans edge ahead). A
 > literal **alternation** (`cat|dog|fish`, `foo|far|fizz`) is scanned by **Teddy** instead: one
 > dynamic in-vector byte shuffle (`pshufb`/`vpshufb`/`tbl`) fingerprints the first 1–3 bytes of
 > *all* branches across a 16-byte chunk at once, then verifies — far more selective than a

@@ -9,40 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 `0.7.0-dev` on `main`.
 
+## [0.6.2] - 2026-06-29
+
+A performance release. Every change is speed-only: matches and captures are byte-for-byte identical
+to 0.6.1 at runtime and comptime — the gains come entirely from the prefilters that decide *where*
+to run the matching engine. The headline is ARM64 (Apple Silicon / NEON), where literal and
+character-class scanning now run at or near the speed of Rust's `regex`. All of it stays portable —
+no hand-written, per-architecture assembly.
+
 ### Performance
 
-- **Unbounded leading multi-prefix alternations now jump-and-confirm with a reach budget instead of
-  a full DFA pass.** A top-level alternation whose branches each begin with a literal but are
-  separated by an *unbounded* gap — `Holmes(?:\s*.+\s*){0,10}Watson|Watson(?:\s*.+\s*){0,10}Holmes`
-  (rebar `holmes-coword-watson`) — extracts a sound leading prefix set (`{Holmes, Watson}`) and is
-  not bounded-confirmable, so the lazy-DFA arm skipped to the *first* prefix occurrence and then ran
-  **one native pass over the whole input** — O(input × states) over the two-branch `.+` program. The
-  single-`prefix` arm already had the right shape (jump literal-to-literal via the multi-literal
-  prefilter, confirm anchored at each with a `dfa.confirmReach` budget that abandons to the native
-  find on overrun); this gives the **multi-prefix** arm the same loop, sound because every match
-  begins at a prefix occurrence (`off == 0`, so `cand == hit` stays leftmost-first). On an Apple M4
-  `holmes-coword-watson` goes **65 → 813 MB/s (21× → 1.7× vs `rust/regex`)**, rebar Sherlock geomean
-  **1.69 → 1.56**. `\b` programs and non-leading sets (`off_max > 0`, where `hit − d` is not
-  monotonic) keep the single-skip + native pass. Pinned by a `conformance.zig` regression
-  (Pike-VM-oracle leftmost-first across both branch orders, a leftmost-across-order case, greedy
-  span, no-match) and the rebar/regex-bench count cross-checks.
-- **Gate the SIMD movemask behind a cheap any-hit reduce on targets without a native movemask
-  (aarch64 NEON).** The single-literal `memmem`, the multi-literal `teddy`, and the leading-class
-  `classscan` scanners all locate candidate lanes by `@bitCast`-ing an N-lane `@Vector(N, bool)`
-  to an N-bit integer. On x86-64 that is one `pmovmskb`; **aarch64 NEON has no movemask**, so LLVM
-  emulates it with a multi-instruction shift-narrow-reduce that was paid on *every* 16-byte chunk —
-  including the overwhelming majority that contain no hit. New `simd.cheap_movemask` (true only on
-  x86-64) gates each scan: on NEON it first asks the cheap question "did **any** lane match?" via
-  `@reduce(.Or, …)` (one `umaxv`) and pays the emulated movemask only on a chunk that actually hit;
-  on x86 the comptime branch drops the test entirely. Speed-only — every surviving candidate is
-  still fully verified, so no result changes (pinned by each module's exhaustive differential and a
-  new empty-chunk regression). On an Apple M4 this restores the literal- and class-scan throughput
-  the engine is designed for: rebar Sherlock geomean **4.30 → 1.69** vs `rust/regex`; on
-  `regex-bench` (median) **`\d+`/`\p{N}+` on `sherlock` ~5× faster** (4.7 → 23 GB/s), single-literal
-  scans (`Sherlock`, `Holmes`, `\w+\s+Holmes`) **~6-13× faster**, overall geomean **1.31 → 1.10**.
-  The residual gaps are the documented [`limitations.md`](docs/limitations.md) trade-offs (a
-  hand-tuned-SIMD literal-throughput gap, an unbounded literal gap, …) and the non-ASCII
-  Unicode-class decode path.
+- **Literal and class scanning are dramatically faster on ARM64 (NEON).** Locating candidate
+  positions inside a SIMD register is a single instruction on x86-64 but has no direct equivalent on
+  ARM64, where it was previously emulated on *every* 16-byte block of input — even the vast majority
+  that contain no possible match. The scanners (single-literal search, the multi-literal Teddy
+  prefilter, and the leading character-class scan) now first ask the cheap question "did any lane in
+  this block match?" and only pay the emulation on a block that actually contains a candidate. On an
+  Apple M4 this restores the throughput the engine was designed for: on the rebar Sherlock suite the
+  geometric mean versus `rust/regex` improves from **~4.3× to ~1.7×**, and class scans such as `\d+`
+  and `\p{N}+` run roughly **5× faster**.
+
+- **Single-literal search now reaches Rust parity.** The substring prefilter scans four 16-byte
+  blocks per iteration (with a short single-block warm-up so densely matching patterns still return
+  immediately), and for short, all-common needles it probes a third byte so that most candidate
+  positions are rejected without a full comparison. Together these bring plain literal scans to par:
+  on an Apple M4, `Sherlock` goes **1.6× → 1.1×** versus `rust/regex`, `Sherlock\s+Holmes`
+  **1.6× → 1.1×**, and the non-matching scans (`no-match-uncommon`, `no-match-common`) now run
+  **faster than `rust/regex`**. The hardest all-lowercase case, `the`, improves from **2.5× → 1.7×**,
+  and `\w+\s+Holmes` from **1.7× → 1.4×**. The rebar Sherlock geometric mean improves from
+  **~1.56 to ~1.45**.
+
+- **Leading multi-literal alternations with an unbounded gap no longer fall back to a full scan.**
+  A top-level alternation whose branches each begin with a literal but are separated by an unbounded
+  gap — e.g. `Holmes(?:\s*.+\s*){0,10}Watson|Watson(?:\s*.+\s*){0,10}Holmes` — used to skip to the
+  first literal occurrence and then run the matching engine across the entire remaining input. It now
+  jumps from one literal occurrence to the next and confirms locally at each, with a budget that
+  falls back to a single full pass only if the prefilter proves ineffective. On an Apple M4 this case
+  improves from **~21× to ~1.7×** versus `rust/regex`.
+
+The remaining slower shapes are the deliberate trade-offs documented in
+[`docs/limitations.md`](docs/limitations.md) (a hand-tuned-SIMD multi-literal throughput gap, an
+unbounded gap between two interior literals, case-insensitive unbounded alternations, …) and the
+non-ASCII Unicode character-class decode path.
 
 ## [0.6.1] - 2026-06-27
 
