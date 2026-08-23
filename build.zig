@@ -340,7 +340,7 @@ pub fn build(b: *std.Build) void {
         std.builtin.OptimizeMode,
         "bench-optimize",
         "Optimization level for the bench executable (default ReleaseFast)",
-    ) orelse .ReleaseFast;
+    ) orelse .fast;
 
     const ezi_code_bench = b.dependency("ezi_code", .{
         .target = target,

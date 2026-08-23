@@ -2,11 +2,11 @@
     .name = .ezi_gex,
     .version = "0.7.0-dev",
     .fingerprint = 0xe2db231a3c00347d,
-    .minimum_zig_version = "0.17.0-dev.702+18b3c78a9",
+    .minimum_zig_version = "0.17.0-dev.1857+3c46da14d",
     .dependencies = .{
         .ezi_code = .{
-            .url = "git+https://github.com/shaik-abdul-thouhid/ezi-code.git?ref=v0.4.1#be7fb6ba7a682695ee18c7a5aa85aae6ca4527d9",
-            .hash = "ezi_code-0.4.1-05Rjj1M91ACuDvORmzRLBKCKmFtXMVxtkE1_wjAXdBDy",
+            .url = "git+https://github.com/shaik-abdul-thouhid/ezi-code.git?ref=main#f01d7e8c5976eb51048beaf6b26166b37ca467c7",
+            .hash = "ezi_code-0.5.0-dev-05Rjj1E91AAxKYNXEOCXa3prlWT2wZqmP-_ltCl-yvlc",
         },
     },
     .paths = .{
