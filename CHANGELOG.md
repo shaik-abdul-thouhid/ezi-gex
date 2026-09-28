@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 `0.7.0-dev` on `main`.
 
+### Changed
+
+- **Unicode 18.0.0.** The `ezi_code` dependency moves from `main` commit `f01d7e8` (Unicode
+  17.0.0) to the tagged `v0.5.0` release (`61d3b29`), which tracks Unicode 18.0.0. Property
+  classes (`\p{…}`, `\w`, `\d`, `\s`), scripts, case folding (`(?i)`), `\b` and `\X` now follow
+  Unicode 18. Newly assigned characters (e.g. U+A7DD LATIN CAPITAL LETTER CLOSED OMEGA) match
+  `\w` / `\p{L}` and fold with their case partners. `\X` follows the Unicode 18 GB9c: a virama
+  followed by a consonant is one cluster even without a preceding consonant. Pin `v0.6.2` to stay
+  on Unicode 17.
+- Minimum Zig is now `0.17.0-dev.2320+1e770dbef`, the minimum `ezi_code` v0.5.0 requires.
+  `build.zig` uses `std.lang.Optimize` for `-Dbench-optimize` in place of the deprecated
+  `std.builtin.OptimizeMode`, and the docs use the `safe` / `fast` optimize-mode names.
+
+### Added
+
+- `\p{Script=…}` / `\p{scx=…}` resolve the Unicode 18 scripts by long name: `Jurchen`,
+  `Proto_Cuneiform` and `Seal` (the ISO 15924 codes `Jurc`, `Pcun` and `Seal` also work). A new
+  test checks that the long-name table covers every `ezi_code` script, so future Unicode bumps
+  can't leave a script unreachable by name. A conformance test pins the Unicode 18 data across
+  backends at runtime and comptime.
+- **Unicode syntax reference** in the usage guide
+  ([§11](docs/usage-guide.md#11-unicode-syntax-reference)). Collapsible sections list every
+  Unicode escape and shorthand class, all 38 general categories and groups, the 19 derived
+  properties, and all 179 scripts, each with every accepted spelling (short/long names, `\pL`,
+  `Script=` / `sc=` / `Script_Extensions=` / `scx=`). The README links to it. Tests keep it honest:
+  every documented spelling must resolve, the documented rejections must be rejected, and each
+  shorthand must equal its spelled-out class on every code point.
+
 ## [0.6.2] - 2026-06-29
 
 A performance release. Every change is speed-only: matches and captures are byte-for-byte identical

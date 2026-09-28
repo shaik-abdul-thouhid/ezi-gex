@@ -1910,6 +1910,157 @@ test "regression: edfa declines a (?m)$ line-end after a nullable alternation" {
     }
 }
 
+// Pin regression (0.7.0): `ezi_code` is pinned to v0.5.0, which tracks Unicode 18.0.0. The cases
+// below depend on Unicode 18 data or rules. The new scripts do not resolve under 17 (so the
+// pattern fails to compile). U+A7DD is unassigned there (so `\w`, `\p{L}` and the case fold all
+// miss). `\X` follows the Unicode 18 GB9c, where a Linker needs no leading Consonant. A stale or
+// wrong pin fails here rather than silently shipping old tables.
+const unicode18_cases = [_]Case{
+    // Scripts new in Unicode 18.0, by long name and by ISO 15924 code.
+    .{ .pat = "\\p{Script=Jurchen}+", .input = "x\u{18E00}\u{18E01}y", .expect = "\u{18E00}\u{18E01}" },
+    .{ .pat = "\\p{sc=Jurc}", .input = "\u{191A0}", .expect = "\u{191A0}" }, // JURCHEN RADICAL-01
+    .{ .pat = "\\p{Script=Seal}+", .input = "a\u{3D000}\u{3FC3F}b", .expect = "\u{3D000}\u{3FC3F}" },
+    .{ .pat = "\\p{sc=Pcun}", .input = "1\u{125A8}", .expect = "\u{125A8}" }, // CUNEIFORM NUMERIC SIGN ONE N56
+    .{ .pat = "\\p{Script=Seal}", .input = "\u{18E00}", .expect = null }, // Jurchen is not Seal
+    // U+A7DD LATIN CAPITAL LETTER CLOSED OMEGA, assigned in 18.0 (case-folds to U+0277 ɷ).
+    .{ .pat = "\\w+", .input = " \u{A7DD}\u{0277} ", .expect = "\u{A7DD}\u{0277}" },
+    .{ .pat = "\\p{Lu}", .input = "\u{0277}\u{A7DD}", .expect = "\u{A7DD}" },
+    .{ .pat = "(?i)\u{0277}", .input = "\u{A7DD}", .expect = "\u{A7DD}" },
+    .{ .pat = "(?i)\u{A7DD}", .input = "\u{0277}", .expect = "\u{0277}" },
+};
+
+// `\X` cases: grapheme clusters run on `backtrack` (and `auto`, which routes `\X` there); the
+// Pike VM rejects `\X` as unsupported.
+const unicode18_grapheme_cases = [_]Case{
+    // UAX #29 GB9c (18.0): DEVANAGARI SIGN VIRAMA + KA is one cluster even with no Consonant
+    // before the virama (17.0 split it after the virama).
+    .{ .pat = "\\X", .input = "\u{094D}\u{0915}a", .expect = "\u{094D}\u{0915}" },
+    // Control, the same under 17 and 18: KA + VIRAMA + TA is one cluster, then 'a'.
+    .{ .pat = "\\X\\X", .input = "\u{0915}\u{094D}\u{0924}a", .expect = "\u{0915}\u{094D}\u{0924}a" },
+};
+
+test "Unicode 18.0 data from the pinned ezi_code agrees across backends (pin regression)" {
+    for (unicode18_cases) |c| {
+        try checkRuntime(pikevm, c);
+        try checkRuntime(backtrack, c);
+        try checkRuntime(auto, c);
+    }
+    for (unicode18_grapheme_cases) |c| {
+        try checkRuntime(backtrack, c);
+        try checkRuntime(auto, c);
+    }
+    // The comptime build path resolves the same tables.
+    try checkComptime(auto, .{ .pat = "\\p{Script=Jurchen}+", .input = "x\u{18E00}\u{18E01}y", .expect = "\u{18E00}\u{18E01}" });
+    try checkComptime(auto, .{ .pat = "(?i)\u{0277}", .input = "\u{A7DD}", .expect = "\u{A7DD}" });
+}
+
+// The Unicode syntax reference in docs/usage-guide.md §11 states that each shorthand equals a
+// spelled-out class. These tests hold the doc to that: every pair must agree on every code point.
+fn encodeUtf8(cp: u21, buf: *[4]u8) []const u8 {
+    if (cp < 0x80) {
+        buf[0] = @intCast(cp);
+        return buf[0..1];
+    } else if (cp < 0x800) {
+        buf[0] = @intCast(0xC0 | (cp >> 6));
+        buf[1] = @intCast(0x80 | (cp & 0x3F));
+        return buf[0..2];
+    } else if (cp < 0x10000) {
+        buf[0] = @intCast(0xE0 | (cp >> 12));
+        buf[1] = @intCast(0x80 | ((cp >> 6) & 0x3F));
+        buf[2] = @intCast(0x80 | (cp & 0x3F));
+        return buf[0..3];
+    }
+    buf[0] = @intCast(0xF0 | (cp >> 18));
+    buf[1] = @intCast(0x80 | ((cp >> 12) & 0x3F));
+    buf[2] = @intCast(0x80 | ((cp >> 6) & 0x3F));
+    buf[3] = @intCast(0x80 | (cp & 0x3F));
+    return buf[0..4];
+}
+
+test "usage guide §11: documented shorthand equivalences hold for every code point" {
+    const gpa = testing.allocator;
+    const Pair = struct { short: []const u8, long: []const u8 };
+    const pairs = [_]Pair{
+        .{ .short = "\\A\\d\\z", .long = "\\A\\p{Decimal_Number}\\z" },
+        .{ .short = "\\A\\D\\z", .long = "\\A\\P{Nd}\\z" },
+        .{ .short = "\\A\\w\\z", .long = "\\A[\\p{Alphabetic}\\p{M}\\p{Nd}\\p{Pc}\\u{200C}\\u{200D}]\\z" },
+        .{ .short = "\\A\\W\\z", .long = "\\A[^\\w]\\z" },
+        .{ .short = "\\A\\s\\z", .long = "\\A[\\t\\n\\v\\f\\r\\x20\\x{85}\\xA0\\u{1680}\\u{2000}-\\u{200A}\\u{2028}\\u{2029}\\u{202F}\\u{205F}\\u{3000}]\\z" },
+        .{ .short = "\\A\\S\\z", .long = "\\A[^\\s]\\z" },
+        .{ .short = "\\A.\\z", .long = "\\A[^\\n]\\z" },
+        .{ .short = "\\A\\pL\\z", .long = "\\A\\p{Letter}\\z" },
+        .{ .short = "\\A\\p{sc=Grek}\\z", .long = "\\A\\p{Script=Greek}\\z" },
+    };
+    var buf: [4]u8 = undefined;
+    for (pairs) |p| {
+        var diag: regex.Diagnostic = .{};
+        var a = try regex.compileRuntime(gpa, p.short, &diag, .{});
+        defer a.deinit();
+        var b = try regex.compileRuntime(gpa, p.long, &diag, .{});
+        defer b.deinit();
+        var sa = try @TypeOf(a).Scratch.init(gpa, &a.program);
+        defer sa.deinit(gpa);
+        var sb = try @TypeOf(b).Scratch.init(gpa, &b.program);
+        defer sb.deinit(gpa);
+        var cp: u21 = 0;
+        while (cp <= 0x10FFFF) : (cp += 1) {
+            if (cp >= 0xD800 and cp <= 0xDFFF) continue;
+            const in = encodeUtf8(cp, &buf);
+            if (a.isMatch(&sa, in) != b.isMatch(&sb, in)) {
+                std.debug.print("/{s}/ and /{s}/ disagree on U+{X:0>4}\n", .{ p.short, p.long, cp });
+                return error.DocEquivalenceBroken;
+            }
+        }
+    }
+
+    // `\s` is exactly 25 code points, and `\p{sc=Hrkt}` (an alias-only value) matches none.
+    const counts = [_]struct { pat: []const u8, want: usize }{
+        .{ .pat = "\\A\\s\\z", .want = 25 },
+        .{ .pat = "\\A\\p{sc=Hrkt}\\z", .want = 0 },
+    };
+    for (counts) |c| {
+        var diag: regex.Diagnostic = .{};
+        var re = try regex.compileRuntime(gpa, c.pat, &diag, .{});
+        defer re.deinit();
+        var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+        defer sc.deinit(gpa);
+        var n: usize = 0;
+        var cp: u21 = 0;
+        while (cp <= 0x10FFFF) : (cp += 1) {
+            if (cp >= 0xD800 and cp <= 0xDFFF) continue;
+            if (re.isMatch(&sc, encodeUtf8(cp, &buf))) n += 1;
+        }
+        try testing.expectEqual(c.want, n);
+    }
+}
+
+test "usage guide §11: documented escape and folding examples" {
+    const cases = [_]Case{
+        .{ .pat = "\\u{1F600}", .input = "a😀", .expect = "😀" },
+        .{ .pat = "\\x{1F600}", .input = "a😀", .expect = "😀" },
+        .{ .pat = "\\u00E9", .input = "café", .expect = "é" },
+        .{ .pat = "\\xA0", .input = "a\u{00A0}b", .expect = "\u{00A0}" },
+        .{ .pat = "(?i)ω", .input = "Ω", .expect = "Ω" },
+        .{ .pat = "(?i)k", .input = "\u{212A}", .expect = "\u{212A}" },
+        .{ .pat = "\\d+", .input = "x7٣७７y", .expect = "7٣७７" },
+        .{ .pat = "[\\p{L}\\p{Nd}_]+", .input = "-αβ_12-", .expect = "αβ_12" },
+        .{ .pat = "[^\\p{sc=Grek}\\s]+", .input = "αβ xyz", .expect = "xyz" },
+        .{ .pat = "\\P{Script=Greek}+", .input = "αβxyz", .expect = "xyz" },
+        .{ .pat = "\\PL+", .input = "ab12cd", .expect = "12" },
+        .{ .pat = "\\p{Sc}", .input = "cost: €5", .expect = "€" }, // Currency_Symbol, not a script
+        .{ .pat = "[\\b]", .input = "a\x08b", .expect = "\x08" }, // backspace inside a class
+    };
+    for (cases) |c| {
+        try checkRuntime(pikevm, c);
+        try checkRuntime(auto, c);
+    }
+    const grapheme_cases = [_]Case{
+        .{ .pat = "\\X", .input = "e\u{0301}z", .expect = "e\u{0301}" },
+        .{ .pat = "\\X", .input = "👨‍👩‍👧!", .expect = "👨‍👩‍👧" },
+    };
+    for (grapheme_cases) |c| try checkRuntime(auto, c);
+}
+
 test {
     testing.refAllDecls(@This());
 }

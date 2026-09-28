@@ -333,13 +333,13 @@ pub fn build(b: *std.Build) void {
     }
 
     // ── Benchmarks ────────────────────────────────────────────────────────────
-    // Built against an `ezi_gex` module in ReleaseFast by default so the engine is
+    // Built against an `ezi_gex` module in `fast` mode by default so the engine is
     // measured optimized. The seam (and the whole module tree) is rebuilt at the
     // bench optimize level — a distinct ezi_code instance needs distinct wrappers.
     const bench_optimize = b.option(
-        std.builtin.OptimizeMode,
+        std.lang.Optimize,
         "bench-optimize",
-        "Optimization level for the bench executable (default ReleaseFast)",
+        "Optimization level for the bench executable (default fast)",
     ) orelse .fast;
 
     const ezi_code_bench = b.dependency("ezi_code", .{

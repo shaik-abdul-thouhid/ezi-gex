@@ -12,6 +12,8 @@ A copy-paste tutorial for **using** ezi_gex, end to end:
 8. [Writing your own backend](#8-writing-your-own-backend) — a complete, runnable example, built up step by step.
 9. [Thread-safety](#9-thread-safety).
 10. [Gotchas](#10-gotchas--semantics).
+11. [Unicode syntax reference](#11-unicode-syntax-reference): every Unicode escape, property,
+    and script, with all accepted spellings (Unicode 18.0).
 
 > This is the *how-to*. For the *why* — the design, the contract's fine print, the
 > performance roadmap — read [`architecture.md`](architecture.md). For the one-screen
@@ -992,6 +994,338 @@ Read these before trusting edge cases (full list in [`architecture.md`](architec
 - **`case_fold = .full`** expands 1→many foldings for literals (`(?i)ß` also matches
   `ss`, `ﬀ` matches `ff`); character classes use simple folding (a class matches one
   code point). `Script_Extensions` falls back to plain `Script` ranges.
+
+---
+
+## 11. Unicode syntax reference
+
+Every Unicode-aware construct ezi_gex accepts, with each accepted spelling. The data behind it
+comes from the pinned `ezi_code` (`v0.5.0`, **Unicode 18.0.0**). Some rules apply throughout:
+
+- **Names are exact and case-sensitive.** UAX #44 loose matching is not applied, so `\p{Letter}`
+  works but `\p{letter}`, `\p{LETTER}` and `\p{Script=latin}` are rejected with
+  `unknown_property`.
+- **`\P{…}` negates any property**, e.g. `\P{L}`, `\P{Script=Greek}`, `\PL`.
+- **Everything works inside a class**, alone or combined: `[\p{L}\p{Nd}_]`, `[^\p{sc=Grek}\s]`.
+- **Scripts always need a prefix.** `\p{Script=Greek}` / `\p{sc=Grek}` work, but a bare
+  `\p{Greek}` does not. Note that `\p{Sc}` (no `=`) is the *Currency_Symbol* category, not a
+  script.
+- `unicode = false` in `Options` only narrows `\d` `\w` `\s` to ASCII. `\p{…}`, `.`, `\b` and `\X`
+  stay Unicode.
+
+<details>
+<summary><b>Escapes and shorthand classes</b>: <code>\d</code> <code>\w</code> <code>\s</code> <code>\b</code> <code>\X</code> <code>.</code> <code>\u{…}</code> <code>(?i)</code></summary>
+
+| Syntax | Equivalent spellings | Matches |
+|---|---|---|
+| `\d` | `\p{Nd}` · `\p{Decimal_Number}` · `[\p{Nd}]` | any decimal digit: `7`, `٣`, `७`, `７`. With `unicode = false`: `[0-9]` |
+| `\D` | `\P{Nd}` · `\P{Decimal_Number}` · `[^\d]` | anything that is not a decimal digit |
+| `\w` | `[\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\u{200C}\u{200D}]` | a word character (Alphabetic ∪ Mark ∪ Nd ∪ Connector_Punctuation ∪ Join_Control). With `unicode = false`: `[0-9A-Za-z_]` |
+| `\W` | `[^\w]` | anything that is not a word character |
+| `\s` | `[\t\n\v\f\r\x20\x{85}\xA0\u{1680}\u{2000}-\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}]` | White_Space (25 code points). With `unicode = false`: `[\t\n\v\f\r\x20]` |
+| `\S` | `[^\s]` | anything that is not White_Space |
+| `\b` | none | a Unicode word boundary (a `\w` on exactly one side). Inside a class, `[\b]` is backspace (U+0008) |
+| `\B` | none | not a word boundary |
+| `\X` | none | one extended grapheme cluster (UAX #29, Unicode 18 rules): `e\u{0301}`, `👨‍👩‍👧`, `\u{094D}\u{0915}`. Runs on `backtrack`/`auto` only. Inside a class, `[\X]` is a literal `X` |
+| `.` | `[^\n]` · with `(?s)`: any code point | any code point except `\n`. `(?s)` or `dot_matches_newline = true` includes `\n` |
+| `\u{H…}` | `\x{H…}` · `\uHHHH` (exactly 4 hex digits) · the character itself | one code point by hex value, e.g. `\u{1F600}` = `\x{1F600}` = `😀`; `\u00E9` = `é`. Surrogates are rejected |
+| `\xHH` | `\x{HH}` · `\u00HH` | a code point up to U+00FF (0–2 hex digits; a bare `\x` is U+0000) |
+| `(?i)` | `Options.case_insensitive = true` · scoped `(?i:…)` | Unicode case folding: `(?i)ω` matches `Ω`, `(?i)k` matches `K` and U+212A KELVIN SIGN. `case_fold = .full` also folds literals 1→many (`(?i)ß` matches `ss`); classes always use simple folding |
+
+**Not supported:** POSIX classes (`[[:alpha:]]` is rejected with `unsupported_posix_class`),
+`\N{NAME}`, `\p{Any}` / `\p{ASCII}` / `\p{Assigned}`, and binary properties outside the
+table below (`White_Space`, `Emoji`, `Block=…`, `Age=…`, …). For those, use the shorthand or write
+the class out.
+
+</details>
+
+<details>
+<summary><b>General categories</b>: 8 groups and 30 categories, e.g. <code>\p{L}</code> <code>\p{Lu}</code> <code>\pN</code></summary>
+
+The short and long names are interchangeable, and one-letter names also take the brace-free form
+`\pL`. Every row below also works negated (`\P{…}` / `\PL`).
+
+**Groups**
+
+| Short | Long | All spellings | Covers |
+|---|---|---|---|
+| `L` | `Letter` | `\p{L}` · `\pL` · `\p{Letter}` | Lu Ll Lt Lm Lo |
+| `LC` | `Cased_Letter` | `\p{LC}` · `\p{Cased_Letter}` | Lu Ll Lt |
+| `M` | `Mark` | `\p{M}` · `\pM` · `\p{Mark}` | Mn Mc Me |
+| `N` | `Number` | `\p{N}` · `\pN` · `\p{Number}` | Nd Nl No |
+| `P` | `Punctuation` | `\p{P}` · `\pP` · `\p{Punctuation}` | Pc Pd Ps Pe Pi Pf Po |
+| `S` | `Symbol` | `\p{S}` · `\pS` · `\p{Symbol}` | Sm Sc Sk So |
+| `Z` | `Separator` | `\p{Z}` · `\pZ` · `\p{Separator}` | Zs Zl Zp |
+| `C` | `Other` | `\p{C}` · `\pC` · `\p{Other}` | Cc Cf Cs Co Cn |
+
+**Single categories**
+
+| Short | Long | All spellings | Examples |
+|---|---|---|---|
+| `Lu` | `Uppercase_Letter` | `\p{Lu}` · `\p{Uppercase_Letter}` | `A` `Ж` `Ω` |
+| `Ll` | `Lowercase_Letter` | `\p{Ll}` · `\p{Lowercase_Letter}` | `a` `ж` `ω` |
+| `Lt` | `Titlecase_Letter` | `\p{Lt}` · `\p{Titlecase_Letter}` | `ǅ` `ᾈ` |
+| `Lm` | `Modifier_Letter` | `\p{Lm}` · `\p{Modifier_Letter}` | `ʰ` `ー` |
+| `Lo` | `Other_Letter` | `\p{Lo}` · `\p{Other_Letter}` | `中` `א` `ก` |
+| `Mn` | `Nonspacing_Mark` | `\p{Mn}` · `\p{Nonspacing_Mark}` | U+0301 (◌́) |
+| `Mc` | `Spacing_Mark` | `\p{Mc}` · `\p{Spacing_Mark}` | U+0903 (◌ः) |
+| `Me` | `Enclosing_Mark` | `\p{Me}` · `\p{Enclosing_Mark}` | U+20DD (◌⃝) |
+| `Nd` | `Decimal_Number` | `\p{Nd}` · `\p{Decimal_Number}` | `7` `٣` `७` |
+| `Nl` | `Letter_Number` | `\p{Nl}` · `\p{Letter_Number}` | `Ⅻ` `〇` |
+| `No` | `Other_Number` | `\p{No}` · `\p{Other_Number}` | `½` `²` `①` |
+| `Pc` | `Connector_Punctuation` | `\p{Pc}` · `\p{Connector_Punctuation}` | `_` `‿` |
+| `Pd` | `Dash_Punctuation` | `\p{Pd}` · `\p{Dash_Punctuation}` | `-` `–` `—` |
+| `Ps` | `Open_Punctuation` | `\p{Ps}` · `\p{Open_Punctuation}` | `(` `[` `「` |
+| `Pe` | `Close_Punctuation` | `\p{Pe}` · `\p{Close_Punctuation}` | `)` `]` `」` |
+| `Pi` | `Initial_Punctuation` | `\p{Pi}` · `\p{Initial_Punctuation}` | `«` `“` |
+| `Pf` | `Final_Punctuation` | `\p{Pf}` · `\p{Final_Punctuation}` | `»` `”` |
+| `Po` | `Other_Punctuation` | `\p{Po}` · `\p{Other_Punctuation}` | `!` `,` `。` |
+| `Sm` | `Math_Symbol` | `\p{Sm}` · `\p{Math_Symbol}` | `+` `=` `∑` |
+| `Sc` | `Currency_Symbol` | `\p{Sc}` · `\p{Currency_Symbol}` | `$` `€` `₹` |
+| `Sk` | `Modifier_Symbol` | `\p{Sk}` · `\p{Modifier_Symbol}` | `^` `` ` `` `˘` |
+| `So` | `Other_Symbol` | `\p{So}` · `\p{Other_Symbol}` | `©` `°` `😀` |
+| `Zs` | `Space_Separator` | `\p{Zs}` · `\p{Space_Separator}` | U+0020, U+00A0, U+3000 |
+| `Zl` | `Line_Separator` | `\p{Zl}` · `\p{Line_Separator}` | U+2028 |
+| `Zp` | `Paragraph_Separator` | `\p{Zp}` · `\p{Paragraph_Separator}` | U+2029 |
+| `Cc` | `Control` | `\p{Cc}` · `\p{Control}` | U+0000–U+001F, U+007F–U+009F |
+| `Cf` | `Format` | `\p{Cf}` · `\p{Format}` | U+200B, U+200D, U+FEFF |
+| `Cs` | `Surrogate` | `\p{Cs}` · `\p{Surrogate}` | U+D800–U+DFFF (never in valid UTF-8) |
+| `Co` | `Private_Use` | `\p{Co}` · `\p{Private_Use}` | U+E000–U+F8FF, planes 15–16 |
+| `Cn` | `Unassigned` | `\p{Cn}` · `\p{Unassigned}` | any code point not assigned in Unicode 18.0 |
+
+</details>
+
+<details>
+<summary><b>Derived core properties</b>: 19 binary properties, e.g. <code>\p{Alphabetic}</code> <code>\p{ID_Start}</code></summary>
+
+Only the long names below are accepted; the UCD short aliases (`Alpha`, `Lower`, `IDS`, …) are
+not. Each also works negated (`\P{Alphabetic}`).
+
+| Syntax | Matches |
+|---|---|
+| `\p{Math}` | mathematical symbols and letters (`+`, `∑`, `𝐀`) |
+| `\p{Alphabetic}` | letters, letter numbers and alphabetic marks |
+| `\p{Lowercase}` | lowercase characters (a superset of `Ll`) |
+| `\p{Uppercase}` | uppercase characters (a superset of `Lu`) |
+| `\p{Cased}` | characters with case (`Lowercase` ∪ `Uppercase` ∪ `Lt`) |
+| `\p{Case_Ignorable}` | characters ignored when determining case context (e.g. `'`, U+0301) |
+| `\p{Changes_When_Lowercased}` | changes under lowercase mapping |
+| `\p{Changes_When_Uppercased}` | changes under uppercase mapping |
+| `\p{Changes_When_Titlecased}` | changes under titlecase mapping |
+| `\p{Changes_When_Casefolded}` | changes under case folding |
+| `\p{Changes_When_Casemapped}` | changes under any case mapping |
+| `\p{ID_Start}` | can start an identifier (UAX #31) |
+| `\p{ID_Continue}` | can continue an identifier (UAX #31) |
+| `\p{XID_Start}` | `ID_Start`, closed under NFKC |
+| `\p{XID_Continue}` | `ID_Continue`, closed under NFKC |
+| `\p{Default_Ignorable_Code_Point}` | invisible by default (e.g. U+200B, U+00AD, variation selectors) |
+| `\p{Grapheme_Extend}` | extends a grapheme cluster (combining marks, ZWNJ, …) |
+| `\p{Grapheme_Base}` | can be the base of a grapheme cluster |
+| `\p{Grapheme_Link}` | virama-like characters that link clusters (e.g. U+094D) |
+
+</details>
+
+<details>
+<summary><b>Scripts</b>: all 179 Unicode 18.0 scripts, via <code>Script=</code> / <code>sc=</code> / <code>Script_Extensions=</code> / <code>scx=</code></summary>
+
+Each script can be named by its long name or its 4-letter ISO 15924 code, after any of four
+prefixes. For Greek, these are all the same:
+
+| Prefix | Long name | Code |
+|---|---|---|
+| `Script=` | `\p{Script=Greek}` | `\p{Script=Grek}` |
+| `sc=` | `\p{sc=Greek}` | `\p{sc=Grek}` |
+| `Script_Extensions=` | `\p{Script_Extensions=Greek}` | `\p{Script_Extensions=Grek}` |
+| `scx=` | `\p{scx=Greek}` | `\p{scx=Grek}` |
+
+`Script_Extensions=` / `scx=` are accepted, but they currently match the same ranges as `Script=`
+(see [Gotchas](#10-gotchas--semantics)). Long names use underscores exactly as listed
+(`Old_Italic`, not `Old Italic` or `OldItalic`). The "Short spellings" column shows the `sc=` forms;
+the `Script=`, `Script_Extensions=` and `scx=` prefixes take the same names.
+
+| Script | Long name | Code | Short spellings | Note |
+|---|---|---|---|---|
+| Adlam | `Adlam` | `Adlm` | `sc=Adlam` · `sc=Adlm` |  |
+| Ahom | `Ahom` | `Ahom` | `sc=Ahom` |  |
+| Anatolian Hieroglyphs | `Anatolian_Hieroglyphs` | `Hluw` | `sc=Anatolian_Hieroglyphs` · `sc=Hluw` |  |
+| Arabic | `Arabic` | `Arab` | `sc=Arabic` · `sc=Arab` |  |
+| Armenian | `Armenian` | `Armn` | `sc=Armenian` · `sc=Armn` |  |
+| Avestan | `Avestan` | `Avst` | `sc=Avestan` · `sc=Avst` |  |
+| Balinese | `Balinese` | `Bali` | `sc=Balinese` · `sc=Bali` |  |
+| Bamum | `Bamum` | `Bamu` | `sc=Bamum` · `sc=Bamu` |  |
+| Bassa Vah | `Bassa_Vah` | `Bass` | `sc=Bassa_Vah` · `sc=Bass` |  |
+| Batak | `Batak` | `Batk` | `sc=Batak` · `sc=Batk` |  |
+| Bengali | `Bengali` | `Beng` | `sc=Bengali` · `sc=Beng` |  |
+| Beria Erfe | `Beria_Erfe` | `Berf` | `sc=Beria_Erfe` · `sc=Berf` |  |
+| Bhaiksuki | `Bhaiksuki` | `Bhks` | `sc=Bhaiksuki` · `sc=Bhks` |  |
+| Bopomofo | `Bopomofo` | `Bopo` | `sc=Bopomofo` · `sc=Bopo` |  |
+| Brahmi | `Brahmi` | `Brah` | `sc=Brahmi` · `sc=Brah` |  |
+| Braille | `Braille` | `Brai` | `sc=Braille` · `sc=Brai` |  |
+| Buginese | `Buginese` | `Bugi` | `sc=Buginese` · `sc=Bugi` |  |
+| Buhid | `Buhid` | `Buhd` | `sc=Buhid` · `sc=Buhd` |  |
+| Canadian Aboriginal | `Canadian_Aboriginal` | `Cans` | `sc=Canadian_Aboriginal` · `sc=Cans` |  |
+| Carian | `Carian` | `Cari` | `sc=Carian` · `sc=Cari` |  |
+| Caucasian Albanian | `Caucasian_Albanian` | `Aghb` | `sc=Caucasian_Albanian` · `sc=Aghb` |  |
+| Chakma | `Chakma` | `Cakm` | `sc=Chakma` · `sc=Cakm` |  |
+| Cham | `Cham` | `Cham` | `sc=Cham` |  |
+| Cherokee | `Cherokee` | `Cher` | `sc=Cherokee` · `sc=Cher` |  |
+| Chorasmian | `Chorasmian` | `Chrs` | `sc=Chorasmian` · `sc=Chrs` |  |
+| Common | `Common` | `Zyyy` | `sc=Common` · `sc=Zyyy` | characters shared by several scripts (digits, punctuation, …) |
+| Coptic | `Coptic` | `Copt` | `sc=Coptic` · `sc=Copt` |  |
+| Cuneiform | `Cuneiform` | `Xsux` | `sc=Cuneiform` · `sc=Xsux` |  |
+| Cypriot | `Cypriot` | `Cprt` | `sc=Cypriot` · `sc=Cprt` |  |
+| Cypro Minoan | `Cypro_Minoan` | `Cpmn` | `sc=Cypro_Minoan` · `sc=Cpmn` |  |
+| Cyrillic | `Cyrillic` | `Cyrl` | `sc=Cyrillic` · `sc=Cyrl` |  |
+| Deseret | `Deseret` | `Dsrt` | `sc=Deseret` · `sc=Dsrt` |  |
+| Devanagari | `Devanagari` | `Deva` | `sc=Devanagari` · `sc=Deva` |  |
+| Dives Akuru | `Dives_Akuru` | `Diak` | `sc=Dives_Akuru` · `sc=Diak` |  |
+| Dogra | `Dogra` | `Dogr` | `sc=Dogra` · `sc=Dogr` |  |
+| Duployan | `Duployan` | `Dupl` | `sc=Duployan` · `sc=Dupl` |  |
+| Egyptian Hieroglyphs | `Egyptian_Hieroglyphs` | `Egyp` | `sc=Egyptian_Hieroglyphs` · `sc=Egyp` |  |
+| Elbasan | `Elbasan` | `Elba` | `sc=Elbasan` · `sc=Elba` |  |
+| Elymaic | `Elymaic` | `Elym` | `sc=Elymaic` · `sc=Elym` |  |
+| Ethiopic | `Ethiopic` | `Ethi` | `sc=Ethiopic` · `sc=Ethi` |  |
+| Garay | `Garay` | `Gara` | `sc=Garay` · `sc=Gara` |  |
+| Georgian | `Georgian` | `Geor` | `sc=Georgian` · `sc=Geor` |  |
+| Glagolitic | `Glagolitic` | `Glag` | `sc=Glagolitic` · `sc=Glag` |  |
+| Gothic | `Gothic` | `Goth` | `sc=Gothic` · `sc=Goth` |  |
+| Grantha | `Grantha` | `Gran` | `sc=Grantha` · `sc=Gran` |  |
+| Greek | `Greek` | `Grek` | `sc=Greek` · `sc=Grek` |  |
+| Gujarati | `Gujarati` | `Gujr` | `sc=Gujarati` · `sc=Gujr` |  |
+| Gunjala Gondi | `Gunjala_Gondi` | `Gong` | `sc=Gunjala_Gondi` · `sc=Gong` |  |
+| Gurmukhi | `Gurmukhi` | `Guru` | `sc=Gurmukhi` · `sc=Guru` |  |
+| Gurung Khema | `Gurung_Khema` | `Gukh` | `sc=Gurung_Khema` · `sc=Gukh` |  |
+| Han | `Han` | `Hani` | `sc=Han` · `sc=Hani` |  |
+| Hangul | `Hangul` | `Hang` | `sc=Hangul` · `sc=Hang` |  |
+| Hanifi Rohingya | `Hanifi_Rohingya` | `Rohg` | `sc=Hanifi_Rohingya` · `sc=Rohg` |  |
+| Hanunoo | `Hanunoo` | `Hano` | `sc=Hanunoo` · `sc=Hano` |  |
+| Hatran | `Hatran` | `Hatr` | `sc=Hatran` · `sc=Hatr` |  |
+| Hebrew | `Hebrew` | `Hebr` | `sc=Hebrew` · `sc=Hebr` |  |
+| Hiragana | `Hiragana` | `Hira` | `sc=Hiragana` · `sc=Hira` |  |
+| Imperial Aramaic | `Imperial_Aramaic` | `Armi` | `sc=Imperial_Aramaic` · `sc=Armi` |  |
+| Inherited | `Inherited` | `Zinh` | `sc=Inherited` · `sc=Zinh` | combining marks that inherit their base's script |
+| Inscriptional Pahlavi | `Inscriptional_Pahlavi` | `Phli` | `sc=Inscriptional_Pahlavi` · `sc=Phli` |  |
+| Inscriptional Parthian | `Inscriptional_Parthian` | `Prti` | `sc=Inscriptional_Parthian` · `sc=Prti` |  |
+| Javanese | `Javanese` | `Java` | `sc=Javanese` · `sc=Java` |  |
+| Jurchen | `Jurchen` | `Jurc` | `sc=Jurchen` · `sc=Jurc` | **new in Unicode 18.0** |
+| Kaithi | `Kaithi` | `Kthi` | `sc=Kaithi` · `sc=Kthi` |  |
+| Kannada | `Kannada` | `Knda` | `sc=Kannada` · `sc=Knda` |  |
+| Katakana | `Katakana` | `Kana` | `sc=Katakana` · `sc=Kana` |  |
+| Katakana Or Hiragana | `Katakana_Or_Hiragana` | `Hrkt` | `sc=Katakana_Or_Hiragana` · `sc=Hrkt` | alias value only: no code point has this Script (use `Hira` / `Kana`) |
+| Kawi | `Kawi` | `Kawi` | `sc=Kawi` |  |
+| Kayah Li | `Kayah_Li` | `Kali` | `sc=Kayah_Li` · `sc=Kali` |  |
+| Kharoshthi | `Kharoshthi` | `Khar` | `sc=Kharoshthi` · `sc=Khar` |  |
+| Khitan Small Script | `Khitan_Small_Script` | `Kits` | `sc=Khitan_Small_Script` · `sc=Kits` |  |
+| Khmer | `Khmer` | `Khmr` | `sc=Khmer` · `sc=Khmr` |  |
+| Khojki | `Khojki` | `Khoj` | `sc=Khojki` · `sc=Khoj` |  |
+| Khudawadi | `Khudawadi` | `Sind` | `sc=Khudawadi` · `sc=Sind` |  |
+| Kirat Rai | `Kirat_Rai` | `Krai` | `sc=Kirat_Rai` · `sc=Krai` |  |
+| Lao | `Lao` | `Laoo` | `sc=Lao` · `sc=Laoo` |  |
+| Latin | `Latin` | `Latn` | `sc=Latin` · `sc=Latn` |  |
+| Lepcha | `Lepcha` | `Lepc` | `sc=Lepcha` · `sc=Lepc` |  |
+| Limbu | `Limbu` | `Limb` | `sc=Limbu` · `sc=Limb` |  |
+| Linear A | `Linear_A` | `Lina` | `sc=Linear_A` · `sc=Lina` |  |
+| Linear B | `Linear_B` | `Linb` | `sc=Linear_B` · `sc=Linb` |  |
+| Lisu | `Lisu` | `Lisu` | `sc=Lisu` |  |
+| Lycian | `Lycian` | `Lyci` | `sc=Lycian` · `sc=Lyci` |  |
+| Lydian | `Lydian` | `Lydi` | `sc=Lydian` · `sc=Lydi` |  |
+| Mahajani | `Mahajani` | `Mahj` | `sc=Mahajani` · `sc=Mahj` |  |
+| Makasar | `Makasar` | `Maka` | `sc=Makasar` · `sc=Maka` |  |
+| Malayalam | `Malayalam` | `Mlym` | `sc=Malayalam` · `sc=Mlym` |  |
+| Mandaic | `Mandaic` | `Mand` | `sc=Mandaic` · `sc=Mand` |  |
+| Manichaean | `Manichaean` | `Mani` | `sc=Manichaean` · `sc=Mani` |  |
+| Marchen | `Marchen` | `Marc` | `sc=Marchen` · `sc=Marc` |  |
+| Masaram Gondi | `Masaram_Gondi` | `Gonm` | `sc=Masaram_Gondi` · `sc=Gonm` |  |
+| Medefaidrin | `Medefaidrin` | `Medf` | `sc=Medefaidrin` · `sc=Medf` |  |
+| Meetei Mayek | `Meetei_Mayek` | `Mtei` | `sc=Meetei_Mayek` · `sc=Mtei` |  |
+| Mende Kikakui | `Mende_Kikakui` | `Mend` | `sc=Mende_Kikakui` · `sc=Mend` |  |
+| Meroitic Cursive | `Meroitic_Cursive` | `Merc` | `sc=Meroitic_Cursive` · `sc=Merc` |  |
+| Meroitic Hieroglyphs | `Meroitic_Hieroglyphs` | `Mero` | `sc=Meroitic_Hieroglyphs` · `sc=Mero` |  |
+| Miao | `Miao` | `Plrd` | `sc=Miao` · `sc=Plrd` |  |
+| Modi | `Modi` | `Modi` | `sc=Modi` |  |
+| Mongolian | `Mongolian` | `Mong` | `sc=Mongolian` · `sc=Mong` |  |
+| Mro | `Mro` | `Mroo` | `sc=Mro` · `sc=Mroo` |  |
+| Multani | `Multani` | `Mult` | `sc=Multani` · `sc=Mult` |  |
+| Myanmar | `Myanmar` | `Mymr` | `sc=Myanmar` · `sc=Mymr` |  |
+| Nabataean | `Nabataean` | `Nbat` | `sc=Nabataean` · `sc=Nbat` |  |
+| Nag Mundari | `Nag_Mundari` | `Nagm` | `sc=Nag_Mundari` · `sc=Nagm` |  |
+| Nandinagari | `Nandinagari` | `Nand` | `sc=Nandinagari` · `sc=Nand` |  |
+| New Tai Lue | `New_Tai_Lue` | `Talu` | `sc=New_Tai_Lue` · `sc=Talu` |  |
+| Newa | `Newa` | `Newa` | `sc=Newa` |  |
+| Nko | `Nko` | `Nkoo` | `sc=Nko` · `sc=Nkoo` |  |
+| Nushu | `Nushu` | `Nshu` | `sc=Nushu` · `sc=Nshu` |  |
+| Nyiakeng Puachue Hmong | `Nyiakeng_Puachue_Hmong` | `Hmnp` | `sc=Nyiakeng_Puachue_Hmong` · `sc=Hmnp` |  |
+| Ogham | `Ogham` | `Ogam` | `sc=Ogham` · `sc=Ogam` |  |
+| Ol Chiki | `Ol_Chiki` | `Olck` | `sc=Ol_Chiki` · `sc=Olck` |  |
+| Ol Onal | `Ol_Onal` | `Onao` | `sc=Ol_Onal` · `sc=Onao` |  |
+| Old Hungarian | `Old_Hungarian` | `Hung` | `sc=Old_Hungarian` · `sc=Hung` |  |
+| Old Italic | `Old_Italic` | `Ital` | `sc=Old_Italic` · `sc=Ital` |  |
+| Old North Arabian | `Old_North_Arabian` | `Narb` | `sc=Old_North_Arabian` · `sc=Narb` |  |
+| Old Permic | `Old_Permic` | `Perm` | `sc=Old_Permic` · `sc=Perm` |  |
+| Old Persian | `Old_Persian` | `Xpeo` | `sc=Old_Persian` · `sc=Xpeo` |  |
+| Old Sogdian | `Old_Sogdian` | `Sogo` | `sc=Old_Sogdian` · `sc=Sogo` |  |
+| Old South Arabian | `Old_South_Arabian` | `Sarb` | `sc=Old_South_Arabian` · `sc=Sarb` |  |
+| Old Turkic | `Old_Turkic` | `Orkh` | `sc=Old_Turkic` · `sc=Orkh` |  |
+| Old Uyghur | `Old_Uyghur` | `Ougr` | `sc=Old_Uyghur` · `sc=Ougr` |  |
+| Oriya | `Oriya` | `Orya` | `sc=Oriya` · `sc=Orya` |  |
+| Osage | `Osage` | `Osge` | `sc=Osage` · `sc=Osge` |  |
+| Osmanya | `Osmanya` | `Osma` | `sc=Osmanya` · `sc=Osma` |  |
+| Pahawh Hmong | `Pahawh_Hmong` | `Hmng` | `sc=Pahawh_Hmong` · `sc=Hmng` |  |
+| Palmyrene | `Palmyrene` | `Palm` | `sc=Palmyrene` · `sc=Palm` |  |
+| Pau Cin Hau | `Pau_Cin_Hau` | `Pauc` | `sc=Pau_Cin_Hau` · `sc=Pauc` |  |
+| Phags Pa | `Phags_Pa` | `Phag` | `sc=Phags_Pa` · `sc=Phag` |  |
+| Phoenician | `Phoenician` | `Phnx` | `sc=Phoenician` · `sc=Phnx` |  |
+| Proto Cuneiform | `Proto_Cuneiform` | `Pcun` | `sc=Proto_Cuneiform` · `sc=Pcun` | **new in Unicode 18.0** |
+| Psalter Pahlavi | `Psalter_Pahlavi` | `Phlp` | `sc=Psalter_Pahlavi` · `sc=Phlp` |  |
+| Rejang | `Rejang` | `Rjng` | `sc=Rejang` · `sc=Rjng` |  |
+| Runic | `Runic` | `Runr` | `sc=Runic` · `sc=Runr` |  |
+| Samaritan | `Samaritan` | `Samr` | `sc=Samaritan` · `sc=Samr` |  |
+| Saurashtra | `Saurashtra` | `Saur` | `sc=Saurashtra` · `sc=Saur` |  |
+| Seal | `Seal` | `Seal` | `sc=Seal` | **new in Unicode 18.0** |
+| Sharada | `Sharada` | `Shrd` | `sc=Sharada` · `sc=Shrd` |  |
+| Shavian | `Shavian` | `Shaw` | `sc=Shavian` · `sc=Shaw` |  |
+| Siddham | `Siddham` | `Sidd` | `sc=Siddham` · `sc=Sidd` |  |
+| Sidetic | `Sidetic` | `Sidt` | `sc=Sidetic` · `sc=Sidt` |  |
+| SignWriting | `SignWriting` | `Sgnw` | `sc=SignWriting` · `sc=Sgnw` |  |
+| Sinhala | `Sinhala` | `Sinh` | `sc=Sinhala` · `sc=Sinh` |  |
+| Sogdian | `Sogdian` | `Sogd` | `sc=Sogdian` · `sc=Sogd` |  |
+| Sora Sompeng | `Sora_Sompeng` | `Sora` | `sc=Sora_Sompeng` · `sc=Sora` |  |
+| Soyombo | `Soyombo` | `Soyo` | `sc=Soyombo` · `sc=Soyo` |  |
+| Sundanese | `Sundanese` | `Sund` | `sc=Sundanese` · `sc=Sund` |  |
+| Sunuwar | `Sunuwar` | `Sunu` | `sc=Sunuwar` · `sc=Sunu` |  |
+| Syloti Nagri | `Syloti_Nagri` | `Sylo` | `sc=Syloti_Nagri` · `sc=Sylo` |  |
+| Syriac | `Syriac` | `Syrc` | `sc=Syriac` · `sc=Syrc` |  |
+| Tagalog | `Tagalog` | `Tglg` | `sc=Tagalog` · `sc=Tglg` |  |
+| Tagbanwa | `Tagbanwa` | `Tagb` | `sc=Tagbanwa` · `sc=Tagb` |  |
+| Tai Le | `Tai_Le` | `Tale` | `sc=Tai_Le` · `sc=Tale` |  |
+| Tai Tham | `Tai_Tham` | `Lana` | `sc=Tai_Tham` · `sc=Lana` |  |
+| Tai Viet | `Tai_Viet` | `Tavt` | `sc=Tai_Viet` · `sc=Tavt` |  |
+| Tai Yo | `Tai_Yo` | `Tayo` | `sc=Tai_Yo` · `sc=Tayo` |  |
+| Takri | `Takri` | `Takr` | `sc=Takri` · `sc=Takr` |  |
+| Tamil | `Tamil` | `Taml` | `sc=Tamil` · `sc=Taml` |  |
+| Tangsa | `Tangsa` | `Tnsa` | `sc=Tangsa` · `sc=Tnsa` |  |
+| Tangut | `Tangut` | `Tang` | `sc=Tangut` · `sc=Tang` |  |
+| Telugu | `Telugu` | `Telu` | `sc=Telugu` · `sc=Telu` |  |
+| Thaana | `Thaana` | `Thaa` | `sc=Thaana` · `sc=Thaa` |  |
+| Thai | `Thai` | `Thai` | `sc=Thai` |  |
+| Tibetan | `Tibetan` | `Tibt` | `sc=Tibetan` · `sc=Tibt` |  |
+| Tifinagh | `Tifinagh` | `Tfng` | `sc=Tifinagh` · `sc=Tfng` |  |
+| Tirhuta | `Tirhuta` | `Tirh` | `sc=Tirhuta` · `sc=Tirh` |  |
+| Todhri | `Todhri` | `Todr` | `sc=Todhri` · `sc=Todr` |  |
+| Tolong Siki | `Tolong_Siki` | `Tols` | `sc=Tolong_Siki` · `sc=Tols` |  |
+| Toto | `Toto` | `Toto` | `sc=Toto` |  |
+| Tulu Tigalari | `Tulu_Tigalari` | `Tutg` | `sc=Tulu_Tigalari` · `sc=Tutg` |  |
+| Ugaritic | `Ugaritic` | `Ugar` | `sc=Ugaritic` · `sc=Ugar` |  |
+| Unknown | `Unknown` | `Zzzz` | `sc=Unknown` · `sc=Zzzz` | unassigned code points |
+| Vai | `Vai` | `Vaii` | `sc=Vai` · `sc=Vaii` |  |
+| Vithkuqi | `Vithkuqi` | `Vith` | `sc=Vithkuqi` · `sc=Vith` |  |
+| Wancho | `Wancho` | `Wcho` | `sc=Wancho` · `sc=Wcho` |  |
+| Warang Citi | `Warang_Citi` | `Wara` | `sc=Warang_Citi` · `sc=Wara` |  |
+| Yezidi | `Yezidi` | `Yezi` | `sc=Yezidi` · `sc=Yezi` |  |
+| Yi | `Yi` | `Yiii` | `sc=Yi` · `sc=Yiii` |  |
+| Zanabazar Square | `Zanabazar_Square` | `Zanb` | `sc=Zanabazar_Square` · `sc=Zanb` |  |
+
+</details>
 
 ---
 

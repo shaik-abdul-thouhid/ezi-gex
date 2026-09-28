@@ -9,7 +9,9 @@ backend architecture.
   Unicode-correct. Classes resolve once to sorted code-point ranges and match by a range check,
   with no per-character table lookup; `\b` and `\X` read `ezi_code`'s property tables directly.
   All Unicode comes from [`ezi_code`](https://github.com/shaik-abdul-thouhid/ezi-code); ezi_gex
-  never touches `std.unicode`.
+  never touches `std.unicode`. `main` pins `ezi_code` `v0.5.0`, which tracks **Unicode 18.0.0**
+  (see [Unicode version](#unicode-version)). Every supported escape, property and script is listed
+  in the [Unicode syntax reference](docs/usage-guide.md#11-unicode-syntax-reference).
 - **Comptime-capable.** You can compile a pattern and run the match at compile time: the program
   lands in `ro_data` and the matcher runs in `comptime`. (It's the C++ `ctre` trick in Zig, with
   full Unicode.)
@@ -27,7 +29,8 @@ backend architecture.
 The latest release is `v0.6.2`; `main` is the development branch (`0.7.0-dev`). See
 [Installing](#installing) for pinning the tag versus tracking `main`. It is pre-1.0, so the API
 can still change, though everything public is annotated `@stable-since: vX.Y.Z` and follows
-SemVer. It needs a recent Zig dev build (`0.17.0-dev`) and will not compile on stable 0.16.
+SemVer. It needs a recent Zig dev build (`0.17.0-dev.2320+1e770dbef` or newer, the same minimum as
+its `ezi_code` dependency) and will not compile on stable 0.16.
 
 The default `auto` engine is byte-DFA-first: a Hopcroft-minimized eager DFA as the primary span
 engine, a lazy DFA as the fallback. It runs in O(input) on every pattern, is leftmost-first,
@@ -37,7 +40,7 @@ agrees byte-for-byte with the reference Pike VM, and works at both comptime and 
 
 It is benchmarked against Rust's `regex` and Go's `regexp` on real
 [rebar](https://github.com/BurntSushi/rebar) haystacks. The harness is a separate, reproducible
-repo: [regex-bench](https://github.com/shaik-abdul-thouhid/regex-bench). Around 490 tests cover
+repo: [regex-bench](https://github.com/shaik-abdul-thouhid/regex-bench). Around 500 tests cover
 per-module behaviour, cross-backend conformance (every backend has to agree with the Pike VM, at
 runtime and comptime), and ReDoS immunity (`engine/redos.zig`), plus a hardened, parallel
 **fuzz** suite (`fuzz/` — every backend differenced against the Pike VM; `zig build fuzz --fuzz=N`).
@@ -76,6 +79,21 @@ add `ezi_gex`):
 const ezi_gex = b.dependency("ezi_gex", .{ .target = target, .optimize = optimize });
 exe.root_module.addImport("ezi_gex", ezi_gex.module("ezi_gex"));
 ```
+
+### Unicode version
+
+ezi_gex takes its Unicode data from its pinned `ezi_code`. That data covers property classes,
+scripts, case folding, `\w` and `\b`, so the Unicode version depends on the ezi_gex version:
+
+| ezi_gex | Pinned `ezi_code` | Unicode |
+| ------- | ----------------- | ------- |
+| `v0.1.0` – `v0.6.2` | `main` commits, then `v0.4.1` (from `v0.3.0`) | 17.0.0 |
+| `main` (`0.7.0-dev`) | `v0.5.0` | 18.0.0 |
+
+With Unicode 18, `\p{Script=…}` accepts the new scripts (`Jurchen`/`Jurc`, `Proto_Cuneiform`/`Pcun`,
+`Seal`), and the classes and case folding cover the newly assigned characters. To stay on Unicode 17,
+pin `v0.6.2`. The complete list of script names and codes is in the
+[Unicode syntax reference](docs/usage-guide.md#11-unicode-syntax-reference).
 
 ## Quick look
 
@@ -344,7 +362,7 @@ const year = comptime Re.capturesComptime("y2026-06").?.namedSlice("year").?; //
 | Literals, `.`, `\|`, `*` `+` `?` `{m,n}`, lazy `*?`… | ✅ |
 | Groups `(…)`, `(?:…)`, named `(?<n>…)`/`(?P<n>…)` | ✅ |
 | Classes `[...]`, `[^...]`, ranges, `\d \w \s` (+ negations) | ✅ |
-| Unicode `\p{L}` `\P{…}` `\p{Script=…}`, `\pL` | ✅ |
+| Unicode `\p{L}` `\P{…}` `\p{Script=…}`, `\pL` ([full list](docs/usage-guide.md#11-unicode-syntax-reference)) | ✅ |
 | Anchors `^ $ \A \z`, word boundary `\b \B`, multiline `(?m)` | ✅ |
 | Inline flags `(?i)` `(?m)` `(?s)` `(?x)`, scoped `(?i:…)` | ✅ |
 | Escapes `\n \t \xHH \x{…} \u{…} \cX`, comments `(?#…)`, verbose `(?x)` | ✅ |
@@ -353,6 +371,11 @@ const year = comptime Re.capturesComptime("y2026-06").?.namedSlice("year").?; //
 
 Anchors are JS/RE2-style: `$` without `(?m)` is end-of-input (`\z`), and `\Z` is
 treated as `\z`. See [`docs/architecture.md`](docs/architecture.md) §Caveats.
+
+Every Unicode escape, general category, derived property and script that `\p{…}` accepts is listed,
+with all its alternative spellings (`\p{L}` / `\pL` / `\p{Letter}`, `Script=` / `sc=` / `scx=`, …),
+in the [Unicode syntax reference](docs/usage-guide.md#11-unicode-syntax-reference) of the usage
+guide.
 
 ## Backends
 
@@ -525,14 +548,18 @@ a one-time build cost; match time stays O(input). For the details see
 
 As a reference point, here is the bundled `main.zig` demo — which exercises runtime and comptime
 compilation, classes, captures, replace, split, `\p{L}`, scripts, and all three byte backends —
-built with Zig `0.17.0-dev` on macOS arm64:
+built with Zig `0.17.0-dev.2320+1e770dbef` against `ezi_code` `v0.5.0` (Unicode 18.0.0) on
+macOS arm64:
 
 | Optimize mode | Demo binary |
 |---|---|
-| `Debug` | 3.64 MB (3,819,672 B) |
-| `ReleaseSafe` | 1.35 MB (1,415,288 B) |
-| `ReleaseFast` | 1.20 MB (1,262,472 B) |
-| `ReleaseSmall` | 0.79 MB (830,712 B) |
+| `debug` | 3.69 MB (3,870,904 B) |
+| `safe` | 1.38 MB (1,448,184 B) |
+| `fast` | 1.23 MB (1,293,176 B) |
+| `small` | 0.81 MB (847,592 B) |
+
+On the same toolchain, moving from Unicode 17 to 18 adds about 1 KB to the `safe` and `fast`
+builds and about 16 KB to `small`.
 
 Most of the `Debug` figure is Zig's debug runtime, not regex data. Your own binary will come in
 under the demo: it won't link the demo's full spread of backends and Unicode features, and
@@ -543,7 +570,9 @@ under the demo: it won't link the demo's full spread of backends and Unicode fea
 - [`docs/usage-guide.md`](docs/usage-guide.md) — **the hands-on guide**: copy-paste
   recipes for every front-door op, the full pipeline used **from lexing** (scan → AST
   → HIR → backend), comptime/no-allocator paths, and a complete, runnable, step-by-step
-  **"write your own backend"** walkthrough. Start here if you want to *do* something.
+  **"write your own backend"** walkthrough. Start here if you want to *do* something. Its
+  [§11 Unicode syntax reference](docs/usage-guide.md#11-unicode-syntax-reference) lists every
+  Unicode escape, property and script with all accepted spellings.
 - [`docs/architecture.md`](docs/architecture.md) — architecture, data flow,
   **how to write your own backend** (with a complete tiny example), caveats, and
   the implicit assumptions backends rely on.
@@ -558,8 +587,8 @@ under the demo: it won't link the demo's full spread of backends and Unicode fea
 ```sh
 zig build                                   # build the demo exe (zig-out/bin/ezi_gex)
 zig build run                               # build + run it
-zig build bench                             # benchmarks (ReleaseFast by default)
-zig build test -Doptimize=ReleaseSafe       # full suite (ReleaseSafe is faster than Debug)
+zig build bench                             # benchmarks (`fast` by default)
+zig build test -Doptimize=safe              # full suite (safe mode is faster than Debug)
 ```
 
 The test suite is split into **16 independently-cacheable units** — one named module per area, so a
@@ -571,10 +600,10 @@ file recompiles and re-runs only the unit(s) whose inputs changed; the rest stay
 
 ```sh
 zig build test-core                         # run ONE unit (cached; also test-auto, test-edfa, …)
-zig build test-conformance -Doptimize=ReleaseSafe
+zig build test-conformance -Doptimize=safe
 zig build --help                            # lists every test-<unit> step
 # Gate the aggregate `test` step to a subset (REPEAT the flag — there is no comma form):
-zig build test -Dinclude-test=auto -Dinclude-test=conformance -Doptimize=ReleaseSafe
+zig build test -Dinclude-test=auto -Dinclude-test=conformance -Doptimize=safe
 ```
 
 Use `test-<unit>` while iterating on one file; run the full `zig build test` before committing.

@@ -1,10 +1,10 @@
 # bench/ — benchmarks
 
-Throughput and allocation measurements for the engine, built in `ReleaseFast`.
+Throughput and allocation measurements for the engine, built in `fast` mode.
 
 ```sh
-zig build bench                         # run (ReleaseFast by default)
-zig build bench -Dbench-optimize=ReleaseSafe
+zig build bench                         # run (`fast` by default)
+zig build bench -Dbench-optimize=safe
 ```
 
 | File | Role |

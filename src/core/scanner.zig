@@ -1803,6 +1803,80 @@ test "unicode property escapes" {
     try expectSexpr("\\P{L}", "(unprop)");
     try expectSexpr("\\pL", "(uprop)");
     try expectSexpr("\\p{Script=Latin}", "(uprop)");
+    // Scripts new in Unicode 18.0, by long name and by ISO 15924 code.
+    try expectSexpr("\\p{Script=Jurchen}", "(uprop)");
+    try expectSexpr("\\p{sc=Jurc}", "(uprop)");
+    try expectSexpr("\\p{Script=Proto_Cuneiform}", "(uprop)");
+    try expectSexpr("\\p{scx=Pcun}", "(uprop)");
+    try expectSexpr("\\p{Script=Seal}", "(uprop)");
+}
+
+test "script long-name table covers every ezi_code ScriptType" {
+    // `token.script_long_name_entries` is hand-maintained from PropertyValueAliases.txt, so a
+    // Unicode bump in ezi_code that adds scripts must add them here too. Every entry must resolve
+    // (long name and code agree), and every ScriptType must be reachable by its long name.
+    const scripts = utils.unicode.scripts;
+    const all = std.enums.values(scripts.ScriptType);
+    var covered: [all.len]bool = @splat(false);
+    for (token.script_long_name_entries) |e| {
+        const by_code = scripts.fromAbbreviation(e.abbr) orelse {
+            std.debug.print("script code {s} ({s}) is unknown to ezi_code\n", .{ e.abbr, e.key });
+            return error.UnknownScriptCode;
+        };
+        try std.testing.expectEqual(@as(?scripts.ScriptType, by_code), token.resolveScriptType(e.key));
+        covered[@intFromEnum(by_code)] = true;
+    }
+    for (all, covered) |st, seen| {
+        if (!seen) {
+            std.debug.print("ScriptType .{t} has no long-name entry in token.zig\n", .{st});
+            return error.MissingScriptLongName;
+        }
+    }
+}
+
+test "usage guide §11: every documented property spelling resolves, and the rejected ones don't" {
+    const expectResolves = struct {
+        fn f(name: []const u8) !void {
+            if (token.resolveProperty(name) == null) {
+                std.debug.print("documented spelling \\p{{{s}}} does not resolve\n", .{name});
+                return error.DocumentedSpellingRejected;
+            }
+        }
+    }.f;
+    var buf: [64]u8 = undefined;
+
+    // General categories and groups (short + long), plus the one-letter `\pL` form.
+    for (token.gc_map_entries) |e| {
+        try expectResolves(e.key);
+        if (e.key.len == 1) {
+            const pat = try std.fmt.bufPrint(&buf, "\\p{s}", .{e.key});
+            try expectSexpr(pat, "(uprop)");
+            const neg = try std.fmt.bufPrint(&buf, "\\P{s}", .{e.key});
+            try expectSexpr(neg, "(unprop)");
+        }
+    }
+    for (token.derived_map_entries) |e| try expectResolves(e.key);
+
+    // Every script, by long name and by code, under all four prefixes.
+    for (token.script_long_name_entries) |e| {
+        inline for (.{ "Script=", "sc=", "Script_Extensions=", "scx=" }) |prefix| {
+            try expectResolves(try std.fmt.bufPrint(&buf, "{s}{s}", .{ prefix, e.key }));
+            try expectResolves(try std.fmt.bufPrint(&buf, "{s}{s}", .{ prefix, e.abbr }));
+        }
+    }
+
+    // `\p{Sc}` without `=` is the Currency_Symbol category, not a script prefix.
+    try std.testing.expect(token.resolveProperty("Sc").? == .general_category);
+
+    // Spellings the reference documents as rejected: loose matching, bare script names, UCD short
+    // aliases, and properties outside the tables.
+    inline for (.{
+        "letter", "LETTER",     "Script=latin", "script=Latin", "Greek", "Alpha",
+        "Lower",  "White_Space", "Emoji",        "Any",          "ASCII", "Assigned",
+    }) |name| {
+        try std.testing.expect(token.resolveProperty(name) == null);
+    }
+    try expectError("[[:alpha:]]", .unsupported_posix_class);
 }
 
 test "property errors" {
