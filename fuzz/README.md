@@ -91,8 +91,7 @@ shared-front-end class — and did once: `word_boundary_with_lazy_repetition`
 (`[^a]+?\B *`) was found that way, not by the in-process targets.
 
 That is a **cross-language comparison activity, not a library concern**, so it lives
-in the sibling **`regex-bench`** project (which already builds ezi against Rust/Go
-for parity), *not* here. As of v0.6.0 ezi follows **RE2/Rust leftmost-first**
+outside this repository, *not* here. As of v0.6.0 ezi follows **RE2/Rust leftmost-first**
 semantics uniformly — including the empty-width-loop rule (`(?:|.)+` → `""`,
 `(?:a?b??)+` → `"a"`) — so a Rust differential no longer needs to carve out an
 empty-loop subset; the two coincide across the full ASCII space.

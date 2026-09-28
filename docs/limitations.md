@@ -9,7 +9,7 @@ Every entry below is **deliberate** — a behaviour or a performance trade-off e
 purpose. None of it is on the roadmap to change. The semantic choices are pinned by the
 cross-backend conformance suite and the fuzz differential (`fuzz/`) so they cannot silently
 change; the performance limitations are accepted shapes where the engine is and will remain
-slower than Rust.
+comparatively slow.
 
 There are no open correctness limitations: every backend agrees on the leftmost-first match (RE2/Rust
 semantics), at runtime and comptime. This page lists only the deliberate trade-offs.
@@ -41,35 +41,33 @@ safeguard, not a matching limitation — within the ceiling, counted repetition 
 
 ### Performance shapes ezi_gex does not chase
 
-The benchmark harness ([regex-bench](https://github.com/shaik-abdul-thouhid/regex-bench), built
-on [rebar](https://github.com/BurntSushi/rebar)) surfaces a handful of pattern shapes where
-ezi_gex is meaningfully slower than Rust's `regex`. These are accepted: they are not bugs and not
-on the roadmap. Each would only improve by trading away something the engine will not give up —
-its linear-time guarantee, its portability (no hand-written per-architecture SIMD), or its
-simplicity. The multipliers are from the rebar Sherlock suite (how many times slower than Rust on
-that one benchmark).
+A handful of pattern shapes are meaningfully slower than the rest of the engine. These are
+accepted: they are not bugs and not on the roadmap. Each would only improve by trading away
+something the engine will not give up — its linear-time guarantee, its portability (no
+hand-written per-architecture SIMD), or its simplicity.
 
 - **An unbounded gap between two required literals** — `Holmes(?:\s*.+\s*){0,10}Watson` and
   similar. Both literals prefilter fine, but the `.+` between them still has to be walked; nothing
-  can skip an arbitrary-length span. The common **leading-alternation** form (rebar
-  `holmes-coword-watson`, `Holmes…Watson|Watson…Holmes`) is no longer slow — as of 0.6.2 it
-  jump-and-confirms prefix-to-prefix with a reach budget (~1.7× vs Rust, down from ~20×). The
-  residual gap is only on shapes where neither literal is a sound leading prefix (the match can
-  begin mid-span), where the engine must fall back to walking the span.
-- **A common single byte as the only distinctive feature** — `\b\w+n\b` (~8×). The one selective
+  can skip an arbitrary-length span. The common **leading-alternation** form
+  (`Holmes…Watson|Watson…Holmes`) is no longer slow — as of 0.6.2 it jump-and-confirms
+  prefix-to-prefix with a reach budget. The residual gap is only on shapes where neither literal
+  is a sound leading prefix (the match can begin mid-span), where the engine must fall back to
+  walking the span.
+- **A common single byte as the only distinctive feature** — `\b\w+n\b`. The one selective
   thing is the trailing `n`, which is far too common to prefilter on and too short for the
   literal skip. There is no rare anchor to jump to.
-- **A bounded run of a negated class** — `["'][^"']{0,30}[?!.]["']` (~6.5×). The `[^"']{0,30}`
+- **A bounded run of a negated class** — `["'][^"']{0,30}[?!.]["']`. The `[^"']{0,30}`
   span is scanned byte by byte. A specialized negated-class skip could shave this, but only on
   this narrow shape and not without growing the DFA machinery.
-- **An unbounded case-insensitive alternation** — `(?i:Sher[a-z]+|Hol[a-z]+)` (~6.4×). It is
+- **An unbounded case-insensitive alternation** — `(?i:Sher[a-z]+|Hol[a-z]+)`. It is
   prefiltered, but because the branch is unbounded it cannot use the fast per-occurrence confirm
   without risking quadratic time, so it falls back to a slower scan. Keeping the linear-time
   guarantee is worth more than the throughput here. (The *bounded* form,
-  `(?i:Sherlock|Holmes|Watson)`, is faster than Rust.)
-- **A line anchor inside an alternation** — `(?m)^...|...` (~4×). This routes to the linear
+  `(?i:Sherlock|Holmes|Watson)`, does take the fast path.)
+- **A line anchor inside an alternation** — `(?m)^...|...`. This routes to the linear
   Pike VM; the DFAs do not carry `(?m)` line context through an alternation. Correct, just not
   the fast path.
-- **Pure-literal alternation throughput** — `Sherlock|Street` (~3.3×). The prefilter is the right
-  one (Teddy), but Rust's hand-tuned Teddy scans faster. Matching it would mean per-architecture
-  assembly, which ezi_gex deliberately avoids in favour of portable `@Vector` code.
+- **Pure-literal alternation throughput** — `Sherlock|Street`. The prefilter is the right one
+  (Teddy), but a hand-tuned per-architecture Teddy would scan faster, and that would mean
+  per-architecture assembly, which ezi_gex deliberately avoids in favour of portable `@Vector`
+  code.

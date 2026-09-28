@@ -110,7 +110,7 @@ sound one-sided bounds (hold for *every* match), so a skip never drops a real ma
 
 `Options.strategy.byte_engine` defaults to `.auto` (≡ `.enabled`), so the byte DFA is built
 **by default** — building it is a strict throughput win (~5–10× the code-point engine on a
-class scan, never slower; class scans are now at Rust-`regex` parity). `auto` **prefers the
+class scan, never slower). `auto` **prefers the
 eager DFA** and falls back to the **lazy DFA** when the eager one declines a pattern because its
 full state space overflows `edfa.max_states` (4096), then to the NFA. For a **`\b`/`\B` program**
 the lazy DFA is *also* built alongside the eager one as the **non-ASCII arm**: `auto` runs the

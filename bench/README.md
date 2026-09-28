@@ -33,12 +33,10 @@ measurable have **landed**:
   falling back to the **lazy DFA** (`engine/backends/dfa.zig`) when the eager table
   overflows its state bound.
 
-The result: the character-class family (`\w+`, `\d+`, `[A-Za-z]+`, `\p{L}+`) now runs at
-**Rust-`regex` parity** (~1.1–1.3×, was ~1.6–2.3×), and the default is ≥ the code-point
-Pike VM in every cell (5–10× on class scans). `zig build bench` measures the engine in
+The result: the default is ≥ the code-point Pike VM in every cell (5–10× on class scans
+such as `\w+`, `\d+`, `[A-Za-z]+`, `\p{L}+`). `zig build bench` measures the engine in
 isolation. The biggest remaining gap is a Teddy / Aho-Corasick multi-substring prefilter
-for literal
-alternations (Rust's Teddy is still well ahead there).
+for literal alternations.
 
 See [`../docs/architecture.md`](../docs/architecture.md) §10 for the tier roadmap (what
 is done vs still open). The `count()`-per-match shape of the search bench is also why an

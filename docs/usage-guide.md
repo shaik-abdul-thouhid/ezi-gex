@@ -315,7 +315,7 @@ _ = gex.compileRuntime(gpa, "a{9}", &diag, .{ .max_repetition = 8 });           
 //                falling back to the lazy DFA when the eager table overflows its state bound
 //                (or for Unicode \b on non-ASCII input); captures come from `onepass` or the
 //                Pike VM anchored at the DFA span, so the result is identical, just 5–10×
-//                faster on a class scan (Rust parity). .disabled = compact NFA-only (minimal
+//                faster on a class scan. .disabled = compact NFA-only (minimal
 //                memory; right for match-once / tiny inputs).
 _ = try gex.compileRuntime(gpa, "\\w+", &diag, .{}); // DFA on by default — no flag needed
 _ = try gex.compileRuntime(gpa, "\\w+", &diag, .{ .strategy = .{ .byte_engine = .disabled } });
@@ -352,8 +352,7 @@ _ = try gex.compileRuntime(gpa, "cat|dog|fish", &diag, .{ .strategy = .{ .simd =
 > verify only where they coincide — far fewer candidates than a one-byte memchr on a common lead
 > byte. It scans four chunks per iteration (after a short single-chunk warm-up so dense matches
 > return at once) and adds a third probe byte for short all-common needles like `the`. It is **fully
-> portable** (SSE2 `pcmpeqb`/NEON via `@Vector`, no arch asm), so it runs everywhere; on Sherlock it
-> runs at `rust/regex` parity (and the non-matching scans edge ahead). A
+> portable** (SSE2 `pcmpeqb`/NEON via `@Vector`, no arch asm), so it runs everywhere. A
 > literal **alternation** (`cat|dog|fish`, `foo|far|fizz`) is scanned by **Teddy** instead: one
 > dynamic in-vector byte shuffle (`pshufb`/`vpshufb`/`tbl`) fingerprints the first 1–3 bytes of
 > *all* branches across a 16-byte chunk at once, then verifies — far more selective than a
@@ -663,9 +662,7 @@ class-repetitions** — does a **structured reverse walk** backward to the *exac
 runs one anchored confirm per hit (the automaton runs only at real candidate starts, not over the
 gaps; ASCII-exact, with a sound flat-scan fallback for non-ASCII windows). A bounded fixed-length
 pattern with a **rare byte at a fixed code-point offset** (`[a-q][^u-z]{13}x`) instead `memchr`s the
-byte and confirms at the pinned start. On Sherlock these take `\w+\s+Holmes`/`\w+\s+Holmes\s+\w+`
-from ~13×/~28× behind Rust to ~1.2× (parity), and `[a-q][^u-z]{13}x` from ~183× behind to faster
-than Rust.
+byte and confirms at the pinned start.
 
 A couple more, illustrating soundness:
 

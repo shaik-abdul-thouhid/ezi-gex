@@ -42,8 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 A performance release. Every change is speed-only: matches and captures are byte-for-byte identical
 to 0.6.1 at runtime and comptime — the gains come entirely from the prefilters that decide *where*
 to run the matching engine. The headline is ARM64 (Apple Silicon / NEON), where literal and
-character-class scanning now run at or near the speed of Rust's `regex`. All of it stays portable —
-no hand-written, per-architecture assembly.
+character-class scanning are now much faster. All of it stays portable — no hand-written,
+per-architecture assembly.
 
 ### Performance
 
@@ -53,27 +53,20 @@ no hand-written, per-architecture assembly.
   that contain no possible match. The scanners (single-literal search, the multi-literal Teddy
   prefilter, and the leading character-class scan) now first ask the cheap question "did any lane in
   this block match?" and only pay the emulation on a block that actually contains a candidate. On an
-  Apple M4 this restores the throughput the engine was designed for: on the rebar Sherlock suite the
-  geometric mean versus `rust/regex` improves from **~4.3× to ~1.7×**, and class scans such as `\d+`
-  and `\p{N}+` run roughly **5× faster**.
+  Apple M4 this restores the throughput the engine was designed for: class scans such as `\d+` and
+  `\p{N}+` run roughly **5× faster**.
 
-- **Single-literal search now reaches Rust parity.** The substring prefilter scans four 16-byte
-  blocks per iteration (with a short single-block warm-up so densely matching patterns still return
+- **Single-literal search is faster.** The substring prefilter scans four 16-byte blocks per
+  iteration (with a short single-block warm-up so densely matching patterns still return
   immediately), and for short, all-common needles it probes a third byte so that most candidate
-  positions are rejected without a full comparison. Together these bring plain literal scans to par:
-  on an Apple M4, `Sherlock` goes **1.6× → 1.1×** versus `rust/regex`, `Sherlock\s+Holmes`
-  **1.6× → 1.1×**, and the non-matching scans (`no-match-uncommon`, `no-match-common`) now run
-  **faster than `rust/regex`**. The hardest all-lowercase case, `the`, improves from **2.5× → 1.7×**,
-  and `\w+\s+Holmes` from **1.7× → 1.4×**. The rebar Sherlock geometric mean improves from
-  **~1.56 to ~1.45**.
+  positions are rejected without a full comparison.
 
 - **Leading multi-literal alternations with an unbounded gap no longer fall back to a full scan.**
   A top-level alternation whose branches each begin with a literal but are separated by an unbounded
   gap — e.g. `Holmes(?:\s*.+\s*){0,10}Watson|Watson(?:\s*.+\s*){0,10}Holmes` — used to skip to the
   first literal occurrence and then run the matching engine across the entire remaining input. It now
   jumps from one literal occurrence to the next and confirms locally at each, with a budget that
-  falls back to a single full pass only if the prefilter proves ineffective. On an Apple M4 this case
-  improves from **~21× to ~1.7×** versus `rust/regex`.
+  falls back to a single full pass only if the prefilter proves ineffective.
 
 The remaining slower shapes are the deliberate trade-offs documented in
 [`docs/limitations.md`](docs/limitations.md) (a hand-tuned-SIMD multi-literal throughput gap, an
@@ -228,8 +221,7 @@ regressions); none of these divergences was reachable through the comptime path 
 A throughput + correctness release. The **prefilter fast path** grew three sound, leftmost-first
 start-skips — a **required interior/suffix-literal** `memmem` + structured reverse walk, a
 **fixed-offset rare-byte** confirm for bounded patterns, and a **case-insensitive alternation**
-ASCII-folding Teddy — taking the rebar Sherlock geometric mean from **2.67 → 1.50** vs `rust/regex`
-(several patterns now *faster* than Rust). Correctness: the empty-width-loop work closes the two
+ASCII-folding Teddy. Correctness: the empty-width-loop work closes the two
 remaining **deferred** entries from `docs/limitations.md` (an empty loop over a nullable concat
 body, and a `\b`/`\B` after a length-varying alternation) — there are now **no known cross-backend
 correctness gaps** — and adopts **uniform RE2/Rust leftmost-first** empty-loop semantics across
@@ -300,10 +292,8 @@ jump-and-confirm for prone leading-literal / rare interior-anchor patterns. **No
   keeping an alternation of casei branches inside the `MAX_PREFIX_BRANCHES` budget. Non-ASCII fold
   members of the leading window (`s`→`ſ`, `k`→KELVIN) fan out into extra needles so the set stays a
   sound necessary prefix; the automaton confirm at each hit enforces full Unicode-correct matching
-  (Teddy is purely a candidate generator). On `sherlock` (rebar): **`(?i:Sherlock|Holmes|Watson)`
-  ~14× → ~1× *faster* than Rust**, **`(?i:Sher[a-z]+|Hol[a-z]+)` ~15× → ~6.4×** (the residual is the
-  *unbounded* branch, which still takes the single-skip + native-find arm rather than a per-
-  occurrence confirm); overall Sherlock geomean **1.64 → 1.50** vs Rust ~1.16. Leftmost-first
+  (Teddy is purely a candidate generator). An *unbounded* branch (`(?i:Sher[a-z]+|Hol[a-z]+)`)
+  still takes the single-skip + native-find arm rather than a per-occurrence confirm. Leftmost-first
   preserved; O(input). White-box tested (needle sets, fold flag) and differential-tested vs the
   Pike VM oracle over mixed-case prose including a long-s `ſ`.
 - **Required-literal prefilter — whole-literal `memmem` skip + structured reverse walk.** A pattern
@@ -314,9 +304,7 @@ jump-and-confirm for prone leading-literal / rare interior-anchor patterns. **No
   (`\w+\s+`) — those pre-atoms. `auto` then (a) leaps to the whole literal with SIMD `memmem`
   (selective even when the first byte is common — the `i` of `ing`), and (b) walks the pre-atoms
   **backward to the exact match start** per hit and runs **one anchored confirm there**, so the
-  automaton runs only at real candidate starts instead of scanning the gaps. Wins on `sherlock`
-  (rebar): **`\w+\s+Holmes` ~13.5×→1.18×** vs the prior build (now ~Rust parity), **`\w+\s+Holmes\s+\w+`
-  ~28×→1.27×**, **`[a-zA-Z]+ing` →1.0×**, **`\s[a-zA-Z]{0,12}ing\s` ~10×→1.0×**. The reverse walk is
+  automaton runs only at real candidate starts instead of scanning the gaps. The reverse walk is
   ASCII-exact (a Unicode class's high bytes are conservative), so it engages on ASCII-dominant input
   with a per-occurrence pure-window check and a sound flat-reverse-scan fallback for the rare
   non-ASCII window. Leftmost-first preserved (the automaton confirms every candidate); O(input)
@@ -327,8 +315,7 @@ jump-and-confirm for prone leading-literal / rare interior-anchor patterns. **No
   (`[a-q][^u-z]{13}x` — the `x` 14 code points in) now `memchr`s that byte, walks back the fixed
   number of **code points** (`cpBack`, UTF-8 aware — correct on non-ASCII without an ASCII gate), and
   confirms anchored at the pinned start, one confirm per occurrence, instead of scanning the dense
-  leading `[a-q]` class. `repeated-class-negation` on `sherlock` goes from the suite's worst cliff
-  (~183× slower) to **~1.4× *faster* than Rust** (`regex`). Gated to a single ≤-`byteFreq`-threshold
+  leading `[a-q]` class. Gated to a single ≤-`byteFreq`-threshold
   byte in a bounded match; leftmost-first + O(input).
 - **Lazy-DFA arm: leading-literal & rare interior-anchor *jump-and-confirm*.** When a prone
   pattern (an unbounded non-accepting run before the first accept) lands on the lazy DFA, `auto`
@@ -336,9 +323,8 @@ jump-and-confirm for prone leading-literal / rare interior-anchor patterns. **No
   literal-to-literal (or rare-anchor-to-rare-anchor) with SIMD `memmem`/`memchr` and confirms
   anchored at each occurrence**, touching far fewer bytes when the prefilter is selective. The win
   shows where the native pass is expensive (a Unicode class to walk) and the prefilter is sparse:
-  **`the\s+\p{L}+` ~2.4× faster** on `sherlock` (`regex-bench`, 732µs → ~305µs, now within ~1.2× of
-  Rust) and **`[\w.+-]+@…` (email) ~2.1× faster** on `logs` (125µs → ~59µs, now *faster than* Rust
-  `regex`). Kept **provably linear** by a `reach` budget: a prone confirm can scan far, so once
+  **`the\s+\p{L}+` ~2.4× faster** on `sherlock` (732µs → ~305µs) and **`[\w.+-]+@…` (email) ~2.1×
+  faster** on `logs` (125µs → ~59µs). Kept **provably linear** by a `reach` budget: a prone confirm can scan far, so once
   cumulative confirm work overruns ~2×input the loop hands the rest to the native find — no Θ(n²)
   on an adversarial begin-but-don't-complete input (`Scratch.lazy_confirm_bytes`, asserted to grow
   linearly by a revert-failing `redos.zig` guard). The interior-anchor jump is gated on a **rare**
@@ -354,7 +340,7 @@ jump-and-confirm for prone leading-literal / rare interior-anchor patterns. **No
   that dominated a sparse class scan over non-ASCII text. The old single-bucket scheme saturated
   the low-nibble table for a broad lead set like `\p{N}` (lead bytes `30-39 c2 d9 db df e0-e3 ea ef
   f0`), so every Cyrillic lead byte (`0xD0`/`0xD1`) survived to the scalar confirm — half the bytes
-  of 2-byte Cyrillic text. **~1.7× faster** `\p{N}+` on `subtitles-ru` (`regex-bench`, 515µs →
+  of 2-byte Cyrillic text. **~1.7× faster** `\p{N}+` on `subtitles-ru` (515µs →
   308µs) and ~1.2× on `subtitles-zh`, no regression on the ASCII `\p{N}+`/`\d+` fast paths (still
   exact, ~18 GiB/s on `sherlock`). Correctness is unchanged regardless (every survivor is confirmed
   against the exact bitset); pinned by white-box precision tests in `classscan.zig` and the
@@ -366,7 +352,7 @@ jump-and-confirm for prone leading-literal / rare interior-anchor patterns. **No
   over-approximation**, `{the class's ASCII members} ∪ {all high bytes}` (`asciiLeadDerived`): every
   match start is one of those, so it never skips a real start. On Latin-script text (where high
   bytes are rare) it skips the lowercase gaps to the next capital — **`\p{Lu}\p{Ll}+` ~1.7× faster**
-  on `sherlock` (`regex-bench`, ezi 1123µs → ~660µs, now *faster than* Rust `regex`). The derived
+  on `sherlock` (1123µs → ~660µs). The derived
   set engages **only when the input is ASCII-dominant** (high bytes < ⅛ of the input,
   `inputAsciiDominant`); on Cyrillic/CJK text — where every byte is high and the scan can't help —
   the arm falls through to the native find on the **identical code path as before**, so there is no
@@ -377,7 +363,7 @@ jump-and-confirm for prone leading-literal / rare interior-anchor patterns. **No
   case-variant phrase the `auto` dispatcher now seeds its Teddy prefilter from the **rarest**
   2–3-position window instead of always the leading one (`(?i)sherlock holmes` probes the rare
   `[cC][kK] ` window rather than the common leading `[sS][hH][eE]`, ~2× fewer candidates to
-  confirm) — **~1.13× faster** on the `ci_phrase` benchmark (`regex-bench`), no regression on the
+  confirm) — **~1.13× faster** on the `ci_phrase` benchmark, no regression on the
   other case-variant cases (`ci_the` ~1.06×). The window sits at a byte-offset **range** from the
   match start (`Filter.prefix_set_off_min/off_max`) so a variable-length fold variant of a
   preceding position (`s`→2-byte `ſ`) is handled soundly; every hit is still fully confirmed, so
@@ -396,7 +382,7 @@ jump-and-confirm for prone leading-literal / rare interior-anchor patterns. **No
 Patch release: leftmost-first correctness fixes for degenerate anchor / empty-width-loop /
 `\b` patterns surfaced by the coverage-guided fuzz suite, plus a new `docs/limitations.md`.
 Results-invariant for real-world patterns; the benchmarked `\b`/`$`/`(?m)` fast paths stay
-DFA-eligible (regex-bench parity unchanged).
+DFA-eligible.
 
 ### Fixed
 
@@ -512,8 +498,8 @@ DFA-eligible (regex-bench parity unchanged).
   smoke tests under a plain `zig build test`, so CI stays green; `zig build fuzz --fuzz=N` runs a
   bounded coverage-guided session (see `fuzz/README.md`). (A complementary *cross-engine* differential
   against Rust `regex` — which catches shared-front-end bugs the in-process targets structurally
-  cannot, and did find `word_boundary_with_lazy_repetition` — is a comparison activity that lives in
-  the sibling `regex-bench` project, not in this library.)
+  cannot, and did find `word_boundary_with_lazy_repetition` — is a comparison activity that lives
+  outside this library.)
 
 ### Fixed
 
@@ -556,8 +542,8 @@ DFA-eligible (regex-bench parity unchanged).
     `[^a]+?\B *`): the lazy "prefer fewer" picks the short match where the boundary holds, but the
     longest-match DFA picks the long one. Caught by the **external Rust oracle** (the internal
     differential had missed it); greedy `\w*\b`/`a*\b` are unaffected and stay DFA-eligible.
-  Verified results-invariant by the regex-bench parity suite: **all 32 match counts unchanged and no
-  search regression** (geomean vs Rust still 1.12×) — no benchmarked pattern is newly declined.
+  Verified results-invariant: **all 32 benchmarked match counts unchanged and no search
+  regression** — no benchmarked pattern is newly declined.
 
 ### Changed
 
@@ -623,7 +609,7 @@ DFA-eligible (regex-bench parity unchanged).
 
 ### Performance
 
-Measured on `regex-bench` (Apple M4, ReleaseFast; non-overlapping `count` over the corpus):
+Measured on an Apple M4 (ReleaseFast; non-overlapping `count` over the corpus):
 
 - **`\bthe\b` over prose** ~490 MiB/s → **~3.7 GiB/s (≈8×)** — the per-occurrence anchored DFA
   confirm replaced by the O(1) boundary check (`lit_wb_confirm`), and the `memmem` finder hoisted out
@@ -748,11 +734,10 @@ direct `decline_if_prone` / cascade-routing test guards the new dispatch).
     start offset (chunk/scalar-tail seam, boundaries, overlap, repeated bytes, UTF-8, needles longer
     than a vector, no-match); a revert-failing `simd = .auto` vs `.off` results-invariance test over
     single literals in `literal.zig`; cross-backend conformance unchanged.
-  - **Benchmark** (`zig/regex-bench`, Apple M4): `Sherlock` **233.67 → 13.54 µs (17×, 40.9 GiB/s —
-    now faster than Rust)**, `Sherlock Holmes` **227.33 → 13.54 µs (16.8×, 41.6 GiB/s > Rust)**, `the`
-    **504.75 → 62.88 µs (8×, 7.56 GiB/s > Rust)**; via the prefix upgrade, `\bthe\b` on logs
-    **144.96 → 23.75 µs (6×)** and `the\s+\p{L}+` **837 → 670 µs**. Overall geomean Rust lead
-    **3.54× → 2.55×**; ezi_gex fastest in **9/32** cells (was 4).
+  - **Benchmark** (Apple M4): `Sherlock` **233.67 → 13.54 µs (17×, 40.9 GiB/s)**,
+    `Sherlock Holmes` **227.33 → 13.54 µs (16.8×, 41.6 GiB/s)**, `the`
+    **504.75 → 62.88 µs (8×, 7.56 GiB/s)**; via the prefix upgrade, `\bthe\b` on logs
+    **144.96 → 23.75 µs (6×)** and `the\s+\p{L}+` **837 → 670 µs**.
 
 - **Whole-run literal prefilter (SIMD `memmem` start-skip) in `auto`.** The analysis prefilter's
   leading-literal start-skip previously used only the **first byte** of `prefix_literal` (a SIMD
@@ -804,8 +789,8 @@ direct `decline_if_prone` / cascade-routing test guards the new dispatch).
     the Pike VM. Results-invariant: a wide differential corpus pins every byte-engine `\b` span to the
     Pike VM (the lazy DFA on **non-ASCII** too — e.g. `\bcafé\b` over `"cafés"`, where an ASCII-only
     boundary would mismatch), runtime and comptime, alongside exhaustive per-backend `\b`/`\B` tests
-    and revert-failing regressions. **Benchmark** (`zig/regex-bench`, Apple M4): `\b\w+\b` **37 → 244
-    MiB/s (~6.6×)** — now ≈ plain `\w+` (the boundary is free) and 1.63× of Rust `regex` (was ~11×);
+    and revert-failing regressions. **Benchmark** (Apple M4): `\b\w+\b` **37 → 244
+    MiB/s (~6.6×)** — now ≈ plain `\w+` (the boundary is free);
     `\bthe\b` **89 MiB/s → 2.49 GiB/s (~28×)**. New decls `@stable-since v0.4.0`:
     `byte.isAsciiWordByte`; `edfa.Program.{accept_before_word, accept_before_nonword, startNW,
     has_word_boundary}`; `dfa.Program.has_word_boundary`; `dfa.Scratch.{state_has_wb, wb_cache}`.
@@ -895,7 +880,7 @@ direct `decline_if_prone` / cascade-routing test guards the new dispatch).
   (`classLeadSelective`: no whitespace, few ASCII lowercase, ≤ 16 high lead bytes) so a near-universal
   letter class (`\p{L}+`, `[A-Za-z]+`) — which would land on almost every byte — is declined. Sound
   (every match begins with a member) and results-invariant. Bench (sparse-match corpora): `\d+`/`\p{N}+`
-  on `sherlock` ~33–37× (now **faster than Rust**), `\d+` on `logs` ~1.9×.
+  on `sherlock` ~33–37×, `\d+` on `logs` ~1.9×.
 
 - **`(?m)^` line anchors on the lazy DFA** (`backends.dfa`). The lazy DFA previously declined every
   `(?m)` line anchor, so a `(?m)^…` pattern too large or too **prone** for the eager DFA (whose line
@@ -1141,8 +1126,7 @@ signature or match-result changes.
   means *build and use the byte DFA* on an eligible pattern (`.auto` ≡ `.enabled`). `auto`
   **prefers the eager DFA** (the frozen-table engine above; ~5–10× the lazy DFA on class
   scans, and the only DFA that runs at **comptime**), falling back to the **lazy** DFA only
-  when the eager one overflows its `max_states` bound, then to the NFA. The class-scan family
-  (`\w+`, `\d+`, `[A-Za-z]+`, `\p{L}+`) is now **at Rust-`regex` parity** (~1–1.3× behind, was ~1.6–2.3×). Results-invariant — `conformance.zig`
+  when the eager one overflows its `max_states` bound, then to the NFA. Results-invariant — `conformance.zig`
   pins every DFA span/captures to the Pike VM and fuzzes the strategy knobs. `.disabled` opts
   back to the compact NFA-only program. `auto.route` reports `"nfa+edfa"` (preferred),
   `"nfa+dfa"` (lazy fallback), `"nfa"`, or `"literal"`.
@@ -1207,8 +1191,8 @@ signature or match-result changes.
   *rarest* needle's next occurrence — re-scanning the same region for a sparse branch on every
   match. It now collects the distinct first bytes and skips to the next candidate with a single
   SIMD `indexOfAny` pass, verifying branches in priority order at each candidate — O(input).
-  `foo|bar|baz|qux` went from **~7 MiB/s to ~460 MiB/s** in the bench (Rust's Teddy is still far
-  ahead, but it is no longer quadratic). A single-literal pattern is unchanged (one `indexOfPos`).
+  `foo|bar|baz|qux` went from **~7 MiB/s to ~460 MiB/s** in the bench (it is no longer
+  quadratic). A single-literal pattern is unchanged (one `indexOfPos`).
 
 ### Changed
 
@@ -1429,7 +1413,7 @@ First public surface and first tagged release. Everything here is annotated
 - **`{m,n}` is not size-capped yet** — a huge counted repeat expands to a large
   program (bounded by allocation / the comptime branch quota, never UB).
 - **No lazy-DFA backend yet.** Tier-1 (the literal/prefilter fast path) is wired, but
-  on general (non-prefixable) patterns throughput is still NFA-simulation-bound and
-  below RE2/Rust. A one-pass capture path and a runtime-only lazy DFA are the next,
+  on general (non-prefixable) patterns throughput is still NFA-simulation-bound. A
+  one-pass capture path and a runtime-only lazy DFA are the next,
   additive tiers — the backend contract is the seam for both. See
   `docs/architecture.md` for the planned tiers.

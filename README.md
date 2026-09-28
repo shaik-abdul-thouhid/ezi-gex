@@ -38,12 +38,9 @@ agrees byte-for-byte with the reference Pike VM, and works at both comptime and 
 [Backends](#backends) and [Performance](#performance) cover how it works;
 [CHANGELOG.md](CHANGELOG.md) has what each release added.
 
-It is benchmarked against Rust's `regex` and Go's `regexp` on real
-[rebar](https://github.com/BurntSushi/rebar) haystacks. The harness is a separate, reproducible
-repo: [regex-bench](https://github.com/shaik-abdul-thouhid/regex-bench). Around 500 tests cover
-per-module behaviour, cross-backend conformance (every backend has to agree with the Pike VM, at
-runtime and comptime), and ReDoS immunity (`engine/redos.zig`), plus a hardened, parallel
-**fuzz** suite (`fuzz/` — every backend differenced against the Pike VM; `zig build fuzz --fuzz=N`).
+Around 500 tests cover per-module behaviour, cross-backend conformance (every backend has to agree
+with the Pike VM, at runtime and comptime), and ReDoS immunity (`engine/redos.zig`), plus a
+hardened, parallel **fuzz** suite (`fuzz/` — every backend differenced against the Pike VM; `zig build fuzz --fuzz=N`).
 
 ## Installing
 
@@ -405,7 +402,7 @@ A **single** literal (`Sherlock`) routed to `literal` is scanned with a portable
 16/32-byte chunk, verify only where they coincide — no arch asm (lowers to SSE2/NEON everywhere). The
 scan processes four chunks per iteration (after a short single-chunk warm-up so dense matches return
 at once), and adds a third probe byte for short all-common needles so most candidates are rejected
-without a comparison — which brings plain literal scans to `rust/regex` parity on ARM64. A literal **alternation** (`cat|dog|fish`) instead uses the **Teddy** SIMD prefilter on
+without a comparison. A literal **alternation** (`cat|dog|fish`) instead uses the **Teddy** SIMD prefilter on
 a target with a native dynamic shuffle (x86-64 SSSE3/AVX2, aarch64 NEON) — fingerprint all branches
 across a 16-byte chunk at once, then verify. Slim (≤8 buckets) by default; **fat** (16 buckets) on
 AVX2 for larger sets; portable scalar fallback at comptime and on other targets. Both are governed by
@@ -500,18 +497,7 @@ Full details in [`docs/architecture.md`](docs/architecture.md) §11 and the usag
 
 ## Performance
 
-> **Benchmark:** the numbers below come from a like-for-like, three-way throughput +
-> compile-time comparison against **Rust `regex`** and **Go `regexp`** on byte-identical
-> [rebar](https://github.com/BurntSushi/rebar) haystacks. The harness is a separate,
-> reproducible repo — clone it and run `./run.sh`:
-> **[github.com/shaik-abdul-thouhid/regex-bench](https://github.com/shaik-abdul-thouhid/regex-bench)**
-> (it fetches this engine from GitHub, so anyone can reproduce the comparison).
-
-ezi_gex is competitive with Rust's `regex`, and it never goes quadratic. On the rebar Sherlock
-suite its throughput is within a small factor of Rust overall (geometric mean about 1.45×, against
-Rust's 1.15×). As of 0.6.2, plain single-literal scans run at or near Rust parity on ARM64 (and a
-few run faster); it matches Rust on most character-class scans, and beats Rust on a number of
-literal and case-insensitive patterns. Against its own simple reference engine it is several times
+ezi_gex never goes quadratic, and against its own simple reference engine it is several times
 faster across the board.
 
 The default `auto` engine compiles each pattern into a minimized byte-level DFA and matches with a
@@ -522,7 +508,7 @@ O(input) on every pattern and every input: there is no catastrophic backtracking
 ReDoS suite proves it. Every fast path is checked byte-for-byte against the reference engine, so
 none of it changes a result.
 
-Where it still trails Rust is dense Unicode-class throughput: `\p{L}+`, `[A-Za-z]+` and similar,
+Its slowest shape is dense Unicode-class throughput: `\p{L}+`, `[A-Za-z]+` and similar,
 where the match is the whole input, so there is nothing to skip and the table walk itself is the
 cost. That is the current focus. See [`docs/architecture.md`](docs/architecture.md) §10, and
 [CHANGELOG.md](CHANGELOG.md) for the performance work in each release.
@@ -637,14 +623,13 @@ comptime — a deliberate semantic choice, pinned by the cross-backend conforman
 parallel fuzz differential (`fuzz/`, the full backend matrix against the Pike VM oracle) so it
 can't silently drift.
 
-There are also a few **performance** shapes where ezi_gex is slower than Rust and that won't be
-optimized — each fix would cost the linear-time guarantee, portability, or simplicity. From the
-rebar Sherlock suite: a common single byte as the only distinctive feature (`\b\w+n\b`, ~8×), a
-bounded negated-class run (`["'][^"']{0,30}…`, ~6.5×), an unbounded case-insensitive alternation
-(`(?i:Sher[a-z]+|…)`, ~6.4×), a line anchor inside an alternation (`(?m)^…|…`, ~4×), pure-literal
-alternation throughput (`Sherlock|Street`, ~3.3×), and an unbounded gap between two *interior*
-literals where neither is a sound leading prefix (the leading-alternation form,
-`Holmes…Watson|Watson…Holmes`, is now ~1.7× after the 0.6.2 jump-and-confirm). These are spelled
+There are also a few **performance** shapes that are comparatively slow and won't be optimized —
+each fix would cost the linear-time guarantee, portability, or simplicity: a common single byte as
+the only distinctive feature (`\b\w+n\b`), a bounded negated-class run (`["'][^"']{0,30}…`), an
+unbounded case-insensitive alternation (`(?i:Sher[a-z]+|…)`), a line anchor inside an alternation
+(`(?m)^…|…`), pure-literal alternation throughput (`Sherlock|Street`), and an unbounded gap between
+two *interior* literals where neither is a sound leading prefix (the leading-alternation form,
+`Holmes…Watson|Watson…Holmes`, is handled by the 0.6.2 jump-and-confirm). These are spelled
 out in [`docs/limitations.md`](docs/limitations.md).
 
 ## License
