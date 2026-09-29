@@ -5,9 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] - 2026-09-30
 
-`0.7.0-dev` on `main`.
+A front-door and Unicode release with one correctness fix. Two changes are breaking: matching now
+follows **Unicode 18.0.0** (the `ezi_code` dependency moves to its tagged `v0.5.0`, and the minimum
+Zig becomes `0.17.0-dev.2320+1e770dbef`), and `Compiled(B).Scratch` is now a thin front-door wrapper
+over the backend's own scratch, which changes its type identity for code that reached past the front
+door. The everyday API gets simpler for it — `re.initScratch(gpa)` replaces
+`@TypeOf(re).Scratch.init(gpa, &re.program)`, and `gex.Regex` / `gex.Scratch` are nameable — and a
+reused input buffer can no longer be searched against a stale ASCII verdict.
 
 ### Added
 
@@ -38,24 +44,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Script=` / `sc=` / `Script_Extensions=` / `scx=`). The README links to it. Tests keep it honest:
   every documented spelling must resolve, the documented rejections must be rejected, and each
   shorthand must equal its spelled-out class on every code point.
-
-### Fixed
-
-- **A reused input buffer could be matched against a stale ASCII verdict (wrong matches).** The
-  default `auto` backend caches whether the input is all ASCII — the byte DFA evaluates `\b` as an
-  ASCII word boundary, so non-ASCII input must run on the Pike VM — keyed on the input's pointer
-  and length so a `count`/`findAll` scans once. Nothing invalidated that cache between searches,
-  so refilling one buffer with different bytes of the same length (the everyday shape of chunked
-  reads) could run a `\b` pattern on the ASCII-boundary DFA over Unicode text: `\bfoo\b` matched
-  `foo` inside the word `éfooé`, `\b\w+@\w+\b` missed `é@é`, and `\b\w+\b` returned `b` for `éb`.
-  Every public search primitive now drops the input-derived caches on entry unless the caller
-  asserts the new `SearchOptions.same_input`; the `Engine` iterators assert it between the calls
-  of one iteration, so `count`/`findAll` still pay the scan once per input. The scans themselves
-  are now skipped for a program that never consults the verdict and run at vector width otherwise
-  (the all-ASCII check through `ezi_code`'s SIMD `asciiRunLength`, the ASCII-dominance count as a
-  vector lane sum), so a fresh search on a large input costs at most one memory-speed pass.
-  Pinned by a differential test against the Pike VM over alternating refills of one buffer (both
-  DFA arms, every front-door op) and a revert-failing scan-count guard.
 
 ### Changed
 
@@ -90,6 +78,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Minimum Zig is now `0.17.0-dev.2320+1e770dbef`, the minimum `ezi_code` v0.5.0 requires.
   `build.zig` uses `std.lang.Optimize` for `-Dbench-optimize` in place of the deprecated
   `std.builtin.OptimizeMode`, and the docs use the `safe` / `fast` optimize-mode names.
+
+### Fixed
+
+- **A reused input buffer could be matched against a stale ASCII verdict (wrong matches).** The
+  default `auto` backend caches whether the input is all ASCII — the byte DFA evaluates `\b` as an
+  ASCII word boundary, so non-ASCII input must run on the Pike VM — keyed on the input's pointer
+  and length so a `count`/`findAll` scans once. Nothing invalidated that cache between searches,
+  so refilling one buffer with different bytes of the same length (the everyday shape of chunked
+  reads) could run a `\b` pattern on the ASCII-boundary DFA over Unicode text: `\bfoo\b` matched
+  `foo` inside the word `éfooé`, `\b\w+@\w+\b` missed `é@é`, and `\b\w+\b` returned `b` for `éb`.
+  Every public search primitive now drops the input-derived caches on entry unless the caller
+  asserts the new `SearchOptions.same_input`; the `Engine` iterators assert it between the calls
+  of one iteration, so `count`/`findAll` still pay the scan once per input. The scans themselves
+  are now skipped for a program that never consults the verdict and run at vector width otherwise
+  (the all-ASCII check through `ezi_code`'s SIMD `asciiRunLength`, the ASCII-dominance count as a
+  vector lane sum), so a fresh search on a large input costs at most one memory-speed pass.
+  Pinned by a differential test against the Pike VM over alternating refills of one buffer (both
+  DFA arms, every front-door op) and a revert-failing scan-count guard.
 
 ## [0.6.2] - 2026-06-29
 
