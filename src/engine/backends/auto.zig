@@ -1545,7 +1545,8 @@ pub const Scratch = struct {
     /// the code-point Pike VM (correct **Unicode** word boundaries), and the span arms' `input_ascii`
     /// soundness gates read the same verdict. Scanning the input for non-ASCII bytes is O(n), so it
     /// is cached here keyed on the input slice (`ptr`+`len`) — a `count`/`findAll` over one input
-    /// pays the scan **once**, not per match. The key alone cannot tell a **refilled** buffer (same
+    /// pays the scan **once**, not per match — and computed only for a program that consults it
+    /// (`inputAsciiArg` / `edfaArm`). The key alone cannot tell a **refilled** buffer (same
     /// `ptr`+`len`, new bytes) from the same input, so every public search primitive drops this
     /// cache on entry (`beginSearch`) unless the caller asserts `SearchOptions.same_input` — which
     /// the `Engine` iterators do between the calls of one iteration; `reset` clears it too.
@@ -2443,10 +2444,13 @@ fn runEdfa(ep: *const edfa.Program, filter: *const Filter, tdy: ?*const teddy.Te
 
 // ── Word-boundary ASCII gate: keep non-ASCII `\b` input on the code-point Pike VM ──────
 
-/// Whether `s` is wholly ASCII (no byte ≥ 0x80). Used by the `\b` gate; cached per input.
+/// Whether `s` is wholly ASCII (no byte ≥ 0x80). Used by the `\b` gate; cached per input. Runs
+/// at memory speed: `ezi_code`'s SIMD `asciiRunLength` compares a whole vector block per step and
+/// stops at the first non-ASCII byte, so non-ASCII text exits almost immediately and pure-ASCII
+/// text costs one pass at vector width (this scan is paid once per top-level search since the
+/// caches are dropped on entry — see `beginSearch` — so it must be cheap on large inputs).
 fn isAsciiSlice(s: []const u8) bool {
-    for (s) |b| if (b >= 0x80) return false;
-    return true;
+    return utils.unicode.utf8.asciiRunLength(s) == s.len;
 }
 
 /// Whether `input` is wholly ASCII — cached on `scratch` keyed by the input slice so a
@@ -2471,13 +2475,44 @@ const ASCII_DOMINANT_DIV: usize = 8;
 /// `inputAllAscii`), cached on the input slice so a `count`/`findAll` pays it once.
 fn inputAsciiDominant(scratch: *Scratch, input: []const u8) bool {
     if (scratch.ad_input_ptr == input.ptr and scratch.ad_input_len == input.len) return scratch.ad_dominant;
-    var high: usize = 0;
-    for (input) |b| high += @intFromBool(b >= 0x80);
+    const high = countHighBytes(input);
     const dominant = high *| ASCII_DOMINANT_DIV < input.len;
     scratch.ad_input_ptr = input.ptr;
     scratch.ad_input_len = input.len;
     scratch.ad_dominant = dominant;
     return dominant;
+}
+
+/// Number of bytes ≥ 0x80 in `s` — the ASCII-dominance count, at vector width: one compare and one
+/// lane-sum per block (a `u8` lane sum cannot overflow: at most `N ≤ 255` lanes), scalar tail. Like
+/// `isAsciiSlice` this is paid once per top-level search on a program that consults the verdict.
+fn countHighBytes(s: []const u8) usize {
+    const N = comptime std.simd.suggestVectorLength(u8) orelse 16;
+    const V = @Vector(N, u8);
+    const limit: V = @splat(0x7F);
+    const ones: V = @splat(1);
+    const zeros: V = @splat(0);
+    var high: usize = 0;
+    var i: usize = 0;
+    while (i + N <= s.len) : (i += N) {
+        const chunk: V = s[i..][0..N].*;
+        high += @reduce(.Add, @select(u8, chunk > limit, ones, zeros));
+    }
+    while (i < s.len) : (i += 1) high += @intFromBool(s[i] >= 0x80);
+    return high;
+}
+
+/// The `input_ascii` argument for the span arms (`runEdfa` / `runByteDfa`): the O(n) whole-input
+/// scan runs **only** for a program that consults the verdict — both consumers (the fixed-offset
+/// `bounded_confirm` jump and the lazy arm's rare-anchor reverse walk) sit under `filter.inner_byte`.
+/// Every other program never reads the flag, so it pays nothing. Returning `false` when nobody
+/// reads it is the conservative direction by construction: each consumer uses `input_ascii` to
+/// *enable* a fast path, so a spurious `false` can only cost speed, never a result. (The `\b`
+/// routing in `edfaArm` is the third consumer and calls `inputAllAscii` itself.) Cached per input
+/// in the scratch and invalidated by `beginSearch`.
+inline fn inputAsciiArg(program: *const Program, scratch: *Scratch, input: []const u8) bool {
+    if (program.filter.inner_byte == null) return false;
+    return inputAllAscii(scratch, input);
 }
 
 /// The `ascii_dominant` argument for the span arms: the O(n) dominance count runs **only** for a
@@ -2639,11 +2674,11 @@ pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, op
             // Eager DFA span scan (prefiltered, stateless) when built and usable — the fastest arm,
             // same result the NFA arm gives. A `\b` program's eager DFA is used only on ASCII input
             // (`edfaArm`); non-ASCII `\b` input falls through to the Pike VM (Unicode boundaries).
-            if (edfaArm(program, scratch, input)) |ep| return runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, true, inputAllAscii(scratch, input), asciiDominantArg(program, scratch, input), &scratch.confirm_probes) != null;
+            if (edfaArm(program, scratch, input)) |ep| return runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, true, inputAsciiArg(program, scratch, input), asciiDominantArg(program, scratch, input), &scratch.confirm_probes) != null;
             // Lazy DFA fallback (prefiltered) when built and not disabled.
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
-                    const r = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, true, inputAllAscii(scratch, input), asciiDominantArg(program, scratch, input), &scratch.lazy_confirm_bytes);
+                    const r = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, true, inputAsciiArg(program, scratch, input), asciiDominantArg(program, scratch, input), &scratch.lazy_confirm_bytes);
                     if (d.gave_up) scratch.dfa_disabled = true; // cache thrashed → stop using it
                     return r != null;
                 };
@@ -2662,10 +2697,10 @@ pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opt
             // Line-anchored span fast path (`(?m)^…`, no eager DFA — `log_line`): see `lineAnchoredSpan`.
             if (program.filter.line_anchored and !opts.anchored and program.edfa_prog == null)
                 return lineAnchoredSpan(program, scratch, p, input, opts, false);
-            if (edfaArm(program, scratch, input)) |ep| return runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, false, inputAllAscii(scratch, input), asciiDominantArg(program, scratch, input), &scratch.confirm_probes);
+            if (edfaArm(program, scratch, input)) |ep| return runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, false, inputAsciiArg(program, scratch, input), asciiDominantArg(program, scratch, input), &scratch.confirm_probes);
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
-                    const r = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, false, inputAllAscii(scratch, input), asciiDominantArg(program, scratch, input), &scratch.lazy_confirm_bytes);
+                    const r = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, false, inputAsciiArg(program, scratch, input), asciiDominantArg(program, scratch, input), &scratch.lazy_confirm_bytes);
                     if (d.gave_up) scratch.dfa_disabled = true;
                     return r;
                 };
@@ -2699,12 +2734,12 @@ pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const
             // A `\b` program's eager DFA is used only on ASCII input (`edfaArm`); otherwise the whole
             // capture search runs on the Pike VM (Unicode boundaries), via the NFA arm below.
             if (edfaArm(program, scratch, input)) |ep| {
-                const m = runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, false, inputAllAscii(scratch, input), asciiDominantArg(program, scratch, input), &scratch.confirm_probes) orelse return null;
+                const m = runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, false, inputAsciiArg(program, scratch, input), asciiDominantArg(program, scratch, input), &scratch.confirm_probes) orelse return null;
                 return fillCapturesAnchored(program, &scratch.inner.nfa, p, input, slots, m, opts);
             }
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
-                    const span = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, false, inputAllAscii(scratch, input), asciiDominantArg(program, scratch, input), &scratch.lazy_confirm_bytes);
+                    const span = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, false, inputAsciiArg(program, scratch, input), asciiDominantArg(program, scratch, input), &scratch.lazy_confirm_bytes);
                     if (d.gave_up) {
                         scratch.dfa_disabled = true; // cache thrashed → fall through to the NFA arm
                     } else {
@@ -3719,6 +3754,48 @@ test "auto: the ASCII scan runs once per iteration and again per fresh search (r
     try testing.expectEqual(@as(u64, 3), re.scratch.ascii_scans); // without it, a re-scan
     re.scratch.reset();
     try testing.expectEqual(@as(u64, 0), re.scratch.ascii_scans);
+}
+
+
+test "auto: SIMD input scans agree with scalar references across block boundaries" {
+    // `isAsciiSlice` / `countHighBytes` run at vector width with a scalar tail; check every length
+    // from 0 to a few blocks, with the single high byte placed at every position, plus mixed text.
+    const gpa = testing.allocator;
+    const N = comptime std.simd.suggestVectorLength(u8) orelse 16;
+    const max_len = 3 * N + 5;
+    const buf = try gpa.alloc(u8, max_len);
+    defer gpa.free(buf);
+    var len: usize = 0;
+    while (len <= max_len) : (len += 1) {
+        const s = buf[0..len];
+        @memset(s, 'a');
+        try testing.expect(isAsciiSlice(s));
+        try testing.expectEqual(@as(usize, 0), countHighBytes(s));
+        var pos: usize = 0;
+        while (pos < len) : (pos += 1) {
+            @memset(s, 'a');
+            s[pos] = 0xC3;
+            try testing.expect(!isAsciiSlice(s));
+            try testing.expectEqual(@as(usize, 1), countHighBytes(s));
+        }
+    }
+    // Mixed content: a scalar reference count over pseudo-random bytes.
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const rnd = prng.random();
+    var trial: usize = 0;
+    while (trial < 64) : (trial += 1) {
+        const n = rnd.uintLessThan(usize, max_len + 1);
+        const s = buf[0..n];
+        rnd.bytes(s);
+        var want: usize = 0;
+        var all_ascii = true;
+        for (s) |b| {
+            want += @intFromBool(b >= 0x80);
+            if (b >= 0x80) all_ascii = false;
+        }
+        try testing.expectEqual(want, countHighBytes(s));
+        try testing.expectEqual(all_ascii, isAsciiSlice(s));
+    }
 }
 
 test {

@@ -50,9 +50,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `foo` inside the word `éfooé`, `\b\w+@\w+\b` missed `é@é`, and `\b\w+\b` returned `b` for `éb`.
   Every public search primitive now drops the input-derived caches on entry unless the caller
   asserts the new `SearchOptions.same_input`; the `Engine` iterators assert it between the calls
-  of one iteration, so `count`/`findAll` still pay the scan once per input. Pinned by a
-  differential test against the Pike VM over alternating refills of one buffer (both DFA arms,
-  every front-door op) and a revert-failing scan-count guard.
+  of one iteration, so `count`/`findAll` still pay the scan once per input. The scans themselves
+  are now skipped for a program that never consults the verdict and run at vector width otherwise
+  (the all-ASCII check through `ezi_code`'s SIMD `asciiRunLength`, the ASCII-dominance count as a
+  vector lane sum), so a fresh search on a large input costs at most one memory-speed pass.
+  Pinned by a differential test against the Pike VM over alternating refills of one buffer (both
+  DFA arms, every front-door op) and a revert-failing scan-count guard.
 
 ### Changed
 
