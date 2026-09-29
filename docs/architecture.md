@@ -104,6 +104,20 @@ pattern  ──scan──▶  AST  ──hir.build──▶  Hir  ──Backend.
                                                           Engine(Backend).find / captures / …
 ```
 
+**The scratch wrapper layer.** `Compiled(B).Scratch` — what `re.initScratch(gpa)` /
+`re.initScratchBuffer(buf)` return and every `re.*` search method takes — is a thin
+front-door wrapper: a struct holding the backend's own `B.Scratch` in its `.inner`
+field. It forwards the lifecycle the backend provides (`init`/`initBuffer`/`bufferLen`/
+`reset`/`deinit`) and substitutes a no-op / `.{}` / `0` where the backend has none, so a
+stateless `struct{}` scratch and a cache-carrying lazy-DFA scratch look the same to
+users. Backends are unaware of it: `Engine(B)` and the backend primitives still take
+the raw `B.Scratch`, and `Compiled` unwraps (`&sc.inner`) at every forward. Two escape
+hatches cross the boundary: `&sc.inner` hands the raw scratch to `Engine(B)` or a
+backend primitive, and `Scratch.fromBackend(raw)` wraps a scratch built directly off
+the backend (e.g. `dfa.Scratch.initOptions` with a custom cache budget). The older
+spelling `@TypeOf(re).Scratch.init(gpa, &re.program)` still works — it is the
+wrapper's own `init`.
+
 1. **`scan`** (`core/scanner.zig`) — one O(n) pass, explicit stack (no recursion),
    produces the flat `Ast`. Malformed → `error.InvalidPattern` + a `Diagnostic`.
 2. **`hir.build`** (`core/hir.zig`) — lowers the AST to the `Hir` (see §2).
@@ -288,7 +302,7 @@ comptime gex.verifyBackend(WholeLiteral); // assert the contract at compile time
 var diag: gex.Diagnostic = .{};
 var re = try gex.compileRuntimeWith(WholeLiteral, gpa, "abc", &diag, .{});
 defer re.deinit();
-var sc = try @TypeOf(re).Scratch.init(gpa, &re.program); // construct off the Scratch type
+var sc = try re.initScratch(gpa); // construct off the Scratch type
 defer sc.deinit(gpa);
 
 const m = re.find(&sc, "xxabcyy").?;     // "abc"  — and findAll/count/split/replaceAll
@@ -931,7 +945,7 @@ give **each thread its own `Scratch`**. No locks, no atomics, no global mutable 
 // shared, read-only, across N threads:
 const re = try gex.compileRuntime(gpa, pattern, &diag, .{});
 // per thread:
-var sc = try @TypeOf(re).Scratch.init(thread_gpa, &re.program);
+var sc = try re.initScratch(thread_gpa);
 _ = re.find(&sc, input);
 ```
 
@@ -945,7 +959,7 @@ _ = re.find(&sc, input);
 - **The built-in `backtrack` backend allocates *during* a search** — but through the
   allocator *you* gave it, not a hidden internal one (the front door allocates nothing while
   matching). Its heap `Scratch` grows the `(pc, sp)` visited bitset on demand through the
-  allocator passed to `Scratch.init`, and `auto` routes inputs ≤ 4096 bytes to backtrack. So a
+  allocator passed to `initScratch`, and `auto` routes inputs ≤ 4096 bytes to backtrack. So a
   per-thread `Scratch` is **necessary but not sufficient** — if every thread's Scratch shares
   one *non-thread-safe* allocator, two threads growing their visited sets at once race **inside
   the allocator**. Pick one:

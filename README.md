@@ -109,10 +109,8 @@ var re = gex.compileRuntime(gpa, "(?<user>\\w+)@(?<host>\\w+)", &diag, .{}) catc
 defer re.deinit();
 
 // The Scratch is the per-search working state — you own it; one per thread.
-// Build it directly off the backend's `Scratch` type (heap-backed here); the front
-// door never constructs it for you. Reuse one across many searches; never share a
-// Scratch across threads.
-var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+// Reuse one across many searches; never share a Scratch across threads.
+var sc = try re.initScratch(gpa);
 defer sc.deinit(gpa);
 
 if (re.find(&sc, "ping bob@example")) |m| {
@@ -168,58 +166,57 @@ single piece of mutable per-search state.
 
 ### 1. The `Scratch` — the engine only needs *a* scratch
 
-The engine is **`Scratch`-type agnostic.** Every search op takes a
-`*@TypeOf(re).Scratch`, and that is the *entire* requirement. The front door never
-constructs it, never stores an allocator for it, and assumes **nothing** about what it
-holds — whether a `Scratch` is heap-allocated, carved from a caller buffer, stateless
-(`struct{}`), or something exotic is **purely the backend's design**. Buffer
-semantics, allocator semantics, comptime-ability: all optional, all the backend's
-call. `Compiled` holds only the `Scratch` *type* and forwards your `&sc` straight
-through to the backend — so you build the `Scratch` yourself, directly off
-`@TypeOf(re).Scratch`, threading in `&re.program`:
+Every search op takes a `*Scratch` — the caller-owned, per-search working state — and
+that is the *entire* requirement. You make one **from the regex**: `re.initScratch(gpa)`
+for a heap-backed scratch, or `re.initScratchBuffer(buf)` over storage you own. The
+types are nameable, too: `gex.Regex` is what `compileRuntime`/`compileComptime` return
+and `gex.Scratch` is its scratch, so a struct field or a function parameter can carry
+either without `@TypeOf`.
 
 ```zig
 var re = try gex.compileRuntime(gpa, "[a-z]+\\d+", &diag, .{});
 defer re.deinit();
 
-// Heap-backed — every built-in backend's Scratch defines `init` / `deinit`.
-var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+// Heap-backed — one per thread, reused across searches.
+var sc = try re.initScratch(gpa);
 defer sc.deinit(gpa);
 ```
 
-If the backend implements the **buffer convention** (its `Scratch` exposes
+If the backend implements the **buffer convention** (its scratch exposes
 `Buf` / `bufferLen` / `initBuffer` — every built-in except the runtime-only lazy `dfa`
 does), you can hand it caller-owned storage instead, with no allocator and no allocation
 *during* a search:
 
 ```zig
-// Fixed buffer — `bufferLen` reports how many `Buf` words this program needs.
-const buf = try gpa.alloc(@TypeOf(re).Scratch.Buf, @TypeOf(re).Scratch.bufferLen(&re.program));
+// Fixed buffer — `scratchBufferLen` reports how many `Buf` words this regex needs.
+const buf = try gpa.alloc(gex.Scratch.Buf, re.scratchBufferLen());
 defer gpa.free(buf);
-var sc_buf = try @TypeOf(re).Scratch.initBuffer(buf, &re.program);
+var sc_buf = try re.initScratchBuffer(buf);
 
 // For a comptime regex the length is comptime-known → a stack array, no allocator:
 const Re = comptime gex.compileComptime("[a-z]+\\d+", .{});
-var stack_buf: [@TypeOf(Re).Scratch.bufferLen(&Re.program)]@TypeOf(Re).Scratch.Buf = undefined;
-var sc_ct = try @TypeOf(Re).Scratch.initBuffer(&stack_buf, &Re.program);
+var stack_buf: [Re.scratchBufferLen()]gex.Scratch.Buf = undefined;
+var sc_ct = try Re.initScratchBuffer(&stack_buf);
 ```
 
-A backend with a different construction protocol is built however *it* specifies — for
-a stateless one that is simply `var sc: @TypeOf(re).Scratch = .{};`. Whatever the
-backend's choice, you end up with a value the engine accepts.
+Under the hood `Scratch` is a thin wrapper: `Compiled(B).Scratch` holds the backend's
+own `B.Scratch` in its `.inner` field and forwards the lifecycle the backend provides
+(`init`/`initBuffer`/`bufferLen`/`reset`/`deinit`), substituting a no-op where the backend has none
+(a stateless `struct{}` scratch needs nothing). The backends never see the wrapper;
+`gex.Engine(B)` still takes the raw `B.Scratch`, so pass `&sc.inner` there, and
+`Scratch.fromBackend(raw)` wraps a scratch you built yourself (e.g. the lazy `dfa`'s
+`Scratch.initOptions` with a custom cache budget). The pre-0.7 spelling
+`@TypeOf(re).Scratch.init(gpa, &re.program)` still compiles and yields the same type.
 
-> The front door dictates no representation and reaches for no scratch method on the
-> runtime path: it cares that a `Scratch` *value* exists, not how it was made. (The
-> comptime helpers — `isMatchComptime`/`findComptime`/… — are the one exception: with
-> no allocator in const-eval they carve a buffer `Scratch` inline, so there they do
-> require the backend's buffer convention.)
+> The comptime helpers — `isMatchComptime`/`findComptime`/… — carve a buffer scratch
+> inline (no allocator in const-eval), so they require the backend's buffer convention.
 
 ### 2. Searching — `isMatch`, `find`, `findAll`, `count`, `split`
 
 ```zig
 var re = try gex.compileRuntime(gpa, "\\w+", &diag, .{});
 defer re.deinit();
-var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+var sc = try re.initScratch(gpa);
 defer sc.deinit(gpa);
 
 const text = "the quick brown fox";
@@ -253,7 +250,7 @@ whole match at index 0). At **runtime** the group count is dynamic, so allocate;
 ```zig
 var re = try gex.compileRuntime(gpa, "(?<user>\\w+)@(?<host>\\w+)", &diag, .{});
 defer re.deinit();
-var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+var sc = try re.initScratch(gpa);
 defer sc.deinit(gpa);
 
 const slots = try gpa.alloc(?usize, re.slotCount()); // 2 * (2 groups + 1) = 6
@@ -290,7 +287,7 @@ There's a `Writer`-based form, a count-bounded form, an **allocating** form, and
 ```zig
 var re = try gex.compileRuntime(gpa, "(\\w+)@(\\w+)", &diag, .{});
 defer re.deinit();
-var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+var sc = try re.initScratch(gpa);
 defer sc.deinit(gpa);
 const slots = try gpa.alloc(?usize, re.slotCount());
 defer gpa.free(slots);
@@ -486,7 +483,7 @@ Two facts about the built-ins, both stemming from the *caller-supplied* allocato
 rather than any hidden internal one — the front door allocates nothing during a search:
 
 - The `backtrack` heap `Scratch` (which `auto` uses for small inputs) grows its visited
-  set on demand **through the allocator you passed to `Scratch.init`**. So if several
+  set on demand **through the allocator you passed to `initScratch`**. So if several
   threads' scratches share one *non-thread-safe* allocator, two growing at once race
   inside that allocator — give each thread its own allocator, or a thread-safe one.
 - A **buffer-backed `Scratch`** (`initBuffer`) and the **`pikevm`** backend allocate

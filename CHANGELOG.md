@@ -9,7 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 `0.7.0-dev` on `main`.
 
+### Added
+
+- **Front-door scratch construction.** `re.initScratch(gpa)` builds the per-search
+  `Scratch` for a compiled regex, `re.initScratchBuffer(buf)` builds one over caller-owned
+  storage (no allocator, comptime-able), and `re.scratchBufferLen()` sizes that buffer
+  (comptime-known for a comptime regex, so it can size a stack array). No more
+  `@TypeOf(re).Scratch.init(gpa, &re.program)` at every call site.
+- `gex.Regex` and `gex.Scratch` name the default regex type (what `compileRuntime` /
+  `compileComptime` return) and its scratch, so struct fields and function parameters can be
+  typed without `@TypeOf`.
+- `Scratch.fromBackend(raw)` wraps a backend scratch you built yourself — the path to a lazy
+  `dfa` scratch with custom `ScratchOptions` (`dfa.Scratch.initOptions`).
+
 ### Changed
+
+- **`Compiled(B).Scratch` is now a front-door wrapper over the backend's `B.Scratch`** (held in
+  its `.inner` field), forwarding `init` / `initBuffer` / `bufferLen` / `reset` / `deinit` when
+  the backend provides them and substituting no-ops when it doesn't. The backend contract and
+  every backend's `Program` / `Scratch` are unchanged; the old
+  `@TypeOf(re).Scratch.init(gpa, &re.program)` spelling still compiles and yields the same type.
+  **Migration notes** (the `!`):
+  - Code that passed a front-door scratch straight into `Engine(B)` or a backend primitive must
+    now pass `&sc.inner` (or build the backend scratch itself and wrap it with
+    `Scratch.fromBackend`). Reading a backend field off a front-door scratch (e.g. the ReDoS
+    observables `confirm_probes` / `lazy_confirm_bytes`) likewise goes through `sc.inner`.
+  - `@TypeOf(re).Scratch` is no longer the same type as `B.Scratch`, so a field or variable
+    typed `gex.backends.auto.Scratch` (or `pikevm.Scratch`, …) can no longer be assigned from
+    `@TypeOf(re).Scratch.init(...)`. Type it `@TypeOf(re).Scratch` (or `gex.Scratch` for the
+    default backend) instead.
+  - `@TypeOf(re).Scratch.initOptions(gpa, &re.program, opts)` on a `dfa`-pinned regex no longer
+    exists on the front-door type: write
+    `@TypeOf(re).Scratch.fromBackend(try gex.backends.dfa.Scratch.initOptions(gpa, &re.program, opts))`.
+  - The wrapper's `init` (and `re.initScratch`) has an inferred error set — the backend's own
+    (`OutOfMemory` for every built-in) — rather than the backend's spelled-out one. `try`,
+    `catch` and `errdefer` are unaffected; only code that spelled the return type is.
 
 - **Unicode 18.0.0.** The `ezi_code` dependency moves from `main` commit `f01d7e8` (Unicode
   17.0.0) to the tagged `v0.5.0` release (`61d3b29`), which tracks Unicode 18.0.0. Property

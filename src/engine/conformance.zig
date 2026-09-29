@@ -2061,6 +2061,91 @@ test "usage guide §11: documented escape and folding examples" {
     for (grapheme_cases) |c| try checkRuntime(auto, c);
 }
 
+
+// ── front-door Scratch wrapper across backends ────────────────────────────────────
+
+/// `re.initScratch` + find / count on backend `B`, cross-checked against the old
+/// `@TypeOf(re).Scratch.init(gpa, &re.program)` spelling on the same regex.
+fn checkInitScratch(comptime B: type, pat: []const u8, input: []const u8, expect: []const u8) !void {
+    const gpa = testing.allocator;
+    var diag: regex.Diagnostic = .{};
+    var re = try regex.compileRuntimeWith(B, gpa, pat, &diag, .{});
+    defer re.deinit();
+    var sc = try re.initScratch(gpa);
+    defer sc.deinit(gpa);
+    var old = try @TypeOf(re).Scratch.init(gpa, &re.program);
+    defer old.deinit(gpa);
+    try testing.expect(@TypeOf(sc) == @TypeOf(old));
+    try testing.expect(@TypeOf(sc.inner) == B.Scratch);
+    try testing.expectEqualStrings(expect, re.find(&sc, input).?.slice(input));
+    try testing.expectEqualStrings(expect, re.find(&old, input).?.slice(input));
+    try testing.expectEqual(re.count(&old, input), re.count(&sc, input));
+    sc.reset();
+    try testing.expect(re.isMatch(&sc, input));
+}
+
+test "front door: re.initScratch works on every pinned backend" {
+    try checkInitScratch(auto, "[a-z]+\\d+", "??abc12!!", "abc12");
+    try checkInitScratch(pikevm, "[a-z]+\\d+", "??abc12!!", "abc12");
+    try checkInitScratch(backtrack, "[a-z]+\\d+", "??abc12!!", "abc12");
+    try checkInitScratch(bytepike, "[a-z]+\\d+", "??abc12!!", "abc12");
+    try checkInitScratch(edfa, "[a-z]+\\d+", "??abc12!!", "abc12");
+    try checkInitScratch(dfa, "[a-z]+\\d+", "??abc12!!", "abc12");
+    try checkInitScratch(onepass, "[a-z]+\\d+", "abc12!!", "abc12");
+    try checkInitScratch(literal, "cat|dog", "hot dog", "dog");
+}
+
+test "front door: captures + replaceAll through re.initScratch on capture backends" {
+    inline for (.{ auto, pikevm, backtrack, bytepike }) |B| {
+        const gpa = testing.allocator;
+        var diag: regex.Diagnostic = .{};
+        var re = try regex.compileRuntimeWith(B, gpa, "(\\w+)@(\\w+)", &diag, .{});
+        defer re.deinit();
+        var sc = try re.initScratch(gpa);
+        defer sc.deinit(gpa);
+        const slots = try gpa.alloc(?usize, re.slotCount());
+        defer gpa.free(slots);
+        const c = re.captures(&sc, slots, "user@host").?;
+        try testing.expectEqualStrings("user", c.groupSlice(1).?);
+        try testing.expectEqualStrings("host", c.groupSlice(2).?);
+        const out = try re.replaceAllAlloc(gpa, &sc, "a@b c@d", "$2@$1", slots);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("b@a d@c", out);
+    }
+}
+
+test "front door: comptime regex + initScratchBuffer on the comptime-capable backends" {
+    inline for (.{ auto, pikevm, backtrack, bytepike, edfa, literal }) |B| {
+        // ASCII classes only: `\d` is a big Unicode class, past edfa's comptime budget.
+        const pat = if (B == literal) "abc" else "[a-z]+[0-9]+";
+        const re = comptime regex.compileComptimeWith(B, pat, .{});
+        var buf: [re.scratchBufferLen()]@TypeOf(re).Scratch.Buf = undefined;
+        var sc = try re.initScratchBuffer(&buf);
+        const input = "??abc12!!";
+        const expect = if (B == literal) "abc" else "abc12";
+        try testing.expectEqualStrings(expect, re.find(&sc, input).?.slice(input));
+    }
+}
+
+test "front door: Scratch.fromBackend wraps a dfa scratch built with non-default options" {
+    const gpa = testing.allocator;
+    var diag: regex.Diagnostic = .{};
+    var re = try regex.compileRuntimeWith(dfa, gpa, "[a-z]+\\d+", &diag, .{});
+    defer re.deinit();
+    // The lazy DFA's cache budget is only reachable through its own `initOptions`;
+    // the wrapper's `fromBackend` takes that hand-built scratch and owns it from here.
+    const raw = try dfa.Scratch.initOptions(gpa, &re.program, .{ .max_bytes = 4096, .on_full = .give_up });
+    var sc = @TypeOf(re).Scratch.fromBackend(raw);
+    defer sc.deinit(gpa);
+    try testing.expectEqual(@as(usize, 4096), sc.inner.opts.max_bytes);
+    try testing.expectEqual(backend.ScratchOptions{ .max_bytes = 4096, .on_full = .give_up }, sc.inner.opts);
+    const input = "  abc123!  xy9 ";
+    try testing.expectEqualStrings("abc123", re.find(&sc, input).?.slice(input));
+    try testing.expectEqual(@as(usize, 2), re.count(&sc, input));
+    // `&sc.inner` is what Engine(dfa) takes — the same answer, no wrapper in the way.
+    try testing.expectEqual(@as(usize, 2), backend.Engine(dfa).count(&re.program, &sc.inner, input, .{}));
+}
+
 test {
     testing.refAllDecls(@This());
 }

@@ -104,7 +104,7 @@ test "backtracker work is deterministically linear on catastrophic patterns" {
             const input = try worstCase(gpa, n, c.fill, c.tail);
             defer gpa.free(input);
             const m = re.find(&sc, input);
-            steps[i] = sc.steps;
+            steps[i] = sc.inner.steps;
             matched[i] = m != null;
         }
 
@@ -221,8 +221,8 @@ test "default-engine prefilter: prone/end_anchored => 0 confirms; fast-confirm =
         var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
         defer sc.deinit(gpa);
         try testing.expect(re.find(&sc, input) == null); // worst case is a no-match (correctness)
-        if (sc.confirm_probes != 0) {
-            std.debug.print("/{s}/: {d} per-occurrence confirms (expected 0) -- quadratic prefilter regression\n", .{ c.pat, sc.confirm_probes });
+        if (sc.inner.confirm_probes != 0) {
+            std.debug.print("/{s}/: {d} per-occurrence confirms (expected 0) -- quadratic prefilter regression\n", .{ c.pat, sc.inner.confirm_probes });
             return error.QuadraticPrefilterRegression;
         }
     }
@@ -245,7 +245,7 @@ test "default-engine prefilter: prone/end_anchored => 0 confirms; fast-confirm =
         var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
         defer sc.deinit(gpa);
         try testing.expect(re.find(&sc, input) == null); // correct no-match despite the loop running
-        try testing.expect(sc.confirm_probes > 0); // the loop is kept for fast-confirm patterns
+        try testing.expect(sc.inner.confirm_probes > 0); // the loop is kept for fast-confirm patterns
     }
     {
         var diag: regex.Diagnostic = .{};
@@ -254,7 +254,7 @@ test "default-engine prefilter: prone/end_anchored => 0 confirms; fast-confirm =
         var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
         defer sc.deinit(gpa);
         _ = re.find(&sc, "fx fo food foo9 bar"); // two "foo" runs; the memmem loop probes each
-        try testing.expect(sc.confirm_probes > 0);
+        try testing.expect(sc.inner.confirm_probes > 0);
     }
 }
 
@@ -288,12 +288,12 @@ test "prefilter: bounded-prefix proneness threshold (a{64}b on edfa vs a{65}b of
         defer sc.deinit(gpa);
         try testing.expect(re.find(&sc, input) == null); // correct no-match either way
         if (c.want_probes_zero) {
-            if (sc.confirm_probes != 0) {
-                std.debug.print("/{s}/: {d} per-occurrence confirms (expected 0) — bounded-prefix gate regression\n", .{ c.pat, sc.confirm_probes });
+            if (sc.inner.confirm_probes != 0) {
+                std.debug.print("/{s}/: {d} per-occurrence confirms (expected 0) — bounded-prefix gate regression\n", .{ c.pat, sc.inner.confirm_probes });
                 return error.BoundedPrefixQuadratic;
             }
         } else {
-            try testing.expect(sc.confirm_probes > 0); // positive control: the loop is live & bounded
+            try testing.expect(sc.inner.confirm_probes > 0); // positive control: the loop is live & bounded
         }
     }
 }
@@ -356,7 +356,7 @@ test "lazy-arm jump-and-confirm stays linear under a reach budget (0.6.0 regress
         while (k < n) : (k += 1) input[k] = if (k % 2 == 0) 'x' else 'y'; // "xyxy…", no 'z'/'!'
         sc.reset();
         try testing.expect(re.find(&sc, input) == null); // correct no-match
-        scanned[i] = sc.lazy_confirm_bytes;
+        scanned[i] = sc.inner.lazy_confirm_bytes;
     }
     // The loop must have actually run (else the ratio is meaningless): confirms scanned > input.
     if (scanned[0] <= sizes[0]) return error.WorkTooSmall;

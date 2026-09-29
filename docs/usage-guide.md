@@ -38,8 +38,8 @@ var diag: gex.Diagnostic = .{};
 var re = try gex.compileRuntime(gpa, "\\d+", &diag, .{}); // gpa: std.mem.Allocator
 defer re.deinit();
 
-// The caller OWNS the per-search scratch and makes it off the regex's Scratch type.
-var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+// The caller OWNS the per-search scratch and makes it from the regex.
+var sc = try re.initScratch(gpa);
 defer sc.deinit(gpa);
 
 std.debug.print("{}\n", .{re.isMatch(&sc, "abc123")});          // true
@@ -50,8 +50,9 @@ if (re.find(&sc, "abc123")) |m|
 Two things to internalize, because they recur everywhere:
 
 - **`re` is immutable and shareable; `sc` is the mutable per-search state.** You build
-  `sc` *directly* off `@TypeOf(re).Scratch` (not through a method on `re`) and pass
-  `&sc` to every call. One `sc` per thread (see [§9](#9-thread-safety)).
+  `sc` with `re.initScratch(gpa)` (or `re.initScratchBuffer(buf)`, no allocator) and pass
+  `&sc` to every call. One `sc` per thread (see [§9](#9-thread-safety)). The types are
+  nameable as `gex.Regex` / `gex.Scratch` (the default-backend regex and its scratch).
 - **A bad pattern never crashes.** `compileRuntime` returns `error.InvalidPattern`
   and fills `diag` (code + byte span + message). Surface it however you like:
 
@@ -120,7 +121,7 @@ right; a group that didn't participate reads back `null`.
 ```zig
 var re = try gex.compileRuntime(gpa, "(?<user>\\w+)@(?<host>\\w+)", &diag, .{});
 defer re.deinit();
-var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+var sc = try re.initScratch(gpa);
 defer sc.deinit(gpa);
 
 const slots = try gpa.alloc(?usize, re.slotCount()); // here: 6 = 2*(2+1)
@@ -171,7 +172,7 @@ skipped, the final piece is always yielded):
 ```zig
 var sep = try gex.compileRuntime(gpa, "\\s+", &diag, .{});
 defer sep.deinit();
-var ssc = try @TypeOf(sep).Scratch.init(gpa, &sep.program);
+var ssc = try sep.initScratch(gpa);
 defer ssc.deinit(gpa);
 
 var parts = sep.split(&ssc, "the  quick fox");
@@ -189,7 +190,7 @@ The template references captures: `$0`/`$&` is the whole match, `$1`/`${name}` r
 ```zig
 var re = try gex.compileRuntime(gpa, "(\\w+)@(\\w+)", &diag, .{});
 defer re.deinit();
-var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+var sc = try re.initScratch(gpa);
 defer sc.deinit(gpa);
 const slots = try gpa.alloc(?usize, re.slotCount());
 defer gpa.free(slots);
@@ -270,11 +271,12 @@ defer re.deinit();
 > `(?m)$` / interior `(?m)^`, and `\b`+`$` (the code-point engines cover those). Through `auto` it
 > is the arm reached when the eager `edfa` overflows its `max_states` bound **or declines a prone
 > leading `(?m)^`**, and for **Unicode** `\b` on non-ASCII input; you rarely pin it. When you *do* pin it, its
-> determinization cache is bounded by a `ScratchOptions`: plain `Scratch.init` uses the default
-> (`max_bytes = 1 MiB`, `on_full = .reset` — clear the cache and continue), and
-> `Scratch.initOptions(gpa, &re.program, .{ .max_bytes = …, .on_full = … })` overrides it
+> determinization cache is bounded by a `ScratchOptions`: plain `re.initScratch(gpa)` uses the
+> default (`max_bytes = 1 MiB`, `on_full = .reset` — clear the cache and continue). To override it,
+> build the backend's scratch yourself and wrap it:
+> `var sc = @TypeOf(re).Scratch.fromBackend(try gex.backends.dfa.Scratch.initOptions(gpa, &re.program, .{ .max_bytes = …, .on_full = … }));`
 > (`on_full`: `.reset` / `.give_up` (fail the search; `auto` then routes to the NFA) / `.grow`).
-> Only the lazy `dfa` has a growable cache; every other backend's `Scratch.init` takes no options.
+> Only the lazy `dfa` has a growable cache; every other backend's scratch takes no options.
 
 ### Options
 
@@ -405,16 +407,16 @@ validation/lookup tables; bounded by the eval-branch quota (see the warning belo
 
 ### (b) Match at runtime with a **buffer** Scratch (still no allocator)
 
-The backend's `Scratch` exposes a buffer convention (`Buf` / `bufferLen` / `initBuffer`)
-so you can back the scratch with a stack/`ro_data` array instead of the heap:
+The backend's scratch exposes a buffer convention (`Buf` / `bufferLen` / `initBuffer`),
+surfaced on the regex as `scratchBufferLen()` / `initScratchBuffer(buf)`, so you can back
+the scratch with a stack/`ro_data` array instead of the heap:
 
 ```zig
 const re = comptime gex.compileComptime("[a-z]+\\d+", .{});
-const Scratch = @TypeOf(re).Scratch;
 
-var buf: [Scratch.bufferLen(&re.program)]Scratch.Buf = undefined; // exact size, no heap
-var sc = try Scratch.initBuffer(&buf, &re.program);
-_ = re.find(&sc, "??abc12!!").?.slice("??abc12!!");               // "abc12"
+var buf: [re.scratchBufferLen()]gex.Scratch.Buf = undefined; // exact size, no heap
+var sc = try re.initScratchBuffer(&buf);
+_ = re.find(&sc, "??abc12!!").?.slice("??abc12!!");          // "abc12"
 ```
 
 This also works for a **runtime**-compiled regex when you want zero allocation during
@@ -893,7 +895,7 @@ comptime gex.verifyBackend(DemoLiteral); // assert the contract; precise compile
 var diag: gex.Diagnostic = .{};
 var re = try gex.compileRuntimeWith(DemoLiteral, gpa, "cat|dog", &diag, .{});
 defer re.deinit();
-var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+var sc = try re.initScratch(gpa);
 defer sc.deinit(gpa);
 
 _ = re.find(&sc, "i have a dog").?.slice("i have a dog"); // "dog"
@@ -948,7 +950,7 @@ var re = try gex.compileRuntime(gpa, pattern, &diag, .{});
 defer re.deinit();
 
 // per thread:
-var sc = try @TypeOf(re).Scratch.init(thread_gpa, &re.program);
+var sc = try re.initScratch(thread_gpa);
 defer sc.deinit(thread_gpa);
 _ = re.find(&sc, input);
 ```

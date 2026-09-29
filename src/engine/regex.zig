@@ -11,11 +11,14 @@
 //! The compiled value exposes the user-facing API — `isMatch`, `find`, `captures`,
 //! `findAll`, `capturesAll`, `count`, `split`, `replaceAll` — all delegating to the
 //! backend-agnostic `Engine`. Per the contract, the **caller owns the `Scratch`**
-//! and creates it at the call site off the `Scratch` type
-//! (`var s = try @TypeOf(re).Scratch.init(alloc, &re.program);`); the regex methods
-//! take `&s`. The default backend is the `auto` dispatcher (`default_backend`), which
-//! picks literal / backtrack / Pike VM from the pattern + input; pass a specific
-//! backend to the `*With` constructors to override it.
+//! and creates it at the call site — `var sc = try re.initScratch(alloc);` (or
+//! `re.initScratchBuffer(buf)` for a no-allocator buffer); the regex methods take
+//! `&sc`. `re.Scratch` is a thin front-door wrapper over the backend's own scratch
+//! (`Compiled(B).Scratch` wraps `B.Scratch` in its `.inner` field); the older
+//! spelling `@TypeOf(re).Scratch.init(alloc, &re.program)` still works. The default
+//! backend is the `auto` dispatcher (`default_backend`), which picks literal /
+//! backtrack / Pike VM from the pattern + input; pass a specific backend to the
+//! `*With` constructors to override it.
 //!
 //! ══════════════════════════════════════════════════════════════════════════════
 //! USAGE GUIDE
@@ -36,7 +39,7 @@
 //! var diag: gex.Diagnostic = .{};
 //! var re = try gex.compileRuntime(gpa, "\\d+", &diag, .{}); // .{} = default Options
 //! defer re.deinit();
-//! var sc = try @TypeOf(re).Scratch.init(gpa, &re.program); // caller-owned, per thread
+//! var sc = try re.initScratch(gpa); // caller-owned, per thread
 //! defer sc.deinit(gpa);
 //!
 //! _ = re.isMatch(&sc, "abc123"); //          bool
@@ -49,12 +52,12 @@
 //!
 //! ```zig
 //! const re = comptime gex.compileComptime("\\d{3}-\\d{4}", .{});
-//! const Scratch = @TypeOf(re).Scratch; // the backend's Scratch type, exposing the buffer convention
 //! // (a) match AT comptime — the result is a compile-time constant:
 //! const ok = comptime re.isMatchComptime("call 555-1234"); // true
-//! // (b) or match at RUNTIME with a buffer Scratch (still no allocator):
-//! var buf: [Scratch.bufferLen(&re.program)]Scratch.Buf = undefined;
-//! var sc = try Scratch.initBuffer(&buf, &re.program);
+//! // (b) or match at RUNTIME with a buffer Scratch (still no allocator): the
+//! //     regex is comptime-known, so `scratchBufferLen()` sizes a stack array.
+//! var buf: [re.scratchBufferLen()]gex.Scratch.Buf = undefined;
+//! var sc = try re.initScratchBuffer(&buf);
 //! _ = re.find(&sc, "call 555-1234");
 //! _ = ok;
 //! ```
@@ -213,9 +216,11 @@ pub const Options = struct {
 /// `replaceAll` live here and forward to `Engine(B)`.
 ///
 /// Thread-safe to SHARE (immutable, `*const`-borrowed by every method); each thread
-/// brings its OWN `Scratch`. Per the contract the caller owns the `Scratch` and builds
-/// it directly off `@TypeOf(re).Scratch` — `Compiled` only holds the type and forwards
-/// `&sc`.
+/// brings its OWN `Scratch`. Per the contract the caller owns the `Scratch`: make one
+/// with `re.initScratch(gpa)` (heap) or `re.initScratchBuffer(buf)` (caller storage,
+/// no allocator) and pass `&sc` to every search. `Compiled(B).Scratch` is a thin
+/// wrapper around the backend's `B.Scratch` (see `Scratch`); the older spelling
+/// `@TypeOf(re).Scratch.init(gpa, &re.program)` still works and yields the same type.
 ///
 /// Step by step (runtime):
 ///
@@ -225,8 +230,8 @@ pub const Options = struct {
 /// var re = try gex.compileRuntime(gpa, "(\\w+)@(\\w+)", &diag, .{});
 /// defer re.deinit();
 ///
-/// // 2) make a Scratch off the regex's Scratch type — caller-owned, one per thread.
-/// var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+/// // 2) make a Scratch — caller-owned, one per thread.
+/// var sc = try re.initScratch(gpa);
 /// defer sc.deinit(gpa);
 ///
 /// // 3) use the API; pass &sc to each call.
@@ -240,9 +245,10 @@ pub const Options = struct {
 /// if (re.captures(&sc, slots, "user@host")) |c| _ = c.groupSlice(1); // "user"
 /// ```
 ///
-/// Comptime (no allocator, no deinit): `const re = compileComptime("\\d+", .{});` then
-/// either use the runtime methods with a buffer `Scratch`
-/// (`@TypeOf(re).Scratch.initBuffer`), or the `*Comptime` methods that run the match
+/// Comptime (no allocator, no deinit): `const re = comptime compileComptime("\\d+", .{});`
+/// then either use the runtime methods with a buffer `Scratch`
+/// (`var buf: [re.scratchBufferLen()]gex.Scratch.Buf = undefined;` +
+/// `re.initScratchBuffer(&buf)`), or the `*Comptime` methods that run the match
 /// itself at compile time (`isMatchComptime`, `findComptime`, `capturesComptime`, …).
 ///
 /// @stable-since: v0.1.0
@@ -251,17 +257,111 @@ pub fn Compiled(comptime B: type) type {
     return struct {
         const Self = @This();
 
-        /// The per-search state type — initialize one at the call site
-        /// (`@TypeOf(re).Scratch.init(gpa, &re.program)`, or `.initBuffer(buf, …)` for
-        /// a no-allocator/comptime buffer).
+        /// The per-search state type: the front-door **wrapper** over the backend's own
+        /// `B.Scratch`, which lives in `.inner`. Make one with `re.initScratch(gpa)` /
+        /// `re.initScratchBuffer(buf)`; every search method takes `*Scratch`.
         ///
-        /// @stable-since: v0.1.0
-        pub const Scratch = B.Scratch;
+        /// The wrapper exists so users never spell `@TypeOf(re)` or `&re.program`: it
+        /// forwards the backend's lifecycle (`init`/`initBuffer`/`bufferLen`/`reset`/
+        /// `deinit`) when the backend provides it and substitutes a sensible default
+        /// when it doesn't (a stateless `struct{}` scratch needs none of them). The
+        /// forwarders are trivial functions the optimizer inlines (zero cost in a
+        /// release build); backends are unaware of the wrapper and `Engine(B)` still
+        /// takes the raw `B.Scratch`.
+        ///
+        /// Escape hatches for code that drives `Engine(B)` or a backend directly:
+        /// `&sc.inner` hands the raw backend scratch out, and `Scratch.fromBackend(raw)`
+        /// wraps a backend scratch you built yourself (e.g. `dfa.Scratch.initOptions`
+        /// with a custom cache budget).
+        ///
+        /// The pre-0.7 spelling `@TypeOf(re).Scratch.init(gpa, &re.program)` still
+        /// compiles and yields this same type.
+        ///
+        /// @stable-since: v0.1.0 (a wrapper over `B.Scratch` since v0.7.0)
+        pub const Scratch = struct {
+            /// The backend's own per-search state — what `Engine(B)` and the backend's
+            /// `search`/`isMatch` primitives take. Pass `&sc.inner` to those directly.
+            /// (The default `auto` backend's scratch has a field of the same name for
+            /// its routed sub-scratch, so a debugger shows `sc.inner.inner` there.)
+            ///
+            /// @stable-since: v0.7.0
+            inner: B.Scratch,
+
+            /// Buffer element type for `initBuffer` (the backend's `Scratch.Buf`, e.g.
+            /// `backend.Cell` for the built-ins); `void` for a backend without the
+            /// buffer convention.
+            ///
+            /// @stable-since: v0.1.0
+            pub const Buf = if (@hasDecl(B.Scratch, "Buf")) B.Scratch.Buf else void;
+
+            /// Heap-backed construction (`re.initScratch(gpa)` is the front-door form).
+            /// Forwards `B.Scratch.init`; a backend whose scratch has no `init` is
+            /// default-constructed (`.{}`). The error set is the backend's own.
+            ///
+            /// @stable-since: v0.1.0
+            pub fn init(gpa: std.mem.Allocator, program: *const B.Program) !Scratch {
+                if (comptime @hasDecl(B.Scratch, "init")) {
+                    return .{ .inner = try B.Scratch.init(gpa, program) };
+                } else {
+                    return .{ .inner = .{} };
+                }
+            }
+
+            /// Caller-buffer construction (`re.initScratchBuffer(buf)` is the front-door
+            /// form): carve the scratch out of `buf`, which must hold at least
+            /// `bufferLen(program)` words; no allocator, works at comptime. A backend
+            /// without `initBuffer` makes this a `@compileError`.
+            ///
+            /// @stable-since: v0.1.0
+            pub fn initBuffer(buf: []Buf, program: *const B.Program) backend.ScratchError!Scratch {
+                if (comptime !@hasDecl(B.Scratch, "initBuffer"))
+                    @compileError("backend `" ++ @typeName(B) ++ "`'s Scratch has no `initBuffer` (the buffer/no-allocator path needs Buf/bufferLen/initBuffer)");
+                return .{ .inner = try B.Scratch.initBuffer(buf, program) };
+            }
+
+            /// How many `Buf` words `initBuffer` needs for `program`
+            /// (`re.scratchBufferLen()` is the front-door form). 0 for a backend
+            /// without the buffer convention.
+            ///
+            /// @stable-since: v0.1.0
+            pub fn bufferLen(program: *const B.Program) usize {
+                if (comptime @hasDecl(B.Scratch, "bufferLen")) return B.Scratch.bufferLen(program);
+                return 0;
+            }
+
+            /// Wrap a backend scratch you built yourself — the escape hatch for backends
+            /// whose scratch takes extra configuration (e.g. `dfa.Scratch.initOptions(gpa,
+            /// &re.program, .{ .max_bytes = … })`). The wrapper takes ownership: `deinit`
+            /// releases it.
+            ///
+            /// @stable-since: v0.7.0
+            pub fn fromBackend(inner: B.Scratch) Scratch {
+                return .{ .inner = inner };
+            }
+
+            /// Clear per-search state so the scratch can be reused on a new input
+            /// (forwards `B.Scratch.reset`; a no-op for a backend without one).
+            ///
+            /// @stable-since: v0.1.0
+            pub fn reset(self: *Scratch) void {
+                if (comptime @hasDecl(B.Scratch, "reset")) self.inner.reset();
+            }
+
+            /// Release the scratch's heap memory (forwards `B.Scratch.deinit`; a no-op
+            /// for a backend without one). Pass the allocator `init` received.
+            ///
+            /// @stable-since: v0.1.0
+            pub fn deinit(self: *Scratch, gpa: std.mem.Allocator) void {
+                if (comptime @hasDecl(B.Scratch, "deinit")) self.inner.deinit(gpa);
+            }
+        };
         /// The backend type `B` this regex was compiled with (e.g. `backends.auto`).
         pub const Backend = B;
 
         /// The backend's immutable executable form (NFA insts, literal set, …),
-        /// shareable across threads. Pass `&re.program` to `Scratch.init`.
+        /// shareable across threads. **Internal / advanced use:** the front door's
+        /// own methods and `initScratch` reach it for you; take `&re.program` only to
+        /// drive `Engine(B)` or a backend primitive directly (with `&sc.inner`).
         program: B.Program,
         /// Capture metadata (group count + names): sizes `slots` and resolves names.
         meta: backend.Meta,
@@ -294,6 +394,34 @@ pub fn Compiled(comptime B: type) type {
             return self.meta.capture_count;
         }
 
+        // ── the caller-owned Scratch ────────────────────────────────────────────
+
+        /// Make a heap-backed `Scratch` for this regex: `var sc = try re.initScratch(gpa);`
+        /// then `defer sc.deinit(gpa);`. One per thread, reused across searches.
+        /// The error set is the backend's (`OutOfMemory` for every built-in).
+        ///
+        /// @stable-since: v0.7.0
+        pub fn initScratch(self: *const Self, gpa: std.mem.Allocator) !Scratch {
+            return Scratch.init(gpa, &self.program);
+        }
+        /// Make a `Scratch` over caller-owned storage — no allocator, no allocation
+        /// during a search, and usable at comptime. `buf` must hold at least
+        /// `scratchBufferLen()` words of `Scratch.Buf` (else `error.BufferTooSmall`).
+        /// Needs the backend's buffer convention (every built-in except the lazy `dfa`).
+        ///
+        /// @stable-since: v0.7.0
+        pub fn initScratchBuffer(self: *const Self, buf: []Scratch.Buf) backend.ScratchError!Scratch {
+            return Scratch.initBuffer(buf, &self.program);
+        }
+        /// How many `Scratch.Buf` words `initScratchBuffer` needs for this regex. For a
+        /// comptime regex this is comptime-known, so it sizes a stack array:
+        /// `var buf: [re.scratchBufferLen()]gex.Scratch.Buf = undefined;`.
+        ///
+        /// @stable-since: v0.7.0
+        pub fn scratchBufferLen(self: *const Self) usize {
+            return Scratch.bufferLen(&self.program);
+        }
+
         // ── the user-facing API ──────────────────────────────────────────────────
 
         /// Does the pattern match anywhere in `input`? (Unanchored; cheapest op —
@@ -301,26 +429,26 @@ pub fn Compiled(comptime B: type) type {
         ///
         /// @stable-since: v0.1.0
         pub fn isMatch(self: *const Self, scratch: *Scratch, input: []const u8) bool {
-            return Eng.isMatch(&self.program, scratch, input, .{});
+            return Eng.isMatch(&self.program, &scratch.inner, input, .{});
         }
         /// `isMatch` with explicit `SearchOptions` (`.start` offset, `.anchored`).
         ///
         /// @stable-since: v0.1.0
         pub fn isMatchAt(self: *const Self, scratch: *Scratch, input: []const u8, opts: backend.SearchOptions) bool {
-            return Eng.isMatch(&self.program, scratch, input, opts);
+            return Eng.isMatch(&self.program, &scratch.inner, input, opts);
         }
         /// The leftmost match in `input`, or null. The returned `Match` is byte
         /// offsets; use `m.slice(input)` for the text.
         ///
         /// @stable-since: v0.1.0
         pub fn find(self: *const Self, scratch: *Scratch, input: []const u8) ?Match {
-            return Eng.find(&self.program, scratch, input, .{});
+            return Eng.find(&self.program, &scratch.inner, input, .{});
         }
         /// `find` with explicit `SearchOptions` (resume at `.start`, or `.anchored`).
         ///
         /// @stable-since: v0.1.0
         pub fn findAt(self: *const Self, scratch: *Scratch, input: []const u8, opts: backend.SearchOptions) ?Match {
-            return Eng.find(&self.program, scratch, input, opts);
+            return Eng.find(&self.program, &scratch.inner, input, opts);
         }
         /// Resolve the first match's submatches into `slots` (length `slotCount()`),
         /// returning a `Captures` view (or null on no match). Read groups via
@@ -328,34 +456,34 @@ pub fn Compiled(comptime B: type) type {
         ///
         /// @stable-since: v0.1.0
         pub fn captures(self: *const Self, scratch: *Scratch, slots: []?usize, input: []const u8) ?Captures {
-            return Eng.captures(&self.program, scratch, input, slots, self.meta, .{});
+            return Eng.captures(&self.program, &scratch.inner, input, slots, self.meta, .{});
         }
         /// Iterator over every non-overlapping match, left to right. Empty matches
         /// advance one code point so iteration always terminates.
         ///
         /// @stable-since: v0.1.0
         pub fn findAll(self: *const Self, scratch: *Scratch, input: []const u8) Eng.MatchIterator {
-            return Eng.findAll(&self.program, scratch, input, .{});
+            return Eng.findAll(&self.program, &scratch.inner, input, .{});
         }
         /// Iterator yielding a `Captures` per non-overlapping match into the SHARED
         /// `slots` — each view is valid only until the next `next()` reuses `slots`.
         ///
         /// @stable-since: v0.1.0
         pub fn capturesAll(self: *const Self, scratch: *Scratch, slots: []?usize, input: []const u8) Eng.CaptureIterator {
-            return Eng.capturesAll(&self.program, scratch, input, slots, self.meta, .{});
+            return Eng.capturesAll(&self.program, &scratch.inner, input, slots, self.meta, .{});
         }
         /// Count the non-overlapping matches in `input`.
         ///
         /// @stable-since: v0.1.0
         pub fn count(self: *const Self, scratch: *Scratch, input: []const u8) usize {
-            return Eng.count(&self.program, scratch, input, .{});
+            return Eng.count(&self.program, &scratch.inner, input, .{});
         }
         /// Iterator over the substrings between successive matches (the pattern is the
         /// separator). Empty matches are skipped; the final piece is always yielded.
         ///
         /// @stable-since: v0.1.0
         pub fn split(self: *const Self, scratch: *Scratch, input: []const u8) Eng.SplitIterator {
-            return Eng.split(&self.program, scratch, input, .{});
+            return Eng.split(&self.program, &scratch.inner, input, .{});
         }
         /// Replace every match, writing the result to `writer`. `template` may
         /// reference captures: `$0`/`$1`/… by number, `${name}` by name, `$$` for a
@@ -370,7 +498,7 @@ pub fn Compiled(comptime B: type) type {
             slots: []?usize,
             writer: *std.Io.Writer,
         ) std.Io.Writer.Error!void {
-            return Eng.replaceAll(&self.program, scratch, input, template, slots, self.meta, writer);
+            return Eng.replaceAll(&self.program, &scratch.inner, input, template, slots, self.meta, writer);
         }
 
         /// `captures` with explicit `SearchOptions` (resume at `.start`, or `.anchored`) —
@@ -378,7 +506,7 @@ pub fn Compiled(comptime B: type) type {
         ///
         /// @stable-since: v0.5.0
         pub fn capturesAt(self: *const Self, scratch: *Scratch, slots: []?usize, input: []const u8, opts: backend.SearchOptions) ?Captures {
-            return Eng.captures(&self.program, scratch, input, slots, self.meta, opts);
+            return Eng.captures(&self.program, &scratch.inner, input, slots, self.meta, opts);
         }
         /// Replace only the **first** match (template syntax as `replaceAll`).
         ///
@@ -391,7 +519,7 @@ pub fn Compiled(comptime B: type) type {
             slots: []?usize,
             writer: *std.Io.Writer,
         ) std.Io.Writer.Error!void {
-            return Eng.replace(&self.program, scratch, input, template, slots, self.meta, writer);
+            return Eng.replace(&self.program, &scratch.inner, input, template, slots, self.meta, writer);
         }
         /// Replace the first **`n`** matches (`n == 0` copies the input verbatim).
         ///
@@ -405,7 +533,7 @@ pub fn Compiled(comptime B: type) type {
             writer: *std.Io.Writer,
             n: usize,
         ) std.Io.Writer.Error!void {
-            return Eng.replaceN(&self.program, scratch, input, template, slots, self.meta, writer, n);
+            return Eng.replaceN(&self.program, &scratch.inner, input, template, slots, self.meta, writer, n);
         }
         /// Replace every match and return the result as a freshly **allocated** `[]u8`
         /// (caller frees). The convenience over `replaceAll` for when you just want the
@@ -423,7 +551,7 @@ pub fn Compiled(comptime B: type) type {
             var out: std.Io.Writer.Allocating = .init(allocator);
             errdefer out.deinit();
             // An Allocating writer fails only on OOM, so `WriteFailed` ⇒ `OutOfMemory`.
-            Eng.replaceAll(&self.program, scratch, input, template, slots, self.meta, &out.writer) catch return error.OutOfMemory;
+            Eng.replaceAll(&self.program, &scratch.inner, input, template, slots, self.meta, &out.writer) catch return error.OutOfMemory;
             return out.toOwnedSlice();
         }
         /// Replace every match, computing each replacement with a **callback**
@@ -441,14 +569,14 @@ pub fn Compiled(comptime B: type) type {
             context: anytype,
             comptime replacer: fn (@TypeOf(context), Captures, *std.Io.Writer) std.Io.Writer.Error!void,
         ) std.Io.Writer.Error!void {
-            return Eng.replaceAllWith(&self.program, scratch, input, slots, self.meta, writer, context, replacer);
+            return Eng.replaceAllWith(&self.program, &scratch.inner, input, slots, self.meta, writer, context, replacer);
         }
         /// Iterator over the substrings between matches, yielding **at most `n` pieces**
         /// (the remainder after `n − 1` separators is the final piece). The `splitn` form.
         ///
         /// @stable-since: v0.5.0
         pub fn splitN(self: *const Self, scratch: *Scratch, input: []const u8, n: usize) Eng.SplitIterator {
-            return Eng.splitN(&self.program, scratch, input, n, .{});
+            return Eng.splitN(&self.program, &scratch.inner, input, n, .{});
         }
         /// The index of the capture group named `name` (1-based; group 0 is the whole
         /// match), or null if there is no such name. Resolves from the compiled metadata —
@@ -1271,6 +1399,148 @@ test "dead-on-invalid: the scan resyncs and matches the valid region after a bad
     defer sc.deinit(testing.allocator);
     // The leading 0xFF is skipped; the digits after it still match.
     try testing.expectEqualStrings("42", re.find(&sc, "\xFF42").?.slice("\xFF42"));
+}
+
+
+// ── front-door Scratch wrapper (`re.initScratch` & co.) ──────────────────────────
+
+test "front door: re.initScratch + find/captures/replaceAll (auto)" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "(\\w+)@(\\w+)", &diag, .{});
+    defer re.deinit();
+    var sc = try re.initScratch(testing.allocator);
+    defer sc.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("a@b", re.find(&sc, "x a@b y").?.slice("x a@b y"));
+    const slots = try testing.allocator.alloc(?usize, re.slotCount());
+    defer testing.allocator.free(slots);
+    const c = re.captures(&sc, slots, "user@host").?;
+    try testing.expectEqualStrings("user", c.groupSlice(1).?);
+    try testing.expectEqualStrings("host", c.groupSlice(2).?);
+
+    const out = try re.replaceAllAlloc(testing.allocator, &sc, "a@b c@d", "$2@$1", slots);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("b@a d@c", out);
+
+    sc.reset(); // the wrapper forwards reset; the scratch stays usable afterwards
+    try testing.expectEqual(@as(usize, 2), re.count(&sc, "a@b c@d"));
+}
+
+test "front door: comptime regex + initScratchBuffer needs no allocator" {
+    const re = comptime compileComptime("[a-z]+\\d+", .{});
+    var buf: [re.scratchBufferLen()]Compiled(default_backend).Scratch.Buf = undefined;
+    var sc = try re.initScratchBuffer(&buf);
+    try testing.expectEqualStrings("abc12", re.find(&sc, "??abc12!!").?.slice("??abc12!!"));
+    try testing.expect(!re.isMatch(&sc, "ABC"));
+}
+
+test "front door: runtime regex + initScratchBuffer over a heap-sized buffer" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "[a-z]+\\d+", &diag, .{});
+    defer re.deinit();
+    const buf = try testing.allocator.alloc(@TypeOf(re).Scratch.Buf, re.scratchBufferLen());
+    defer testing.allocator.free(buf);
+    var sc = try re.initScratchBuffer(buf);
+    try testing.expectEqualStrings("abc12", re.find(&sc, "??abc12!!").?.slice("??abc12!!"));
+    // A too-small buffer is the contract's BufferTooSmall, surfaced through the wrapper
+    // (an empty buffer can never hold the Pike VM's thread lists for an NFA program).
+    try testing.expectError(error.BufferTooSmall, re.initScratchBuffer(buf[0..0]));
+}
+
+test "front door: old @TypeOf(re).Scratch.init form and re.initScratch agree" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "\\b\\w+\\b", &diag, .{});
+    defer re.deinit();
+    var old = try @TypeOf(re).Scratch.init(testing.allocator, &re.program);
+    defer old.deinit(testing.allocator);
+    var new = try re.initScratch(testing.allocator);
+    defer new.deinit(testing.allocator);
+    const input = "héllo wörld 42";
+    try testing.expectEqual(re.count(&old, input), re.count(&new, input));
+    try testing.expectEqualStrings(re.find(&old, input).?.slice(input), re.find(&new, input).?.slice(input));
+    // Both are the same type: the old spelling is the wrapper too.
+    try testing.expect(@TypeOf(old) == @TypeOf(new));
+    // The backend's own scratch is reachable through `.inner` for Engine(B) callers.
+    try testing.expect(@TypeOf(new.inner) == default_backend.Scratch);
+    try testing.expectEqual(re.count(&new, input), backend.Engine(default_backend).count(&re.program, &new.inner, input, .{}));
+}
+
+/// A minimal backend whose `Scratch` has NO lifecycle decls at all (no `init`,
+/// `deinit`, `reset`, `Buf`, `bufferLen`, `initBuffer`) — the contract's bare
+/// minimum. No built-in backend exercises this path, so the wrapper's
+/// missing-decl fallbacks are pinned here. Matches a single ASCII literal run.
+const BareLiteral = struct {
+    pub const caps = backend.Caps{ .captures = false, .stateless = true };
+    pub const Program = struct { needle: []const u8 };
+    pub const Scratch = struct {};
+    pub const Options = struct {};
+
+    pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: BareLiteral.Options) backend.BuildError!Program {
+        const root = h.nodes[h.root];
+        if (root.tag != .literal) return error.Unsupported;
+        const run = root.data.run;
+        const needle = try gpa.alloc(u8, run.len);
+        errdefer gpa.free(needle);
+        for (h.literals[run.start..][0..run.len], 0..) |cp, i| {
+            if (cp > 0x7F) return error.Unsupported;
+            needle[i] = @intCast(cp);
+        }
+        return .{ .needle = needle };
+    }
+    pub fn buildComptime(comptime h: hir.Hir, comptime _: BareLiteral.Options) Program {
+        const root = h.nodes[h.root];
+        if (root.tag != .literal) @compileError("BareLiteral: not a literal");
+        const run = root.data.run;
+        var needle: [run.len]u8 = undefined;
+        for (h.literals[run.start..][0..run.len], 0..) |cp, i| needle[i] = @intCast(cp);
+        const frozen = needle;
+        return .{ .needle = &frozen };
+    }
+    pub fn freeProgram(gpa: std.mem.Allocator, p: *Program) void {
+        gpa.free(p.needle);
+    }
+    pub fn search(p: *const Program, _: *Scratch, input: []const u8, o: backend.SearchOptions) ?Match {
+        var i = o.start;
+        while (i + p.needle.len <= input.len) : (i += 1) {
+            if (std.mem.eql(u8, input[i .. i + p.needle.len], p.needle))
+                return .{ .start = i, .end = i + p.needle.len };
+            if (o.anchored) return null;
+        }
+        return null;
+    }
+    pub fn isMatch(p: *const Program, s: *Scratch, input: []const u8, o: backend.SearchOptions) bool {
+        return search(p, s, input, o) != null;
+    }
+};
+
+test "front door: a backend Scratch with no lifecycle decls still works through the wrapper" {
+    comptime backend.verifyBackend(BareLiteral);
+    var diag: Diagnostic = .{};
+    var re = try compileRuntimeWith(BareLiteral, testing.allocator, "dog", &diag, .{});
+    defer re.deinit();
+    var sc = try re.initScratch(testing.allocator); // no `init` on B.Scratch → `.{ .inner = .{} }`
+    defer sc.deinit(testing.allocator); // no `deinit` → no-op
+    sc.reset(); // no `reset` → no-op
+    try testing.expectEqualStrings("dog", re.find(&sc, "hot dog").?.slice("hot dog"));
+    try testing.expectEqual(@as(usize, 2), re.count(&sc, "dog dog"));
+    try testing.expectEqual(@as(usize, 0), re.scratchBufferLen()); // no `bufferLen` → 0
+    try testing.expect(@TypeOf(re).Scratch.Buf == void); // no `Buf` → void
+
+    const cre = comptime compileComptimeWith(BareLiteral, "cat", .{});
+    var csc = try cre.initScratch(testing.allocator);
+    defer csc.deinit(testing.allocator);
+    try testing.expect(cre.isMatch(&csc, "a cat"));
+    try testing.expect(!cre.isMatch(&csc, "a dog"));
+}
+
+test "front door: Scratch.fromBackend wraps a hand-built backend scratch" {
+    var diag: Diagnostic = .{};
+    var re = try compileRuntime(testing.allocator, "\\d+", &diag, .{});
+    defer re.deinit();
+    const raw = try default_backend.Scratch.init(testing.allocator, &re.program);
+    var sc = @TypeOf(re).Scratch.fromBackend(raw);
+    defer sc.deinit(testing.allocator);
+    try testing.expectEqualStrings("42", re.find(&sc, "x42y").?.slice("x42y"));
 }
 
 test {

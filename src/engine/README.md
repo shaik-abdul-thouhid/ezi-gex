@@ -20,17 +20,16 @@
 
 1. `regex.compile*` runs `core` (pattern → AST → HIR), then `Backend.build*`
    (HIR → `Program`), and stores the `Program` + capture `Meta`.
-2. The caller makes a `Scratch` of the backend's `Scratch` type and hands it to the
-   search ops — that is all the engine requires; it dictates no representation. *How*
-   the `Scratch` is built is the backend's design, so the caller builds it **directly
-   off `@TypeOf(re).Scratch`**, not through any front-door method — `Compiled` holds the
-   `Scratch` type and forwards `&sc`, nothing more. The built-in backends offer two
-   conventions: `@TypeOf(re).Scratch.init(gpa, &re.program)` (heap) and
-   `@TypeOf(re).Scratch.initBuffer(buf, &re.program)` over a
-   `@TypeOf(re).Scratch.bufferLen(&re.program)`-sized `@TypeOf(re).Scratch.Buf` buffer
-   (no allocator). A backend with a different protocol is built however it specifies (a
-   stateless one is just `.{}`). The caller owns it; the built-ins' `Scratch` is one per
-   thread (a backend may instead implement a thread-safe one).
+2. The caller makes a `Scratch` from the regex — `re.initScratch(gpa)` (heap) or
+   `re.initScratchBuffer(buf)` over a `re.scratchBufferLen()`-sized
+   `@TypeOf(re).Scratch.Buf` buffer (no allocator) — and hands `&sc` to the search
+   ops. `Compiled(B).Scratch` is a thin wrapper holding the backend's own `B.Scratch`
+   in `.inner`; it forwards the lifecycle the backend provides and substitutes no-ops
+   where it doesn't (a stateless backend's scratch is just `struct{}`). Backends never
+   see the wrapper — `Engine(B)` takes the raw `B.Scratch`, so pass `&sc.inner` there,
+   or wrap a hand-built backend scratch with `Scratch.fromBackend`. The caller owns it;
+   the built-ins' `Scratch` is one per thread (a backend may instead implement a
+   thread-safe one).
 3. `re.find(&sc, input)` forwards to `Engine(Backend).find`, which calls the
    backend's `search` primitive. The backend only locates a match and fills slots;
    `Engine` does all iteration/captures/replace.

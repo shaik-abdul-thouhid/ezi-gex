@@ -2,7 +2,7 @@ const std = @import("std");
 
 const ezi_gex = @import("ezi_gex");
 
-// Until the `Regex`/`Compiled` front door lands, wire the pipeline by hand:
+// First, the pipeline wired by hand — what `compileRuntime` does for you:
 // pattern → AST → HIR → Pike VM `Program`, then drive it through the
 // backend-agnostic `Engine` (isMatch/find/captures/findAll/count/split/replace).
 const PikeVM = ezi_gex.engine.backends.pikevm;
@@ -100,11 +100,10 @@ pub fn main(init: std.process.Init) !void {
     defer re.deinit(); // frees the heap program
 
     // The Scratch is the per-search working state — you own it, reuse it across
-    // searches, one per thread. The front door never builds it for you: construct it
-    // directly off the backend's `Scratch` type (heap-backed here). For a no-allocator
-    // path use `@TypeOf(re).Scratch.initBuffer(buf, &re.program)` over a
-    // `@TypeOf(re).Scratch.bufferLen(&re.program)`-sized `@TypeOf(re).Scratch.Buf` buffer.
-    var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+    // searches, one per thread. `re.initScratch(gpa)` builds a heap-backed one; for a
+    // no-allocator path use `re.initScratchBuffer(buf)` over a `re.scratchBufferLen()`-
+    // sized `ezi_gex.Scratch.Buf` buffer.
+    var sc = try re.initScratch(gpa);
     defer sc.deinit(gpa);
 
     const text = "Þú ert hér 2026";
@@ -155,7 +154,7 @@ pub fn main(init: std.process.Init) !void {
     var mdiag: ezi_gex.Diagnostic = .{};
     var mre = try ezi_gex.compileRuntime(gpa, "(\\w+)@(\\w+)", &mdiag, .{});
     defer mre.deinit();
-    var msc = try @TypeOf(mre).Scratch.init(gpa, &mre.program);
+    var msc = try mre.initScratch(gpa);
     defer msc.deinit(gpa);
     const mslots = try gpa.alloc(?usize, mre.slotCount());
     const emails = "to alice@example and bob@test";
@@ -182,7 +181,7 @@ pub fn main(init: std.process.Init) !void {
     var cdiag: ezi_gex.Diagnostic = .{};
     var cre = try ezi_gex.compileRuntime(gpa, ",", &cdiag, .{});
     defer cre.deinit();
-    var csc = try @TypeOf(cre).Scratch.init(gpa, &cre.program);
+    var csc = try cre.initScratch(gpa);
     defer csc.deinit(gpa);
     std.debug.print("splitN(\"a,b,c,d\", 2):", .{});
     var nit = cre.splitN(&csc, "a,b,c,d", 2);
@@ -200,7 +199,7 @@ pub fn main(init: std.process.Init) !void {
     var bdiag: ezi_gex.Diagnostic = .{};
     var bre = try ezi_gex.compileRuntimeWith(BytePike, gpa, "\\p{Script=Greek}+", &bdiag, .{});
     defer bre.deinit();
-    var bsc = try @TypeOf(bre).Scratch.init(gpa, &bre.program);
+    var bsc = try bre.initScratch(gpa);
     defer bsc.deinit(gpa);
     const greek = "αβγ rest";
     if (bre.find(&bsc, greek)) |m|
@@ -239,7 +238,7 @@ pub fn main(init: std.process.Init) !void {
     var adiag: ezi_gex.Diagnostic = .{};
     var are = try ezi_gex.compileRuntimeWith(ezi_gex.backends.auto, gpa, "(\\w+)@(\\w+)", &adiag, .{ .strategy = .{ .byte_engine = .enabled } });
     defer are.deinit();
-    var asc = try @TypeOf(are).Scratch.init(gpa, &are.program);
+    var asc = try are.initScratch(gpa);
     defer asc.deinit(gpa);
     const aslots = try gpa.alloc(?usize, are.slotCount());
     std.debug.print("auto+dfa /(\\w+)@(\\w+)/  route=\"{s}\"  ", .{ezi_gex.backends.auto.route(&are.program)});
@@ -263,7 +262,7 @@ pub fn main(init: std.process.Init) !void {
     var ediag: ezi_gex.Diagnostic = .{};
     var ere = try ezi_gex.compileRuntimeWith(ezi_gex.backends.edfa, gpa, "[a-z]+[0-9]+", &ediag, .{});
     defer ere.deinit();
-    var edsc = try @TypeOf(ere).Scratch.init(gpa, &ere.program); // empty struct — no per-search state
+    var edsc = try ere.initScratch(gpa); // empty struct — no per-search state
     defer edsc.deinit(gpa);
     if (ere.find(&edsc, "  abc123!  ")) |m|
         std.debug.print("edfa /[a-z]+[0-9]+/ → \"{s}\"\n", .{m.slice("  abc123!  ")});
@@ -273,7 +272,7 @@ pub fn main(init: std.process.Init) !void {
     var tdiag: ezi_gex.Diagnostic = .{};
     var tre = try ezi_gex.compileRuntimeWith(ezi_gex.backends.edfa, gpa, "[a-z]+$", &tdiag, .{});
     defer tre.deinit();
-    var tsc = try @TypeOf(tre).Scratch.init(gpa, &tre.program);
+    var tsc = try tre.initScratch(gpa);
     defer tsc.deinit(gpa);
     if (tre.find(&tsc, "first second third")) |m|
         std.debug.print("edfa /[a-z]+$/ on \"first second third\" → \"{s}\" (anchored to end)\n", .{m.slice("first second third")});
@@ -303,7 +302,7 @@ fn demoDfa(gpa: std.mem.Allocator, pat: []const u8, input: []const u8) !void {
     var diag: ezi_gex.Diagnostic = .{};
     var re = try ezi_gex.compileRuntimeWith(ezi_gex.backends.dfa, gpa, pat, &diag, .{});
     defer re.deinit();
-    var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+    var sc = try re.initScratch(gpa);
     defer sc.deinit(gpa);
     if (re.find(&sc, input)) |m|
         std.debug.print("  dfa /{s}/ on \"{s}\"  →  \"{s}\"\n", .{ pat, input, m.slice(input) })
@@ -354,12 +353,36 @@ test "usage: comptime compile bakes the AST into the binary (no allocator)" {
     try std.testing.expect(phone_re.nodes.len > 0);
 }
 
+test "usage: gex.Regex / gex.Scratch name the default types without @TypeOf" {
+    const gpa = std.testing.allocator;
+    // A struct can carry the regex and its scratch by name — no `@TypeOf(re)`.
+    const Matcher = struct {
+        re: ezi_gex.Regex,
+        sc: ezi_gex.Scratch,
+        fn deinit(self: *@This(), a: std.mem.Allocator) void {
+            self.sc.deinit(a);
+            self.re.deinit();
+        }
+    };
+    var diag: ezi_gex.Diagnostic = .{};
+    var m: Matcher = undefined;
+    m.re = try ezi_gex.compileRuntime(gpa, "\\d+", &diag, .{});
+    errdefer m.re.deinit();
+    m.sc = try m.re.initScratch(gpa);
+    defer m.deinit(gpa);
+    try std.testing.expectEqualStrings("42", m.re.find(&m.sc, "x42y").?.slice("x42y"));
+    // The names resolve to the front-door types themselves.
+    try std.testing.expect(ezi_gex.Regex == ezi_gex.Compiled(ezi_gex.backends.auto));
+    try std.testing.expect(ezi_gex.Scratch == ezi_gex.Regex.Scratch);
+    try std.testing.expect(ezi_gex.Scratch.Buf == ezi_gex.Backend.Cell);
+}
+
 test "usage: byte engine (bytepike) matches a Unicode class without decoding" {
     const gpa = std.testing.allocator;
     var diag: ezi_gex.Diagnostic = .{};
     var re = try ezi_gex.compileRuntimeWith(ezi_gex.backends.bytepike, gpa, "[α-ω]+", &diag, .{});
     defer re.deinit();
-    var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+    var sc = try re.initScratch(gpa);
     defer sc.deinit(gpa);
     try std.testing.expectEqualStrings("αβγ", re.find(&sc, "ΑΒΓαβγ").?.slice("ΑΒΓαβγ"));
 }
@@ -369,14 +392,14 @@ test "usage: lazy DFA finds spans (span-only, runtime-only, leftmost-first)" {
     var diag: ezi_gex.Diagnostic = .{};
     var re = try ezi_gex.compileRuntimeWith(ezi_gex.backends.dfa, gpa, "[a-z]+[0-9]+", &diag, .{});
     defer re.deinit();
-    var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+    var sc = try re.initScratch(gpa);
     defer sc.deinit(gpa);
     try std.testing.expectEqualStrings("abc123", re.find(&sc, "  abc123!  ").?.slice("  abc123!  "));
 
     // leftmost-first, identical to the Pike VM (the first alternative wins on a tie).
     var re2 = try ezi_gex.compileRuntimeWith(ezi_gex.backends.dfa, gpa, "a|ab", &diag, .{});
     defer re2.deinit();
-    var sc2 = try @TypeOf(re2).Scratch.init(gpa, &re2.program);
+    var sc2 = try re2.initScratch(gpa);
     defer sc2.deinit(gpa);
     try std.testing.expectEqualStrings("a", re2.find(&sc2, "ab").?.slice("ab"));
 }
@@ -388,7 +411,7 @@ test "usage: auto opts into the DFA span arm (byte_engine=.enabled); captures st
     // exceeds the eager-determinization budget and uses the lazy DFA instead — see `auto`).
     var re = try ezi_gex.compileRuntimeWith(ezi_gex.backends.auto, gpa, "(\\d{4})-(\\d{2})", &diag, .{ .strategy = .{ .byte_engine = .enabled } });
     defer re.deinit();
-    var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+    var sc = try re.initScratch(gpa);
     defer sc.deinit(gpa);
     try std.testing.expectEqualStrings("nfa+edfa", ezi_gex.backends.auto.route(&re.program)); // eager DFA span arm built
     const slots = try gpa.alloc(?usize, re.slotCount());

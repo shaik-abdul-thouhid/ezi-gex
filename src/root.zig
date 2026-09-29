@@ -107,6 +107,18 @@ pub const compileRuntimeWith = engine.compileRuntimeWith;
 /// Comptime: compile with an explicit backend.
 pub const compileComptimeWith = engine.compileComptimeWith;
 pub const Compiled = engine.Compiled;
+/// The default regex type — what `compileRuntime` / `compileComptime` return
+/// (`Compiled` over the default `auto` backend). Nameable, so a struct field or a
+/// function parameter can be typed `gex.Regex` without spelling `@TypeOf(re)`.
+///
+/// @stable-since: v0.7.0
+pub const Regex = Compiled(engine.default_backend);
+/// The default regex's per-search scratch type (`Regex.Scratch`): what
+/// `re.initScratch(gpa)` returns; `gex.Scratch.Buf` is the element type of a
+/// buffer handed to `re.initScratchBuffer`.
+///
+/// @stable-since: v0.7.0
+pub const Scratch = Regex.Scratch;
 
 /// Runtime: build a heap-allocated AST (free with `Ast.deinit`).
 pub const parse = build.parse;
