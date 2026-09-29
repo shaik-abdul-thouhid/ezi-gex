@@ -21,6 +21,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   typed without `@TypeOf`.
 - `Scratch.fromBackend(raw)` wraps a backend scratch you built yourself — the path to a lazy
   `dfa` scratch with custom `ScratchOptions` (`dfa.Scratch.initOptions`).
+- `SearchOptions.same_input` — assert that the haystack is byte-for-byte unchanged since the
+  previous search on this scratch, so a backend may reuse input-derived work across the calls of
+  one iteration. The `Engine` iterators set it on every call after their first; leave it off
+  unless you are walking an unchanged buffer yourself (see **Fixed**). `auto.Scratch.ascii_scans`
+  is the matching observable (how many whole-input ASCII scans the scratch has performed).
+- `\p{Script=…}` / `\p{scx=…}` resolve the Unicode 18 scripts by long name: `Jurchen`,
+  `Proto_Cuneiform` and `Seal` (the ISO 15924 codes `Jurc`, `Pcun` and `Seal` also work). A new
+  test checks that the long-name table covers every `ezi_code` script, so future Unicode bumps
+  can't leave a script unreachable by name. A conformance test pins the Unicode 18 data across
+  backends at runtime and comptime.
+- **Unicode syntax reference** in the usage guide
+  ([§11](docs/usage-guide.md#11-unicode-syntax-reference)). Collapsible sections list every
+  Unicode escape and shorthand class, all 38 general categories and groups, the 19 derived
+  properties, and all 179 scripts, each with every accepted spelling (short/long names, `\pL`,
+  `Script=` / `sc=` / `Script_Extensions=` / `scx=`). The README links to it. Tests keep it honest:
+  every documented spelling must resolve, the documented rejections must be rejected, and each
+  shorthand must equal its spelled-out class on every code point.
+
+### Fixed
+
+- **A reused input buffer could be matched against a stale ASCII verdict (wrong matches).** The
+  default `auto` backend caches whether the input is all ASCII — the byte DFA evaluates `\b` as an
+  ASCII word boundary, so non-ASCII input must run on the Pike VM — keyed on the input's pointer
+  and length so a `count`/`findAll` scans once. Nothing invalidated that cache between searches,
+  so refilling one buffer with different bytes of the same length (the everyday shape of chunked
+  reads) could run a `\b` pattern on the ASCII-boundary DFA over Unicode text: `\bfoo\b` matched
+  `foo` inside the word `éfooé`, `\b\w+@\w+\b` missed `é@é`, and `\b\w+\b` returned `b` for `éb`.
+  Every public search primitive now drops the input-derived caches on entry unless the caller
+  asserts the new `SearchOptions.same_input`; the `Engine` iterators assert it between the calls
+  of one iteration, so `count`/`findAll` still pay the scan once per input. Pinned by a
+  differential test against the Pike VM over alternating refills of one buffer (both DFA arms,
+  every front-door op) and a revert-failing scan-count guard.
 
 ### Changed
 
@@ -55,21 +87,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Minimum Zig is now `0.17.0-dev.2320+1e770dbef`, the minimum `ezi_code` v0.5.0 requires.
   `build.zig` uses `std.lang.Optimize` for `-Dbench-optimize` in place of the deprecated
   `std.builtin.OptimizeMode`, and the docs use the `safe` / `fast` optimize-mode names.
-
-### Added
-
-- `\p{Script=…}` / `\p{scx=…}` resolve the Unicode 18 scripts by long name: `Jurchen`,
-  `Proto_Cuneiform` and `Seal` (the ISO 15924 codes `Jurc`, `Pcun` and `Seal` also work). A new
-  test checks that the long-name table covers every `ezi_code` script, so future Unicode bumps
-  can't leave a script unreachable by name. A conformance test pins the Unicode 18 data across
-  backends at runtime and comptime.
-- **Unicode syntax reference** in the usage guide
-  ([§11](docs/usage-guide.md#11-unicode-syntax-reference)). Collapsible sections list every
-  Unicode escape and shorthand class, all 38 general categories and groups, the 19 derived
-  properties, and all 179 scripts, each with every accepted spelling (short/long names, `\pL`,
-  `Script=` / `sc=` / `Script_Extensions=` / `scx=`). The README links to it. Tests keep it honest:
-  every documented spelling must resolve, the documented rejections must be rejected, and each
-  shorthand must equal its spelled-out class on every code point.
 
 ## [0.6.2] - 2026-06-29
 

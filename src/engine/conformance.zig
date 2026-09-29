@@ -2146,6 +2146,67 @@ test "front door: Scratch.fromBackend wraps a dfa scratch built with non-default
     try testing.expectEqual(@as(usize, 2), backend.Engine(dfa).count(&re.program, &sc.inner, input, .{}));
 }
 
+
+// ── front door: a refilled buffer must never be served a stale input verdict ────────────
+
+test "front door: a refilled buffer (same ptr/len, new bytes) matches exactly like the Pike VM" {
+    // `auto` caches an input-derived verdict (is the input all ASCII?) on the scratch to pay the
+    // scan once per `count`/`findAll`. Refilling ONE buffer with different bytes of the same length
+    // is the everyday shape of chunked I/O; every front-door op on the refilled buffer must agree
+    // with a Pike VM oracle (Unicode `\b`, no caches). Contents are byte-length-equal by design.
+    const RefillCase = struct { pat: []const u8, ascii: []const u8, unicode: []const u8 };
+    const cases = [_]RefillCase{
+        .{ .pat = "\\bfoo\\b", .ascii = "xx foo yy", .unicode = "éfooé y" },
+        .{ .pat = "\\b\\w+@\\w+\\b", .ascii = "ab@cd x", .unicode = "é@é x" },
+        .{ .pat = "\\b\\w+\\b", .ascii = "aab cd eef gh", .unicode = "éb cd éf gh" },
+    };
+    const gpa = testing.allocator;
+    for (cases) |c| {
+        var diag: regex.Diagnostic = .{};
+        var re = try regex.compileRuntime(gpa, c.pat, &diag, .{});
+        defer re.deinit();
+        var sc = try re.initScratch(gpa);
+        defer sc.deinit(gpa);
+        var ref = try regex.compileRuntimeWith(pikevm, gpa, c.pat, &diag, .{});
+        defer ref.deinit();
+        var rsc = try ref.initScratch(gpa);
+        defer rsc.deinit(gpa);
+        const slots = try gpa.alloc(?usize, re.slotCount());
+        defer gpa.free(slots);
+        const rslots = try gpa.alloc(?usize, ref.slotCount());
+        defer gpa.free(rslots);
+
+        try testing.expectEqual(c.ascii.len, c.unicode.len);
+        const buf = try gpa.alloc(u8, c.ascii.len);
+        defer gpa.free(buf);
+
+        var round: usize = 0;
+        while (round < 6) : (round += 1) {
+            @memcpy(buf, if (round % 2 == 0) c.ascii else c.unicode);
+            try testing.expectEqual(ref.isMatch(&rsc, buf), re.isMatch(&sc, buf));
+            try testing.expectEqual(ref.find(&rsc, buf), re.find(&sc, buf));
+            try testing.expectEqual(ref.findAt(&rsc, buf, .{ .start = 2 }), re.findAt(&sc, buf, .{ .start = 2 }));
+            try testing.expectEqual(ref.count(&rsc, buf), re.count(&sc, buf));
+            var want_it = ref.findAll(&rsc, buf);
+            var got_it = re.findAll(&sc, buf);
+            while (true) {
+                const want = want_it.next();
+                try testing.expectEqual(want, got_it.next());
+                if (want == null) break;
+            }
+            const want_c = ref.captures(&rsc, rslots, buf);
+            const got_c = re.captures(&sc, slots, buf);
+            try testing.expectEqual(want_c == null, got_c == null);
+            if (want_c) |w| try testing.expectEqual(w.match(), got_c.?.match());
+            const want_r = try ref.replaceAllAlloc(gpa, &rsc, buf, "<$0>", rslots);
+            defer gpa.free(want_r);
+            const got_r = try re.replaceAllAlloc(gpa, &sc, buf, "<$0>", slots);
+            defer gpa.free(got_r);
+            try testing.expectEqualStrings(want_r, got_r);
+        }
+    }
+}
+
 test {
     testing.refAllDecls(@This());
 }

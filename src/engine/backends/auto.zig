@@ -1540,13 +1540,15 @@ pub const Scratch = struct {
     /// @stable-since: v0.6.0
     lazy_confirm_bytes: u64 = 0,
 
-    /// Cached ASCII-ness of the current input, for `\b`/`\B` (word-boundary) programs. The byte DFA
-    /// evaluates `\b` as an **ASCII** word boundary (exact for ASCII text); for **non-ASCII** input
-    /// `auto` must instead use the code-point Pike VM (correct **Unicode** word boundaries). Scanning
-    /// the input for non-ASCII bytes is O(n), so it is cached here keyed on the input slice
-    /// (`ptr`+`len`) — a `count`/`findAll` over one input pays the scan **once**, not per match.
-    /// `reset` clears it; a caller reusing one `Scratch` across DIFFERENT inputs must `reset` between
-    /// them (the conventional contract). Dormant (never consulted) for non-`\b` programs.
+    /// Cached ASCII-ness of the current input. The byte DFA evaluates `\b` as an **ASCII** word
+    /// boundary (exact for ASCII text); for **non-ASCII** input a `\b` program must instead run on
+    /// the code-point Pike VM (correct **Unicode** word boundaries), and the span arms' `input_ascii`
+    /// soundness gates read the same verdict. Scanning the input for non-ASCII bytes is O(n), so it
+    /// is cached here keyed on the input slice (`ptr`+`len`) — a `count`/`findAll` over one input
+    /// pays the scan **once**, not per match. The key alone cannot tell a **refilled** buffer (same
+    /// `ptr`+`len`, new bytes) from the same input, so every public search primitive drops this
+    /// cache on entry (`beginSearch`) unless the caller asserts `SearchOptions.same_input` — which
+    /// the `Engine` iterators do between the calls of one iteration; `reset` clears it too.
     ///
     /// @stable-since: v0.4.0
     wb_input_ptr: ?[*]const u8 = null,
@@ -1559,12 +1561,22 @@ pub const Scratch = struct {
     /// ASCII gaps. Distinct from `wb_all_ascii` (strict, early-exit) because Latin prose is rarely
     /// *pure* ASCII (a stray accent / curly quote) yet is overwhelmingly ASCII — a strict gate would
     /// forfeit the skip on real text. O(n) to compute (a full count), so cached on the input slice
-    /// like `wb_*`; consulted only by a `class_lead_ascii_only` program. `reset` clears it.
+    /// like `wb_*` and invalidated the same way (`beginSearch` / `reset`); consulted only by a
+    /// `class_lead_ascii_only` program.
     ///
     /// @stable-since: v0.6.0
     ad_input_ptr: ?[*]const u8 = null,
     ad_input_len: usize = 0,
     ad_dominant: bool = false,
+
+    /// Observable: how many whole-input ASCII scans (`inputAllAscii`) this scratch has performed.
+    /// Pins the cache discipline from both sides — a `count`/`findAll` over one input scans **once**
+    /// (the iterator asserts `same_input`), and every fresh top-level search scans **again** (the
+    /// bytes behind an unchanged `ptr`+`len` may have been refilled). Observational only; never
+    /// affects a result. Accumulates across searches; `reset` zeroes it.
+    ///
+    /// @stable-since: v0.7.0
+    ascii_scans: u64 = 0,
 
     /// @stable-since: v0.1.0
     pub fn bufferLen(program: *const Program) usize {
@@ -1623,6 +1635,7 @@ pub const Scratch = struct {
         self.lazy_confirm_bytes = 0; // the lazy-arm jump-confirm observable, likewise per-reuse
         self.wb_input_ptr = null; // invalidate the input-ASCII cache (a new search may use a new input)
         self.ad_input_ptr = null; // invalidate the ASCII-dominant cache (likewise input-keyed)
+        self.ascii_scans = 0; // the scan observable is per-reuse, like the two above
         switch (self.inner) {
             .literal => |*s| s.reset(),
             .nfa => |*s| {
@@ -2440,6 +2453,7 @@ fn isAsciiSlice(s: []const u8) bool {
 /// `count`/`findAll` over one input scans once (see `Scratch.wb_*`).
 fn inputAllAscii(scratch: *Scratch, input: []const u8) bool {
     if (scratch.wb_input_ptr == input.ptr and scratch.wb_input_len == input.len) return scratch.wb_all_ascii;
+    scratch.ascii_scans += 1;
     const a = isAsciiSlice(input);
     scratch.wb_input_ptr = input.ptr;
     scratch.wb_input_len = input.len;
@@ -2494,6 +2508,19 @@ inline fn edfaArm(program: *const Program, scratch: *Scratch, input: []const u8)
 }
 
 // ── Contract: matching entry points ──────────────────────────────────────────────
+
+/// Entry hook of every public search primitive: unless the caller asserts the haystack is
+/// unchanged since the previous search on this scratch (`opts.same_input`, which the `Engine`
+/// iterators set between the calls of one iteration), drop the input-derived caches (`wb_*`,
+/// `ad_*`). Their `(ptr, len)` key cannot distinguish a refilled buffer from the same input, so
+/// without this a buffer refilled with non-ASCII bytes was served an "all ASCII" verdict and a
+/// `\b` pattern ran the ASCII-boundary DFA over Unicode text (a wrong match). Two stores.
+inline fn beginSearch(scratch: *Scratch, opts: SearchOptions) void {
+    if (!opts.same_input) {
+        scratch.wb_input_ptr = null;
+        scratch.ad_input_ptr = null;
+    }
+}
 
 /// Pointer to the program's multi-prefix Teddy accelerator (or null) — the SIMD finder the
 /// `run*` arms use for `prefix_set`. Pointer into the program, valid for the call.
@@ -2601,6 +2628,7 @@ fn lineAnchoredAttempt(program: *const Program, scratch: *Scratch, p: *const nfa
 
 /// @stable-since: v0.1.0
 pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) bool {
+    beginSearch(scratch, opts);
     switch (program.inner) {
         .literal => |*p| return literal.isMatch(p, &scratch.inner.literal, input, opts),
         .nfa => |*p| {
@@ -2627,6 +2655,7 @@ pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, op
 
 /// @stable-since: v0.1.0
 pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) ?Match {
+    beginSearch(scratch, opts);
     switch (program.inner) {
         .literal => |*p| return literal.search(p, &scratch.inner.literal, input, opts),
         .nfa => |*p| {
@@ -2648,6 +2677,7 @@ pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opt
 
 /// @stable-since: v0.1.0
 pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const u8, slots: []?usize, opts: SearchOptions) ?Match {
+    beginSearch(scratch, opts);
     switch (program.inner) {
         .literal => |*p| return literal.searchCaptures(p, &scratch.inner.literal, input, slots, opts),
         .nfa => |*p| {
@@ -3596,6 +3626,99 @@ test "auto: a big-class join (`\\w+@\\w+`, email) skips the eager DFA for the la
         defer freeProgram(gpa, &program);
         try testing.expectEqualStrings(c.route, route(&program));
     }
+}
+
+
+// ── Input-derived caches must never go stale on a refilled buffer ────────────────────
+
+/// One refill case: `ascii` and `unicode` are **byte-length-equal** contents for the SAME buffer,
+/// so the `(ptr, len)` key of the scratch's input caches is identical across refills and only the
+/// bytes differ — exactly the shape of a reused read buffer (fixed-size chunks, a pool slot).
+/// Every case is a `\b` pattern whose ASCII-boundary reading of the Unicode content differs from
+/// the Unicode-boundary reading (`é` is a word character), so a stale "all ASCII" verdict is
+/// observable as a wrong span, a phantom match, or a missed match.
+const RefillCase = struct { pat: []const u8, ascii: []const u8, unicode: []const u8 };
+const refill_cases = [_]RefillCase{
+    // eager DFA: an ASCII `\b` finds "foo" INSIDE the Unicode word "éfooé" (phantom match).
+    .{ .pat = "\\bfoo\\b", .ascii = "xx foo yy", .unicode = "éfooé y" },
+    // lazy DFA (big Unicode classes): an ASCII `\b` sees no boundary before `é@é` (missed match).
+    .{ .pat = "\\b\\w+@\\w+\\b", .ascii = "ab@cd x", .unicode = "é@é x" },
+    // dense matches through the iterators: same count, different spans ("b" vs "éb").
+    .{ .pat = "\\b\\w+\\b", .ascii = "aab cd eef gh", .unicode = "éb cd éf gh" },
+};
+
+fn expectSameMatch(want: ?Match, got: ?Match) !void {
+    try testing.expectEqual(want, got);
+}
+
+test "auto: a refilled buffer (same ptr/len, new bytes) never gets a stale ASCII verdict" {
+    const gpa = testing.allocator;
+    const EP = backend.Engine(pikevm);
+    var saw_edfa = false;
+    var saw_dfa = false;
+    for (refill_cases) |c| {
+        var re = try Compiled.init(c.pat);
+        defer re.deinit();
+        // The DFA arms are what consult the ASCII verdict; a `\b` pattern that stopped routing
+        // there would make this test vacuous, so pin that each case reaches a DFA arm.
+        const r = route(&re.program);
+        if (std.mem.eql(u8, r, "nfa+edfa")) {
+            saw_edfa = true;
+        } else if (std.mem.eql(u8, r, "nfa+dfa")) {
+            saw_dfa = true;
+        } else {
+            std.debug.print("/{s}/ routes to \"{s}\" — this test needs a DFA arm\n", .{ c.pat, r });
+            return error.NotDfaRouted;
+        }
+        try testing.expectEqual(c.ascii.len, c.unicode.len); // equal length is the whole point
+        const buf = try gpa.alloc(u8, c.ascii.len);
+        defer gpa.free(buf);
+        // Oracle: the Pike VM on the very same NFA program (Unicode word boundaries, no caches).
+        const np = &re.program.inner.nfa;
+        var psc = try pikevm.Scratch.init(gpa, np);
+        defer psc.deinit(gpa);
+
+        // Alternate the contents in the SAME buffer, ASCII first — the direction that went wrong
+        // (an ASCII verdict cached, then Unicode bytes served the ASCII `\b`). Six rounds cover
+        // each transition several times; every op is checked against the oracle on every round.
+        var round: usize = 0;
+        while (round < 6) : (round += 1) {
+            @memcpy(buf, if (round % 2 == 0) c.ascii else c.unicode);
+            try testing.expectEqual(EP.isMatch(np, &psc, buf, .{}), E.isMatch(&re.program, &re.scratch, buf, .{}));
+            try expectSameMatch(EP.find(np, &psc, buf, .{}), E.find(&re.program, &re.scratch, buf, .{}));
+            // A resumed search (`start > 0`, on a code-point boundary in every case) must not be
+            // served the verdict cached by the search before it either.
+            try expectSameMatch(EP.find(np, &psc, buf, .{ .start = 2 }), E.find(&re.program, &re.scratch, buf, .{ .start = 2 }));
+            try testing.expectEqual(EP.count(np, &psc, buf, .{}), E.count(&re.program, &re.scratch, buf, .{}));
+            var want_it = EP.findAll(np, &psc, buf, .{});
+            var got_it = E.findAll(&re.program, &re.scratch, buf, .{});
+            while (true) {
+                const want = want_it.next();
+                try expectSameMatch(want, got_it.next());
+                if (want == null) break;
+            }
+        }
+    }
+    try testing.expect(saw_edfa and saw_dfa); // both DFA arms were exercised
+}
+
+test "auto: the ASCII scan runs once per iteration and again per fresh search (revert-failing)" {
+    // Revert `beginSearch` (never invalidate) → the "fresh search re-scans" expectations fail; drop
+    // the iterators' `same_input` assertion → the "one scan per iteration" expectation fails.
+    var re = try Compiled.init("\\bfoo\\b");
+    defer re.deinit();
+    const input = "foo foo foo foo";
+    try testing.expectEqual(@as(u64, 0), re.scratch.ascii_scans);
+    try testing.expectEqual(@as(usize, 4), E.count(&re.program, &re.scratch, input, .{}));
+    try testing.expectEqual(@as(u64, 1), re.scratch.ascii_scans); // four matches (five calls), ONE scan
+    _ = E.find(&re.program, &re.scratch, input, .{});
+    try testing.expectEqual(@as(u64, 2), re.scratch.ascii_scans); // a fresh top-level search re-scans: same ptr/len may hold new bytes
+    _ = search(&re.program, &re.scratch, input, .{ .start = 4, .same_input = true });
+    try testing.expectEqual(@as(u64, 2), re.scratch.ascii_scans); // the assertion reuses the verdict
+    _ = search(&re.program, &re.scratch, input, .{ .start = 4 });
+    try testing.expectEqual(@as(u64, 3), re.scratch.ascii_scans); // without it, a re-scan
+    re.scratch.reset();
+    try testing.expectEqual(@as(u64, 0), re.scratch.ascii_scans);
 }
 
 test {

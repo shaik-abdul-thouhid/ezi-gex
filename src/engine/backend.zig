@@ -166,6 +166,18 @@ pub const SearchOptions = struct {
     /// them; it is reserved for an engine with a distinct earliest-match mode (e.g.
     /// a future byte DFA).
     earliest: bool = false,
+    /// Assert that `input` is **byte-for-byte the same haystack** as the previous search on
+    /// this scratch — same pointer, same length AND same contents. It lets a backend reuse
+    /// input-derived work across the calls of one iteration (e.g. `auto`'s whole-input ASCII
+    /// scan, which decides whether a `\b` pattern may run on the byte DFA) instead of redoing
+    /// it per match; the `Engine` iterators (`findAll`/`count`/`split`/`capturesAll`/`replace*`)
+    /// set it on every call after their first. Off (the default) a backend must treat the
+    /// input as new, so a buffer **refilled** behind an unchanged pointer and length gets a
+    /// fresh verdict, never a stale one. Asserting it falsely can produce wrong matches —
+    /// leave it `false` unless you are walking an unchanged buffer yourself.
+    ///
+    /// @stable-since: v0.7.0
+    same_input: bool = false,
 };
 
 /// Budget/behaviour hints a backend may accept when its `Scratch` is constructed.
@@ -536,12 +548,18 @@ pub fn Engine(comptime Backend: type) type {
             input: []const u8,
             pos: usize,
             anchored: bool,
+            /// False until the first `next()` has called the backend: the haystack is asserted
+            /// unchanged (`SearchOptions.same_input`) only from the second call on.
+            started: bool = false,
 
             pub fn next(self: *MatchIterator) ?Match {
                 if (self.pos > self.input.len) return null;
+                const same_input = self.started;
+                self.started = true;
                 const m = Backend.search(self.program, self.scratch, self.input, .{
                     .start = self.pos,
                     .anchored = self.anchored,
+                    .same_input = same_input,
                 }) orelse {
                     self.pos = self.input.len + 1;
                     return null;
@@ -571,13 +589,18 @@ pub fn Engine(comptime Backend: type) type {
             meta: Meta,
             pos: usize,
             anchored: bool,
+            /// As `MatchIterator.started`: `same_input` is asserted from the second call on.
+            started: bool = false,
 
             pub fn next(self: *CaptureIterator) ?Captures {
                 if (self.pos > self.input.len) return null;
                 @memset(self.slots, null);
+                const same_input = self.started;
+                self.started = true;
                 const m = Backend.searchCaptures(self.program, self.scratch, self.input, self.slots, .{
                     .start = self.pos,
                     .anchored = self.anchored,
+                    .same_input = same_input,
                 }) orelse {
                     self.pos = self.input.len + 1;
                     return null;
@@ -722,13 +745,16 @@ pub fn Engine(comptime Backend: type) type {
             var written: usize = 0; // input consumed/emitted up to here
             var from: usize = 0; // next search start
             var done: usize = 0; // replacements made so far
+            var first = true; // the haystack is asserted unchanged only from the second search on
             while (done < limit and from <= input.len) {
                 @memset(slots, null);
+                const so: SearchOptions = .{ .start = from, .same_input = !first };
+                first = false;
                 var m: Match = undefined;
                 if (needs_caps) {
-                    m = Backend.searchCaptures(program, scratch, input, slots, .{ .start = from }) orelse break;
+                    m = Backend.searchCaptures(program, scratch, input, slots, so) orelse break;
                 } else {
-                    m = Backend.search(program, scratch, input, .{ .start = from }) orelse break;
+                    m = Backend.search(program, scratch, input, so) orelse break;
                     if (slots.len >= 2) { // group 0 (the whole match) drives `$0`/`$&`
                         slots[0] = m.start;
                         slots[1] = m.end;
@@ -763,9 +789,12 @@ pub fn Engine(comptime Backend: type) type {
                 @compileError("backend `" ++ @typeName(Backend) ++ "` does not support captures (replaceAllWith needs them)");
             var written: usize = 0;
             var from: usize = 0;
+            var first = true; // as `replaceCore`: `same_input` only from the second search on
             while (from <= input.len) {
                 @memset(slots, null);
-                const m = Backend.searchCaptures(program, scratch, input, slots, .{ .start = from }) orelse break;
+                const so: SearchOptions = .{ .start = from, .same_input = !first };
+                first = false;
+                const m = Backend.searchCaptures(program, scratch, input, slots, so) orelse break;
                 try writer.writeAll(input[written..m.start]);
                 try replacer(context, .{ .slots = slots, .meta = meta, .input = input }, writer);
                 written = m.end;

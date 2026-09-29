@@ -667,7 +667,12 @@ Backends — including yours — may rely on all of these; the frontend guarante
     ops clamp the haystack to `[start, span_end)` before calling your `search`, so a
     backend never sees `span_end`; returned offsets still index the full `input`.
     `earliest` is advisory — a no-op for the leftmost-first built-ins (reserved for a
-    future earliest-match engine).
+    future earliest-match engine). `same_input` (0.7.0) is an **assertion from the
+    caller**: the haystack is byte-for-byte the one of the previous search on this
+    scratch. `Engine`'s iterators set it on every call after their first; a backend may
+    reuse input-derived work (e.g. `auto`'s whole-input ASCII scan behind its `\b`
+    routing) only under that assertion and must otherwise treat the input as new — a
+    `(ptr, len)` key alone cannot tell a refilled buffer from the same input.
 12. **`Match.pattern` is reserved** — a defaulted `u32`, always `0` today (single
     pattern), threaded through `Match` for a future multi-pattern / set API. Leave it
     `0`; `Match{ .start, .end }` literals keep compiling unchanged.
