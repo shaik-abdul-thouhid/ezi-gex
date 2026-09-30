@@ -151,8 +151,8 @@ const wide_cases = [_]Case{
     // \p{...} classes & scripts
     .{ .pat = "\\P{L}+", .input = "abc123!!", .expect = "123!!" },
     .{ .pat = "\\p{Lu}+", .input = "abcDEFghi", .expect = "DEF" },
-    .{ .pat = "\\p{Greek}+", .input = "abcαβγdef", .expect = "αβγ" },
-    .{ .pat = "\\p{Han}+", .input = "ab漢字cd", .expect = "漢字" },
+    .{ .pat = "\\p{sc=Greek}+", .input = "abcαβγdef", .expect = "αβγ" },
+    .{ .pat = "\\p{sc=Han}+", .input = "ab漢字cd", .expect = "漢字" },
     .{ .pat = "[\\p{L}\\p{N}]+", .input = "  a1b2!! ", .expect = "a1b2" },
     // case folding incl. special folds
     .{ .pat = "(?i)hello", .input = "HeLLo world", .expect = "HeLLo" },
@@ -950,7 +950,10 @@ const line_cases = [_]LineCase{
 /// agnostic `findAll` iterator, which advances past empty matches by one position.
 fn collectSpans(comptime B: type, gpa: std.mem.Allocator, pat: []const u8, input: []const u8, out: *[16][2]usize) !?usize {
     var diag: regex.Diagnostic = .{};
-    var re = regex.compileRuntimeWith(B, gpa, pat, &diag, .{}) catch return null; // declined → skip
+    var re = regex.compileRuntimeWith(B, gpa, pat, &diag, .{}) catch |e| switch (e) {
+        error.Unsupported => return null, // declined → skip
+        else => |x| return x, // a pattern the parser rejects is a broken row, never a skip
+    };
     defer re.deinit();
     var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
     defer sc.deinit(gpa);
@@ -1051,15 +1054,19 @@ test "auto never @compileErrors at comptime — big/prone patterns route to the 
     try testing.expect(ok);
 }
 
-/// `find` a backend's span for `(pat, input)`, or `.skip` when the pattern does not
-/// compile for it (an unsupported `\p{…}` name, or a backend declining the shape) — so
-/// the differential corpus tolerates patterns outside a given backend's domain without
-/// trusting any hand-computed expectation.
+/// `find` a backend's span for `(pat, input)`, or `.skip` when the backend declines the
+/// shape (`error.Unsupported`) — so the differential corpus tolerates patterns outside a
+/// given backend's domain without trusting any hand-computed expectation. Any other compile
+/// error fails: a row the parser rejects (once `\p{Greek}`, a bare script name) used to be
+/// skipped silently and so tested nothing.
 const Outcome = union(enum) { skip, span: ?backend.Match };
 fn findOutcome(comptime B: type, pat: []const u8, input: []const u8) !Outcome {
     const gpa = testing.allocator;
     var diag: regex.Diagnostic = .{};
-    var re = regex.compileRuntimeWith(B, gpa, pat, &diag, .{}) catch return .skip;
+    var re = regex.compileRuntimeWith(B, gpa, pat, &diag, .{}) catch |e| switch (e) {
+        error.Unsupported => return .skip,
+        else => |x| return x, // a pattern the parser rejects is a broken row, never a skip
+    };
     defer re.deinit();
     var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
     defer sc.deinit(gpa);
@@ -1089,7 +1096,7 @@ test "wide differential corpus: every backend agrees with the Pike VM (byte/eage
     // dfa / edfa fails.
     for (wide_cases) |c| {
         const ref = switch (try findOutcome(pikevm, c.pat, c.input)) {
-            .skip => continue, // unsupported property name etc. — skip the whole case
+            .skip => continue, // the Pike VM declines only `\X` — skip the whole case
             .span => |s| s,
         };
         try expectSameSpan(c.pat, ref, try findOutcome(backtrack, c.pat, c.input));
@@ -1101,7 +1108,7 @@ test "wide differential corpus: every backend agrees with the Pike VM (byte/eage
 
 test "prefilter on/off and byte_engine on/off are results-invariant on the wide corpus" {
     // The strategy tier must never change a match. Compile each case four ways and pin
-    // every span to the default `auto`. Patterns that do not compile are skipped.
+    // every span to the default `auto`. Only a pattern `auto` declines (`\X`) is skipped.
     const gpa = testing.allocator;
     const variants = [_]regex.Options{
         .{}, // default (DFA on, prefilter on)
@@ -1111,7 +1118,10 @@ test "prefilter on/off and byte_engine on/off are results-invariant on the wide 
     };
     for (wide_cases) |c| {
         var diag: regex.Diagnostic = .{};
-        var ref = regex.compileRuntimeWith(auto, gpa, c.pat, &diag, .{}) catch continue;
+        var ref = regex.compileRuntimeWith(auto, gpa, c.pat, &diag, .{}) catch |e| switch (e) {
+            error.Unsupported => continue,
+            else => |x| return x,
+        };
         defer ref.deinit();
         var rsc = try @TypeOf(ref).Scratch.init(gpa, &ref.program);
         defer rsc.deinit(gpa);
@@ -1448,7 +1458,10 @@ test "identical class blocks are interned into one range-block in the program" {
 /// Assert `isMatch == (find != null) == want` for backend `B` (a declining backend is skipped).
 fn expectIsMatchEqFind(comptime B: type, gpa: std.mem.Allocator, pattern: []const u8, input: []const u8, want: bool) !void {
     var diag: regex.Diagnostic = .{};
-    var re = regex.compileRuntimeWith(B, gpa, pattern, &diag, .{}) catch return; // backend declined → skip
+    var re = regex.compileRuntimeWith(B, gpa, pattern, &diag, .{}) catch |e| switch (e) {
+        error.Unsupported => return, // backend declined → skip
+        else => |x| return x,
+    };
     defer re.deinit();
     var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
     defer sc.deinit(gpa);
@@ -1518,11 +1531,20 @@ test "regression: non-ASCII \\b — code-point engines agree; byte engines may d
         try testing.expectEqual(nref, n);
         try testing.expectEqualSlices([2]usize, ref[0..nref], got[0..n]);
     }
-    // And the byte engine genuinely takes the ASCII-\b path here (documents *why* it is gated):
-    // it matches `\b.` at offset 1 where the code-point engines match empty.
+    // 0xBA is a stray continuation byte: every engine reads it as non-word (U+FFFD on the
+    // code-point side, a non-ASCII byte on the ASCII side), so the byte engine agrees here too.
+    // (This row once "showed" a byte-engine divergence — that was the code-point engines
+    // misreading the malformed byte as U+00BA 'º', a letter, looking backward.)
     var bp: [16][2]usize = undefined;
     const nbp = try collectFindAll(bytepike, gpa, pat, &input, &bp);
-    try testing.expect(nbp != nref or !std.mem.eql([2]usize, ref[0..nref], bp[0..nbp]));
+    try testing.expectEqualSlices([2]usize, ref[0..nref], bp[0..nbp]);
+    // The genuine by-design difference is a VALID non-ASCII letter (documents *why* the byte
+    // engines are gated off non-ASCII `\b`): `\b.` over "é" matches [0,2] on the code-point
+    // engines (é is a word character); the ASCII-`\b` byte engine sees no boundary at 0.
+    const nref2 = try collectFindAll(pikevm, gpa, "\\b.", "\xC3\xA9", &ref);
+    try testing.expectEqualSlices([2]usize, &.{.{ 0, 2 }}, ref[0..nref2]);
+    const nbp2 = try collectFindAll(bytepike, gpa, "\\b.", "\xC3\xA9", &bp);
+    try testing.expect(!std.mem.eql([2]usize, ref[0..nref2], bp[0..nbp2]));
 }
 
 fn faSeqEq(a: []const [2]usize, b: []const [2]usize) bool {
@@ -1569,7 +1591,10 @@ test "regression: backtracker unanchored scan is code-point-aligned (no mid-code
 
 fn checkFindAllVsPike(comptime B: type, gpa: std.mem.Allocator, pattern: []const u8, input: []const u8, ref: []const [2]usize) !void {
     var diag: regex.Diagnostic = .{};
-    var re = regex.compileRuntimeWith(B, gpa, pattern, &diag, .{}) catch return; // backend declined → skip
+    var re = regex.compileRuntimeWith(B, gpa, pattern, &diag, .{}) catch |e| switch (e) {
+        error.Unsupported => return, // backend declined → skip
+        else => |x| return x,
+    };
     defer re.deinit();
     var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
     defer sc.deinit(gpa);
@@ -1628,7 +1653,10 @@ test "regression: eager-DFA isMatch agrees with find for interior text_start + e
 /// internal-consistency invariant across the three entry points. Skips a declining backend.
 fn expectCapturesEqFind(comptime B: type, gpa: std.mem.Allocator, pattern: []const u8, input: []const u8, want: bool) !void {
     var diag: regex.Diagnostic = .{};
-    var re = regex.compileRuntimeWith(B, gpa, pattern, &diag, .{}) catch return;
+    var re = regex.compileRuntimeWith(B, gpa, pattern, &diag, .{}) catch |e| switch (e) {
+        error.Unsupported => return,
+        else => |x| return x,
+    };
     defer re.deinit();
     var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
     defer sc.deinit(gpa);
@@ -2217,6 +2245,37 @@ test {
 // "\xE6a" (0xE6 claims 3 bytes, only 2 remain, and `a` is not a continuation) yielded only
 // [0,0] and `count` said 1. Dead-on-invalid resyncs one byte past a malformed byte, so the
 // sequence is [0,0] [1,2] [2,2]. Found by the fuzz `invariants` group (findAll resume law).
+test "regression: \\b reads a malformed byte as non-word from either side" {
+    // The reverse decode used to fall back to the raw byte as a code point (0xC3 read as
+    // 'Ã', a word character) while the forward decode reads U+FFFD (non-word), so `\b`
+    // over a lone "\xC3" matched at its end.
+    const gpa = testing.allocator;
+    const cases = [_]struct { pat: []const u8, in: []const u8, want: ?[2]usize }{
+        .{ .pat = "\\b", .in = "\xC3", .want = null },
+        .{ .pat = "\\B", .in = "\xC3", .want = .{ 0, 0 } },
+        .{ .pat = "\\b", .in = "a\xC3", .want = .{ 0, 0 } },
+        .{ .pat = "\\b", .in = "\xC3a", .want = .{ 1, 1 } },
+        .{ .pat = "\\b", .in = "\xE6\x97", .want = null },
+        .{ .pat = "x\\b", .in = "x\x80", .want = .{ 0, 1 } },
+        .{ .pat = "\\b\\w", .in = "\xC3\xA9\x80\xC3\xA9", .want = .{ 0, 2 } },
+    };
+    inline for (.{ pikevm, backtrack, auto }) |B| {
+        for (cases) |c| {
+            var diag: regex.Diagnostic = .{};
+            var re = try regex.compileRuntimeWith(B, gpa, c.pat, &diag, .{});
+            defer re.deinit();
+            var sc = try re.initScratch(gpa);
+            defer sc.deinit(gpa);
+            const got = re.find(&sc, c.in);
+            if (c.want) |w| {
+                const m = got orelse return error.ExpectedMatch;
+                try testing.expectEqual(w[0], m.start);
+                try testing.expectEqual(w[1], m.end);
+            } else try testing.expect(got == null);
+        }
+    }
+}
+
 test "regression: findAll/count/split step one byte over a malformed lead after an empty match" {
     const gpa = testing.allocator;
     inline for (.{ pikevm, backtrack, auto }) |B| {

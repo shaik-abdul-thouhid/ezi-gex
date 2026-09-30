@@ -381,10 +381,12 @@ pub fn decodeAt(input: []const u8, sp: usize) Decoded {
     return .{ .cp = d.code_point, .len = d.len };
 }
 
-/// Decode the code point ending just before byte offset `sp`, or null at the start.
+/// Decode the code point ending just before byte offset `sp`, or null at the start. A
+/// malformed sequence reads as U+FFFD (a non-word character) — the same substitution
+/// `decodeAt` makes going forward, so `\b` sees a bad byte identically from either side.
 fn cpBefore(input: []const u8, sp: usize) ?CodePoint {
     if (sp == 0) return null;
-    const d = utf8.validateAndDecodeCodePointBytesReverse(input, sp - 1) catch return input[sp - 1];
+    const d = utf8.validateAndDecodeCodePointBytesReverse(input, sp - 1) catch return 0xFFFD;
     return d.code_point;
 }
 

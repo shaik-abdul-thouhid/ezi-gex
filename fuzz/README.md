@@ -147,12 +147,5 @@ fix is a harness gate, not an engine change.
 Findings from building the stricter suite that are NOT fixed on this branch (fixes need an
 owner decision). Fixed ones are in the CHANGELOG.
 
-- **`\b` treats a malformed byte asymmetrically** (`engine/nfa.zig` `cpBefore` falls back to the raw
-  byte as a code point — `0xC3` reads as `Ã`, a word character — while `wordAfter` decodes it as
-  U+FFFD, a non-word character): `\b` over `"\xC3"` matches at `[1,1]`. Spec question: the
-  word-ness of a malformed byte.
-- **Silently skipped conformance rows**: `src/engine/conformance.zig` `wide_cases` rows
-  `\p{Greek}+` and `\p{Han}+` use names the scanner rejects, and `findOutcome` maps the compile
-  error to `.skip`, so those rows test nothing.
 - A reference-vs-Pike-VM span divergence (`want {13,13} got {5,5}`) was printed once during a
   health measurement; to be minimized and classified in the shakedown.

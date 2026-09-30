@@ -37,6 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backtracker's memory before routing to it and uses the lazy DFA's fallible entry points,
   falling back to the Pike VM (which never allocates during a search) on failure — same
   answer, no panic, no leak.
+- **`\b`/`\B` read a malformed byte differently depending on direction.** Looking forward, a
+  malformed byte decodes as U+FFFD (non-word); looking backward, the decoder fell back to the
+  raw byte as a code point, so `0xC3` read as `Ã` (a word character). `\b` over `"\xC3"`
+  therefore matched at `[1,1]`. Both directions now read U+FFFD, and the code-point engines
+  agree with the ASCII-`\b` byte engines on malformed input. Found by the fuzz `reference`
+  group; pinned in `conformance.zig`.
 - **The lazy `dfa` leaked on an allocation failure mid-search, and could leave its reverse
   cache inconsistent.** Interning a new state copied its key into the map before growing the
   per-state lists, so a failed append orphaned the copy; the reverse-scan cache (which
