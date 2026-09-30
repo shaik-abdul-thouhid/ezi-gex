@@ -10,13 +10,17 @@ const std = @import("std");
 
 pub const gen = struct {
     pub const pattern = @import("gen/pattern.zig");
+    pub const input = @import("gen/input.zig");
 };
 
 pub const check = struct {
+    pub const common = @import("check/common.zig");
     pub const differential = @import("check/differential.zig");
 };
 
 test {
     _ = @import("gen/pattern.zig");
+    _ = @import("gen/input.zig");
+    _ = @import("check/common.zig");
     _ = @import("check/differential.zig");
 }

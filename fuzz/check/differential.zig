@@ -32,89 +32,23 @@ const ps = @import("../gen/pattern.zig");
 
 pub const pattern_smith = ps;
 
-/// Largest haystack a matching target feeds the engine. Small so the bounded
-/// backtracker's visited set (`program × (input+1)` bits) stays tiny and each
-/// iteration is fast.
-pub const max_input_len = 64;
-
-// ══════════════════════════════════════════════════════════════════════════════
-// Input generation
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// Generate a haystack into `buf`. 3:1 it draws from the shared alphabet (so
-/// matches actually happen and match-path code is exercised) vs raw full-range
-/// bytes (so the no-match / prefilter-miss / invalid-UTF-8 paths are too).
-pub fn genInput(smith: *Smith, buf: []u8) []const u8 {
-    @disableInstrumentation();
-    const n = smith.slice(buf[0..@min(buf.len, max_input_len)]);
-    if (smith.boolWeighted(3, 1)) {
-        for (buf[0..n]) |*b| b.* = ps.alphabet[b.* % ps.alphabet.len];
-    }
-    return buf[0..n];
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// Byte-engine ASCII-`\b` contract (see engine/conformance.zig)
-// ══════════════════════════════════════════════════════════════════════════════
-//
-// CONVENTION: the byte engines — `bytepike`, eager `edfa`, lazy `dfa` — evaluate `\b`/`\B`
-// as **ASCII** word boundaries. That is exact on ASCII input (ASCII and Unicode boundaries
-// coincide there), and the dispatcher (`auto`) routes a `\b` pattern over **non-ASCII** input
-// to the code-point engines, so a *pinned* byte engine is only contracted on ASCII input for a
-// `\b` pattern. The differential honours that: for a `\b`-bearing pattern over a non-ASCII
-// haystack, the byte engines are skipped (the code-point engines — pikevm/backtrack/onepass —
-// and `auto`, which routes correctly, still run every case). Mirrors `conformance.byteEngineCanRunCase`.
-
-fn isAsciiStr(s: []const u8) bool {
-    for (s) |b| if (b >= 0x80) return false;
-    return true;
-}
-
-/// True if `pattern` carries a `\b`/`\B` (via the HIR analysis flag, so a `\\b` literal or a
-/// `[\b]` backspace does not count). Conservative: a parse/HIR failure ⇒ false (then every
-/// backend agrees `.invalid` anyway).
-fn patternHasWordBoundary(gpa: std.mem.Allocator, pattern: []const u8) bool {
-    @disableInstrumentation();
-    var diag: gex.Diagnostic = .{};
-    const ast = gex.parse(gpa, pattern, &diag) catch return false;
-    defer ast.deinit(gpa);
-    const h = gex.buildHir(gpa, ast, .{}) catch return false;
-    defer gex.freeHir(gpa, h);
-    return h.analysis.has_word_boundary;
-}
-
-/// Whether the ASCII-`\b` byte engines may be compared on this case: always on ASCII input;
-/// on non-ASCII input only when the pattern has no word boundary.
-fn byteEnginesSafe(gpa: std.mem.Allocator, pattern: []const u8, input: []const u8) bool {
-    @disableInstrumentation();
-    if (isAsciiStr(input)) return true;
-    return !patternHasWordBoundary(gpa, pattern);
-}
-
-/// Is `B` one of the ASCII-`\b` byte engines (gated on non-ASCII `\b` cases)?
-fn isByteEngine(comptime B: type) bool {
-    return B == gex.backends.bytepike or B == gex.backends.dfa or B == gex.backends.edfa;
-}
+const common = @import("common.zig");
+const inp = @import("../gen/input.zig");
+pub const Outcome = common.Outcome;
+const spanEq = common.spanEq;
+const byteEnginesSafe = common.byteEnginesSafe;
+const isByteEngine = common.isByteEngine;
+const span_backends = common.span_backends;
+const capture_backends = common.capture_backends;
+const iter_backends = common.iter_backends;
+const replace_backends = common.replace_backends;
+const offset_backends = common.offset_backends;
+pub const max_input_len = inp.max_input_len;
+pub const genInput = inp.genInput;
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Span / find / isMatch differential
 // ══════════════════════════════════════════════════════════════════════════════
-
-/// Per-backend match outcome, so we can compare across engines.
-pub const Outcome = union(enum) {
-    /// Scanner/HIR rejected the pattern (deterministic — same parse for every backend).
-    invalid,
-    /// The backend declined this pattern (Unsupported) or a resource ceiling tripped.
-    skip,
-    /// Matched span, or `null` for no match.
-    span: ?[2]usize,
-};
-
-fn spanEq(a: ?[2]usize, b: ?[2]usize) bool {
-    if (a == null and b == null) return true;
-    if (a == null or b == null) return false;
-    return a.?[0] == b.?[0] and a.?[1] == b.?[1];
-}
 
 /// Compile `pattern` on backend `B`, run `find` over `input`, and check the
 /// per-backend `isMatch == (find != null)` invariant before returning the span.
@@ -143,25 +77,13 @@ fn spanOf(comptime B: type, gpa: std.mem.Allocator, pattern: []const u8, input: 
     return .{ .span = span };
 }
 
-/// The backends compared against the Pike VM for plain `find`. dfa/edfa are
-/// span-only but `find`-capable; onepass/literal decline most patterns (→ skip).
-const span_backends = .{
-    gex.backends.backtrack,
-    gex.backends.auto,
-    gex.backends.bytepike,
-    gex.backends.dfa,
-    gex.backends.edfa,
-    gex.backends.onepass,
-    gex.backends.literal,
-};
-
 /// Compare one backend's span against the oracle's (a normal fn so an early
 /// `return` skips it — `inline for` forbids a runtime-guarded `continue`).
-fn checkSpan(comptime B: type, gpa: std.mem.Allocator, oracle: Outcome, pattern: []const u8, input: []const u8, byte_safe: bool) anyerror!void {
+fn checkSpan(comptime B: type, gpa: std.mem.Allocator, check: common.CheckId, oracle: Outcome, pattern: []const u8, input: []const u8, byte_safe: bool) anyerror!void {
     @disableInstrumentation();
-    if (comptime isByteEngine(B)) if (!byte_safe) return;
+    if (comptime isByteEngine(B)) if (!byte_safe) return common.noteSkipped(check, B);
     const r = try spanOf(B, gpa, pattern, input);
-    if (r == .skip) return;
+    if (r == .skip) return common.noteSkipped(check, B);
     if (oracle == .invalid or r == .invalid) {
         if ((oracle == .invalid) != (r == .invalid)) {
             std.debug.print("validity disagreement on /{s}/ ({s}): oracle={s} other={s}\n", .{ pattern, @typeName(B), @tagName(oracle), @tagName(r) });
@@ -169,6 +91,7 @@ fn checkSpan(comptime B: type, gpa: std.mem.Allocator, oracle: Outcome, pattern:
         }
         return;
     }
+    common.noteCompared(check, B);
     if (!spanEq(oracle.span, r.span)) {
         std.debug.print("span disagreement on /{s}/ over \"{s}\" ({s}): oracle={?any} other={?any}\n  pat.hex={x}\n  in.hex ={x}\n", .{ pattern, input, @typeName(B), oracle.span, r.span, pattern, input });
         return error.SpanDisagreement;
@@ -177,12 +100,13 @@ fn checkSpan(comptime B: type, gpa: std.mem.Allocator, oracle: Outcome, pattern:
 
 /// The shared differential assertion: every accepting backend must agree with the
 /// Pike VM on validity and (when valid) on a byte-identical leftmost-first span.
-pub fn assertBackendsAgree(gpa: std.mem.Allocator, pattern: []const u8, input: []const u8) anyerror!void {
+pub fn assertBackendsAgree(gpa: std.mem.Allocator, check: common.CheckId, pattern: []const u8, input: []const u8) anyerror!void {
     @disableInstrumentation();
     const oracle = try spanOf(gex.backends.pikevm, gpa, pattern, input);
     if (oracle == .skip) return; // even the oracle ducked it (shouldn't happen, but be safe)
+    common.noteRun(check, oracle != .invalid);
     const byte_safe = byteEnginesSafe(gpa, pattern, input);
-    inline for (span_backends) |B| try checkSpan(B, gpa, oracle, pattern, input, byte_safe);
+    inline for (span_backends) |B| try checkSpan(B, gpa, check, oracle, pattern, input, byte_safe);
 }
 
 // ── Target bodies (span) ──────────────────────────────────────────────────────
@@ -192,7 +116,7 @@ pub fn backendsAgree(_: void, smith: *Smith) anyerror!void {
     const gpa = std.testing.allocator;
     var pat = ps.gen(smith);
     var ibuf: [max_input_len]u8 = undefined;
-    try assertBackendsAgree(gpa, pat.slice(), genInput(smith, &ibuf));
+    try assertBackendsAgree(gpa, .span, pat.slice(), genInput(smith, &ibuf));
 }
 
 pub fn anchorsAgree(_: void, smith: *Smith) anyerror!void {
@@ -204,7 +128,7 @@ pub fn anchorsAgree(_: void, smith: *Smith) anyerror!void {
     const n = @min(smith.slice(&ibuf), ibuf.len);
     const alpha = "ab\n";
     for (ibuf[0..n]) |*b| b.* = alpha[b.* % alpha.len];
-    try assertBackendsAgree(gpa, pat.slice(), ibuf[0..n]);
+    try assertBackendsAgree(gpa, .anchors, pat.slice(), ibuf[0..n]);
 }
 
 pub fn unicodeAgree(_: void, smith: *Smith) anyerror!void {
@@ -218,7 +142,7 @@ pub fn unicodeAgree(_: void, smith: *Smith) anyerror!void {
     } else {
         input = ibuf[0..smith.slice(&ibuf)]; // raw fuzzer bytes — often invalid UTF-8
     }
-    try assertBackendsAgree(gpa, pat.slice(), input);
+    try assertBackendsAgree(gpa, .unicode, pat.slice(), input);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -335,12 +259,6 @@ fn capResEq(a: CapRes, b: CapRes) bool {
     return true;
 }
 
-const capture_backends = .{
-    gex.backends.backtrack,
-    gex.backends.auto,
-    gex.backends.onepass,
-    gex.backends.bytepike,
-};
 
 pub fn capturesAgree(_: void, smith: *Smith) anyerror!void {
     @disableInstrumentation();
@@ -352,15 +270,17 @@ pub fn capturesAgree(_: void, smith: *Smith) anyerror!void {
 
     const oracle = try capsWith(gex.backends.pikevm, gpa, pattern, input);
     if (oracle.tag == .skip) return;
+    common.noteRun(.captures, oracle.tag != .invalid);
     const byte_safe = byteEnginesSafe(gpa, pattern, input);
     inline for (capture_backends) |B| try checkCaps(B, gpa, oracle, pattern, input, byte_safe);
 }
 
 fn checkCaps(comptime B: type, gpa: std.mem.Allocator, oracle: CapRes, pattern: []const u8, input: []const u8, byte_safe: bool) anyerror!void {
     @disableInstrumentation();
-    if (comptime isByteEngine(B)) if (!byte_safe) return;
+    if (comptime isByteEngine(B)) if (!byte_safe) return common.noteSkipped(.captures, B);
     const r = try capsWith(B, gpa, pattern, input);
-    if (r.tag == .skip) return;
+    if (r.tag == .skip) return common.noteSkipped(.captures, B);
+    common.noteCompared(.captures, B);
     if (!capResEq(oracle, r)) {
         std.debug.print("capture disagreement on /{s}/ over \"{s}\" ({s}): oracle={s} other={s}\n  pat.hex={x}\n  in.hex ={x}\n", .{ pattern, input, @typeName(B), @tagName(oracle.tag), @tagName(r.tag), pattern, input });
         return error.CaptureDisagreement;
@@ -418,13 +338,6 @@ fn iterResEq(a: IterRes, b: IterRes) bool {
     return true;
 }
 
-const iter_backends = .{
-    gex.backends.backtrack,
-    gex.backends.auto,
-    gex.backends.bytepike,
-    gex.backends.dfa,
-    gex.backends.edfa,
-};
 
 pub fn iterationAgree(_: void, smith: *Smith) anyerror!void {
     @disableInstrumentation();
@@ -436,15 +349,17 @@ pub fn iterationAgree(_: void, smith: *Smith) anyerror!void {
 
     const oracle = try iterWith(gex.backends.pikevm, gpa, pattern, input);
     if (oracle.tag == .skip) return;
+    common.noteRun(.iter, oracle.tag != .invalid);
     const byte_safe = byteEnginesSafe(gpa, pattern, input);
     inline for (iter_backends) |B| try checkIter(B, gpa, oracle, pattern, input, byte_safe);
 }
 
 fn checkIter(comptime B: type, gpa: std.mem.Allocator, oracle: IterRes, pattern: []const u8, input: []const u8, byte_safe: bool) anyerror!void {
     @disableInstrumentation();
-    if (comptime isByteEngine(B)) if (!byte_safe) return;
+    if (comptime isByteEngine(B)) if (!byte_safe) return common.noteSkipped(.iter, B);
     const r = try iterWith(B, gpa, pattern, input);
-    if (r.tag == .skip) return;
+    if (r.tag == .skip) return common.noteSkipped(.iter, B);
+    common.noteCompared(.iter, B);
     if (!iterResEq(oracle, r)) {
         std.debug.print("findAll disagreement on /{s}/ over \"{s}\" ({s}): oracle.len={d} other.len={d}\n  pat.hex={x}\n  in.hex ={x}\n", .{ pattern, input, @typeName(B), oracle.len, r.len, pattern, input });
         return error.IterationDisagreement;
@@ -498,11 +413,6 @@ fn replaceWith(comptime B: type, gpa: std.mem.Allocator, pattern: []const u8, in
     return .{ .tag = .ok, .bytes = out };
 }
 
-const replace_backends = .{
-    gex.backends.backtrack,
-    gex.backends.auto,
-    gex.backends.bytepike,
-};
 
 pub fn replaceAgree(_: void, smith: *Smith) anyerror!void {
     @disableInstrumentation();
@@ -517,16 +427,18 @@ pub fn replaceAgree(_: void, smith: *Smith) anyerror!void {
     const oracle = try replaceWith(gex.backends.pikevm, gpa, pattern, input, template);
     if (oracle.tag != .ok) return;
     defer gpa.free(oracle.bytes);
+    common.noteRun(.replace, true);
     const byte_safe = byteEnginesSafe(gpa, pattern, input);
     inline for (replace_backends) |B| try checkReplace(B, gpa, oracle.bytes, pattern, input, template, byte_safe);
 }
 
 fn checkReplace(comptime B: type, gpa: std.mem.Allocator, oracle: []const u8, pattern: []const u8, input: []const u8, template: []const u8, byte_safe: bool) anyerror!void {
     @disableInstrumentation();
-    if (comptime isByteEngine(B)) if (!byte_safe) return;
+    if (comptime isByteEngine(B)) if (!byte_safe) return common.noteSkipped(.replace, B);
     const r = try replaceWith(B, gpa, pattern, input, template);
-    if (r.tag != .ok) return;
+    if (r.tag != .ok) return common.noteSkipped(.replace, B);
     defer gpa.free(r.bytes);
+    common.noteCompared(.replace, B);
     if (!std.mem.eql(u8, oracle, r.bytes)) {
         std.debug.print("replace disagreement on /{s}/ ~ \"{s}\" over \"{s}\" ({s}):\n  oracle=\"{s}\"\n  other =\"{s}\"\n  pat.hex={x}\n  in.hex ={x}\n  tmpl.hex={x}\n", .{ pattern, template, input, @typeName(B), oracle, r.bytes, pattern, input, template });
         return error.ReplaceDisagreement;
@@ -552,13 +464,6 @@ fn findAtOf(comptime B: type, gpa: std.mem.Allocator, pattern: []const u8, input
     return .{ .span = if (m) |mm| .{ mm.start, mm.end } else null };
 }
 
-const offset_backends = .{
-    gex.backends.backtrack,
-    gex.backends.auto,
-    gex.backends.bytepike,
-    gex.backends.dfa,
-    gex.backends.edfa,
-};
 
 pub fn searchOffsetAgree(_: void, smith: *Smith) anyerror!void {
     @disableInstrumentation();
@@ -577,6 +482,7 @@ pub fn searchOffsetAgree(_: void, smith: *Smith) anyerror!void {
 
     const oracle = try findAtOf(gex.backends.pikevm, gpa, pattern, input, opts);
     if (oracle == .skip or oracle == .invalid) return;
+    common.noteRun(.offset, true);
 
     // Oracle self-invariants: anchored ⇒ match starts exactly at `start`; unanchored
     // ⇒ at/after `start`; and no match may end past `span_end`.
@@ -601,9 +507,10 @@ pub fn searchOffsetAgree(_: void, smith: *Smith) anyerror!void {
 
 fn checkOffset(comptime B: type, gpa: std.mem.Allocator, oracle: Outcome, pattern: []const u8, input: []const u8, opts: gex.SearchOptions, byte_safe: bool) anyerror!void {
     @disableInstrumentation();
-    if (comptime isByteEngine(B)) if (!byte_safe) return;
+    if (comptime isByteEngine(B)) if (!byte_safe) return common.noteSkipped(.offset, B);
     const r = try findAtOf(B, gpa, pattern, input, opts);
-    if (r == .skip or r == .invalid) return;
+    if (r == .skip or r == .invalid) return common.noteSkipped(.offset, B);
+    common.noteCompared(.offset, B);
     if (!spanEq(oracle.span, r.span)) {
         std.debug.print("findAt disagreement on /{s}/ over \"{s}\" (start={d} anchored={} span_end={?d}) ({s}): oracle={?any} other={?any}\n  pat.hex={x}\n  in.hex ={x}\n", .{ pattern, input, opts.start, opts.anchored, opts.span_end, @typeName(B), oracle.span, r.span, pattern, input });
         return error.OffsetDisagreement;
@@ -639,6 +546,7 @@ pub fn strategyInvariant(_: void, smith: *Smith) anyerror!void {
 
     const base = try matchWithOpts(.{}, gpa, pattern, input);
     if (base == .skip or base == .invalid) return;
+    common.noteRun(.strategy, true);
     const variants = .{
         gex.Options{ .strategy = .{ .byte_engine = .disabled } },
         gex.Options{ .strategy = .{ .byte_engine = .enabled } },
