@@ -110,6 +110,177 @@ pub fn compileVariant(comptime B: type, gpa: std.mem.Allocator, pattern: []const
     };
 }
 
+const tree = @import("../gen/tree.zig");
+comptime {
+    std.debug.assert(opt_variants.len == tree.opt_sem.len);
+    for (opt_variants, tree.opt_sem) |o, sm| {
+        std.debug.assert(o.unicode == sm.unicode);
+        std.debug.assert((o.case_fold != .none) == sm.fold);
+        std.debug.assert(o.case_insensitive == sm.base.i and o.multiline == sm.base.m and o.dot_matches_newline == sm.base.s);
+    }
+}
+
+const print = @import("../gen/print.zig");
+const pattern_gen = @import("../gen/pattern.zig");
+const input_gen = @import("../gen/input.zig");
+const witness = @import("../gen/witness.zig");
+const uni = @import("../ref/uni.zig");
+const Smith = std.testing.Smith;
+const replay = @import("../gen/replay.zig");
+
+pub const NONE = std.math.maxInt(usize);
+
+pub fn Built(comptime B: type) type {
+    return union(enum) { ok: gex.Compiled(B), invalid, skip };
+}
+
+/// Compile under option variant `opt`: InvalidPattern → `.invalid`; Unsupported /
+/// PatternTooComplex / any routing decline → `.skip`; OOM propagates.
+pub fn build(comptime B: type, gpa: std.mem.Allocator, pattern: []const u8, opt: u8) error{OutOfMemory}!Built(B) {
+    var diag: gex.Diagnostic = .{};
+    const re = compileVariant(B, gpa, pattern, &diag, opt) catch |e| return switch (e) {
+        error.InvalidPattern => .invalid,
+        error.OutOfMemory => error.OutOfMemory,
+        else => .skip,
+    };
+    return .{ .ok = re };
+}
+
+/// `build` with an explicit comptime `Options` (strategy-tier variants).
+pub fn buildWith(comptime B: type, comptime opts: gex.Options, gpa: std.mem.Allocator, pattern: []const u8) error{OutOfMemory}!Built(B) {
+    var diag: gex.Diagnostic = .{};
+    const re = gex.compileRuntimeWith(B, gpa, pattern, &diag, opts) catch |e| return switch (e) {
+        error.InvalidPattern => .invalid,
+        error.OutOfMemory => error.OutOfMemory,
+        else => .skip,
+    };
+    return .{ .ok = re };
+}
+
+pub fn slotsEq(a: []const ?usize, b: []const ?usize) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if ((x == null) != (y == null)) return false;
+        if (x != null and x.? != y.?) return false;
+    }
+    return true;
+}
+
+/// A flat, comparable record of what an engine returned.
+pub const Summary = struct {
+    v: [640]usize = undefined,
+    n: usize = 0,
+
+    pub fn push(s: *Summary, x: usize) void {
+        if (s.n < s.v.len) {
+            s.v[s.n] = x;
+            s.n += 1;
+        }
+    }
+    pub fn pushMatch(s: *Summary, m: ?gex.Match) void {
+        s.push(if (m) |x| x.start else NONE);
+        s.push(if (m) |x| x.end else NONE);
+    }
+    pub fn eql(a: *const Summary, b: *const Summary) bool {
+        return a.n == b.n and std.mem.eql(usize, a.v[0..a.n], b.v[0..b.n]);
+    }
+};
+
+/// find, isMatch, captures (capture backends), and the first 32 findAll spans.
+pub fn summarize(comptime B: type, gpa: std.mem.Allocator, re: *const gex.Compiled(B), input: []const u8) !Summary {
+    var sc = try re.initScratch(gpa);
+    defer sc.deinit(gpa);
+    var s: Summary = .{};
+    s.pushMatch(re.find(&sc, input));
+    s.push(@intFromBool(re.isMatch(&sc, input)));
+    if (comptime B.caps.captures) {
+        var slots: [96]?usize = undefined;
+        const n = re.slotCount();
+        if (n <= slots.len) {
+            if (re.captures(&sc, slots[0..n], input)) |_| {
+                for (slots[0..n]) |x| s.push(x orelse NONE);
+            } else s.push(NONE);
+        }
+    }
+    var it = re.findAll(&sc, input);
+    var k: usize = 0;
+    while (it.next()) |m| : (k += 1) {
+        if (k == 32) break;
+        s.pushMatch(m);
+    }
+    return s;
+}
+
+/// The option variant to PRINT and COMPILE a tree with: any variant whose only difference
+/// from the tree's is the Options-seeded flags (the printer re-establishes them inline).
+pub fn printOpt(smith: *Smith, tree_opt: u8) u8 {
+    @disableInstrumentation();
+    const flag_only = [_]u8{ 0, 3, 4, 5 };
+    if (std.mem.indexOfScalar(u8, &flag_only, tree_opt) == null) return tree_opt;
+    return flag_only[smith.index(flag_only.len)];
+}
+
+pub const PatBuf = struct {
+    printed: print.Printed = .{},
+    smithy: pattern_gen.PatternSmith = .{},
+    t: tree.Tree = undefined,
+};
+pub const Picked = struct { pattern: []const u8, opt: u8, tree: ?*const tree.Tree };
+
+/// 1:1 a string-level `pattern.gen` pattern (opt 0) or a randomly printed tree.
+pub fn pickPattern(smith: *Smith, buf: *PatBuf) ?Picked {
+    @disableInstrumentation();
+    if (smith.valueRangeAtMost(u8, 0, 1) == 0) {
+        buf.smithy = pattern_gen.gen(smith);
+        return .{ .pattern = buf.smithy.slice(), .opt = 0, .tree = null };
+    }
+    buf.t = tree.generate(smith, tree.pickOpt(smith));
+    const popt = printOpt(smith, buf.t.opt);
+    buf.printed = print.variant(&buf.t, popt, smith.value(u64)) orelse return null;
+    return .{ .pattern = buf.printed.slice(), .opt = popt, .tree = &buf.t };
+}
+
+/// Half the time a small generated input; half the time noise + a witness of `t` + noise,
+/// so the tree actually matches somewhere.
+pub fn inputWithWitness(gpa: std.mem.Allocator, smith: *Smith, t: *const tree.Tree, buf: []u8) ![]const u8 {
+    @disableInstrumentation();
+    if (smith.valueRangeAtMost(u8, 0, 1) == 0) return input_gen.pickSmall(smith, buf);
+    var w = (try witness.sample(gpa, t, smith.value(u64))) orelse return input_gen.pickSmall(smith, buf);
+    const pre = input_gen.pickSmall(smith, buf[0..@min(buf.len, 12)]);
+    var len = pre.len;
+    const ws = w.slice();
+    if (len + ws.len > buf.len) return buf[0..len];
+    @memcpy(buf[len..][0..ws.len], ws);
+    len += ws.len;
+    var tail: [12]u8 = undefined;
+    const post = input_gen.pickSmall(smith, &tail);
+    const n = @min(post.len, buf.len - len);
+    @memcpy(buf[len..][0..n], post[0..n]);
+    return buf[0 .. len + n];
+}
+
+pub fn isValidUtf8(s: []const u8) bool {
+    var i: usize = 0;
+    while (i < s.len) {
+        const d = uni.decode(s, i);
+        if (!d.valid) return false;
+        i += d.len;
+    }
+    return true;
+}
+
+/// Bytes to the next scalar boundary from `i`: the decoded length, or 1 over a malformed
+/// byte (the reference's reading of "resync one byte").
+pub fn scalarLen(input: []const u8, i: usize) usize {
+    if (i >= input.len) return 1;
+    return uni.decode(input, i).len;
+}
+
+/// Seed corpora for the fuzz groups: replay-word streams (see gen/replay.zig) so each
+/// finite `zig build test` replay drives the generators through non-trivial cases.
+const generic_corpus_arr = replay.corpus(10, 256, 0xC0FFEE);
+pub const generic_corpus: []const []const u8 = &generic_corpus_arr;
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Accounting (read by fuzz/health.zig)
 // ══════════════════════════════════════════════════════════════════════════════
@@ -117,7 +288,7 @@ pub fn compileVariant(comptime B: type, gpa: std.mem.Allocator, pattern: []const
 pub const CheckId = enum(u8) {
     span, anchors, unicode, captures, iter, replace, offset, strategy, scanner, grapheme,
     reference, metamorphic, invariants, state, large, literals, api, oom, comptime_parity,
-    complexity, utf8class, chaos,
+    complexity, utf8class, chaos, compile_bomb,
 };
 pub const n_checks = @typeInfo(CheckId).@"enum".field_names.len;
 pub const max_gates = 32;
@@ -353,4 +524,32 @@ test "stats count compared and skipped per check and backend" {
     try testing.expectEqual(@as(u32, 1), stats.skipped[@intFromEnum(CheckId.span)][backendIndex(gex.backends.literal)]);
     try testing.expectEqual(@as(f64, 1.0), comparedFraction(.span, backendIndex(gex.backends.dfa)));
     stats.reset();
+}
+
+test "summarize + build classify patterns" {
+    const gpa = testing.allocator;
+    const bad = try build(gex.backends.pikevm, gpa, "(", 0);
+    try testing.expect(bad == .invalid);
+    var good = try build(gex.backends.pikevm, gpa, "(a)b", 0);
+    defer if (good == .ok) good.ok.deinit();
+    const s = try summarize(gex.backends.pikevm, gpa, &good.ok, "xab ab");
+    // find [1,3], isMatch, captures (0/1 = 1,3; group 1 = 1,2), findAll [1,3] [4,6]
+    try testing.expectEqualSlices(usize, &.{ 1, 3, 1, 1, 3, 1, 2, 1, 3, 4, 6 }, s.v[0..s.n]);
+}
+
+test "pickPattern mostly yields parseable patterns" {
+    var prng = std.Random.DefaultPrng.init(53);
+    var sb: [4096]u8 = undefined;
+    var pb: PatBuf = .{};
+    var ok: usize = 0;
+    for (0..500) |_| {
+        var s = replay.smith(&prng, &sb);
+        const p = pickPattern(&s, &pb) orelse continue;
+        var diag: gex.Diagnostic = .{};
+        if (gex.parse(testing.allocator, p.pattern, &diag)) |a| {
+            ok += 1;
+            a.deinit(testing.allocator);
+        } else |_| {}
+    }
+    try testing.expect(ok >= 400);
 }

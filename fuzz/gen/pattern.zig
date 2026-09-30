@@ -44,6 +44,16 @@ const max_depth = 4;
 /// tab and newline (so `\s`/`\d`/`(?m)` boundaries fire over real input).
 pub const alphabet = "abABc1 \t\n";
 
+/// Raw UTF-8 for code points that stress case folding and UTF-8 length handling: folds
+/// that change encoded length (K U+212A ↔ k: 3→1 bytes; ſ U+017F ↔ s; Ⱥ U+023A ↔ ⱥ
+/// U+2C65: 2→3), multi-member orbits (ς/σ/Σ, µ/μ, İ/ı, ǅ), a 4-byte cased letter (𐐀),
+/// and a real U+FFFD (distinct from an invalid byte under dead-on-invalid).
+pub const trap_raw = [_][]const u8{
+    "\xE2\x84\xAA", "\xC5\xBF", "\xC8\xBA", "\xE2\xB1\xA5", "\xCF\x82", "\xCF\x83", "\xCE\xA3",
+    "\xC2\xB5",     "\xCE\xBC", "\xC4\xB0", "\xC4\xB1",     "\xC7\x85", "\xF0\x90\x90\x80",
+    "\xF0\x90\x90\xA8", "\xEF\xBF\xBD",
+};
+
 /// A bounded pattern builder. Build with `gen`, then use `slice()`.
 pub const PatternSmith = struct {
     buf: [max_pattern_len]u8 = undefined,
@@ -107,7 +117,15 @@ fn genConcat(p: *PatternSmith, smith: *Smith, depth: u8) void {
     // 0 atoms is a valid empty branch (`a|`); usually 1–5.
     const n = smith.valueRangeAtMost(u8, 0, 5);
     var i: u8 = 0;
-    while (i < n and !p.nearlyFull()) : (i += 1) genQuantified(p, smith, depth);
+    while (i < n and !p.nearlyFull()) : (i += 1) {
+        // Occasionally verbose-mode text: a literal space/`#`/newline when `x` is off,
+        // insignificant when it is on — the differential compares backends on the same text.
+        if (smith.valueRangeAtMost(u8, 0, 9) == 0) {
+            const junk = [_][]const u8{ " ", "\t", " #c\n" };
+            p.puts(junk[smith.index(junk.len)]);
+        }
+        genQuantified(p, smith, depth);
+    }
 }
 
 /// `atom quantifier?`
@@ -146,7 +164,10 @@ fn genAtom(p: *PatternSmith, smith: *Smith, depth: u8) void {
     // At max depth, never open a group — only leaf atoms — so recursion ends.
     const kind_max: u8 = if (depth >= max_depth or p.nearlyFull()) 5 else 8;
     switch (smith.valueRangeAtMost(u8, 0, kind_max)) {
-        0, 1 => p.put(litByte(smith)), // weight literals heaviest
+        0, 1 => if (smith.valueRangeAtMost(u8, 0, 4) == 0) // weight literals heaviest; 1 in 5 a trap
+            p.puts(trap_raw[smith.index(trap_raw.len)])
+        else
+            p.put(litByte(smith)),
         2 => p.put('.'),
         3 => genShorthand(p, smith),
         4 => genClass(p, smith),
@@ -179,7 +200,7 @@ fn genAtom(p: *PatternSmith, smith: *Smith, depth: u8) void {
 
 /// `\d \w \s \D \W \S` or an anchor `^ $ \b \B \A \z`.
 fn genShorthand(p: *PatternSmith, smith: *Smith) void {
-    switch (smith.valueRangeAtMost(u8, 0, 11)) {
+    switch (smith.valueRangeAtMost(u8, 0, 12)) {
         0 => p.puts("\\d"),
         1 => p.puts("\\w"),
         2 => p.puts("\\s"),
@@ -191,25 +212,22 @@ fn genShorthand(p: *PatternSmith, smith: *Smith) void {
         8 => p.puts("\\b"),
         9 => p.puts("\\B"),
         10 => p.puts("\\A"),
+        11 => p.puts("\\Z"),
         else => p.puts("\\z"),
     }
 }
 
-/// A literal-yielding escape the scanner accepts: `\xHH`, `\x{…}`, `\u{…}`,
-/// `\cX`, or an escaped punctuation char.
+/// A literal-yielding escape the scanner accepts.
 fn genEscape(p: *PatternSmith, smith: *Smith) void {
-    switch (smith.valueRangeAtMost(u8, 0, 5)) {
-        0 => p.puts("\\x61"), // 'a'
-        1 => p.puts("\\x{42}"), // 'B'
-        2 => p.puts("\\u{0063}"), // 'c'
-        3 => p.puts("\\u0031"), // '1'
-        4 => p.puts("\\cA"), // control-A
-        else => { // escaped metachar → literal
-            const metas = ".*+?()[]{}|^$\\-";
-            p.put('\\');
-            p.put(metas[smith.index(metas.len)]);
-        },
-    }
+    const fixed = [_][]const u8{
+        "\\x61", "\\x{42}", "\\u{0063}", "\\u0031",  "\\cA",       "\\cj",       "\\n",
+        "\\t",   "\\e",     "\\0",       "\\x{212A}", "\\u{017F}", "\\x{10FFFF}", "\\u{FFFD}",
+    };
+    const k = smith.valueRangeAtMost(u8, 0, fixed.len); // == fixed.len → an escaped metachar
+    if (k < fixed.len) return p.puts(fixed[k]);
+    const metas = ".*+?()[]{}|^$\\-# ";
+    p.put('\\');
+    p.put(metas[smith.index(metas.len)]);
 }
 
 /// `(?flags)` / `(?flags-flags)` bare inline toggle (no group).
@@ -237,15 +255,17 @@ fn genClass(p: *PatternSmith, smith: *Smith) void {
     const want = smith.valueRangeAtMost(u8, 1, 4);
     var n: u8 = 0;
     while (n < want) : (n += 1) {
-        switch (smith.valueRangeAtMost(u8, 0, 4)) {
-            0 => { // a-c style range from the letter sub-alphabet
-                p.put('a');
-                p.put('-');
-                p.put('c');
-            },
-            1 => p.puts("\\d"), // shorthand inside a class
+        switch (smith.valueRangeAtMost(u8, 0, 10)) {
+            0 => p.puts("a-c"), // a range from the letter sub-alphabet
+            1 => p.puts("\\d"), // shorthands inside a class
             2 => p.puts("\\w"),
-            3 => p.puts("\\p{L}"), // property inside a class
+            3 => p.puts("\\p{L}"), // properties inside a class
+            4 => p.puts("\\S"),
+            5 => p.puts("\\D"),
+            6 => p.puts("\\P{Lu}"),
+            7 => p.puts("\\x{e9}-\\x{3b1}"), // a non-ASCII range via escapes
+            8 => p.puts("\\-"),
+            9 => p.puts(trap_raw[smith.index(trap_raw.len)]),
             else => p.put(litByte(smith)),
         }
     }
@@ -476,4 +496,28 @@ pub fn unicodeInput(smith: *Smith, out: []u8) usize {
         len += s.len;
     }
     return len;
+}
+
+test "gen reaches the widened syntax" {
+    const replay = @import("replay.zig");
+    const needles = [_][]const u8{
+        "\\e",   "\\Z",   "\\x{212A}", "\\u{017F}", "\\P{", "\\S",
+        "(?x",   "#",     "\\cj",      "[^",        "\\-",  "\xE2\x84\xAA",
+    };
+    var seen: [needles.len]bool = @splat(false);
+    var prng = std.Random.DefaultPrng.init(7);
+    var buf: [4096]u8 = undefined;
+    for (0..4000) |_| {
+        var s = replay.smith(&prng, &buf);
+        const p = gen(&s);
+        for (needles, 0..) |nd, k| {
+            if (std.mem.indexOf(u8, p.slice(), nd) != null) seen[k] = true;
+        }
+    }
+    for (needles, seen) |nd, ok| {
+        if (!ok) {
+            std.debug.print("gen never emitted {s}\n", .{nd});
+            return error.SyntaxUnreached;
+        }
+    }
 }
