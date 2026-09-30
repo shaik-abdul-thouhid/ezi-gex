@@ -619,9 +619,11 @@ match, so a prefilter or length gate built on them never yields a false negative
   inputs).
 - **No backreferences / lookaround / atomic / conditional / recursion / `\Q…\E`.**
   A Thompson NFA can't express them; each is rejected at parse with a precise code.
-- **`{m,n}` expands, uncapped.** The NFA compiler emits `n` copies; a huge counted
-  repeat makes a large program (bounded by allocation failure or the comptime branch
-  quota — never UB, but there is no `size_limit` yet).
+- **`{m,n}` expands, capped by `Options.size_limit`.** The NFA compiler emits `n` copies;
+  the front door rejects a pattern whose `hir.expandedSize` (an O(pattern), saturating upper
+  bound on the unrolled program) exceeds `size_limit` (default 1 000 000) with
+  `error.PatternTooComplex` before any backend builds. Backends driven directly via
+  `buildAlloc` should apply the same check.
 - **Invalid UTF-8 in input** is *dead-on-invalid* — a malformed byte matches nothing
   (no `U+FFFD` substitution) and the unanchored scan resyncs one byte past it, so a
   match never spans a bad byte. (Pattern bytes, by contrast, must be valid UTF-8 or

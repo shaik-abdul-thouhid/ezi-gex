@@ -39,6 +39,12 @@ pattern like `a{999999999}` fails to compile rather than blowing up the program.
 lower it per-compile via `Options.max_repetition` (see `usage-guide.md`). This is a
 safeguard, not a matching limitation — within the ceiling, counted repetition is exact.
 
+Nested counts multiply, though: `(?:(?:a{1000}){1000}){1000}` has every count under the
+ceiling yet unrolls to ~10⁹ copies. `Options.size_limit` (default `1_000_000`) bounds the
+unrolled size, measured arithmetically from the HIR by `hir.expandedSize` in O(pattern) time,
+and rejects such a pattern with `error.PatternTooComplex` before any program is built. Lower it
+when compiling untrusted patterns.
+
 ### Performance shapes ezi_gex does not chase
 
 A handful of pattern shapes are meaningfully slower than the rest of the engine. These are

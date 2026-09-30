@@ -809,6 +809,57 @@ pub const Hir = struct {
     analysis: Analysis,
 };
 
+/// Default ceiling for `expandedSize` (see `regex.Options.size_limit`): about a million
+/// code-point instructions — every realistic hand-written pattern sits orders of magnitude
+/// below it, while a nested counted-repetition bomb sits orders above.
+///
+/// @stable-since: v0.8.0
+pub const default_size_limit: u64 = 1_000_000;
+
+/// An arithmetic UPPER BOUND on the size of the automaton `h` unrolls into — about one
+/// unit per code-point NFA instruction, with a class counted as `1 + ranges.len` so the
+/// byte lowering (one UTF-8 byte sequence per range) is bounded too. Computed over the
+/// HIR, which keeps `{m,n}` un-expanded, with saturating arithmetic: O(pattern) time,
+/// never proportional to the expansion, and it cannot overflow. The front door rejects
+/// a pattern whose size exceeds `Options.size_limit` BEFORE any backend walks or
+/// allocates the expansion; code that calls a backend's `buildAlloc` directly should
+/// apply the same check.
+///
+/// @stable-since: v0.8.0
+pub fn expandedSize(h: Hir) u64 {
+    return nodeExpandedSize(h, h.root);
+}
+
+fn nodeExpandedSize(h: Hir, i: u32) u64 {
+    const n = h.nodes[i];
+    return switch (n.tag) {
+        .empty => 0,
+        .literal => n.data.run.len,
+        .class => 1 +| @as(u64, n.data.class.len),
+        .any, .anchor, .grapheme => 1,
+        .concat => blk: {
+            const d = n.data.children;
+            var sum: u64 = 0;
+            for (h.children[d.start..][0..d.len]) |c| sum +|= nodeExpandedSize(h, c);
+            break :blk sum;
+        },
+        .alternation => blk: {
+            const d = n.data.children;
+            var sum: u64 = 2 *| @as(u64, d.len); // a split + a jump per branch
+            for (h.children[d.start..][0..d.len]) |c| sum +|= nodeExpandedSize(h, c);
+            break :blk sum;
+        },
+        .repetition => blk: {
+            const r = n.data.repetition;
+            const child = nodeExpandedSize(h, r.child) +| 1; // + the split guarding each copy
+            // {m,n}: n copies; {m,}: m copies + one looped copy; always ≥ 1 copy.
+            const copies: u64 = if (r.max) |mx| @max(@as(u64, mx), 1) else @as(u64, r.min) +| 1;
+            break :blk child *| copies +| 2;
+        },
+        .capture => nodeExpandedSize(h, n.data.capture.child) +| 2, // two saves
+    };
+}
+
 /// The only failure the builder can raise: a class/pattern that overruns the
 /// caller's buffers (e.g. an enormous resolved class). Mirrors the scanner's
 /// "guard every write, never overrun" model.
@@ -1681,9 +1732,11 @@ fn lenBounds(nodes: []const Node, children: []const u32, idx: u32) Bounds {
         .capture => lenBounds(nodes, children, node.data.capture.child),
         .repetition => blk: {
             const c = lenBounds(nodes, children, node.data.repetition.child);
-            const min = c.min * node.data.repetition.min;
+            // Nested counts multiply past u32 (`(?:(?:a{1000}){1000}){1000}`): a saturated
+            // `min` is still a sound lower bound, an overflowing `max` means "unbounded".
+            const min = c.min *| node.data.repetition.min;
             const max: ?u32 = if (node.data.repetition.max) |mx|
-                (if (c.max) |cm| cm * mx else null)
+                (if (c.max) |cm| mulOrNull(cm, mx) else null)
             else
                 null;
             break :blk .{ .min = min, .max = max };
@@ -1694,7 +1747,7 @@ fn lenBounds(nodes: []const Node, children: []const u32, idx: u32) Bounds {
             var max: ?u32 = 0;
             for (children[d.start .. d.start + d.len]) |ci| {
                 const c = lenBounds(nodes, children, ci);
-                min += c.min;
+                min +|= c.min;
                 max = addMax(max, c.max);
             }
             break :blk .{ .min = min, .max = max };
@@ -1714,7 +1767,14 @@ fn lenBounds(nodes: []const Node, children: []const u32, idx: u32) Bounds {
 }
 
 fn addMax(a: ?u32, b: ?u32) ?u32 {
-    return if (a) |x| (if (b) |y| x + y else null) else null;
+    const x = a orelse return null;
+    const y = b orelse return null;
+    return std.math.add(u32, x, y) catch null; // overflow ⇒ no finite upper bound
+}
+
+/// `a * b`, or null when it overflows (an upper bound past u32 is "unbounded").
+fn mulOrNull(a: u32, b: u32) ?u32 {
+    return std.math.mul(u32, a, b) catch null;
 }
 
 fn maxMax(a: ?u32, b: ?u32) ?u32 {
@@ -2642,12 +2702,15 @@ fn atomFixedCps(nodes: []const Node, children: []const u32, idx: u32) ?u32 {
             const mx = r.max orelse break :blk null;
             if (mx != r.min) break :blk null;
             const body = atomFixedCps(nodes, children, r.child) orelse break :blk null;
-            break :blk r.min * body;
+            break :blk mulOrNull(r.min, body);
         },
         .concat => blk: {
             const d = node.data.children;
             var sum: u32 = 0;
-            for (children[d.start .. d.start + d.len]) |ci| sum += atomFixedCps(nodes, children, ci) orelse break :blk null;
+            for (children[d.start .. d.start + d.len]) |ci| {
+                const c = atomFixedCps(nodes, children, ci) orelse break :blk null;
+                sum = std.math.add(u32, sum, c) catch break :blk null;
+            }
             break :blk sum;
         },
         .alternation => blk: {
@@ -2711,7 +2774,7 @@ fn leadFixedCps(nodes: []const Node, idx: u32) ?u32 {
             const mx = r.max orelse break :blk null; // unbounded → variable
             if (mx != r.min) break :blk null; // {m,n}, m≠n → variable
             const body = leadFixedCps(nodes, r.child) orelse break :blk null;
-            break :blk r.min * body;
+            break :blk mulOrNull(r.min, body);
         },
         else => null,
     };
@@ -2918,8 +2981,8 @@ fn byteBounds(nodes: []const Node, children: []const u32, ranges: []const Range,
         .repetition => blk: {
             const c = byteBounds(nodes, children, ranges, literals, node.data.repetition.child);
             const rep = node.data.repetition;
-            const min = c.min * rep.min;
-            const max: ?u32 = if (rep.max) |mx| (if (c.max) |cm| cm * mx else null) else null;
+            const min = c.min *| rep.min; // saturate: still a sound lower bound
+            const max: ?u32 = if (rep.max) |mx| (if (c.max) |cm| mulOrNull(cm, mx) else null) else null;
             break :blk .{ .min = min, .max = max };
         },
         .concat => blk: {
@@ -2928,7 +2991,7 @@ fn byteBounds(nodes: []const Node, children: []const u32, ranges: []const Range,
             var max: ?u32 = 0;
             for (children[d.start .. d.start + d.len]) |ci| {
                 const c = byteBounds(nodes, children, ranges, literals, ci);
-                min += c.min;
+                min +|= c.min;
                 max = addMax(max, c.max);
             }
             break :blk .{ .min = min, .max = max };
@@ -3596,4 +3659,29 @@ test "comptime resolves a unicode property class in ro_data" {
 
 test {
     testing.refAllDecls(@This());
+}
+
+test "expandedSize: arithmetic, class weighting, saturation" {
+    const gpa = testing.allocator;
+    const Probe = struct { pat: []const u8, want: u64 };
+    for ([_]Probe{
+        .{ .pat = "a", .want = 1 },
+        .{ .pat = "abc", .want = 3 },
+        .{ .pat = "[a-c]", .want = 2 }, // 1 + one range
+        .{ .pat = "a{3}", .want = 3 * 2 + 2 }, // (child+1) × copies + 2
+    }) |p| {
+        var diag: compile.Diagnostic = .{};
+        const a = try compile.parse(gpa, p.pat, &diag);
+        defer a.deinit(gpa);
+        const h = try buildAlloc(gpa, a, .{});
+        defer deinitHir(gpa, h);
+        try testing.expectEqual(p.want, expandedSize(h));
+    }
+    // A nested bomb is sized without walking it, and saturates instead of overflowing.
+    var diag: compile.Diagnostic = .{};
+    const a = try compile.parse(gpa, "(?:(?:(?:a{100000}){100000}){100000}){100000}", &diag);
+    defer a.deinit(gpa);
+    const h = try buildAlloc(gpa, a, .{});
+    defer deinitHir(gpa, h);
+    try testing.expect(expandedSize(h) > default_size_limit);
 }

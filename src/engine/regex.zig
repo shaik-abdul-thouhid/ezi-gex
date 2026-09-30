@@ -141,6 +141,21 @@ pub const Options = struct {
     /// @stable-since: v0.5.0
     max_repetition: u32 = core.scanner.default_max_repetition,
 
+    /// Ceiling on the pattern's EXPANDED size (`hir.expandedSize` — about one unit per
+    /// code-point NFA instruction once counted repetitions are unrolled). `max_repetition`
+    /// bounds each `{m,n}` count on its own; nested counts multiply —
+    /// `(?:(?:a{1000}){1000}){1000}` unrolls to ~10⁹ copies — so this bounds the product.
+    /// A pattern over it fails with `error.PatternTooComplex` (`diag.code =
+    /// .pattern_too_complex`, spanning the whole pattern) or, on the comptime path, a
+    /// `@compileError` — BEFORE any program is built, so rejecting costs O(pattern) time
+    /// and no allocation proportional to the expansion. The default
+    /// (`hir.default_size_limit`, 1 000 000) clears realistic patterns (`a{100000}`,
+    /// `\p{L}{500}`) by a wide margin; lower it to harden a service that compiles
+    /// untrusted patterns, raise it for genuinely huge unrolled programs.
+    ///
+    /// @stable-since: v0.8.0
+    size_limit: u64 = hir.default_size_limit,
+
     /// Execution-strategy knobs. **Results-invariant by contract:** changing any
     /// field here may affect only speed/memory, never which text matches (the
     /// conformance suite fuzzes over them and pins the match). The byte engine wiring
@@ -737,6 +752,10 @@ pub fn compileRuntimeWith(comptime B: type, allocator: std.mem.Allocator, patter
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer hir.deinitHir(allocator, h);
+    if (hir.expandedSize(h) > opts.size_limit) {
+        diag.* = .{ .code = .pattern_too_complex, .span = .{ .start = 0, .end = @intCast(pattern.len) } };
+        return error.PatternTooComplex;
+    }
 
     var program = try B.buildAlloc(allocator, h, backendOptions(B, opts));
     errdefer if (@hasDecl(B, "freeProgram")) B.freeProgram(allocator, &program);
@@ -764,6 +783,8 @@ pub fn compileComptimeWith(comptime B: type, comptime pattern: []const u8, compt
         .ok => |x| x,
         .fail => @compileError("ezi_gex: HIR build failed for pattern \"" ++ pattern ++ "\""),
     };
+    if (comptime hir.expandedSize(h) > opts.size_limit)
+        @compileError("ezi_gex: pattern \"" ++ pattern ++ "\" exceeds Options.size_limit (its counted repetitions unroll past the limit)");
     const program = comptime B.buildComptime(h, backendOptions(B, opts));
     const names = comptime comptimeGroupNames(h);
     return .{
@@ -866,6 +887,42 @@ test "Options.max_repetition: the default ceiling accepts large but sane counts"
     const r = compileRuntime(testing.allocator, "a{100001}", &diag, .{});
     try testing.expectError(error.InvalidPattern, r);
     try testing.expectEqual(core.errors.ErrorCode.quantifier_exceeds_limit, diag.code);
+}
+
+test "Options.size_limit: a nested repetition bomb is rejected before it is expanded" {
+    // Each count is under max_repetition; their product (10^9) is not under size_limit.
+    var counting = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var diag: Diagnostic = .{};
+    const r = compileRuntime(counting.allocator(), "(?:(?:a{1000}){1000}){1000}", &diag, .{});
+    try testing.expectError(error.PatternTooComplex, r);
+    try testing.expectEqual(core.errors.ErrorCode.pattern_too_complex, diag.code);
+    // Rejected from the HIR alone: nothing proportional to the expansion was allocated.
+    try testing.expect(counting.allocated_bytes < 1 << 20);
+}
+
+test "Options.size_limit: the default keeps large but sane patterns" {
+    var diag: Diagnostic = .{};
+    inline for (.{ "a{100000}", "\\w{200}", "(?:ab|cd){1000}", "\\p{L}{500}" }) |p| {
+        var re = try compileRuntime(testing.allocator, p, &diag, .{});
+        re.deinit();
+    }
+}
+
+test "Options.size_limit: a tightened limit rejects, and the error is located" {
+    var diag: Diagnostic = .{};
+    var ok = try compileRuntime(testing.allocator, "a{20}", &diag, .{ .size_limit = 50 });
+    ok.deinit();
+    const r = compileRuntime(testing.allocator, "a{40}", &diag, .{ .size_limit = 50 });
+    try testing.expectError(error.PatternTooComplex, r);
+    try testing.expectEqual(core.errors.ErrorCode.pattern_too_complex, diag.code);
+    try testing.expectEqual(@as(u32, 0), diag.span.start);
+    try testing.expectEqual(@as(u32, 5), diag.span.end);
+}
+
+test "Options.size_limit: threads through the comptime path" {
+    const re = comptime compileComptime("a{20}", .{ .size_limit = 50 });
+    try testing.expect(comptime re.isMatchComptime("aaaaaaaaaaaaaaaaaaaa"));
+    // An over-limit pattern here is a @compileError (not testable in-process).
 }
 
 test "Options.max_repetition: the option threads through the comptime path" {

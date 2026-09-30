@@ -308,6 +308,13 @@ _ = gex.compileRuntime(gpa, "a{9}", &diag, .{ .max_repetition = 8 });           
 // The same ceiling reaches the AST/scanner layers via Limits: gex.parseWith / gex.compileWith /
 // gex.scanWith all take `gex.Limits{ .max_repetition = … }` (default `gex.default_max_repetition`).
 
+// size_limit: ceiling on the EXPANDED pattern (gex.hir.expandedSize ≈ NFA instructions once {m,n}
+// unrolls; default 1_000_000). max_repetition bounds each count; nested counts multiply, and this
+// bounds the product. Over it: error.PatternTooComplex (diag.code = .pattern_too_complex) before
+// anything is built. Lower it when compiling untrusted patterns.
+_ = gex.compileRuntime(gpa, "(?:(?:a{1000}){1000}){1000}", &diag, .{}); // → error.PatternTooComplex (10^9 copies)
+_ = try gex.compileRuntime(gpa, "a{40}", &diag, .{ .size_limit = 100 });  // ok (82 units)
+
 // strategy tier — results-invariant: flipping any field changes only speed/memory,
 // never which text matches.
 //   byte_engine: .auto (default) ≡ .enabled → `auto` builds the byte DFA and uses it for
