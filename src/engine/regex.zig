@@ -1603,3 +1603,20 @@ test "front door: Scratch.fromBackend wraps a hand-built backend scratch" {
 test {
     testing.refAllDecls(@This());
 }
+
+test "compile memory is linear in unrolled capture groups" {
+    // The one-pass accelerator sized its transition table for states × insts up front, so
+    // `(?:(a)){10000}` (40 002 units, far under `size_limit`) allocated 21 GB and
+    // `(?:(a)){100000}` ~100 GB. Doubling the count must now roughly double the bytes.
+    const gpa = testing.allocator;
+    var totals: [2]usize = undefined;
+    inline for (.{ "(?:(a)){5000}", "(?:(a)){10000}" }, 0..) |p, i| {
+        var counting = std.testing.FailingAllocator.init(gpa, .{});
+        var diag: Diagnostic = .{};
+        var re = try compileRuntime(counting.allocator(), p, &diag, .{});
+        re.deinit();
+        totals[i] = counting.allocated_bytes;
+    }
+    try testing.expect(totals[1] < 32 << 20);
+    try testing.expect(totals[1] <= 3 * totals[0] + (1 << 20));
+}

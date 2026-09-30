@@ -185,7 +185,11 @@ const Det = struct {
     q_tail: u32 = 0,
 
     // per-closure scratch
-    seen: []bool, // len = #insts
+    // `seen[pc] == stamp` ⇔ pc visited in the current closure. A per-closure generation stamp,
+    // not a bool array cleared per closure: clearing all #insts for each of up to #insts states
+    // made the build quadratic in time (`(?:(a)){100000}`: 203 ms vs 1 ms for `a{100000}`).
+    seen: []u32, // len = #insts
+    stamp: u32 = 0,
     rec_mask: []u64, // len = #insts (mask each pc was first reached with)
     stack: []StackEnt, // len ≥ 2 * #insts + 2
 
@@ -240,6 +244,7 @@ const Det = struct {
         self.r_len = k;
 
         @memset(self.state_of, NO_STATE);
+        @memset(self.seen, 0); // stamp 0 is never current (the first closure uses 1)
         _ = try self.getState(0); // start = state 0 = closure(pc 0)
         while (self.q_head < self.q_tail) {
             const entry = self.queue[self.q_head];
@@ -268,7 +273,7 @@ const Det = struct {
     /// with two different save masks (ambiguous captures), or two live transitions whose
     /// symbol sets overlap (ambiguous next step).
     fn closure(self: *Det, entry_pc: u32, state_idx: u32) Err!void {
-        @memset(self.seen, false);
+        self.stamp += 1; // ≤ #insts closures, so it never wraps back to a live stamp
         var mask: u64 = 0;
         const tstart = self.t_len;
         var can_match = false;
@@ -283,13 +288,13 @@ const Det = struct {
                 .visit => |start_pc| {
                     var pc = start_pc;
                     follow: while (true) {
-                        if (self.seen[pc]) {
+                        if (self.seen[pc] == self.stamp) {
                             // Re-reaching a pc: one-pass requires the same capture state,
                             // or the match would be ambiguous. (Also breaks epsilon cycles.)
                             if (self.rec_mask[pc] != mask) return error.Unsupported;
                             break :follow;
                         }
-                        self.seen[pc] = true;
+                        self.seen[pc] = self.stamp;
                         self.rec_mask[pc] = mask;
                         switch (self.insts[pc]) {
                             .jmp => |t| {
@@ -300,7 +305,7 @@ const Det = struct {
                                 // to the exit (leftmost-first terminates the loop) instead of
                                 // looping. Keeps onepass consistent with the other backends on a
                                 // nullable lazy/concat body (`(?:a?b??)+` → "a"). See nfa.zig.
-                                if (t < pc and self.seen[t]) pc += 1 else pc = t;
+                                if (t < pc and self.seen[t] == self.stamp) pc += 1 else pc = t;
                             },
                             .split => |s| {
                                 try self.push(&top, .{ .visit = s.b }); // defer lower priority
@@ -407,8 +412,16 @@ pub fn supports(h: hir.Hir) bool {
 }
 
 /// Sizes for the determinizer's buffers, derived from the NFA program. `states`/`queue`
-/// are bounded by the instruction count (states are keyed by a single pc); `trans` by
-/// states × consuming-insts; `ranges` by the NFA ranges plus one singleton per char.
+/// are bounded by the instruction count (states are keyed by a single pc); `ranges` by the
+/// NFA ranges plus one singleton per char.
+///
+/// `trans` is capped LINEARLY (`trans_per_inst` per instruction): the true worst case is
+/// states × consuming-insts, and sizing every build for it made compile memory quadratic —
+/// `(?:(a)){10000}` (40 002 units, far under `size_limit`) asked for 21 GB. A pattern whose
+/// table would outgrow the cap (`a?b?c?…` over many distinct characters) is declined like any
+/// other non-one-pass pattern; `auto` then fills its captures with the Pike VM (same slots).
+const trans_per_inst = 4;
+
 const Bufs = struct {
     ic: u32,
     state_cap: u32,
@@ -422,7 +435,7 @@ const Bufs = struct {
         return .{
             .ic = ic,
             .state_cap = state_cap,
-            .trans_cap = state_cap *| ic +| 1,
+            .trans_cap = @min(state_cap *| ic +| 1, trans_per_inst *| ic +| 64),
             .ranges_cap = @as(u32, @intCast(prog.ranges.len)) +| ic +| 1,
             .stack_cap = 2 *| ic +| 2,
         };
@@ -467,7 +480,7 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     defer gpa.free(char_off);
     const queue = try gpa.alloc(u32, b.state_cap);
     defer gpa.free(queue);
-    const seen = try gpa.alloc(bool, b.ic);
+    const seen = try gpa.alloc(u32, b.ic);
     defer gpa.free(seen);
     const rec_mask = try gpa.alloc(u64, b.ic);
     defer gpa.free(rec_mask);
@@ -519,7 +532,7 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
     comptime var state_of: [b.ic]u32 = undefined;
     comptime var char_off: [b.ic]u32 = undefined;
     comptime var queue: [b.state_cap]u32 = undefined;
-    comptime var seen: [b.ic]bool = undefined;
+    comptime var seen: [b.ic]u32 = undefined;
     comptime var rec_mask: [b.ic]u64 = undefined;
     comptime var stack: [b.stack_cap]StackEnt = undefined;
 

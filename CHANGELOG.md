@@ -37,6 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backtracker's memory before routing to it and uses the lazy DFA's fallible entry points,
   falling back to the Pike VM (which never allocates during a search) on failure — same
   answer, no panic, no leak.
+- **Compile memory was quadratic in unrolled capture groups.** The one-pass capture
+  accelerator (which `auto` builds for every capture-bearing pattern) sized its transition
+  table for states × instructions up front: `(?:(a)){10000}` — 40 002 units, far under
+  `size_limit` — allocated 21 GB, and `(?:(a)){100000}` ~100 GB. The table is now capped
+  linearly (a pattern that would need more is declined as not one-pass; `auto` fills its
+  captures with the Pike VM, same slots), and the determinizer's per-state `seen` reset is a
+  generation stamp instead of a full clear, which made the build quadratic in time as well.
+  `(?:(a)){100000}` now compiles in 8 ms holding 57 MB (was 9.7 s). Found by the fuzz
+  compile-bomb check; pinned in `regex.zig`.
 - **`\b`/`\B` read a malformed byte differently depending on direction.** Looking forward, a
   malformed byte decodes as U+FFFD (non-word); looking backward, the decoder fell back to the
   raw byte as a code point, so `0xC3` read as `Ã` (a word character). `\b` over `"\xC3"`
