@@ -42,4 +42,5 @@ test {
     _ = @import("groups/captures.zig");
     _ = @import("groups/iter.zig");
     _ = @import("groups/search.zig");
+    _ = @import("health.zig");
 }

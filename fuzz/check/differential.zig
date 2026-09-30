@@ -602,10 +602,10 @@ pub const seed_corpus = [_][]const u8{
 pub const unicode_seed_corpus = [_][]const u8{
     "\\p{L}+",                   "\\w+",
     "(?i:stra\xC3\x9fe)",        "[\xCE\xB1-\xCF\x89]+",
-    "\xE6\x97\xA5+",             "\\p{Greek}",
+    "\xE6\x97\xA5+",             "\\p{sc=Greek}",
     "a\\p{Nd}*?b",              ".",
     "\\P{L}",                    "\\x{1f600}",
-    "(?i:\xCE\xA9)",             "[a-z\\p{Cyrillic}]+",
+    "(?i:\xCE\xA9)",             "[a-z\\p{sc=Cyrl}]+",
 };
 
 pub const anchor_seed_corpus = [_][]const u8{

@@ -76,9 +76,13 @@ pub const PatternSmith = struct {
 // General generator
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Generate one pattern from `smith`. Always terminates: every loop is bounded by
-/// `eosWeightedSimple` (guaranteed to eventually stop), by buffer capacity, and
-/// by `max_depth`.
+// Loop lengths are drawn with `valueRangeAtMost`, never steered by `eos`: when a `Smith`
+// REPLAYS bytes (seed corpora, fuzz/health.zig, any deterministic use) `eos` is simply
+// `byte != 0`, so an eos-steered loop almost always stops at once and seed replay would
+// test near-empty patterns. Count draws behave the same under replay and live fuzzing.
+
+/// Generate one pattern from `smith`. Always terminates: every loop is bounded by a
+/// drawn count, by buffer capacity, and by `max_depth`.
 pub fn gen(smith: *Smith) PatternSmith {
     @disableInstrumentation();
     var p: PatternSmith = .{};
@@ -89,8 +93,10 @@ pub fn gen(smith: *Smith) PatternSmith {
 /// `branch ('|' branch)*`
 fn genAlternation(p: *PatternSmith, smith: *Smith, depth: u8) void {
     genConcat(p, smith, depth);
-    // Lean against extra branches (7:1) so most patterns are a single concat.
-    while (!p.nearlyFull() and !smith.eosWeightedSimple(7, 1)) {
+    // Lean against extra branches: 1 in 8 alternations get 1–2 more.
+    const extra: u8 = if (smith.valueRangeAtMost(u8, 0, 7) == 0) smith.valueRangeAtMost(u8, 1, 2) else 0;
+    var i: u8 = 0;
+    while (i < extra and !p.nearlyFull()) : (i += 1) {
         p.put('|');
         genConcat(p, smith, depth);
     }
@@ -98,10 +104,10 @@ fn genAlternation(p: *PatternSmith, smith: *Smith, depth: u8) void {
 
 /// `quantified*`
 fn genConcat(p: *PatternSmith, smith: *Smith, depth: u8) void {
-    // Allow an empty branch (valid: `a|` ), but usually emit at least one atom.
-    while (!p.nearlyFull() and !smith.eosWeightedSimple(4, 1)) {
-        genQuantified(p, smith, depth);
-    }
+    // 0 atoms is a valid empty branch (`a|`); usually 1–5.
+    const n = smith.valueRangeAtMost(u8, 0, 5);
+    var i: u8 = 0;
+    while (i < n and !p.nearlyFull()) : (i += 1) genQuantified(p, smith, depth);
 }
 
 /// `atom quantifier?`
@@ -228,8 +234,9 @@ fn genClass(p: *PatternSmith, smith: *Smith) void {
     if (smith.boolWeighted(3, 1)) p.put('^');
     // A leading ']' is a literal ']' (not the close) — exercise that edge.
     if (smith.boolWeighted(6, 1)) p.put(']');
+    const want = smith.valueRangeAtMost(u8, 1, 4);
     var n: u8 = 0;
-    while (n < 4 and !smith.eosWeightedSimple(2, 1)) : (n += 1) {
+    while (n < want) : (n += 1) {
         switch (smith.valueRangeAtMost(u8, 0, 4)) {
             0 => { // a-c style range from the letter sub-alphabet
                 p.put('a');
@@ -365,12 +372,14 @@ const uni_literals = [_][]const u8{
     "\xF0\x9F\x98\x80", // 😀 U+1F600 (4-byte)
 };
 
-/// Property names known to `token.resolveProperty`. (Unknown names reject
-/// cleanly and consistently across backends, so a stray one is harmless — but a
-/// curated list keeps the budget on matching.)
-const uni_props = [_][]const u8{
-    "L",    "Lu",     "Ll",  "Nd",     "N",
-    "P",    "Greek",  "Latin", "Cyrillic", "White_Space",
+/// Property names the scanner accepts (`token.resolveProperty`): GC names/groups,
+/// DerivedCoreProperties, and scripts ONLY behind a `Script=`/`sc=` prefix. Bare script
+/// names (`Greek`) and `White_Space` are rejected (`unknown_property`) — an earlier
+/// version of this list used them, silently spending a quarter of the unicode group's
+/// budget on the reject path (caught by fuzz/health.zig).
+pub const uni_props = [_][]const u8{
+    "L",  "Lu",       "Ll",      "Nd",              "N",
+    "P",  "sc=Greek", "sc=Latn", "Script=Cyrillic", "Alphabetic",
 };
 
 /// Generate a Unicode-heavy pattern from `smith`.
@@ -458,8 +467,9 @@ pub fn unicodeInput(smith: *Smith, out: []u8) usize {
     @disableInstrumentation();
     const cps = [_][]const u8{ "a", "A", "b", "1", " ", "\n", "\xC3\xA9", "\xCE\xB1", "\xCF\x89", "\xE6\x97\xA5", "\xF0\x9F\x98\x80" };
     var len: usize = 0;
+    const want = smith.valueRangeAtMost(u8, 0, 24);
     var guard: u8 = 0;
-    while (guard < 24 and !smith.eosWeightedSimple(3, 1)) : (guard += 1) {
+    while (guard < want) : (guard += 1) {
         const s = cps[smith.index(cps.len)];
         if (len + s.len > out.len) break;
         @memcpy(out[len .. len + s.len], s);
