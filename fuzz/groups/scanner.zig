@@ -1,8 +1,8 @@
 //! Fuzz group: scanner robustness + the `{m,n}` repetition ceiling. Parse-only,
-//! so the cheapest group — runs many iterations per second. See `harness.zig`.
+//! so the cheapest group — runs many iterations per second. See `check/differential.zig`.
 
 const std = @import("std");
-const h = @import("harness.zig");
+const h = @import("fuzz_lib").check.differential;
 
 test "fuzz: parseWith never crashes on arbitrary bytes" {
     try std.testing.fuzz({}, h.scannerRobustness, .{ .corpus = &h.seed_corpus });

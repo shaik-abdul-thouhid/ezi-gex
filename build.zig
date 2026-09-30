@@ -201,17 +201,28 @@ pub fn build(b: *std.Build) void {
     });
 
     // ── fuzz: coverage-guided fuzz targets (Smith-driven) over the facade ──────
-    // Imports only the published `ezi_gex` module, exactly as a downstream user
-    // would — the fuzzer drives the public surface, not internals. `fuzz` is left
-    // null (default), so instrumentation is added only under `--fuzz`; a plain
-    // `zig build test-fuzz` runs the bodies as finite corpus-replay smoke tests.
-    const fuzz_mod = b.createModule(.{
-        .root_source_file = b.path("fuzz/root.zig"),
+    // `fuzz_lib` (fuzz/lib.zig) holds what every fuzz binary shares: generators
+    // (gen/), the independent reference matcher (ref/), and check bodies (check/).
+    // It drives the published `ezi_gex` module exactly as a downstream user would,
+    // and imports `ezi_code` DIRECTLY — the one module besides `utils` allowed to —
+    // because the reference matcher must evaluate Unicode predicates per code point
+    // without going through ezi_gex's own range tables (independence is its point).
+    // The library itself still only sees `ezi_code` through `utils`.
+    const fuzz_lib_mod = b.createModule(.{
+        .root_source_file = b.path("fuzz/lib.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "ezi_gex", .module = mod },
+            .{ .name = "ezi_code", .module = ezi_code.module("ezi_code") },
         },
+    });
+    const fuzz_lib: std.Build.Module.Import = .{ .name = "fuzz_lib", .module = fuzz_lib_mod };
+    const fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("fuzz/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "ezi_gex", .module = mod }, fuzz_lib },
     });
 
     // ── demo executable ───────────────────────────────────────────────────────
@@ -272,6 +283,11 @@ pub fn build(b: *std.Build) void {
     const run_conformance_tests = b.addRunArtifact(conformance_tests);
     const run_redos_tests = b.addRunArtifact(redos_tests);
     const run_fuzz_tests = b.addRunArtifact(fuzz_tests);
+    // fuzz_lib's own unit tests (generators, reference matcher, check helpers) live in a
+    // different module than the aggregate, so they are a separate binary — chained here so
+    // `test-fuzz` / `-Dinclude-test=fuzz` runs both.
+    const fuzz_lib_tests = b.addTest(.{ .root_module = fuzz_lib_mod });
+    run_fuzz_tests.step.dependOn(&b.addRunArtifact(fuzz_lib_tests).step);
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     // Pair each unit's tag with its run step, so the `test` step gates them by
@@ -307,7 +323,7 @@ pub fn build(b: *std.Build) void {
 
     // ── fuzzing: one binary per group, run in PARALLEL by the build scheduler ───
     // Each file under `fuzz/groups/` compiles into its OWN test binary (its targets
-    // share the differential bodies in `fuzz/groups/harness.zig`). The `fuzz` step
+    // share the bodies in fuzz_lib (`fuzz/lib.zig`)). The `fuzz` step
     // depends on all of them, and the build scheduler runs independent run-steps
     // concurrently — exactly like `zig build test` runs the 15 unit binaries at once
     // — so `zig build fuzz --fuzz=N` fuzzes every group in parallel, N iters EACH
@@ -323,7 +339,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path(b.fmt("fuzz/groups/{s}.zig", .{g})),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "ezi_gex", .module = mod }},
+            .imports = &.{ .{ .name = "ezi_gex", .module = mod }, fuzz_lib },
         });
         const gtest = b.addTest(.{ .root_module = gmod });
         const grun = b.addRunArtifact(gtest);

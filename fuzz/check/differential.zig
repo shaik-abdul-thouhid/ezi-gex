@@ -28,7 +28,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Smith = std.testing.Smith;
 const gex = @import("ezi_gex");
-const ps = @import("pattern_smith.zig");
+const ps = @import("../gen/pattern.zig");
 
 pub const pattern_smith = ps;
 

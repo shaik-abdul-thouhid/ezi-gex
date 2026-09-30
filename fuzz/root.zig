@@ -2,7 +2,7 @@
 //!
 //! The suite is split into independently-compilable **groups** under `groups/`, each
 //! its own test binary (their targets share the differential bodies in
-//! `groups/harness.zig`). `zig build fuzz` depends on every group, and the build
+//! `check/differential.zig`). `zig build fuzz` depends on every group, and the build
 //! scheduler runs independent run-steps concurrently — exactly like `zig build test`
 //! runs the unit binaries at once — so the groups fuzz in PARALLEL, one process per
 //! core, with no shell glue. Each group also has its own `zig build fuzz-<group>`.
@@ -23,7 +23,7 @@
 //!
 //! ⚠️  Bare `--fuzz` (no `=N`) soaks forever by design — always pass `=N`.
 //!
-//! WHAT IS COVERED — see `harness.zig` (the differential bodies) and each group:
+//! WHAT IS COVERED — see `check/differential.zig` (the differential bodies) and each group:
 //!   scanner   — parse robustness + the `{m,n}` repetition ceiling (parse-only).
 //!   diff      — span/find/isMatch across ALL backends (Pike VM oracle).
 //!   anchors   — anchors + zero-width across all backends.

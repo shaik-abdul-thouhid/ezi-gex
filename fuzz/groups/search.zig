@@ -1,10 +1,10 @@
 //! Fuzz group: search offset / anchored (`findAt(.{ .start, .anchored, .span_end })`)
 //! differenced across backends, plus the strategy-tier results-invariance contract
 //! (flipping byte_engine / prefilter / simd must never change the match).
-//! See `harness.zig`.
+//! See `check/differential.zig`.
 
 const std = @import("std");
-const h = @import("harness.zig");
+const h = @import("fuzz_lib").check.differential;
 
 test "fuzz: findAt offset/anchored agree across backends" {
     try std.testing.fuzz({}, h.searchOffsetAgree, .{ .corpus = &h.seed_corpus });
