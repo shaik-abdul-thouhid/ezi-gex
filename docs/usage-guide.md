@@ -1040,7 +1040,7 @@ comes from the pinned `ezi_code` (`v0.5.0`, **Unicode 18.0.0**). Some rules appl
 | `.` | `[^\n]` · with `(?s)`: any code point | any code point except `\n`. `(?s)` or `dot_matches_newline = true` includes `\n` |
 | `\u{H…}` | `\x{H…}` · `\uHHHH` (exactly 4 hex digits) · the character itself | one code point by hex value, e.g. `\u{1F600}` = `\x{1F600}` = `😀`; `\u00E9` = `é`. Surrogates are rejected |
 | `\xHH` | `\x{HH}` · `\u00HH` | a code point up to U+00FF (0–2 hex digits; a bare `\x` is U+0000) |
-| `(?i)` | `Options.case_insensitive = true` · scoped `(?i:…)` | Unicode case folding: `(?i)ω` matches `Ω`, `(?i)k` matches `K` and U+212A KELVIN SIGN. `case_fold = .full` also folds literals 1→many (`(?i)ß` matches `ss`); classes always use simple folding |
+| `(?i)` | `Options.case_insensitive = true` · scoped `(?i:…)` | Unicode case folding: `(?i)ω` matches `Ω`, `(?i)k` matches `K` and U+212A KELVIN SIGN. `case_fold = .full` also folds literals 1→many (`(?i)ß` matches `ss`); classes always use simple folding. A negated property folds **before** negating (Rust/Perl): `(?i)\p{Lu}` matches `a`, `(?i)\P{Ll}` matches no cased letter |
 
 **Not supported:** POSIX classes (`[[:alpha:]]` is rejected with `unsupported_posix_class`),
 `\N{NAME}`, `\p{Any}` / `\p{ASCII}` / `\p{Assigned}`, and binary properties outside the

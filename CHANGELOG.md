@@ -46,6 +46,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generation stamp instead of a full clear, which made the build quadratic in time as well.
   `(?:(a)){100000}` now compiles in 8 ms holding 57 MB (was 9.7 s). Found by the fuzz
   compile-bomb check; pinned in `regex.zig`.
+- **`(?i)` did not fold Unicode property classes.** `\p{…}`/`\P{…}` (bare or in brackets)
+  ignored case-insensitivity, so `(?i)\p{Lu}` matched only uppercase and `(?i)\P{Ll}` matched
+  `A` but not `a` — case-swapping the input changed the result. Property classes now fold
+  before their own negation, as Rust (`unicode_fold_and_negate`) and Perl do: `(?i)\p{Lu}`
+  matches every cased letter's orbit, `(?i)\P{Ll}` matches no cased letter. The ASCII
+  shorthands (`Options.unicode = false`) fold too — `(?i)\w` now includes U+212A KELVIN SIGN,
+  like `(?i)[a-z]` always did; the Unicode shorthands are already fold-closed. Found by the
+  fuzz `metamorphic` group (fold-swapped input); the fuzz reference matcher had the same
+  negate-then-fold mistake and is fixed with it.
 - **`\b`/`\B` read a malformed byte differently depending on direction.** Looking forward, a
   malformed byte decodes as U+FFFD (non-word); looking backward, the decoder fell back to the
   raw byte as a code point, so `0xC3` read as `Ã` (a word character). `\b` over `"\xC3"`

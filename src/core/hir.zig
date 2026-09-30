@@ -1079,6 +1079,33 @@ fn Builder(comptime mode: Mode) type {
             }
         }
 
+        /// Close the WHOLE member scratch under simple case folding, when folding is active —
+        /// what `addFolded` does per literal range, for a member resolved from a table (a
+        /// `\p{…}` property, an ASCII shorthand), whose many ranges would make per-range
+        /// folding quadratic. Sort + merge once, add every member's fold target, re-merge, then
+        /// add every source whose target is a member: binary searches over the merged set, so
+        /// O(table · log ranges). Callers fold BEFORE the member's own negation, as Rust
+        /// (`unicode_fold_and_negate`) and Perl do: `(?i)\P{Ll}` = ¬fold(Ll), matching no cased
+        /// letter. Negating first left the set unclosed — `(?i)\P{Ll}` matched `A` but not `a`.
+        fn foldMember(self: *Self, flags: Flags) BuildError!void {
+            if (!self.foldActive(flags)) return;
+            const table = casing.case_folding.common_simple_table;
+            sortRanges(self.member[0..self.member_len], self.aux);
+            var k = mergeRanges(self.member[0..self.member_len]);
+            self.member_len = @intCast(k);
+            for (table) |entry| {
+                if (entry.to.len != 1) continue;
+                if (rangesHave(self.member[0..k], entry.from)) try self.addMember(entry.to[0], entry.to[0]);
+            }
+            sortRanges(self.member[0..self.member_len], self.aux);
+            k = mergeRanges(self.member[0..self.member_len]);
+            self.member_len = @intCast(k);
+            for (table) |entry| {
+                if (entry.to.len != 1) continue;
+                if (rangesHave(self.member[0..k], entry.to[0])) try self.addMember(entry.from, entry.from);
+            }
+        }
+
         // ── members → ranges ──────────────────────────────────────────────────────
 
         fn addCategory(self: *Self, cat: props.GeneralCategory) BuildError!void {
@@ -1318,10 +1345,15 @@ fn Builder(comptime mode: Mode) type {
                     },
                     .perl => |p| {
                         try self.addPerl(p.kind);
+                        // The Unicode shorthands are already closed under simple folding
+                        // (Rust relies on the same fact); the ASCII ones are not (`K` KELVIN
+                        // SIGN and `ſ` fold into `[A-Za-z]`), so only those fold.
+                        if (!self.opts.unicode) try self.foldMember(flags);
                         try self.flushMemberIntoMain(p.negated);
                     },
                     .property => |p| {
                         try self.addProperty(p.property);
+                        try self.foldMember(flags);
                         try self.flushMemberIntoMain(p.negated);
                     },
                 }
@@ -1331,10 +1363,10 @@ fn Builder(comptime mode: Mode) type {
         }
 
         fn lowerUnicodeProp(self: *Self, up: ast.UnicodePropData, flags: Flags) BuildError!u32 {
-            _ = flags;
             self.main_len = 0;
             self.member_len = 0;
             try self.addProperty(up.property);
+            try self.foldMember(flags);
             try self.flushMemberIntoMain(up.negated);
             const cls = try self.commitMain(false);
             return self.addNode(.{ .tag = .class, .data = .{ .class = cls } });
@@ -1650,6 +1682,22 @@ fn sortRanges(s: []Range, aux: []Range) void {
         dst = t;
     }
     if (src.ptr != s.ptr) @memcpy(s, src[0..n]);
+}
+
+/// Whether `cp` lies in a sorted, merged range list (binary search).
+fn rangesHave(sorted: []const Range, cp: CodePoint) bool {
+    var lo: usize = 0;
+    var hi: usize = sorted.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const r = sorted[mid];
+        if (cp < r.lo) {
+            hi = mid;
+        } else if (cp > r.hi) {
+            lo = mid + 1;
+        } else return true;
+    }
+    return false;
 }
 
 /// Coalesce a sorted range list in place, merging overlapping and adjacent
@@ -3385,6 +3433,54 @@ test "simple case folding widens a literal into a class" {
     try expectHir("(?i)5", .{ .case_fold = .simple }, "(run 5)");
     // case_fold = .none disables folding even under (?i)
     try expectHir("(?i)a", .{ .case_fold = .none }, "(run a)");
+}
+
+/// The root class's membership test for `cp` (runtime build; the root must be a class).
+fn rootClassHas(pattern: []const u8, opts: Options, cp: CodePoint) !bool {
+    var diag: compile.Diagnostic = .{};
+    const a = try compile.parse(testing.allocator, pattern, &diag);
+    defer a.deinit(testing.allocator);
+    const h = try buildAlloc(testing.allocator, a, opts);
+    defer deinitHir(testing.allocator, h);
+    try testing.expectEqual(Tag.class, h.nodes[h.root].tag);
+    const c = h.nodes[h.root].data.class;
+    return rangesHave(h.ranges[c.start .. c.start + c.len], cp);
+}
+
+test "(?i) folds a property / ASCII shorthand BEFORE its negation (Rust semantics)" {
+    // ¬fold(Ll): no cased letter, either case. (Negating first matched 'A' but not 'a'.)
+    for ([_][]const u8{ "(?i)\\P{Ll}", "(?i)[\\P{Ll}]", "(?i)[^\\p{Ll}]" }) |p| {
+        try testing.expect(!try rootClassHas(p, .{}, 'A'));
+        try testing.expect(!try rootClassHas(p, .{}, 'a'));
+        try testing.expect(try rootClassHas(p, .{}, '1'));
+    }
+    // fold(Lu): both cases, and the whole orbit (ſ U+017F folds to s, ſ ∉ Lu).
+    for ([_]CodePoint{ 'a', 'A', 0x017F, 0x212A }) |cp| try testing.expect(try rootClassHas("(?i)\\p{Lu}", .{}, cp));
+    // Without (?i) nothing changes.
+    try testing.expect(try rootClassHas("\\P{Ll}", .{}, 'A'));
+    try testing.expect(!try rootClassHas("\\P{Ll}", .{}, 'a'));
+    try testing.expect(!try rootClassHas("(?i)\\P{Ll}", .{ .case_fold = .none }, 'a'));
+    // ASCII shorthands are not fold-closed: (?i)\w reaches KELVIN SIGN, (?i)\W excludes it.
+    try testing.expect(try rootClassHas("(?i)\\w", .{ .unicode = false }, 0x212A));
+    try testing.expect(!try rootClassHas("(?i)\\W", .{ .unicode = false }, 0x212A));
+    try testing.expect(!try rootClassHas("\\w", .{ .unicode = false }, 0x212A));
+}
+
+test "the Unicode shorthands are closed under simple folding (why they skip foldMember)" {
+    const table = casing.case_folding.common_simple_table;
+    for ([_][]const u8{ "\\w", "\\d", "\\s" }) |p| {
+        var diag: compile.Diagnostic = .{};
+        const a = try compile.parse(testing.allocator, p, &diag);
+        defer a.deinit(testing.allocator);
+        const h = try buildAlloc(testing.allocator, a, .{});
+        defer deinitHir(testing.allocator, h);
+        const c = h.nodes[h.root].data.class;
+        const set = h.ranges[c.start .. c.start + c.len];
+        for (table) |entry| {
+            if (entry.to.len != 1) continue;
+            try testing.expectEqual(rangesHave(set, entry.from), rangesHave(set, entry.to[0]));
+        }
+    }
 }
 
 test "perl \\d resolves to the decimal-number ranges (ascii prefix)" {

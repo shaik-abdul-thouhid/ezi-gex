@@ -183,32 +183,48 @@ pub fn litMatches(x: u21, c: u21, ci: bool) bool {
     return if (ci) fold(x) == fold(c) else x == c;
 }
 
-fn itemsMatch(t: *const tree.Tree, n: tree.Node, y: u21, unicode: bool) bool {
+fn itemBase(it: tree.Item, y: u21, unicode: bool) bool {
+    return switch (it.kind) {
+        .range => y >= it.lo and y <= it.hi,
+        .perl => perl(@enumFromInt(it.which), y, unicode),
+        .prop => prop(it.which, y),
+    };
+}
+
+fn itemsMatch(t: *const tree.Tree, n: tree.Node, y: u21, unicode: bool, ci: bool) bool {
     for (t.itemsOf(n)) |it| {
-        const base = switch (it.kind) {
-            .range => y >= it.lo and y <= it.hi,
-            .perl => perl(@enumFromInt(it.which), y, unicode),
-            .prop => prop(it.which, y),
-        };
+        // Under (?i) an item is folded BEFORE its own negation: `\P{X}` holds for `y` iff no
+        // member of `y`'s fold orbit is in X (regex-syntax `unicode_fold_and_negate`).
+        var base = itemBase(it, y, unicode);
+        if (ci and !base and it.kind != .range) {
+            var ob: [8]u21 = undefined;
+            for (orbit(y, &ob)) |z| {
+                if (itemBase(it, z, unicode)) {
+                    base = true;
+                    break;
+                }
+            }
+        }
         if (base != it.neg) return true;
     }
     return false;
 }
 
-/// Rust's rule: each item's own negation applies first; under `(?i)` the union is closed
-/// over simple-fold orbits; the class's `[^…]` applies last.
+/// Rust's rule: under `(?i)` each item folds, THEN its own negation applies; the union is
+/// closed over simple-fold orbits (a no-op once every item is closed, kept as Rust states
+/// it); the class's `[^…]` applies last. So `(?i)\P{Ll}` matches no cased letter.
 pub fn classMatches(t: *const tree.Tree, n: tree.Node, c: u21, sem: tree.OptSem) bool {
     const ci = n.flags.i and sem.fold;
     var hit = false;
     if (ci) {
         var ob: [8]u21 = undefined;
         for (orbit(c, &ob)) |y| {
-            if (itemsMatch(t, n, y, sem.unicode)) {
+            if (itemsMatch(t, n, y, sem.unicode, true)) {
                 hit = true;
                 break;
             }
         }
-    } else hit = itemsMatch(t, n, c, sem.unicode);
+    } else hit = itemsMatch(t, n, c, sem.unicode, false);
     return hit != (n.a != 0);
 }
 
@@ -295,5 +311,9 @@ test "class membership follows Rust's rule under (?i)" {
     const sem = tree.opt_sem[3];
     try testing.expect(!classMatches(&t, t.nodes[neg_a], 'A', sem)); // negation applied after closure
     try testing.expect(classMatches(&t, t.nodes[neg_a], 'b', sem));
-    try testing.expect(classMatches(&t, t.nodes[not_lu], 'A', sem)); // item negation before closure: 'a' ∈ \P{Lu}
+    // The item folds before its own negation: fold(Lu) holds both 'A' and 'a', so
+    // (?i)[\P{Lu}] matches neither — only uncased characters.
+    try testing.expect(!classMatches(&t, t.nodes[not_lu], 'A', sem));
+    try testing.expect(!classMatches(&t, t.nodes[not_lu], 'a', sem));
+    try testing.expect(classMatches(&t, t.nodes[not_lu], '1', sem));
 }
