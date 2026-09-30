@@ -1361,7 +1361,10 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, opts: Options) BuildError!
         .filter = if (opts.prefilter) filterFromAnalysis(h) else .{},
         .has_grapheme = h.analysis.has_grapheme,
     };
-    errdefer nfa.freeProgram(gpa, &program.inner.nfa);
+    // Free EVERYTHING built so far on any later error — the optional arms (eager/lazy DFA,
+    // one-pass, Teddy) are null until built. Freeing only the NFA leaked the arms when a later
+    // build step failed with OutOfMemory (found by the fuzz `oom` group).
+    errdefer freeProgram(gpa, &program);
     // Byte DFA span arm, built by default (`byte_engine != .disabled`). The DFA serves
     // `isMatch`/`find` and feeds the capture handoff; the bench shows it is **5–10× the
     // code-point Pike VM** on class scans (and never slower), so building it by default is a
@@ -1432,7 +1435,6 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, opts: Options) BuildError!
     // or case-variant set) and a leading-class scanner. Both are sound, results-invariant
     // skips; declining either just keeps the scalar `multiPrefixFrom` / `class_lead` scan.
     program.prefix_teddy = try buildPrefixTeddy(gpa, &program.filter, opts);
-    errdefer if (program.prefix_teddy) |*t| teddy.free(gpa, t);
     if (program.filter.class_lead) |bs| program.class_finder = classscan.ClassFinder.init(bs.bits);
     return program;
 }

@@ -811,10 +811,12 @@ pub fn Engine(comptime Backend: type) type {
 /// loops terminate). Lone/invalid lead bytes advance by 1.
 fn advanceCodePoint(input: []const u8, i: usize) usize {
     if (i >= input.len) return i + 1;
-    // `codePointLenLossy` returns the lead byte's optimistic length (1–4), or 0
-    // for an invalid lead byte — map that to a 1-byte advance.
-    const len = utf8.codePointLenLossy(input[i]);
-    return i + (if (len == 0) 1 else @as(usize, len));
+    // One VALID scalar forward, or one byte over a malformed sequence — the same resync
+    // step the unanchored scan takes (dead-on-invalid). A lead byte's *claimed* length
+    // (`codePointLenLossy`) over-skipped a truncated sequence: `a?` over "\xE6a" jumped
+    // from 0 past the valid `a` at 1 and `findAll` stopped after the empty match at 0.
+    const d = utf8.validateAndDecodeCodePointBytes(input, i) catch return i + 1;
+    return i + d.len;
 }
 
 fn isDigit(c: u8) bool {

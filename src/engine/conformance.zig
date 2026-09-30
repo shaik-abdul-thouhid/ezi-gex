@@ -2210,3 +2210,35 @@ test "front door: a refilled buffer (same ptr/len, new bytes) matches exactly li
 test {
     testing.refAllDecls(@This());
 }
+
+// ── regression: the post-empty-match advance over a malformed byte ─────────────────────────
+// After an empty match the iterators step one scalar. They used the lead byte's CLAIMED length
+// (`codePointLenLossy`), so over a truncated sequence they jumped past valid text: `a?` over
+// "\xE6a" (0xE6 claims 3 bytes, only 2 remain, and `a` is not a continuation) yielded only
+// [0,0] and `count` said 1. Dead-on-invalid resyncs one byte past a malformed byte, so the
+// sequence is [0,0] [1,2] [2,2]. Found by the fuzz `invariants` group (findAll resume law).
+test "regression: findAll/count/split step one byte over a malformed lead after an empty match" {
+    const gpa = testing.allocator;
+    inline for (.{ pikevm, backtrack, auto }) |B| {
+        var diag: regex.Diagnostic = .{};
+        var re = try regex.compileRuntimeWith(B, gpa, "a?", &diag, .{});
+        defer re.deinit();
+        var sc = try @TypeOf(re).Scratch.init(gpa, &re.program);
+        defer sc.deinit(gpa);
+        var it = re.findAll(&sc, "\xE6a");
+        const want = [_][2]usize{ .{ 0, 0 }, .{ 1, 2 }, .{ 2, 2 } };
+        for (want) |w| {
+            const m = it.next() orelse return error.FindAllStoppedEarly;
+            try testing.expectEqual(w[0], m.start);
+            try testing.expectEqual(w[1], m.end);
+        }
+        try testing.expect(it.next() == null);
+        try testing.expectEqual(@as(usize, 3), re.count(&sc, "\xE6a"));
+        // The empty pattern over a lone lead byte: [0,0] then [1,1].
+        var re2 = try regex.compileRuntimeWith(B, gpa, "", &diag, .{});
+        defer re2.deinit();
+        var sc2 = try @TypeOf(re2).Scratch.init(gpa, &re2.program);
+        defer sc2.deinit(gpa);
+        try testing.expectEqual(@as(usize, 2), re2.count(&sc2, "\xC3"));
+    }
+}

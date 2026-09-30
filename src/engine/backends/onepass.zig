@@ -444,15 +444,21 @@ fn finish(det: *Det) Program {
 ///
 /// @stable-since: v0.4.0
 pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Program {
-    var prog = nfa.buildAlloc(gpa, h) catch return error.Unsupported;
+    // An allocation failure must surface as OutOfMemory, not masquerade as "not one-pass"
+    // (the fuzz `oom` group found `Unsupported` swallowing it).
+    var prog = nfa.buildAlloc(gpa, h) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.Unsupported,
+    };
     defer nfa.freeProgram(gpa, &prog); // a build-time scaffold; only the one-pass table escapes
     const b = Bufs.of(&prog);
 
-    const ranges = try gpa.alloc(Range, b.ranges_cap);
+    // `var`: the trims below reassign them, so the errdefers always free the live slice.
+    var ranges = try gpa.alloc(Range, b.ranges_cap);
     errdefer gpa.free(ranges);
-    const trans = try gpa.alloc(Trans, b.trans_cap);
+    var trans = try gpa.alloc(Trans, b.trans_cap);
     errdefer gpa.free(trans);
-    const states = try gpa.alloc(State, b.state_cap);
+    var states = try gpa.alloc(State, b.state_cap);
     errdefer gpa.free(states);
 
     const state_of = try gpa.alloc(u32, b.ic);
@@ -484,11 +490,13 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
     };
     det.run() catch return error.Unsupported;
 
-    // Trim the over-allocated outputs to exactly what was written.
-    const out_ranges = try gpa.realloc(ranges, det.r_len);
-    const out_trans = try gpa.realloc(trans, det.t_len);
-    const out_states = try gpa.realloc(states, det.state_count);
-    return .{ .ranges = out_ranges, .trans = out_trans, .states = out_states, .slot_count = det.slot_count };
+    // Trim the over-allocated outputs to exactly what was written. Reassign in place: a
+    // failing later trim must free the ALREADY-trimmed earlier slices, not their stale
+    // originals (that was a double free + leak under allocation failure).
+    ranges = try gpa.realloc(ranges, det.r_len);
+    trans = try gpa.realloc(trans, det.t_len);
+    states = try gpa.realloc(states, det.state_count);
+    return .{ .ranges = ranges, .trans = trans, .states = states, .slot_count = det.slot_count };
 }
 
 /// Compile a HIR into a ro_data one-pass `Program` at comptime. A non-one-pass pattern (or
@@ -841,6 +849,22 @@ const diff_inputs = [_][]const u8{
     "héllo",    "12:34",          "ababcd",       "no match here!",
     "ABCdef",   "a@b.c",          "x.y z",        "ABCxyz",
 };
+
+test "onepass: buildAlloc surfaces OutOfMemory instead of masking it as Unsupported" {
+    const gpa = testing.allocator;
+    var diag: compile.Diagnostic = .{};
+    const ast = try compile.parse(gpa, "a(b)c", &diag);
+    defer ast.deinit(gpa);
+    const h = try hir.buildAlloc(gpa, ast, .{});
+    defer hir.deinitHir(gpa, h);
+    const S = struct {
+        fn f(a: std.mem.Allocator, hh: hir.Hir) !void {
+            var op = try buildAlloc(a, hh, .{});
+            freeProgram(a, &op);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(gpa, S.f, .{h});
+}
 
 test "onepass: wide differential vs Pike VM (identical slots wherever onepass builds)" {
     const gpa = testing.allocator;
