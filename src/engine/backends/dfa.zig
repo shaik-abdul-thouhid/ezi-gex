@@ -613,6 +613,15 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, _: Options) BuildError!Pro
         },
         else => {},
     };
+    // A CHAINED `\b`/`\B` (`\B+`, `\b\B`: a boundary whose continuation epsilon-reaches another
+    // assertion) needs nested word-context resolution; decline it to the Pike VM, as the eager DFA
+    // does. The lazy DFA used to accept it and stop early: `(?:\B\n*b\B+)+` over "\nbbb" gave
+    // [0,2] (Rust [0,3]). Found by the fuzz `anchors` group.
+    if (has_word) {
+        const era = try gpa.alloc(bool, bp.insts.len);
+        defer gpa.free(era);
+        if (byte.hasChainedBoundary(bp.insts, era)) return error.Unsupported;
+    }
     const classes = byte.byteClasses(&bp);
     var class_rep: [256]u8 = @splat(0);
     var b: u16 = 0;

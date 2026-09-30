@@ -44,6 +44,35 @@ fn selected(include: []const TestEnum, tag: TestEnum) bool {
     }.predicate);
 }
 
+/// Every fuzz group (`fuzz/groups/<name>.zig`) with its measured fuzzing throughput in `safe`
+/// mode: iterations of `--fuzz=N` per minute (N counts per fuzz test in the group), set to
+/// ~0.7 × a timed `zig build fuzz-<name> -Doptimize=safe --fuzz=K` on a warm build (Apple M-series,
+/// 2026-09-30), since inputs grow as coverage does. `zig build campaign` sizes each group's
+/// count from it; the spread (125/min for `search`, 71 000/min for `utf8class`) is why one
+/// global `--fuzz=N` can't serve every group. Re-measure when a group's checks change a lot.
+const FuzzGroup = struct { name: []const u8, per_minute: u32 };
+const fuzz_groups = [_]FuzzGroup{
+    .{ .name = "scanner", .per_minute = 1400 },
+    .{ .name = "diff", .per_minute = 770 },
+    .{ .name = "anchors", .per_minute = 58000 },
+    .{ .name = "unicode", .per_minute = 125 },
+    .{ .name = "captures", .per_minute = 3000 },
+    .{ .name = "iter", .per_minute = 150 },
+    .{ .name = "search", .per_minute = 125 },
+    .{ .name = "reference", .per_minute = 12700 },
+    .{ .name = "metamorphic", .per_minute = 490 },
+    .{ .name = "invariants", .per_minute = 820 },
+    .{ .name = "state", .per_minute = 290 },
+    .{ .name = "large", .per_minute = 780 },
+    .{ .name = "literals", .per_minute = 1780 },
+    .{ .name = "api", .per_minute = 2100 },
+    .{ .name = "oom", .per_minute = 9800 },
+    .{ .name = "comptime_parity", .per_minute = 39000 },
+    .{ .name = "complexity", .per_minute = 790 },
+    .{ .name = "utf8class", .per_minute = 71000 },
+    .{ .name = "chaos", .per_minute = 140 },
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -333,12 +362,8 @@ pub fn build(b: *std.Build) void {
     // into `zig build test` — still bundles every group into one binary for the
     // finite regression pass.)
     const fuzz_step = b.step("fuzz", "Fuzz every group in parallel (add --fuzz=N for N iters/group)");
-    const fuzz_groups = [_][]const u8{
-        "scanner",   "diff",            "anchors",    "unicode",   "captures", "iter",     "search",
-        "reference", "metamorphic",     "invariants", "state",     "large",    "literals", "api",
-        "oom",       "comptime_parity", "complexity", "utf8class", "chaos",
-    };
-    for (fuzz_groups) |g| {
+    for (fuzz_groups) |fg| {
+        const g = fg.name;
         const gmod = b.createModule(.{
             .root_source_file = b.path(b.fmt("fuzz/groups/{s}.zig", .{g})),
             .target = target,
@@ -350,6 +375,53 @@ pub fn build(b: *std.Build) void {
         const gstep = b.step(b.fmt("fuzz-{s}", .{g}), b.fmt("Fuzz only the {s} group (add --fuzz=N)", .{g}));
         gstep.dependOn(&grun.step);
         fuzz_step.dependOn(&grun.step); // `zig build fuzz` → every group, in parallel
+    }
+
+    // ── campaign: every group fuzzed for about the same wall time ────────────────
+    // `--fuzz=N` is ONE global limit, so `zig build fuzz --fuzz=N` gives every group the same
+    // N — seconds for `anchors`, hours for `search` (per-case cost spans ~300×). The campaign
+    // instead runs each group as its own child `zig build fuzz-<group> --fuzz=<n>` with
+    // n = the group's measured iterations per minute × -Dcampaign-minutes, so each group gets
+    // roughly the requested time. Run steps have no timeout: the COUNT is the bound, and it
+    // is approximate (inputs grow as the fuzzer finds coverage, so later iterations cost
+    // more). The scheduler runs up to -j children at once (one fuzzer process each). Always
+    // `safe`: the rates are measured there, and the fuzzer wants the safety checks. A failing
+    // group fails the step with the child's output — the harness has already printed the
+    // replay line and the auto-minimized case.
+    const campaign_minutes = b.option(u32, "campaign-minutes", "`zig build campaign`: target minutes per group (default 10)") orelse 10;
+    const campaign_only = b.option([]const []const u8, "campaign-group", "`zig build campaign`: only this group (repeat the flag)");
+    // Wall time ≈ minutes × ceil(19 groups / -j), since each child fuzzes on one core.
+    const campaign_step = b.step("campaign", "Fuzz every group for ~-Dcampaign-minutes each (default 10), counts sized per group");
+    // `zig build fuzz-<group> --fuzz=N` exits 0 even when a fuzz test fails, so each group's
+    // verdict comes from its captured stderr: `fuzz/campaign_report.zig` prints one summary
+    // line for a clean group, or the whole log (replay line + minimized case) and exit 1.
+    const campaign_report = b.addExecutable(.{
+        .name = "campaign-report",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("fuzz/campaign_report.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    for (fuzz_groups) |fg| {
+        if (campaign_only) |only| {
+            const want = for (only) |o| {
+                if (std.mem.eql(u8, o, fg.name)) break true;
+            } else false;
+            if (!want) continue;
+        }
+        const n = @as(u64, fg.per_minute) * campaign_minutes;
+        const run = b.addSystemCommand(&.{ b.graph.zig_exe, "build", b.fmt("fuzz-{s}", .{fg.name}), b.fmt("--fuzz={d}", .{n}), "-Doptimize=safe" });
+        run.setName(b.fmt("campaign {s} ({d} iterations)", .{ fg.name, n }));
+        run.setCwd(b.path("."));
+        // Captured (`check`) stdio, not the default: an `inherit` Run step holds the global
+        // stderr lock for the child's whole life, which ran the groups one at a time.
+        run.expectExitCode(0); // a build/compile error still fails here
+        run.has_side_effects = true; // fuzzing is never "up to date"
+        const report = b.addRunArtifact(campaign_report);
+        report.addArgs(&.{ fg.name, b.fmt("{d}", .{n}) });
+        report.addFileArg(run.captureStdErr(.{}));
+        report.has_side_effects = true;
+        campaign_step.dependOn(&report.step);
     }
 
     // `zig build fuzz-min -- '<FUZZ-CASE line>'`: replay a failing fuzz case and shrink it.

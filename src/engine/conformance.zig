@@ -2329,6 +2329,29 @@ test "regression: a bare (?flags) applies from its position to the end of its gr
     }
 }
 
+test "regression: the lazy DFA declines a chained word boundary (\\B+)" {
+    // `(?:\B\n*b\B+)+` over "\nbbb" is [0,3] (Rust, Pike VM); the lazy DFA accepted the
+    // chained `\B\B…` and stopped at [0,2]. It now declines, like the eager DFA, and `auto`
+    // (which never routed this to the lazy DFA) keeps the right answer.
+    const gpa = testing.allocator;
+    var diag: regex.Diagnostic = .{};
+    try testing.expectError(error.Unsupported, regex.compileRuntimeWith(dfa, gpa, "(?:\\B\\n*b\\B+)+", &diag, .{}));
+    try testing.expectError(error.Unsupported, regex.compileRuntimeWith(dfa, gpa, "\\b\\Ba", &diag, .{}));
+    inline for (.{ pikevm, backtrack, auto }) |B| {
+        var re = try regex.compileRuntimeWith(B, gpa, "(?:(\\B\\n*b)\\B+)+", &diag, .{});
+        defer re.deinit();
+        var sc = try re.initScratch(gpa);
+        defer sc.deinit(gpa);
+        const m = re.find(&sc, "\nbbb") orelse return error.ExpectedMatch;
+        try testing.expectEqual(@as(usize, 0), m.start);
+        try testing.expectEqual(@as(usize, 3), m.end);
+    }
+    // Control: an unchained boundary stays on the lazy DFA. (`(?:\B\n*b\B)+` is chained too —
+    // the trailing `\B` reaches the leading one through the loop — so it declines as well.)
+    var ok = try regex.compileRuntimeWith(dfa, gpa, "(?:\\n*b\\B)+", &diag, .{});
+    ok.deinit();
+}
+
 test "regression: a class that starts at a surrogate still matches a 3-byte scalar" {
     // `[^\x{0}-\x{D7FF}]` is U+D800–U+10FFFF; its byte-length lower bound was computed from
     // U+D800 (unencodable → a defensive 4), so `auto`'s length gate rejected the 3-byte input
@@ -2407,6 +2430,7 @@ test "regression: findAll/count/split step one byte over a malformed lead after 
         try testing.expectEqual(@as(usize, 2), re2.count(&sc2, "\xC3"));
     }
 }
+
 
 
 

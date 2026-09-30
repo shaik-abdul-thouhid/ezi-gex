@@ -20,20 +20,31 @@ something — a check that silently skips everything fails the build.
 | `findings.zig` | The known-open ledger: minimized cases that must still fail until fixed. |
 | `threads.zig` | Four threads sharing compiled programs must get the serial answers. |
 | `min.zig` | `zig build fuzz-min`: replay and shrink one `FUZZ-CASE` line. |
+| `campaign_report.zig` | `zig build campaign`'s per-group verdict, read from the group's captured log. |
 | `root.zig` | Pulls every group into one binary, so `zig build test` runs the suite finitely. |
 
 ## Running
 
 ```sh
-zig build test-fuzz -Doptimize=ReleaseSafe      # finite: seed corpora, health floors, ledger, threads
-zig build fuzz -Doptimize=ReleaseSafe           # finite smoke of all 19 groups, in parallel (~1 min)
-zig build fuzz-oom -Doptimize=ReleaseSafe --fuzz=5000   # one group, 5000 iterations (~1 min)
-zig build fuzz -Doptimize=ReleaseSafe --fuzz=100K       # every group, 100K iterations EACH
+zig build test-fuzz -Doptimize=safe             # finite: seed corpora, health floors, ledger, threads
+zig build fuzz -Doptimize=safe                  # finite smoke of all 19 groups, in parallel (~1 min)
+zig build campaign -Dcampaign-minutes=10        # real fuzzing: every group ~10 min, in parallel
+zig build campaign -Dcampaign-minutes=30 -Dcampaign-group=reference -Dcampaign-group=oom
+zig build fuzz-oom -Doptimize=safe --fuzz=5000  # one group, a fixed number of iterations
 ```
 
-> ⚠️ Bare `--fuzz` (no `=N`) soaks forever by design — always pass `=N`. Iteration cost
-> differs a lot by group: `oom`, `iter`, `search` and `invariants` are the heavy ones. Size `N`
-> per group rather than giving every group the same large number.
+**Campaign.** Per-iteration cost differs about 500× between groups (`search` ~125 iterations a
+minute, `utf8class` ~71 000), so one global `--fuzz=N` gives some groups seconds and others
+hours. `zig build campaign` runs each group as its own `zig build fuzz-<group> --fuzz=<n>`
+(always `safe`), with `n` = the group's measured rate (`fuzz_groups` in `build.zig`) × the
+requested minutes, up to one group per core at a time: wall time ≈ minutes × ⌈19 / cores⌉. The
+count is the bound, so the time is approximate. **`--fuzz=N` exits 0 even when a fuzz test
+fails**, so the campaign decides each group from its captured log (`campaign_report.zig`): a
+clean group prints one line (iterations, runs, coverage); a failing one prints the whole log —
+the replay line and the minimized case — and fails the build.
+
+> ⚠️ Bare `--fuzz` (no `=N`) soaks forever by design — always pass `=N`. Don't run two fuzz
+> sessions of the same group at once: they share its corpus, and the second one aborts.
 
 ## What the groups check
 
@@ -95,7 +106,7 @@ Every failure prints the check, the pattern and input, a replayable `FUZZ-CASE` 
 shrink a case again:
 
 ```sh
-zig build fuzz-min -Doptimize=ReleaseSafe -- 'FUZZ-CASE check=… pat=… in=…'
+zig build fuzz-min -Doptimize=safe -- 'FUZZ-CASE check=… pat=… in=…'
 ```
 
 It exits 1 if the case no longer reproduces. Then decide whether it is a real bug or a

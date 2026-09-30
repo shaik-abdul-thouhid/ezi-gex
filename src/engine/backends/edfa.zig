@@ -1490,51 +1490,6 @@ fn computeMepsReaches(insts: []const byte.Inst, out: []bool) void {
     }
 }
 
-/// `out[pc]` ← does `pc`, via pure epsilon (`jmp`/`split`/`save`), reach a zero-width **assertion**
-/// (the assertion node itself counts)? A `\b`/`\B` whose continuation `pc+1` does is *chained* — its
-/// fire/acceptance would need nested word-context resolution (deferred) — so the program is declined
-/// to the Pike VM (`hasChainedBoundary`). Real patterns never chain boundaries; this only guards the
-/// pathological `\b\b`/`\b\B` shapes. Caller buffer; comptime + runtime.
-fn computeEpsReachesAssertion(insts: []const byte.Inst, out: []bool) void {
-    const n = insts.len;
-    for (out[0..n]) |*v| v.* = false;
-    var changed = true;
-    while (changed) {
-        changed = false;
-        var i: usize = n;
-        while (i > 0) {
-            i -= 1;
-            if (out[i]) continue;
-            const r = switch (insts[i]) {
-                .assertion => true,
-                .jmp => |t| out[t],
-                .split => |s| out[s.a] or out[s.b],
-                .save => out[i + 1],
-                .byte_range, .match => false,
-            };
-            if (r) {
-                out[i] = true;
-                changed = true;
-            }
-        }
-    }
-}
-
-/// Whether any `\b`/`\B` in `insts` is chained (its continuation `pc+1` epsilon-reaches another
-/// assertion). `era` is a caller scratch buffer (`computeEpsReachesAssertion` fills it). A chained
-/// program is declined to the Pike VM. Comptime + runtime.
-fn hasChainedBoundary(insts: []const byte.Inst, era: []bool) bool {
-    computeEpsReachesAssertion(insts, era);
-    for (insts, 0..) |inst, idx| switch (inst) {
-        .assertion => |k| switch (k) {
-            .word_boundary, .not_word_boundary => if (era[idx + 1]) return true,
-            else => {},
-        },
-        else => {},
-    };
-    return false;
-}
-
 // ── DFA minimization (Moore partition-refinement, dense; comptime + runtime) ─────────
 //
 // After determinization the frozen tables are correct but **not minimal** — distinct DFA states
@@ -1685,7 +1640,7 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, opts: Options) BuildError!
     if (has_word) {
         const era = try gpa.alloc(bool, ic);
         defer gpa.free(era);
-        if (hasChainedBoundary(bp.insts, era)) return error.Unsupported;
+        if (byte.hasChainedBoundary(bp.insts, era)) return error.Unsupported;
     }
 
     const state_cap = @min(ic + 256, max_states); // pattern-proportional, capped
@@ -1980,7 +1935,7 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
     comptime {
         if (has_word) {
             var era: [ic]bool = undefined;
-            if (hasChainedBoundary(bp.insts, &era))
+            if (byte.hasChainedBoundary(bp.insts, &era))
                 @compileError("edfa: chained word boundary (\\b\\b); route to the Pike VM (use compileComptime, not edfa directly)");
         }
     }

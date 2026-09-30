@@ -722,6 +722,51 @@ fn build(h: hir.Hir, insts: []Inst, patch: []u32, entries: []u32, tail_hash: []u
     return .{ .insts = insts[0..b.inst_len], .slot_count = 2 * (h.capture_count + 1) };
 }
 
+/// `out[pc]` ← does `pc`, via pure epsilon (`jmp`/`split`/`save`), reach a zero-width **assertion**
+/// (the assertion node itself counts)? A `\b`/`\B` whose continuation `pc+1` does is *chained* — its
+/// fire/acceptance would need nested word-context resolution (deferred) — so the program is declined
+/// to the Pike VM (`hasChainedBoundary`). Real patterns never chain boundaries; this only guards the
+/// pathological `\b\b`/`\b\B` shapes. Caller buffer; comptime + runtime.
+pub fn computeEpsReachesAssertion(insts: []const Inst, out: []bool) void {
+    const n = insts.len;
+    for (out[0..n]) |*v| v.* = false;
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var i: usize = n;
+        while (i > 0) {
+            i -= 1;
+            if (out[i]) continue;
+            const r = switch (insts[i]) {
+                .assertion => true,
+                .jmp => |t| out[t],
+                .split => |s| out[s.a] or out[s.b],
+                .save => out[i + 1],
+                .byte_range, .match => false,
+            };
+            if (r) {
+                out[i] = true;
+                changed = true;
+            }
+        }
+    }
+}
+
+/// Whether any `\b`/`\B` in `insts` is chained (its continuation `pc+1` epsilon-reaches another
+/// assertion). `era` is a caller scratch buffer (`computeEpsReachesAssertion` fills it). A chained
+/// program is declined to the Pike VM by both byte DFAs (`edfa`, `dfa`). Comptime + runtime.
+pub fn hasChainedBoundary(insts: []const Inst, era: []bool) bool {
+    computeEpsReachesAssertion(insts, era);
+    for (insts, 0..) |inst, idx| switch (inst) {
+        .assertion => |k| switch (k) {
+            .word_boundary, .not_word_boundary => if (era[idx + 1]) return true,
+            else => {},
+        },
+        else => {},
+    };
+    return false;
+}
+
 /// Whether this HIR can be lowered to a **byte** program. False only for `\X` (grapheme).
 /// `\b`/`\B` ARE byte-lowerable (lowered to a byte `assertion` evaluated as an **ASCII** word
 /// boundary — see `lowerableAssertion`/`assertionHolds`); the dispatcher keeps non-ASCII `\b`

@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compile time. The front door now sizes the pattern arithmetically from the HIR (O(pattern),
   saturating) and rejects it with `error.PatternTooComplex` (`diag.code = .pattern_too_complex`)
   or a `@compileError` before any program is built.
+- **`zig build campaign`**: fuzz every group for about `-Dcampaign-minutes` each (default 10),
+  in parallel, with each group's iteration count sized from its measured throughput (group
+  costs differ ~500×, so one global `--fuzz=N` can't serve them all). `-Dcampaign-group=<name>`
+  (repeatable) narrows it. A group's verdict comes from its log, not its exit code — `zig build
+  fuzz-<group> --fuzz=N` exits 0 even when a fuzz test fails.
 - **A much stricter fuzz suite** (`fuzz/`): an independent reference matcher driven by a
   semantic pattern tree, metamorphic printing, oracle-free invariants on every backend,
   long-lived dirty-scratch scripts, 12 KiB inputs across `auto`'s 4096-byte cut, literal sets,
@@ -54,6 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cases in `conformance.zig`; found by the fuzz reference check.
 
 ### Fixed
+- **The lazy `dfa` mis-evaluated a chained word boundary.** A `\b`/`\B` whose continuation
+  reaches another boundary (`\B+`, `\b\B`, or one boundary looping back to another) needs
+  nested word-context resolution the DFA doesn't do; the eager DFA already declined it, the
+  lazy one accepted it and stopped early — `(?:\B\n*b\B+)+` over `"\nbbb"` gave `[0,2]`, Rust
+  `[0,3]`. It now declines too (`auto` never routed these to it). Found by the first fuzz
+  campaign (`anchors`).
 - **A class starting inside the surrogate block missed 3-byte input.** `[^\x{0}-\x{D7FF}]`
   (U+D800–U+10FFFF) took its byte-length lower bound from U+D800, which has no UTF-8 encoding
   (a defensive 4), so `auto`'s length gate rejected a lone U+FFFD or any other 3-byte input.
