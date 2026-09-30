@@ -290,7 +290,8 @@ _ = try gex.compileRuntime(gpa, "(?i)abc",     &diag, .{ .case_fold = .none }); 
 _ = try gex.compileRuntime(gpa, "(?i)stra\u{00DF}e", &diag, .{ .case_fold = .full }); // also matches "strasse"
 
 // Seed (?i)/(?m)/(?s) for the WHOLE pattern without writing the inline flag.
-// Inline flags still compose; a scoped (?-i:…) group turns it back off locally.
+// Inline flags still compose: a scoped (?-i:…) turns it off inside the group, and a bare
+// (?-i) turns it off from that point to the end of its group (RE2/Rust).
 _ = try gex.compileRuntime(gpa, "abc", &diag, .{ .case_insensitive = true });        // == "(?i)abc"
 _ = try gex.compileRuntime(gpa, "^a$", &diag, .{ .multiline = true });               // == "(?m)^a$"
 _ = try gex.compileRuntime(gpa, "a.b", &diag, .{ .dot_matches_newline = true });     // == "(?s)a.b"

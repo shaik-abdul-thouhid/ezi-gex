@@ -285,7 +285,10 @@ test "parse exposes capture count, names, and flags" {
     try testing.expectEqual(@as(u32, 2), a.capture_count);
     try testing.expectEqual(@as(usize, 1), a.names.len);
     try testing.expectEqualStrings("y", a.names[0]);
-    try testing.expect(a.flags.case_insensitive);
+    // A leading bare `(?i)` is a scoped node over the rest of the pattern, not a global flag.
+    try testing.expect(a.flags.isEmpty());
+    try testing.expectEqual(ast.NodeTag.non_capture, a.nodes[a.root].tag);
+    try testing.expect(a.nodes[a.root].data.non_capture.flags_add.case_insensitive);
 }
 
 // ── parseReporting ──────────────────────────────────────────────────────────

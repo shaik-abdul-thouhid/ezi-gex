@@ -602,7 +602,7 @@ pub const Analysis = struct {
     /// then-deliberate JS empty-loop divergence; 0.6.0 made the Pike VM uniformly RE2/Rust
     /// leftmost-first, so the decline is now purely a routing detail — the answer is the same
     /// RE2 span either way.) The non-alternation nullable-concat shape is handled directly on
-    /// every backend (the empty-width-loop guard) and is NOT declined.
+    /// every backend (the NFA's do-while loop for nullable bodies) and is NOT declined.
     ///
     /// @stable-since: v0.5.0
     nullable_alternation_in_repetition: bool,
@@ -1462,17 +1462,15 @@ fn Builder(comptime mode: Mode) type {
             if (q.min == 0 and q.max != null and q.max.? == 0) return self.addNode(.{ .tag = .empty, .data = .{ .none = {} } });
             // Empty-width-loop collapse: an UNBOUNDED outer (`*`/`+`/`{m,}`) over a
             // body that lowers to a NULLABLE repetition (`S*`, `S?`, `S{0,k}` and their
-            // lazy forms, optionally wrapped in a capture) is idempotent up to the
-            // body's unbounded form — `(S*)* ≡ S*`, `(S?)+ ≡ S*`, `(S??){3,} ≡ S*?` —
-            // because repeating a nullable repetition any number of times matches the
-            // same language as one unbounded repetition with the body's greediness.
-            // Without this, the redundant outer loop lets the Pike VM over-consume on a
-            // nullable lazy body (`(?:c*?)+.` matched "cc" not "c"; `(?:a??){3,}` matched
-            // "aaa" not ""), diverging from leftmost-first (Rust/RE2). So drop the outer
-            // and widen the body's repetition to unbounded (`max = null`); the body
-            // keeps its consume capability, so downstream-forced cases (`(?:a*?)+b` →
-            // "aaab") are intact. Decided from the AST (mirrors these collapses
-            // recursively) so the count/emit passes agree; the widening mutates the
+            // lazy forms) is idempotent up to the body's unbounded form — `(?:S*)* ≡ S*`,
+            // `(?:S?)+ ≡ S*`, `(?:S??){3,} ≡ S*?` — because repeating a nullable repetition
+            // any number of times matches the same language as one unbounded repetition
+            // with the body's greediness. It keeps the byte engines (which lower the HIR
+            // themselves) leftmost-first on these shapes. It never looks through a
+            // CAPTURE: `(a?)+` records the last iteration (Rust: `[0,1]` over "a"), while
+            // the collapsed `(a*)` would span them all — the NFA's do-while loop
+            // (`nfa.compileRepetition`) handles the capturing form exactly. Decided from
+            // the AST so the count/emit passes agree; the widening mutates the
             // freshly-lowered body in place (emit only — a no-op for an already
             // unbounded body), adding no node. See `astNullableRepBody`.
             if (q.max == null and self.astNullableRepBody(r.child)) {
@@ -1487,16 +1485,11 @@ fn Builder(comptime mode: Mode) type {
             } } });
         }
 
-        /// Widen the repetition reached through `idx` (looking past a capture wrapper)
-        /// to unbounded (`max = null`) — the emit-only half of the empty-width-loop
-        /// collapse. The body is already nullable (`min == 0`), so only `max` changes;
-        /// for an already-unbounded body this is a no-op.
+        /// Widen the repetition at `idx` to unbounded (`max = null`) — the emit-only half
+        /// of the empty-width-loop collapse. The body is already nullable (`min == 0`), so
+        /// only `max` changes; for an already-unbounded body this is a no-op.
         fn widenBodyRepToUnbounded(self: *Self, idx: u32) void {
-            switch (self.nodes[idx].tag) {
-                .repetition => self.nodes[idx].data.repetition.max = null,
-                .capture => self.widenBodyRepToUnbounded(self.nodes[idx].data.capture.child),
-                else => {},
-            }
+            if (self.nodes[idx].tag == .repetition) self.nodes[idx].data.repetition.max = null;
         }
 
         /// Whether the AST subtree at `idx` lowers to a **nullable repetition** (a
@@ -1508,7 +1501,7 @@ fn Builder(comptime mode: Mode) type {
             const node = self.a.nodes[idx];
             return switch (node.tag) {
                 .non_capture => self.astNullableRepBody(node.data.non_capture.child),
-                .capture => self.astNullableRepBody(node.data.capture.child),
+                .capture => false, // captures keep per-iteration semantics (see `lowerRepetition`)
                 .range => blk: {
                     const q = node.data.range.quantifier;
                     // `{1}` → child: defer to the child's lowering.
@@ -1769,6 +1762,15 @@ fn analyze(
 }
 
 const Bounds = struct { min: u32, max: ?u32 };
+
+/// Whether node `idx` can match the empty string. Sound: `false` only when every match
+/// consumes at least one code point (`lenBounds`' minimum). The NFA compiler lowers an
+/// unbounded repetition over a body that can match empty with Rust's do-while construction.
+///
+/// @stable-since: v0.8.0
+pub fn canMatchEmpty(h: Hir, idx: u32) bool {
+    return lenBounds(h.nodes, h.children, idx).min == 0;
+}
 
 fn lenBounds(nodes: []const Node, children: []const u32, idx: u32) Bounds {
     const node = nodes[idx];
@@ -2995,8 +2997,8 @@ fn addCpBytes(set: *ByteSet, cp: CodePoint) void {
 
 const ByteBounds = struct { min: u32, max: ?u32 };
 
-/// UTF-8 byte length of a code point (1–4). Resolved HIR code points are always
-/// encodable; the `catch 4` is a defensive upper bound.
+/// UTF-8 byte length of a code point (1–4). Literals are always encodable; a CLASS may hold
+/// surrogates (see `classByteBounds`), for which this returns a defensive 4.
 fn utf8Len(cp: CodePoint) u32 {
     // `utf8EncodeLen` is `unreachable` on an out-of-range scalar; guard so the
     // defensive upper bound of 4 still applies to any non-encodable value.
@@ -3004,10 +3006,29 @@ fn utf8Len(cp: CodePoint) u32 {
     return utf8.utf8EncodeLen(cp);
 }
 
+/// UTF-8 byte-length bounds of the class members an input can actually contain. UTF-8 length
+/// is monotonic in code-point value and the ranges are sorted, so the first and last members
+/// bound it — but a class may hold SURROGATES (`[^\x{0}-\x{D7FF}]` starts at U+D800), which
+/// no UTF-8 input encodes, and `utf8Len` of one is a defensive 4. Taking that as the minimum
+/// made `auto`'s length gate reject a 3-byte input (a lone U+FFFD). So the bounds skip
+/// U+D800–U+DFFF; a class with no encodable member gets the vacuous bound of an empty one.
+fn classByteBounds(set: []const Range) ByteBounds {
+    const lo = for (set) |r| {
+        if (r.lo < 0xD800 or r.lo > 0xDFFF) break r.lo;
+        if (r.hi >= 0xE000) break @as(CodePoint, 0xE000);
+    } else return .{ .min = 1, .max = 1 };
+    var i = set.len;
+    const hi = while (i > 0) {
+        i -= 1;
+        const r = set[i];
+        if (r.hi < 0xD800 or r.hi > 0xDFFF) break r.hi;
+        if (r.lo <= 0xD7FF) break @as(CodePoint, 0xD7FF);
+    } else unreachable; // `lo` found an encodable member
+    return .{ .min = utf8Len(lo), .max = utf8Len(hi) };
+}
+
 /// Match-length bounds in UTF-8 bytes (parallels `lenBounds`, which counts code
-/// points). A class spans `[utf8Len(lo) .. utf8Len(hi)]`: UTF-8 length is monotonic
-/// in code-point value and the class ranges are sorted, so the first range's `lo`
-/// is the shortest member and the last range's `hi` the longest.
+/// points). A class spans its encodable members' lengths (`classByteBounds`).
 fn byteBounds(nodes: []const Node, children: []const u32, ranges: []const Range, literals: []const CodePoint, idx: u32) ByteBounds {
     const node = nodes[idx];
     return switch (node.tag) {
@@ -3020,8 +3041,7 @@ fn byteBounds(nodes: []const Node, children: []const u32, ranges: []const Range,
         },
         .class => blk: {
             const c = node.data.class;
-            if (c.len == 0) break :blk .{ .min = 1, .max = 1 }; // unmatchable; vacuous bound
-            break :blk .{ .min = utf8Len(ranges[c.start].lo), .max = utf8Len(ranges[c.start + c.len - 1].hi) };
+            break :blk classByteBounds(ranges[c.start .. c.start + c.len]); // empty ⇒ vacuous bound
         },
         .any => .{ .min = 1, .max = 4 }, // any code point is 1–4 UTF-8 bytes
         .grapheme => .{ .min = 1, .max = null },
@@ -3464,6 +3484,15 @@ test "(?i) folds a property / ASCII shorthand BEFORE its negation (Rust semantic
     try testing.expect(try rootClassHas("(?i)\\w", .{ .unicode = false }, 0x212A));
     try testing.expect(!try rootClassHas("(?i)\\W", .{ .unicode = false }, 0x212A));
     try testing.expect(!try rootClassHas("\\w", .{ .unicode = false }, 0x212A));
+}
+
+test "classByteBounds skips surrogates (a class may start or end inside U+D800–U+DFFF)" {
+    const R = Range;
+    try testing.expectEqual(ByteBounds{ .min = 3, .max = 4 }, classByteBounds(&.{R{ .lo = 0xD800, .hi = 0x10FFFF }}));
+    try testing.expectEqual(ByteBounds{ .min = 1, .max = 3 }, classByteBounds(&.{R{ .lo = 0, .hi = 0xDFFF }}));
+    try testing.expectEqual(ByteBounds{ .min = 4, .max = 4 }, classByteBounds(&.{ R{ .lo = 0xD800, .hi = 0xDFFF }, R{ .lo = 0x10000, .hi = 0x10FFFF } }));
+    try testing.expectEqual(ByteBounds{ .min = 1, .max = 1 }, classByteBounds(&.{R{ .lo = 0xD900, .hi = 0xDAFF }})); // nothing encodable
+    try testing.expectEqual(ByteBounds{ .min = 1, .max = 1 }, classByteBounds(&.{}));
 }
 
 test "the Unicode shorthands are closed under simple folding (why they skip foldMember)" {

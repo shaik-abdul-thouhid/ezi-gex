@@ -255,28 +255,7 @@ fn addThread(program: *const Program, list: *ThreadList, pc0: u32, slots: []Cell
                     if (list.seen[pc].w == list.gen) break :follow; // already queued / cycle
                     list.seen[pc] = .{ .w = list.gen };
                     switch (program.insts[pc]) {
-                        .jmp => |t| {
-                            // Empty-width-loop guard. The compiler emits exactly one
-                            // BACKWARD jmp — the loop-back of an unbounded repetition
-                            // `B*`/`B+`/`B{m,}` (alternation enders all jmp forward), and its
-                            // loop EXIT is always the next instruction (`pc + 1`, the `after`
-                            // label). When the loop head `t` was already visited in THIS
-                            // epsilon closure (same position), the body matched the empty
-                            // string this iteration — a consuming inst would have ended the
-                            // walk before reaching here — so leftmost-first terminates the
-                            // loop: route to the exit at the empty path's priority instead of
-                            // looping (which would dedup-die on the seen head and demote the
-                            // exit below a lower-priority consuming sibling). This is the
-                            // RE2/Rust leftmost-first empty-loop rule, applied uniformly:
-                            // `(?:a?b??)+` on "ab" → "a", and an empty-first nullable
-                            // alternation `(?:|.)+` on "c" → "" (the empty branch is highest
-                            // priority, so the loop exits). A forward jmp, or a back-edge whose
-                            // head is not yet seen (a genuine non-empty next iteration), loops
-                            // as before. See nfa.zig `compileRepetition`.
-                            if (t < pc and list.seen[t].w == list.gen) {
-                                pc += 1; // empty iteration → loop exit (`after`)
-                            } else pc = t;
-                        },
+                        .jmp => |t| pc = t, // an empty loop iteration is handled by the NFA's do-while shape (nfa.zig)
                         .split => |s| {
                             // Pursue the higher-priority branch now; defer `b` so it
                             // pops only after everything `a` reaches — leftmost-first.
@@ -839,7 +818,7 @@ test "nested quantifiers terminate" {
     try testing.expect(re.isMatch("aaaaaa"));
 }
 
-test "empty-width-loop guard: an empty iteration terminates the loop (leftmost-first)" {
+test "an empty loop iteration terminates the loop (leftmost-first, Rust's do-while construction)" {
     // An unbounded loop over a nullable concat/lazy body must STOP at the first empty
     // iteration rather than over-consume — the RE2/Rust leftmost-first rule, now uniform.
     try expectFind("(?:a?b??)+", "ab", "a"); // iter1 "a", iter2 empty → stop (was "ab")

@@ -65,8 +65,9 @@ already `[Aa]`, `(?m)^` is already `line_start`.
 
 `Options` has two tiers. The **semantic** tier changes what matches: `case_fold`
 (`.none`/`.simple`/`.full`); `case_insensitive`/`multiline`/`dot_matches_newline`,
-which *seed* the `(?i)`/`(?m)`/`(?s)` flag state for the whole pattern (inline `(?…)`
-flags OR-merge on top of the seed); `unicode`, which toggles ASCII vs. Unicode
+which *seed* the `(?i)`/`(?m)`/`(?s)` flag state for the whole pattern (an inline `(?…)`
+then sets or clears flags from its position to the end of its group, as in RE2/Rust —
+`(?-i)` under `case_insensitive` turns `i` off for what follows); `unicode`, which toggles ASCII vs. Unicode
 `\d\w\s`; and `max_repetition` (default `100_000`), the ceiling on a `{m,n}` bound —
 a finite bound past it is rejected **at scan time** with `error.InvalidPattern`
 (`ErrorCode.quantifier_exceeds_limit`), a DoS guard *before* any lowering. (The same

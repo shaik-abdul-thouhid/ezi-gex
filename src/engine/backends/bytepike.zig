@@ -52,15 +52,15 @@ pub const Program = byte.Program;
 
 /// A repetition over a **nullable alternation** (`(?:|.)+`, `(?:z*b*$?|.{2})+`): the byte
 /// program's split-based loop shapes (the `plus_loop` loop-back split and the do-while shape in
-/// `byte.zig`) cannot encode the leftmost-first **empty-width-loop** priority for this shape — when
-/// the preferred (earlier) branch matches empty, the loop must terminate at that empty iteration
-/// (`(?:z*b*$?|.{2})+` on `"baa"` is `"b"`, not `"baa"`), but the loop-back arm outranks the exit
-/// and a later *consuming* branch wins. This is a structural limit of the byte lowering — the same
-/// reason `dfa`/`edfa` decline it via `hir.Analysis.nullable_alternation_in_repetition` — and
-/// `bytepike` executes the *same* byte program, so it must decline it too (the code-point engines —
-/// `pikevm`/`backtrack`/`onepass`, via `nfa.zig`'s empty-loop `.jmp` guard — are leftmost-first
-/// correct, and `auto` routes here). A nullable *concat* body (`(?:a?b??)+`) is NOT this shape and
-/// is handled correctly by the do-while loop (the empty-width-loop guard), so it is not declined.
+/// `byte.zig`) were judged unable to encode the leftmost-first **empty-width-loop** priority for
+/// this shape, so `bytepike` declines it like `dfa`/`edfa` (`hir.Analysis.nullable_alternation_in_repetition`)
+/// and `auto` routes it to the code-point engines. Correction (0.8.0): the answer that decline was
+/// built to avoid was right — Rust `regex` gives `"baa"` for `(?:z*b*$?|.{2})+` on `"baa"`, which
+/// `bytepike` returned; the code-point engines' old empty-loop jmp guard gave `"b"`. The code-point
+/// engines now build nullable loops Rust's way (`nfa.compileRepetition`) and agree with Rust, so
+/// the decline is a conservative routing choice, not a correctness fix; lifting it needs the byte
+/// lowering re-verified against Rust. A nullable *concat* body (`(?:a?b??)+`) is not this shape
+/// and is not declined.
 fn byteLoweringSupports(h: hir.Hir) bool {
     return !h.analysis.nullable_alternation_in_repetition;
 }

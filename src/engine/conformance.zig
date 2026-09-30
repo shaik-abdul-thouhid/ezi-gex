@@ -383,7 +383,11 @@ const nullable_alt_repetition_cases = [_]Case{
     .{ .pat = "(|a)+", .input = "aa", .expect = "" },
     .{ .pat = "(a|)+", .input = "aa", .expect = "aa" }, // consuming-first branch → greedily consumes
     .{ .pat = "(?:a|)*b", .input = "aab", .expect = "aab" },
-    .{ .pat = "(b*)(?:b{0}(?:\n*)|.{2}(?:(){0}))+", .input = "\nba", .expect = "\n" }, // fuzz repro (0.6.0)
+    // Fuzz repro (0.6.0). Rust `regex` 1.13.1 gives "\nba": after the empty `\n*` branch
+    // wins the first iteration at 1, the NEXT iteration's `.{2}` consumes "ba". (This row
+    // said "\n" — the old empty-loop jmp guard's answer — until nullable loops adopted
+    // Rust's do-while construction.)
+    .{ .pat = "(b*)(?:b{0}(?:\n*)|.{2}(?:(){0}))+", .input = "\nba", .expect = "\nba" },
     // Controls — an alternation under a repetition with NO nullable branch.
     .{ .pat = "(?:a|b)+", .input = "abab", .expect = "abab" },
     .{ .pat = "(cat|dog)+", .input = "catdog", .expect = "catdog" },
@@ -597,14 +601,11 @@ test "empty-width-loop collapse: unbounded-over-nullable matches leftmost-first 
     }
 }
 
-// Regression (0.6.0): the empty-width-loop guard fixes an unbounded outer over a nullable
-// CONCAT body with a lazy part (`(?:a?b??)+`, `(?:a??b??)+`) — the form the HIR collapse
-// could NOT reach (a concat body is not a single repetition to widen). The fix is the
-// empty-width-loop guard in the pikevm/backtrack/onepass `.jmp` handlers (a loop-back that
-// closes an empty iteration routes to the loop exit at the empty path's priority instead of
-// over-consuming) plus the do-while loop shape for nullable `x*` in `byte.zig` (the byte
-// DFAs / bytepike). All backends — pikevm, backtrack, AND auto — now agree on the
-// leftmost-first answer. Was a documented limitation through 0.5.1; the guard closes it.
+// Regression (0.6.0): an unbounded outer over a nullable CONCAT body with a lazy part
+// (`(?:a?b??)+`, `(?:a??b??)+`) — the form the HIR collapse could NOT reach (a concat body is
+// not a single repetition to widen). Fixed then by an empty-loop jmp guard; since 0.8.0 the
+// NFA builds a nullable loop Rust's way (a do-while, `nfa.compileRepetition`) and the byte
+// lowering uses its own do-while shape (`byte.zig`). Expected spans are Rust `regex`'s.
 // (A nullable-*alternation* body, `(?:|.)+`, is a different shape: it stays routed to the
 // Pike VM via `nullable_alternation_in_repetition`; see that test above.)
 const empty_loop_concat_cases = [_]Case{
@@ -620,7 +621,7 @@ const empty_loop_concat_cases = [_]Case{
 };
 
 test "empty-width-loop over a nullable concat body: all backends leftmost-first correct (0.6.0 regression)" {
-    // pikevm + backtrack now agree with the byte DFA (`auto`) thanks to the empty-loop guard.
+    // pikevm + backtrack agree with the byte DFA (`auto`) and with Rust.
     for (empty_loop_concat_cases) |c| {
         try checkRuntime(pikevm, c);
         try checkRuntime(backtrack, c);
@@ -1715,15 +1716,17 @@ test "regression: auto line-anchored captures confirm the match (no false (?m)^\
 // later *consuming* branch wins. `(?:z*b*$?|.{2})+` on `"baa"` is `"b"` (leftmost-first), but
 // `bytepike` returned `"baa"`. `dfa`/`edfa` already decline this class in `supports`; `bytepike` was
 // missing the decline. **Fixed** by declining it in `bytepike.buildAlloc`/`buildComptime`
-// (`byteLoweringSupports`) — the code-point engines (`pikevm`/`backtrack`/`onepass`, via `nfa.zig`'s
-// empty-loop `.jmp` guard) are correct and `auto` routes here. Surfaced by the fuzz span differential.
+// (`byteLoweringSupports`), and `auto` routes it to the code-point engines. Correction (0.8.0): Rust
+// `regex` gives "baa" and "ab" for the two cases below whose comments once said "b" / "a" — the old
+// empty-loop jmp guard was the one diverging. The code-point engines now build nullable loops Rust's
+// way and agree with Rust; the decline stays as a conservative routing choice.
 test "regression: bytepike declines nullable-alternation-in-repetition (leftmost-first empty loop)" {
     const gpa = testing.allocator;
     const cases = [_]struct { p: []const u8, i: []const u8 }{
         .{ .p = "(())(?:z{,}b*$?|.{2}(?:(?:)(?:)))+", .i = "baa" }, // minimized fuzz repro
-        .{ .p = "(?:z*b*$?|.{2})+", .i = "baa" }, // the essence: nullable branch | 2-consume branch
+        .{ .p = "(?:z*b*$?|.{2})+", .i = "baa" }, // nullable branch | 2-consume branch (Rust: "baa")
         .{ .p = "(?:|.)+", .i = "c" }, // canonical empty-branch alternation under `+`
-        .{ .p = "(a*|b)+", .i = "ab" }, // leftmost-first is "a", not "ab"
+        .{ .p = "(a*|b)+", .i = "ab" }, // Rust: "ab"
     };
     // bytepike must DECLINE every case (so a downstream user / the differential never runs it here).
     for (cases) |c| {
@@ -1743,7 +1746,7 @@ test "regression: bytepike declines nullable-alternation-in-repetition (leftmost
             try checkFindAllVsPike(B, gpa, c.p, c.i, ref[0..nref]);
     }
     // Control: a nullable *concat* body (`(?:a?b??)+`) is NOT this shape — bytepike still accepts it
-    // (the do-while empty-width-loop guard is correct there) and agrees with the Pike VM.
+    // (the byte lowering's do-while loop is correct there) and agrees with the Pike VM.
     {
         var ref: [16][2]usize = undefined;
         const nref = try collectFindAll(pikevm, gpa, "(?:a?b??)+", "ab", &ref);
@@ -2245,6 +2248,109 @@ test {
 // "\xE6a" (0xE6 claims 3 bytes, only 2 remain, and `a` is not a continuation) yielded only
 // [0,0] and `count` said 1. Dead-on-invalid resyncs one byte past a malformed byte, so the
 // sequence is [0,0] [1,2] [2,2]. Found by the fuzz `invariants` group (findAll resume law).
+test "regression: empty loop iterations keep Rust's captures (do-while nullable loops)" {
+    // Expected slots are Rust `regex` 1.13.1's. An unbounded loop over a body that can match
+    // empty used to exit through a jmp guard carrying the EMPTY iteration's captures
+    // (`(a|)+` over "a" gave [1,1]), and an HIR collapse looked through captures
+    // (`(a?)*` → `(a*)`, so a group spanned every iteration). Spans were already right; the
+    // captures now match too. Found by the fuzz reference check (via `chaos`).
+    const gpa = testing.allocator;
+    const LoopCase = struct { pat: []const u8, in: []const u8, slots: []const ?usize };
+    const cases = [_]LoopCase{
+        .{ .pat = "[\\P{Pc}](?:()[B-s\\S]?)+", .in = "R\x10", .slots = &.{ 0, 2, 1, 1 } },
+        .{ .pat = "(a?)+", .in = "a", .slots = &.{ 0, 1, 0, 1 } },
+        .{ .pat = "(?:()a?)+", .in = "a", .slots = &.{ 0, 1, 0, 0 } },
+        .{ .pat = "(?:(a)|())+", .in = "a", .slots = &.{ 0, 1, 0, 1, null, null } },
+        .{ .pat = "(a|)+", .in = "a", .slots = &.{ 0, 1, 0, 1 } },
+        .{ .pat = "(a*)*", .in = "a", .slots = &.{ 0, 1, 0, 1 } },
+        .{ .pat = "(?:a?b??)+", .in = "ab", .slots = &.{ 0, 1 } },
+        .{ .pat = "(a?b??)+", .in = "ab", .slots = &.{ 0, 1, 0, 1 } },
+        .{ .pat = "(?:|.)+", .in = "c", .slots = &.{ 0, 0 } },
+        .{ .pat = "(|a)*", .in = "aaa", .slots = &.{ 0, 0, 0, 0 } },
+        .{ .pat = "(?:(a)|b)*", .in = "ab", .slots = &.{ 0, 2, 0, 1 } },
+        .{ .pat = "((a)|())+", .in = "aa", .slots = &.{ 0, 2, 1, 2, 1, 2, null, null } },
+        .{ .pat = "(?:()|a)+", .in = "a", .slots = &.{ 0, 0, 0, 0 } },
+        .{ .pat = "(a?)*", .in = "aa", .slots = &.{ 0, 2, 1, 2 } },
+        .{ .pat = "(?:(a?)b??)+", .in = "ab", .slots = &.{ 0, 1, 0, 1 } },
+        .{ .pat = "((?:a|)*)+", .in = "a", .slots = &.{ 0, 1, 0, 1 } },
+        .{ .pat = "(a?){2,}", .in = "a", .slots = &.{ 0, 1, 1, 1 } },
+        .{ .pat = "(?:(a)?)+", .in = "a", .slots = &.{ 0, 1, 0, 1 } },
+    };
+    inline for (.{ pikevm, backtrack, auto }) |B| {
+        for (cases) |c| {
+            var diag: regex.Diagnostic = .{};
+            var re = try regex.compileRuntimeWith(B, gpa, c.pat, &diag, .{});
+            defer re.deinit();
+            var sc = try re.initScratch(gpa);
+            defer sc.deinit(gpa);
+            var slots: [16]?usize = undefined;
+            const got = slots[0..re.slotCount()];
+            _ = re.captures(&sc, got, c.in) orelse return error.ExpectedMatch;
+            testing.expectEqualSlices(?usize, c.slots, got) catch |e| {
+                std.debug.print("{s}: /{s}/\n", .{ @typeName(B), c.pat });
+                return e;
+            };
+        }
+    }
+}
+
+test "regression: a bare (?flags) applies from its position to the end of its group" {
+    // Bare directives used to set one WHOLE-pattern flag set starting from nothing: `a(?i)b`
+    // matched "AB", a bare flag inside a group was ignored, and an inline clear lost to a
+    // flag seeded from `Options` (`(?-i)k` matched "K" under case_insensitive).
+    const gpa = testing.allocator;
+    const FlagCase = struct { pat: []const u8, in: []const u8, opts: regex.Options = .{}, want: bool };
+    const cases = [_]FlagCase{
+        .{ .pat = "x((?i)a)", .in = "xA", .want = true },
+        .{ .pat = "x((?i)a)", .in = "XA", .want = false },
+        .{ .pat = "a(?i)b", .in = "aB", .want = true },
+        .{ .pat = "a(?i)b", .in = "AB", .want = false },
+        .{ .pat = "(?:(?i)a|b)", .in = "B", .want = true },
+        .{ .pat = "((?i)a)b", .in = "AB", .want = false },
+        .{ .pat = "(?i)a(?-i)b", .in = "Ab", .want = true },
+        .{ .pat = "(?i)a(?-i)b", .in = "AB", .want = false },
+        .{ .pat = "(?-i)k", .in = "K", .opts = .{ .case_insensitive = true }, .want = false },
+        .{ .pat = "(?-i)k", .in = "k", .opts = .{ .case_insensitive = true }, .want = true },
+        .{ .pat = "(?-m)^a", .in = "\na", .opts = .{ .multiline = true }, .want = false },
+        .{ .pat = "(?-s).", .in = "\n", .opts = .{ .dot_matches_newline = true }, .want = false },
+    };
+    inline for (.{ pikevm, backtrack, auto }) |B| {
+        inline for (cases) |c| {
+            var diag: regex.Diagnostic = .{};
+            var re = try regex.compileRuntimeWith(B, gpa, c.pat, &diag, c.opts);
+            defer re.deinit();
+            var sc = try re.initScratch(gpa);
+            defer sc.deinit(gpa);
+            testing.expectEqual(c.want, re.isMatch(&sc, c.in)) catch |e| {
+                std.debug.print("{s}: /{s}/ over \"{s}\"\n", .{ @typeName(B), c.pat, c.in });
+                return e;
+            };
+        }
+    }
+}
+
+test "regression: a class that starts at a surrogate still matches a 3-byte scalar" {
+    // `[^\x{0}-\x{D7FF}]` is U+D800–U+10FFFF; its byte-length lower bound was computed from
+    // U+D800 (unencodable → a defensive 4), so `auto`'s length gate rejected the 3-byte input
+    // "\u{FFFD}" outright. Found by the fuzz `utf8class` group.
+    const gpa = testing.allocator;
+    inline for (.{ pikevm, backtrack, auto, bytepike, dfa, edfa }) |B| {
+        var diag: regex.Diagnostic = .{};
+        var re = try regex.compileRuntimeWith(B, gpa, "[^\\x{0}-\\x{D7FF}]", &diag, .{});
+        defer re.deinit();
+        var sc = try re.initScratch(gpa);
+        defer sc.deinit(gpa);
+        for ([_][]const u8{ "\xEF\xBF\xBD", "\xEE\x80\x80", "\xF0\x9F\x98\x80" }) |in| {
+            const m = re.find(&sc, in) orelse {
+                std.debug.print("{s}: no match over {x}\n", .{ @typeName(B), in });
+                return error.ExpectedMatch;
+            };
+            try testing.expectEqual(@as(usize, 0), m.start);
+            try testing.expectEqual(in.len, m.end);
+        }
+    }
+}
+
 test "regression: \\b reads a malformed byte as non-word from either side" {
     // The reverse decode used to fall back to the raw byte as a code point (0xC3 read as
     // 'Ã', a word character) while the forward decode reads U+FFFD (non-word), so `\b`
@@ -2301,3 +2407,6 @@ test "regression: findAll/count/split step one byte over a malformed lead after 
         try testing.expectEqual(@as(usize, 2), re2.count(&sc2, "\xC3"));
     }
 }
+
+
+

@@ -30,7 +30,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   usable. The contract's plain `search`/`isMatch` still have no error channel, so those two
   backends' plain entry points keep a documented panic on allocation failure.
 
+### Changed
+- **A bare `(?flags)` now applies from its position to the end of its group** (RE2/Rust),
+  BREAKING for patterns that place one mid-pattern or inside a group. It used to set a single
+  whole-pattern flag set: `a(?i)b` matched `"AB"` (the flag reached backward), `x((?i)a)` did
+  not match `"xA"` (a bare flag inside a group was ignored), `(?:(?i)a|b)` did not match `"B"`,
+  and an inline clear lost to a flag seeded from `Options` — `(?-i)k` matched `"K"` under
+  `case_insensitive`, `(?-m)^` still matched after `\n` under `multiline`. Each directive is
+  now a scoped group over the rest of its enclosing group, carried across later `|` branches.
+  A leading `(?i)`, by far the common use, behaves exactly as before. `Ast.flags` is now always
+  empty from the scanner (the front door seeds `Options` there). Verified against Rust `regex`
+  1.13.1; found by the fuzz `reference` and `metamorphic` groups.
+- **Loops whose iteration can match empty now follow Rust exactly, captures included.** An
+  unbounded repetition over a body that can match the empty string is built the way Rust's
+  regex-automata builds it (`x*` = `(x+)?`, `x{n,}` = `x{n-1} x+`, `x+` a do-while), replacing
+  0.6.0's empty-loop jmp guard. Spans were right for concat bodies, but the guard kept the
+  captures of the final empty iteration (`(a|)+` over `"a"` captured `[1,1]`, Rust `[0,1]`), and
+  an HIR collapse looked through captures (`(a?)*` over `"aa"` captured `[0,2]`, Rust `[1,2]`).
+  The guard also gave non-Rust **spans** on a nullable alternation followed by a consuming one:
+  `(?:z*b*$?|.{2})+` over `"baa"` is now `"baa"` and `(a*|b)+` over `"ab"` is `"ab"` (Rust), not
+  `"b"` / `"a"` — the 0.6.0 entries below that call those "leftmost-first" were wrong. Non-empty
+  loop bodies (`a*`, `\w+`, …) keep their existing, leaner shape. Pinned by 18 Rust-verified
+  cases in `conformance.zig`; found by the fuzz reference check.
+
 ### Fixed
+- **A class starting inside the surrogate block missed 3-byte input.** `[^\x{0}-\x{D7FF}]`
+  (U+D800–U+10FFFF) took its byte-length lower bound from U+D800, which has no UTF-8 encoding
+  (a defensive 4), so `auto`'s length gate rejected a lone U+FFFD or any other 3-byte input.
+  Class byte bounds now come from the first and last members an input can contain. Found by the
+  fuzz `utf8class` group; pinned in `conformance.zig`.
 - **`auto` panicked when an allocation failed during a search.** Its backtracker grows a
   visited set and its lazy DFA grows a transition cache mid-search, and the search API cannot
   return an error, so an `OutOfMemory` there aborted the process. `auto` now reserves the

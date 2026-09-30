@@ -116,7 +116,9 @@ const BraceQuant = struct {
 ///
 /// @stable-since: v0.1.0
 pub const Frame = struct {
-    const Kind = enum { root, capture, non_capture };
+    /// `implicit` is the scope of a bare `(?flags)` directive: it opens at the directive
+    /// and runs to the end of the enclosing group (see `onGroupFlag`).
+    const Kind = enum { root, capture, non_capture, implicit };
 
     kind: Kind,
     /// `seq` index where this frame's current concatenation begins.
@@ -794,8 +796,42 @@ pub const Scanner = struct {
     }
 
     fn onPipe(self: *Scanner) Fail!void {
+        // A bare directive's flags carry into later branches, but its scope must not swallow
+        // the `|`: close it for this branch, then reopen it for the next.
+        const scope = try self.closeImplicit();
         try self.finalizeConcat();
         self.prev = .start;
+        if (scope) |d| try self.openImplicit(d.add, d.remove, self.pos);
+    }
+
+    const Delta = struct { add: token.Flags, remove: token.Flags };
+
+    /// If the top frame is a bare directive's scope, close it: its body becomes a scoped
+    /// non-capture node in the enclosing frame's sequence. Returns its flag delta.
+    fn closeImplicit(self: *Scanner) Fail!?Delta {
+        const fr = self.topFrame().*;
+        if (fr.kind != .implicit) return null;
+        if (self.seq_len == fr.seq_base and self.alt_len == fr.alt_base) { // empty scope: no node
+            self.frame_len -= 1;
+            return .{ .add = fr.flags_add, .remove = fr.flags_remove };
+        }
+        try self.finalizeConcat();
+        const body = try self.buildAlternation(fr.alt_base);
+        self.frame_len -= 1;
+        try self.pushSeq(try self.emitNode(ast.makeNonCaptureScoped(body, fr.flags_add, fr.flags_remove)));
+        return .{ .add = fr.flags_add, .remove = fr.flags_remove };
+    }
+
+    fn openImplicit(self: *Scanner, add: token.Flags, remove: token.Flags, pos: u32) Fail!void {
+        try self.pushFrame(.{
+            .kind = .implicit,
+            .seq_base = self.seq_len,
+            .alt_base = self.alt_len,
+            .flags_add = add,
+            .flags_remove = remove,
+            .open_pos = pos,
+            .saved_flags = self.flags,
+        });
     }
 
     /// Collapse the current concatenation (the `seq` atoms above the active
@@ -871,14 +907,27 @@ pub const Scanner = struct {
         if (gf.scoped) {
             try self.openGroup(.non_capture, null, gf.add, gf.remove, span.start);
         } else {
-            // Bare (?flags): a whole-pattern flag change (a deliberate
-            // simplification of per-group scoping the flat AST cannot store).
+            // Bare (?flags), RE2/Rust semantics: the flags apply from HERE to the end of the
+            // enclosing group, across later `|` branches — not to what precedes it, and not
+            // outside the group. It opens an implicit scope, closed at the group's `)` / the
+            // end of the pattern and re-opened across `|`. A second directive in the same
+            // scope closes it and opens one with the combined delta, so scopes never nest
+            // (node count stays linear). The lexer's own flags (`x`) follow the same span:
+            // they are restored when the enclosing real group closes.
             self.flags = applyDelta(self.flags, gf.add, gf.remove);
+            var add = gf.add;
+            var remove = gf.remove;
+            if (try self.closeImplicit()) |prev| {
+                add = applyDelta(prev.add, gf.add, gf.remove); // (a1 ∪ a2) \ r2
+                remove = applyDelta(prev.remove, gf.remove, gf.add); // (r1 ∪ r2) \ a2
+            }
+            try self.openImplicit(add, remove, span.start);
             self.prev = .start;
         }
     }
 
     fn onCloseGroup(self: *Scanner, span: Span) Fail!void {
+        _ = try self.closeImplicit(); // a bare directive's scope ends with its group
         if (self.topFrame().kind == .root) return self.fail(.unmatched_close_paren, span);
         try self.finalizeConcat();
         const fr = self.topFrame().*;
@@ -892,13 +941,14 @@ pub const Scanner = struct {
                 try self.emitNode(ast.makeNonCapture(body))
             else
                 try self.emitNode(ast.makeNonCaptureScoped(body, fr.flags_add, fr.flags_remove)),
-            .root => unreachable,
+            .root, .implicit => unreachable,
         };
         try self.pushSeq(group_node);
         self.prev = .atom; // a group is itself a repeatable atom
     }
 
     fn finishRoot(self: *Scanner) Fail!u32 {
+        _ = try self.closeImplicit();
         if (self.frame_len > 1) {
             const fr = self.topFrame().*;
             return self.fail(.unclosed_group, Span.range(fr.open_pos, fr.open_pos + 1));
@@ -1257,7 +1307,9 @@ pub fn scanWith(pattern: []const u8, diag: *Diagnostic, buffers: Buffers, limits
         .names = sc.names[0..sc.name_len],
         .root = root,
         .capture_count = sc.capture_count,
-        .flags = sc.flags,
+        // Bare directives are scoped nodes now, so nothing is global: the front door seeds
+        // `Options` flags here.
+        .flags = .{},
     };
 }
 
@@ -1711,14 +1763,23 @@ test "scoped inline flags become a group delta" {
     try expectSexpr("(?i-s:a)", "(grp+i-s (lit a))");
 }
 
-test "global inline flags set the ast flags" {
+test "a bare (?flags) scopes from its position to the end of its group (RE2/Rust)" {
     var arena = try TestArena.init("(?i)abc".len);
     defer arena.deinit();
     var diag: Diagnostic = .{};
     const a = try scan("(?i)abc", &diag, arena.buffers());
-    try testing.expect(a.flags.case_insensitive);
-    try testing.expect(!a.flags.multiline);
-    try expectSexpr("(?i)abc", "(cat (lit a) (lit b) (lit c))");
+    try testing.expect(a.flags.isEmpty()); // a scoped node, not a global flag
+    try expectSexpr("(?i)abc", "(grp+i (cat (lit a) (lit b) (lit c)))");
+    // Not backward: `a` keeps the outer flags.
+    try expectSexpr("a(?i)b", "(cat (lit a) (grp+i (lit b)))");
+    // Across later branches, without swallowing the `|`.
+    try expectSexpr("a(?i)b|c", "(alt (cat (lit a) (grp+i (lit b))) (grp+i (lit c)))");
+    // Not past the enclosing group.
+    try expectSexpr("(a(?i)b)c", "(cat (cap 1 (cat (lit a) (grp+i (lit b)))) (lit c))");
+    // A second directive replaces the scope with the combined delta; empty scopes vanish.
+    try expectSexpr("(?i)a(?-i)b", "(cat (grp+i (lit a)) (grp-i (lit b)))");
+    try expectSexpr("(?i)(?-i)a", "(grp-i (lit a))");
+    try expectSexpr("a|(?i)", "(alt (lit a) (cat))");
 }
 
 test "flag errors" {
@@ -2027,14 +2088,15 @@ test "scoped flags stay on the group and do not touch ast flags" {
     try expectSexpr("(?i:a)b", "(cat (grp+i (lit a)) (lit b))");
 }
 
-test "global flags accumulate and clear" {
-    var arena = try TestArena.init("(?im)a".len);
+test "bare flags accumulate and clear within one scope" {
+    try expectSexpr("(?im)a", "(grp+i+m (lit a))");
+    try expectSexpr("(?im)a(?-m)b", "(cat (grp+i+m (lit a)) (grp+i-m (lit b)))");
+    // A quantifier after a directive has nothing to repeat, as before.
+    var arena = try TestArena.init("a(?i)*".len);
     defer arena.deinit();
     var diag: Diagnostic = .{};
-    const a = try scan("(?im)a", &diag, arena.buffers());
-    try testing.expect(a.flags.case_insensitive);
-    try testing.expect(a.flags.multiline);
-    try testing.expect(!a.flags.dot_all);
+    try testing.expectError(error.InvalidPattern, scan("a(?i)*", &diag, arena.buffers()));
+    try testing.expectEqual(ErrorCode.nothing_to_repeat, diag.code);
 }
 
 test "empty branches inside a group" {

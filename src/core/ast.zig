@@ -257,7 +257,9 @@ pub const Ast = struct {
     root: u32,
     /// Total number of capture groups (group 0, the whole match, is not counted).
     capture_count: u32,
-    /// Global flags accumulated from bare `(?flags)` directives.
+    /// The flags the whole pattern starts with. Always empty from the scanner — a bare
+    /// `(?flags)` becomes a scoped non-capture node over the rest of its group (RE2/Rust
+    /// semantics) — and seeded from `Options` by the front door before lowering.
     flags: Flags = .{},
 
     /// Free the heap arrays of a runtime-parsed AST. The `names` entries point

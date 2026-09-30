@@ -219,9 +219,19 @@ fn Builder(comptime mode: Mode) type {
         }
 
         fn compileRepetition(self: *Self, rep: hir.Node.Repetition) error{Unsupported}!void {
+            // An unbounded loop over a body that can match EMPTY is built the way Rust's
+            // regex-automata builds it (`c_at_least`): `x{n,}` = `x{n-1} x+` and `x*` =
+            // `(x+)?`, where `x+` is a do-while — the body, then a split back to it or on to
+            // the exit. An empty iteration reaches that split again at the same position and
+            // is pruned as already-visited, so the loop leaves through the split's first
+            // visit: at the empty path's priority (leftmost-first — `(?:|.)+` over "c" is
+            // "") and with the captures of the last NON-empty iteration (`(a|)+` over "a"
+            // captures [0,1]). A body that cannot match empty keeps the leaner while-loop
+            // (`split; body; jmp back`): it never has an empty iteration, so the two agree.
+            const do_while = rep.max == null and hir.canMatchEmpty(self.h, rep.child);
+            const copies = if (do_while and rep.min > 0) rep.min - 1 else rep.min;
             var n: u32 = 0;
-            while (n < rep.min) : (n += 1) try self.compileNode(rep.child); // mandatory copies
-
+            while (n < copies) : (n += 1) try self.compileNode(rep.child); // mandatory copies
             if (rep.max) |max| {
                 // (max - min) optional copies; each split skips to the common end.
                 const base = self.patch_len;
@@ -237,17 +247,22 @@ fn Builder(comptime mode: Mode) type {
                     const body = si + 1;
                     self.set(si, if (rep.greedy) .{ .split = .{ .a = body, .b = end } } else .{ .split = .{ .a = end, .b = body } });
                 }
+            } else if (do_while) {
+                // `(x+)?` when min == 0: an entry split that may skip the loop entirely.
+                const entry: ?u32 = if (rep.min == 0) self.emit(.{ .split = .{ .a = 0, .b = 0 } }) else null;
+                const body = self.pc();
+                try self.compileNode(rep.child);
+                const loop = self.emit(.{ .split = .{ .a = 0, .b = 0 } });
+                const after = self.pc();
+                const choose: Inst = if (rep.greedy) .{ .split = .{ .a = body, .b = after } } else .{ .split = .{ .a = after, .b = body } };
+                self.set(loop, choose);
+                if (entry) |e| self.set(e, choose);
             } else {
-                // Unbounded tail: a star of the child (x{min,} = x{min} x*).
+                // Unbounded tail over a non-empty body: a star of the child (x{min,} =
+                // x{min} x*). This is the ONLY backward jmp the compiler emits.
                 const split_at = self.emit(.{ .split = .{ .a = 0, .b = 0 } });
                 const body = self.pc();
                 try self.compileNode(rep.child);
-                // This is the ONLY backward jmp the compiler ever emits (loop head
-                // `split_at < pc`); every alternation ender jmps FORWARD to a common end.
-                // Its loop EXIT is always the very next instruction (`after == this_jmp + 1`).
-                // The pikevm/backtrack empty-width-loop guards rely on both invariants: they
-                // detect a loop-back by `target < jmp_pc` and take the exit as `jmp_pc + 1`
-                // when the iteration matched empty. Keep them true if you change this lowering.
                 _ = self.emit(.{ .jmp = split_at });
                 const after = self.pc();
                 self.set(split_at, if (rep.greedy) .{ .split = .{ .a = body, .b = after } } else .{ .split = .{ .a = after, .b = body } });
