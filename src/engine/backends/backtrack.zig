@@ -241,6 +241,19 @@ pub const Scratch = struct {
     }
 };
 
+/// Take the visited-set allocation a search over an input of `input_len` bytes needs, up
+/// front and WITH an error channel. A heap scratch otherwise grows its visited set during
+/// the search, and the contract's search API cannot return an error, so an allocation
+/// failure there panics; after `reserve` succeeds, `search`/`isMatch`/`searchCaptures` over
+/// such an input never allocate. A buffer scratch returns `error.BufferTooSmall` exactly
+/// when `fits()` is false. `auto` reserves before routing here and falls back to the Pike VM
+/// (which never allocates mid-search) when it fails.
+///
+/// @stable-since: v0.8.0
+pub fn reserve(program: *const Program, scratch: *Scratch, input_len: usize) backend.ScratchError!void {
+    return scratch.ensureVisited(visitedWords(program.insts.len, input_len));
+}
+
 /// Whether `input` is within this scratch's visited ceiling. A heap scratch always
 /// fits (it grows); a buffer scratch fits iff the input's bitset AND its same-length
 /// touched-words list both fit the slack (`initBuffer` sizes them equally, so this is
@@ -412,7 +425,7 @@ fn run(program: *const Program, scratch: *Scratch, input: []const u8, opts: Sear
     // buffer (its ceiling halved to make room for the touched-words list, see
     // `bufferLen`) or use `init()` to lift the cap.
     scratch.ensureVisited(words) catch
-        @panic("ezi_gex backtrack: input exceeds buffer-backed scratch capacity; enlarge the buffer (bufferLen), use init(), or let `auto`/fits() route it");
+        @panic("ezi_gex backtrack: cannot hold this input's visited set (buffer too small, or out of memory growing a heap scratch); call reserve() first to get the error, enlarge the buffer (bufferLen), or let `auto` route it");
 
     // Establish an all-zero `visited[0..words]` cheaply. Steady state (`words` within
     // the known-zero high-water mark): clear ONLY the words the previous run dirtied —
@@ -876,4 +889,33 @@ test "reset() forces a clean prefix on the next search" {
 
 test {
     testing.refAllDecls(@This());
+}
+
+test "reserve reports OutOfMemory up front, and the scratch stays usable" {
+    // A heap scratch grows its visited set per input; `reserve` takes that allocation with an
+    // error channel so a search never has to (the search API cannot return an error).
+    const gpa = testing.allocator;
+    var diag: compile.Diagnostic = .{};
+    const ast = try compile.parse(gpa, "(a|b)*c", &diag);
+    defer ast.deinit(gpa);
+    const h = try hir.buildAlloc(gpa, ast, .{});
+    defer hir.deinitHir(gpa, h);
+    var program = try buildAlloc(gpa, h, .{});
+    defer freeProgram(gpa, &program);
+    var failing = std.testing.FailingAllocator.init(gpa, .{});
+    const fa = failing.allocator();
+    var sc = try Scratch.init(fa, &program);
+    defer sc.deinit(fa);
+    var big: [600]u8 = @splat('a');
+    big[big.len - 1] = 'c';
+    try reserve(&program, &sc, 16); // room for short inputs, taken while memory is available
+    failing.fail_index = failing.alloc_index; // every later allocation fails
+    failing.resize_fail_index = failing.resize_index;
+    try testing.expectError(error.OutOfMemory, reserve(&program, &sc, big.len));
+    try testing.expect(fits(&program, &sc, "abc")); // a heap scratch always reports it can grow
+    try testing.expect(E.find(&program, &sc, "abc", .{}) != null); // within the reserved set: no allocation
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try reserve(&program, &sc, big.len);
+    try testing.expectEqual(@as(usize, big.len), E.find(&program, &sc, &big, .{}).?.end);
 }

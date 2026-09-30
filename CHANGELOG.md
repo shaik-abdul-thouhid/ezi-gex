@@ -22,8 +22,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the full search/replace/split API, allocation-failure injection, comptime parity,
   counter-based complexity and compile-bomb checks, UTF-8 class ground truth, a `\X`
   grapheme oracle, vacuity guards, a known-open ledger, and `zig build fuzz-min`.
+- **Fallible search entry points for the backends that allocate mid-search.**
+  `backtrack.reserve(program, scratch, input_len)` takes the visited-set allocation up front
+  (after it succeeds, searching an input that long never allocates), and the lazy DFA gains
+  `dfa.trySearch` / `dfa.tryIsMatch` / `dfa.tryConfirmReach` (+ `dfa.Reach`), which return
+  `error.OutOfMemory` from the transition cache instead of panicking and leave the scratch
+  usable. The contract's plain `search`/`isMatch` still have no error channel, so those two
+  backends' plain entry points keep a documented panic on allocation failure.
 
 ### Fixed
+- **`auto` panicked when an allocation failed during a search.** Its backtracker grows a
+  visited set and its lazy DFA grows a transition cache mid-search, and the search API cannot
+  return an error, so an `OutOfMemory` there aborted the process. `auto` now reserves the
+  backtracker's memory before routing to it and uses the lazy DFA's fallible entry points,
+  falling back to the Pike VM (which never allocates during a search) on failure — same
+  answer, no panic, no leak.
+- **The lazy `dfa` leaked on an allocation failure mid-search, and could leave its reverse
+  cache inconsistent.** Interning a new state copied its key into the map before growing the
+  per-state lists, so a failed append orphaned the copy; the reverse-scan cache (which
+  outlives a failed search) was left with lists out of step and a map key pointing into a
+  reused work buffer. Interning now makes every allocation before changing anything. Found by
+  the fuzz `oom` group; pinned in `dfa.zig`.
 - **HIR length-bound analysis overflowed on nested counted repetitions.** `lenBounds`,
   `byteBounds` and the fixed-length helpers multiplied repetition bounds in `u32`: a pattern
   like `(?:(?:(?:a{100000}){100000}){100000}){100000}` (every count under `max_repetition`)

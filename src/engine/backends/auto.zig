@@ -1649,6 +1649,15 @@ pub const Scratch = struct {
     }
 };
 
+/// Take the backtracker's per-input visited-set allocation BEFORE routing to it (a heap
+/// scratch grows mid-search otherwise, and a failure there would panic). On OutOfMemory the
+/// caller uses the Pike VM instead, whose scratch never allocates during a search — so the
+/// default engine never panics on allocation failure. Found by the fuzz `oom` group.
+fn reserveBacktrack(p: *const nfa.Program, back: *backtrack.Scratch, input: []const u8) bool {
+    backtrack.reserve(p, back, input.len) catch return false;
+    return true;
+}
+
 /// Per-search engine choice for an NFA program: backtrack on a small input that
 /// fits its scratch, else the Pike VM.
 fn preferBacktrack(p: *const nfa.Program, back: *const backtrack.Scratch, input: []const u8) bool {
@@ -1878,7 +1887,7 @@ fn fillCapturesAnchored(program: *const Program, s: *Scratch.NfaScratch, p: *con
 /// small input that fits, else the Pike VM. Both execute the same program with
 /// identical leftmost-first semantics, so the choice is invisible.
 fn dispatch(p: *const nfa.Program, s: *Scratch.NfaScratch, input: []const u8, opts: SearchOptions, slots: ?[]?usize) ?Match {
-    if (preferBacktrack(p, &s.back, input)) {
+    if (preferBacktrack(p, &s.back, input) and reserveBacktrack(p, &s.back, input)) {
         if (slots) |sl| return backtrack.searchCaptures(p, &s.back, input, sl, opts);
         return backtrack.search(p, &s.back, input, opts);
     }
@@ -1995,10 +2004,10 @@ fn runNfa(p: *const nfa.Program, filter: *const Filter, tdy: ?*const teddy.Teddy
 
 /// Confirm/locate a match anchored at `at` via the DFA. `match_only` selects the op
 /// (a non-null `Match` with `[at, at)` is a true/false token for `isMatch`).
-fn dfaConfirmAt(dp: *const dfa.Program, d: *dfa.Scratch, input: []const u8, at: usize, match_only: bool) ?Match {
+fn dfaConfirmAt(dp: *const dfa.Program, d: *dfa.Scratch, input: []const u8, at: usize, match_only: bool) error{OutOfMemory}!?Match {
     const o = SearchOptions{ .start = at, .anchored = true };
-    if (match_only) return if (dfa.isMatch(dp, d, input, o)) Match{ .start = at, .end = at } else null;
-    return dfa.search(dp, d, input, o);
+    if (match_only) return if (try dfa.tryIsMatch(dp, d, input, o)) Match{ .start = at, .end = at } else null;
+    return dfa.trySearch(dp, d, input, o);
 }
 
 /// The byte-DFA arm's span search. It applies the **same sound prefilter as `runNfa`**
@@ -2007,7 +2016,7 @@ fn dfaConfirmAt(dp: *const dfa.Program, d: *dfa.Scratch, input: []const u8, at: 
 /// is never slower than the default on prefix-literal / sparse-hit patterns. With no
 /// usable filter it runs one DFA pass (one-pass O(n) for `isMatch`, anchored-restart
 /// for `find`). Captures never come here — they always use the Pike VM (`runNfa`).
-fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.Teddy, cf: ?*const classscan.ClassFinder, d: *dfa.Scratch, input: []const u8, opts: SearchOptions, match_only: bool, input_ascii: bool, ascii_dominant: bool, lazy_bytes: *u64) ?Match {
+fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.Teddy, cf: ?*const classscan.ClassFinder, d: *dfa.Scratch, input: []const u8, opts: SearchOptions, match_only: bool, input_ascii: bool, ascii_dominant: bool, lazy_bytes: *u64) error{OutOfMemory}!?Match {
     if (opts.start > input.len) return null;
     if (input.len - opts.start < filter.min_bytes) return null; // length gate
     if (opts.anchored) return dfaConfirmAt(dp, d, input, opts.start, match_only);
@@ -2057,7 +2066,7 @@ fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.
             var pos = o.start;
             while (if (finder) |*fd| fd.find(input, pos) else memchrFrom(input, pos, pfx[0])) |hit| {
                 if (input.len - hit < filter.min_bytes) return null;
-                const c = dfa.confirmReach(dp, d, input, hit, match_only);
+                const c = try dfa.tryConfirmReach(dp, d, input, hit, match_only);
                 lazy_bytes.* += c.reach - hit + 1;
                 if (c.end) |end|
                     return Match{ .start = if (match_only) opts.start else hit, .end = if (match_only) opts.start else end };
@@ -2084,7 +2093,7 @@ fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.
                     if (dd <= hit) {
                         const cand = hit - dd;
                         if (cand >= opts.start and input.len - cand >= filter.min_bytes) {
-                            if (dfaConfirmAt(dp, d, input, cand, match_only)) |m| return m;
+                            if (try dfaConfirmAt(dp, d, input, cand, match_only)) |m| return m;
                         }
                     }
                     if (dd == 0) break;
@@ -2108,7 +2117,7 @@ fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.
             while (nextPrefixHit(filter, tdy, input, pos)) |hit| {
                 pos = hit + 1;
                 if (input.len - hit < filter.min_bytes) return null;
-                const c = dfa.confirmReach(dp, d, input, hit, match_only);
+                const c = try dfa.tryConfirmReach(dp, d, input, hit, match_only);
                 lazy_bytes.* += c.reach - hit + 1;
                 if (c.end) |end|
                     return Match{ .start = if (match_only) opts.start else hit, .end = if (match_only) opts.start else end };
@@ -2138,13 +2147,13 @@ fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.
                     .skip => {},
                     .exact => |cand| {
                         if (input.len - cand >= filter.min_bytes)
-                            if (dfaConfirmAt(dp, d, input, cand, match_only)) |m| return m;
+                            if (try dfaConfirmAt(dp, d, input, cand, match_only)) |m| return m;
                     },
                     .impure => {
                         var s = reqFlatLowerBound(filter, input, q, o.start);
                         while (s <= q) : (s += 1) {
                             if (input.len - s < filter.min_bytes) break;
-                            if (dfaConfirmAt(dp, d, input, s, match_only)) |m| return m;
+                            if (try dfaConfirmAt(dp, d, input, s, match_only)) |m| return m;
                         }
                     },
                 }
@@ -2172,7 +2181,7 @@ fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.
                 const cand = cpBack(input, q, off) orelse continue;
                 if (cand < o.start) continue;
                 if (input.len - cand < filter.min_bytes) return null;
-                if (dfaConfirmAt(dp, d, input, cand, match_only)) |m| return m;
+                if (try dfaConfirmAt(dp, d, input, cand, match_only)) |m| return m;
             }
             return null;
         }
@@ -2190,7 +2199,7 @@ fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.
                     const cand = q - off;
                     if (cand < o.start) continue;
                     if (input.len - cand < filter.min_bytes) return null;
-                    if (dfaConfirmAt(dp, d, input, cand, match_only)) |m| return m;
+                    if (try dfaConfirmAt(dp, d, input, cand, match_only)) |m| return m;
                 }
                 return null;
             }
@@ -2227,7 +2236,7 @@ fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.
                 var cs = q;
                 while (cs > o.start and filter.inner_lead.has(input[cs - 1])) cs -= 1;
                 if (input.len - cs < filter.min_bytes) return null; // cs only grows ⇒ no later fit
-                const c = dfa.confirmReach(dp, d, input, cs, match_only);
+                const c = try dfa.tryConfirmReach(dp, d, input, cs, match_only);
                 lazy_bytes.* += c.reach - cs + 1;
                 if (c.end) |end|
                     return Match{ .start = if (match_only) opts.start else cs, .end = if (match_only) opts.start else end };
@@ -2253,8 +2262,8 @@ fn runByteDfa(dp: *const dfa.Program, filter: *const Filter, tdy: ?*const teddy.
         if (memchrFrom(input, o.start, rb) == null) return null;
     }
     if (match_only)
-        return if (dfa.isMatch(dp, d, input, o)) Match{ .start = opts.start, .end = opts.start } else null;
-    return dfa.search(dp, d, input, o);
+        return if (try dfa.tryIsMatch(dp, d, input, o)) Match{ .start = opts.start, .end = opts.start } else null;
+    return dfa.trySearch(dp, d, input, o);
 }
 
 // ── Eager-DFA arm: span ops with the same prefilter, but stateless (no scratch) ────
@@ -2650,12 +2659,13 @@ fn lineAnchoredSpan(program: *const Program, scratch: *Scratch, p: *const nfa.Pr
 fn lineAnchoredAttempt(program: *const Program, scratch: *Scratch, p: *const nfa.Program, input: []const u8, at: usize, match_only: bool) ?Match {
     if (!scratch.dfa_disabled) {
         if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
-            const m = dfaConfirmAt(dp, d, input, at, match_only);
-            if (d.gave_up) {
-                scratch.dfa_disabled = true; // cache thrashed → use the Pike VM below
-            } else {
-                return m;
-            }
+            if (dfaConfirmAt(dp, d, input, at, match_only)) |m| {
+                if (d.gave_up) {
+                    scratch.dfa_disabled = true; // cache thrashed → use the Pike VM below
+                } else {
+                    return m;
+                }
+            } else |_| scratch.dfa_disabled = true; // out of memory in the lazy cache → Pike VM below
         };
     }
     const o = SearchOptions{ .start = at, .anchored = true };
@@ -2680,9 +2690,10 @@ pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, op
             // Lazy DFA fallback (prefiltered) when built and not disabled.
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
-                    const r = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, true, inputAsciiArg(program, scratch, input), asciiDominantArg(program, scratch, input), &scratch.lazy_confirm_bytes);
-                    if (d.gave_up) scratch.dfa_disabled = true; // cache thrashed → stop using it
-                    return r != null;
+                    if (runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, true, inputAsciiArg(program, scratch, input), asciiDominantArg(program, scratch, input), &scratch.lazy_confirm_bytes)) |r| {
+                        if (d.gave_up) scratch.dfa_disabled = true; // cache thrashed → stop using it
+                        return r != null;
+                    } else |_| scratch.dfa_disabled = true; // out of memory → the NFA arm below
                 };
             }
             return runNfa(p, &program.filter, teddyPtr(program), classPtr(program), &scratch.inner.nfa, input, opts, null, program.has_grapheme) != null;
@@ -2702,9 +2713,10 @@ pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opt
             if (edfaArm(program, scratch, input)) |ep| return runEdfa(ep, &program.filter, teddyPtr(program), classPtr(program), input, opts, false, inputAsciiArg(program, scratch, input), asciiDominantArg(program, scratch, input), &scratch.confirm_probes);
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
-                    const r = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, false, inputAsciiArg(program, scratch, input), asciiDominantArg(program, scratch, input), &scratch.lazy_confirm_bytes);
-                    if (d.gave_up) scratch.dfa_disabled = true;
-                    return r;
+                    if (runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, false, inputAsciiArg(program, scratch, input), asciiDominantArg(program, scratch, input), &scratch.lazy_confirm_bytes)) |r| {
+                        if (d.gave_up) scratch.dfa_disabled = true;
+                        return r;
+                    } else |_| scratch.dfa_disabled = true; // out of memory → the NFA arm below
                 };
             }
             return runNfa(p, &program.filter, teddyPtr(program), classPtr(program), &scratch.inner.nfa, input, opts, null, program.has_grapheme);
@@ -2741,13 +2753,14 @@ pub fn searchCaptures(program: *const Program, scratch: *Scratch, input: []const
             }
             if (!scratch.dfa_disabled) {
                 if (scratch.dfa_sc) |*d| if (program.dfa_prog) |*dp| {
-                    const span = runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, false, inputAsciiArg(program, scratch, input), asciiDominantArg(program, scratch, input), &scratch.lazy_confirm_bytes);
-                    if (d.gave_up) {
-                        scratch.dfa_disabled = true; // cache thrashed → fall through to the NFA arm
-                    } else {
-                        const m = span orelse return null; // DFA is exact: no span ⇒ no match
-                        return fillCapturesAnchored(program, &scratch.inner.nfa, p, input, slots, m, opts);
-                    }
+                    if (runByteDfa(dp, &program.filter, teddyPtr(program), classPtr(program), d, input, opts, false, inputAsciiArg(program, scratch, input), asciiDominantArg(program, scratch, input), &scratch.lazy_confirm_bytes)) |span| {
+                        if (d.gave_up) {
+                            scratch.dfa_disabled = true; // cache thrashed → fall through to the NFA arm
+                        } else {
+                            const m = span orelse return null; // DFA is exact: no span ⇒ no match
+                            return fillCapturesAnchored(program, &scratch.inner.nfa, p, input, slots, m, opts);
+                        }
+                    } else |_| scratch.dfa_disabled = true; // out of memory → the NFA arm below
                 };
             }
             return runNfa(p, &program.filter, teddyPtr(program), classPtr(program), &scratch.inner.nfa, input, opts, slots, program.has_grapheme);
@@ -3802,4 +3815,47 @@ test "auto: SIMD input scans agree with scalar references across block boundarie
 
 test {
     testing.refAllDecls(@This());
+}
+
+test "allocation failure mid-search falls back to the Pike VM: correct answer, no panic, no leak" {
+    // The heap backtracker grows its visited set and the lazy DFA its cache DURING a search;
+    // `auto` reserves / uses the try-variants and falls back to the Pike VM (which never
+    // allocates mid-search) when either fails. Found by the fuzz `oom` group (it panicked).
+    const gpa = testing.allocator;
+    const cases = [_]struct { pat: []const u8, strategy: Options }{
+        .{ .pat = "(a|b)*c", .strategy = .{} }, // backtrack on a small input
+        .{ .pat = "[a-z]+@[a-z]+\\.com", .strategy = .{ .byte_engine = .enabled } }, // lazy DFA arm
+        .{ .pat = "\\bthe\\s+\\w+", .strategy = .{} }, // prefilter + confirm paths
+    };
+    var long: [900]u8 = @splat('a');
+    const tail = " the fox bob@example.com (ab)c ab ababc";
+    @memcpy(long[long.len - tail.len ..], tail);
+    for (cases) |c| {
+        var diag: compile.Diagnostic = .{};
+        const ast = try compile.parse(gpa, c.pat, &diag);
+        defer ast.deinit(gpa);
+        const h = try hir.buildAlloc(gpa, ast, .{});
+        defer hir.deinitHir(gpa, h);
+        var program = try buildAlloc(gpa, h, c.strategy);
+        defer freeProgram(gpa, &program);
+        // The oracle: the Pike VM over the same NFA program, with a healthy allocator.
+        var pv_sc = try pikevm.Scratch.init(gpa, &program.inner.nfa);
+        defer pv_sc.deinit(gpa);
+        for ([_][]const u8{ "xxabc", &long, "the cat", "bob@ex.com", "\xC3\xA9 the fox caf\xC3\xA9" }) |in| {
+            const want = pikevm.search(&program.inner.nfa, &pv_sc, in, .{});
+            var failing = std.testing.FailingAllocator.init(gpa, .{});
+            const fa = failing.allocator();
+            var sc = try Scratch.init(fa, &program);
+            defer sc.deinit(fa);
+            failing.fail_index = failing.alloc_index; // no allocation may succeed from here on
+            failing.resize_fail_index = failing.resize_index;
+            const got = search(&program, &sc, in, .{});
+            try testing.expectEqual(want == null, got == null);
+            if (want) |w| {
+                try testing.expectEqual(w.start, got.?.start);
+                try testing.expectEqual(w.end, got.?.end);
+            }
+            try testing.expectEqual(want != null, isMatch(&program, &sc, in, .{}));
+        }
+    }
 }

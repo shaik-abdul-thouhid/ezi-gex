@@ -165,7 +165,8 @@ const DEAD: u32 = 0;
 /// the bounded backtracker, the contract's `search`/`isMatch` have no error channel,
 /// so an exhausted allocator panics rather than silently returning a wrong answer.
 const OOM_PANIC = "ezi_gex dfa: out of memory growing the lazy transition cache; " ++
-    "use a larger allocator, lower ScratchOptions.max_bytes (on_full = .reset), or route via `auto`";
+    "use trySearch/tryIsMatch/tryConfirmReach to get error.OutOfMemory instead, lower " ++
+    "ScratchOptions.max_bytes (on_full = .reset), or route via `auto` (which falls back to the NFA)";
 
 /// Allocation is the only failure inside the determinizer; surfaced internally, then
 /// turned into a `@panic` at the contract boundary.
@@ -664,7 +665,7 @@ pub fn freeProgram(gpa: std.mem.Allocator, program: *Program) void {
 
 /// Hash-map context interning a DFA state (a priority-ordered, deduplicated `[]u32`
 /// of NFA program counters) to a dense state id. Stateless (zero-sized), so the
-/// non-context `getOrPut(allocator, key)` is available.
+/// non-context `get` / `putAssumeCapacityNoClobber` forms are available.
 const StateCtx = struct {
     pub fn hash(_: StateCtx, key: []const u32) u64 {
         return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(key));
@@ -761,6 +762,9 @@ pub const Scratch = struct {
     ///
     /// @stable-since: v0.3.0
     gave_up: bool = false,
+    /// The DEAD sink (state 0) must be re-interned before the next search: set when an
+    /// allocation failure left the cache dropped (see `dropCache`).
+    needs_seed: bool = false,
     opts: ScratchOptions,
 
     // ── reusable per-closure work buffers (no allocation during a closure) ──
@@ -884,7 +888,7 @@ pub const Scratch = struct {
     /// at a search boundary nothing needs preserving. The cache is a pure optimization,
     /// so this is always results-invariant. Does NOT touch the `work` buffer beyond
     /// `work[0..0]`, so a caller may stage a pc-list in `work` across it.
-    fn clearCache(self: *Scratch) void {
+    fn dropCache(self: *Scratch) void {
         for (self.states.items) |o| self.gpa.free(o);
         self.states.deinit(self.gpa);
         self.states = .empty;
@@ -905,15 +909,30 @@ pub const Scratch = struct {
         self.cache_bytes = 0;
         self.start_ready = false;
         self.work_len = 0;
-        _ = self.internState(false, false) catch @panic(OOM_PANIC); // re-seed DEAD = state 0
+        self.needs_seed = true;
+    }
+
+    /// Re-intern the DEAD sink (state 0) if a `dropCache` left it out.
+    fn ensureSeeded(self: *Scratch) Err!void {
+        if (!self.needs_seed) return;
+        self.work_len = 0;
+        _ = try self.internState(false, false); // DEAD = state 0
+        self.needs_seed = false;
+    }
+
+    /// Drop the whole memo and re-seed the DEAD sink (see `dropCache`).
+    fn clearCache(self: *Scratch) Err!void {
+        self.dropCache();
+        try self.ensureSeeded();
     }
 
     /// Evict the cache if it has outgrown its budget, at a search boundary (no live
     /// state to preserve). Mid-search enforcement is `evictIfNeeded`/`flushPreserving`.
-    fn maybeEvict(self: *Scratch) void {
+    fn maybeEvict(self: *Scratch) Err!void {
+        try self.ensureSeeded();
         if (self.opts.on_full == .grow) return;
         if (self.cache_bytes <= self.opts.max_bytes) return;
-        self.clearCache();
+        try self.clearCache();
     }
 
     /// Flush the cache mid-search, preserving the live `state_id`: copy its pc list into
@@ -928,7 +947,7 @@ pub const Scratch = struct {
         const is_match = self.state_match.items[state_id];
         const is_match_eoi = self.state_match_eoi.items[state_id];
         const has_wb = self.state_has_wb.items[state_id];
-        self.clearCache();
+        try self.clearCache();
         self.work_len = plen;
         self.work_has_wb = has_wb; // preserve across the flush (internState reads it)
         const new_id = try self.internState(is_match, is_match_eoi);
@@ -945,22 +964,30 @@ pub const Scratch = struct {
     /// `is_match_eoi == is_match` at every call.
     fn internState(self: *Scratch, is_match: bool, is_match_eoi: bool) Err!u32 {
         const key = self.work[0..self.work_len];
-        const gop = try self.intern.getOrPut(self.gpa, key);
-        if (gop.found_existing) return gop.value_ptr.*;
+        if (self.intern.get(key)) |id| return id;
 
         // New state: own the key (the work buffer is reused next closure), assign id,
-        // and extend the transition table by one all-UNKNOWN row.
+        // and extend the transition table by one all-UNKNOWN row. Every allocation happens
+        // BEFORE anything is mutated, so an OutOfMemory leaves the cache exactly as it was —
+        // no orphaned key copy, no map entry borrowing `work`, no lists out of step.
+        try self.intern.ensureUnusedCapacity(self.gpa, 1);
+        try self.states.ensureUnusedCapacity(self.gpa, 1);
+        try self.state_match.ensureUnusedCapacity(self.gpa, 1);
+        try self.state_match_eoi.ensureUnusedCapacity(self.gpa, 1);
+        try self.state_has_wb.ensureUnusedCapacity(self.gpa, 1);
+        try self.wb_cache.ensureUnusedCapacity(self.gpa, 2);
+        try self.trans.ensureUnusedCapacity(self.gpa, self.nclass);
+        try self.utrans.ensureUnusedCapacity(self.gpa, self.nclass);
         const owned = try self.gpa.dupe(u32, key);
-        gop.key_ptr.* = owned;
         const id: u32 = @intCast(self.states.items.len);
-        gop.value_ptr.* = id;
-        try self.states.append(self.gpa, owned);
-        try self.state_match.append(self.gpa, is_match);
-        try self.state_match_eoi.append(self.gpa, is_match_eoi);
-        try self.state_has_wb.append(self.gpa, self.work_has_wb); // set by the closure that built `work`
-        try self.wb_cache.appendNTimes(self.gpa, UNKNOWN, 2); // two resolution outcomes per state
-        try self.trans.appendNTimes(self.gpa, UNKNOWN, self.nclass);
-        try self.utrans.appendNTimes(self.gpa, UNKNOWN, self.nclass);
+        self.intern.putAssumeCapacityNoClobber(owned, id);
+        self.states.appendAssumeCapacity(owned);
+        self.state_match.appendAssumeCapacity(is_match);
+        self.state_match_eoi.appendAssumeCapacity(is_match_eoi);
+        self.state_has_wb.appendAssumeCapacity(self.work_has_wb); // set by the closure that built `work`
+        self.wb_cache.appendNTimesAssumeCapacity(UNKNOWN, 2); // two resolution outcomes per state
+        self.trans.appendNTimesAssumeCapacity(UNKNOWN, self.nclass);
+        self.utrans.appendNTimesAssumeCapacity(UNKNOWN, self.nclass);
 
         self.cache_bytes += owned.len * @sizeOf(u32) + 2 * @as(usize, self.nclass) * @sizeOf(u32) + 58;
         return id;
@@ -1517,16 +1544,21 @@ pub const Scratch = struct {
     fn revInternState(self: *Scratch) Err!u32 {
         std.mem.sort(u32, self.work[0..self.work_len], {}, std.sort.asc(u32));
         const key = self.work[0..self.work_len];
-        const gop = try self.r_intern.getOrPut(self.gpa, key);
-        if (gop.found_existing) return gop.value_ptr.*;
+        if (self.r_intern.get(key)) |id| return id;
+        // All allocations first (see `internState`): the reverse cache survives a failed
+        // search (`dropCache` leaves it), so it must never be left half-updated.
+        try self.r_intern.ensureUnusedCapacity(self.gpa, 1);
+        try self.r_states.ensureUnusedCapacity(self.gpa, 1);
+        try self.r_accept.ensureUnusedCapacity(self.gpa, 1);
+        try self.r_accept_line.ensureUnusedCapacity(self.gpa, 1);
+        try self.r_trans.ensureUnusedCapacity(self.gpa, self.nclass);
         const owned = try self.gpa.dupe(u32, key);
-        gop.key_ptr.* = owned;
         const id: u32 = @intCast(self.r_states.items.len);
-        gop.value_ptr.* = id;
-        try self.r_states.append(self.gpa, owned);
-        try self.r_accept.append(self.gpa, self.work_match);
-        try self.r_accept_line.append(self.gpa, self.work_match_line);
-        try self.r_trans.appendNTimes(self.gpa, UNKNOWN, self.nclass);
+        self.r_intern.putAssumeCapacityNoClobber(owned, id);
+        self.r_states.appendAssumeCapacity(owned);
+        self.r_accept.appendAssumeCapacity(self.work_match);
+        self.r_accept_line.appendAssumeCapacity(self.work_match_line);
+        self.r_trans.appendNTimesAssumeCapacity(UNKNOWN, self.nclass);
         return id;
     }
 
@@ -1669,7 +1701,7 @@ pub const Scratch = struct {
 fn searchImpl(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions, earliest: bool) Err!?Match {
     if (opts.start > input.len) return null;
     scratch.gave_up = false;
-    scratch.maybeEvict();
+    try scratch.maybeEvict();
     try scratch.ensureStart(program);
     var flushes: u32 = 0;
 
@@ -1737,7 +1769,7 @@ fn searchImpl(program: *const Program, scratch: *Scratch, input: []const u8, opt
 fn isMatchImpl(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) Err!bool {
     if (opts.start > input.len) return false;
     scratch.gave_up = false;
-    scratch.maybeEvict();
+    try scratch.maybeEvict();
     try scratch.ensureStart(program);
     var flushes: u32 = 0;
 
@@ -1789,7 +1821,20 @@ fn isMatchImpl(program: *const Program, scratch: *Scratch, input: []const u8, op
 ///
 /// @stable-since: v0.3.0
 pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) bool {
-    return isMatchImpl(program, scratch, input, opts) catch @panic(OOM_PANIC);
+    return tryIsMatch(program, scratch, input, opts) catch @panic(OOM_PANIC);
+}
+
+/// `isMatch` with an error channel: the lazy cache grows DURING a search, so an allocation
+/// failure is reported as `error.OutOfMemory` (the cache is dropped, leaving the scratch
+/// usable) instead of the panic `isMatch` must raise (the contract's search API has no
+/// error channel). `auto` uses this to fall back to the NFA.
+///
+/// @stable-since: v0.8.0
+pub fn tryIsMatch(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) Err!bool {
+    return isMatchImpl(program, scratch, input, opts) catch |e| {
+        scratch.dropCache();
+        return e;
+    };
 }
 
 /// The leftmost match span `[start, end)`, or null. Leftmost-first, identical to the
@@ -1798,7 +1843,17 @@ pub fn isMatch(program: *const Program, scratch: *Scratch, input: []const u8, op
 ///
 /// @stable-since: v0.3.0
 pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) ?Match {
-    return searchImpl(program, scratch, input, opts, false) catch @panic(OOM_PANIC);
+    return trySearch(program, scratch, input, opts) catch @panic(OOM_PANIC);
+}
+
+/// `search` with an error channel — see `tryIsMatch`.
+///
+/// @stable-since: v0.8.0
+pub fn trySearch(program: *const Program, scratch: *Scratch, input: []const u8, opts: SearchOptions) Err!?Match {
+    return searchImpl(program, scratch, input, opts, false) catch |e| {
+        scratch.dropCache();
+        return e;
+    };
 }
 
 /// One **anchored** confirm at `at`, reporting both the match (if any) and `reach` — the
@@ -1813,14 +1868,33 @@ pub fn search(program: *const Program, scratch: *Scratch, input: []const u8, opt
 /// (they use the decode-hybrid restart); callers gate on `!has_word_boundary`.
 ///
 /// @stable-since: v0.6.0
-pub fn confirmReach(program: *const Program, scratch: *Scratch, input: []const u8, at: usize, earliest: bool) struct { end: ?usize, reach: usize } {
+pub fn confirmReach(program: *const Program, scratch: *Scratch, input: []const u8, at: usize, earliest: bool) Reach {
+    return tryConfirmReach(program, scratch, input, at, earliest) catch @panic(OOM_PANIC);
+}
+
+/// A `confirmReach` result: the match end (if any) and how far the walk examined.
+///
+/// @stable-since: v0.8.0
+pub const Reach = struct { end: ?usize, reach: usize };
+
+/// `confirmReach` with an error channel — see `tryIsMatch`.
+///
+/// @stable-since: v0.8.0
+pub fn tryConfirmReach(program: *const Program, scratch: *Scratch, input: []const u8, at: usize, earliest: bool) Err!Reach {
     if (at > input.len) return .{ .end = null, .reach = at };
     scratch.gave_up = false;
-    scratch.maybeEvict();
-    scratch.ensureStart(program) catch @panic(OOM_PANIC);
+    return confirmReachImpl(program, scratch, input, at, earliest) catch |e| {
+        scratch.dropCache();
+        return e;
+    };
+}
+
+fn confirmReachImpl(program: *const Program, scratch: *Scratch, input: []const u8, at: usize, earliest: bool) Err!Reach {
+    try scratch.maybeEvict();
+    try scratch.ensureStart(program);
     var flushes: u32 = 0;
     var reach: usize = at;
-    const end = scratch.runAnchored(program, input, at, earliest, &flushes, &reach) catch @panic(OOM_PANIC);
+    const end = try scratch.runAnchored(program, input, at, earliest, &flushes, &reach);
     return .{ .end = end, .reach = reach };
 }
 
@@ -2395,4 +2469,58 @@ test "confirmReach reports the anchored match end and the furthest offset scanne
 
 test {
     testing.refAllDecls(@This());
+}
+
+test "trySearch/tryIsMatch report OutOfMemory from the lazy cache, and the scratch recovers" {
+    const gpa = testing.allocator;
+    var program = try buildFrom(gpa, "[a-z]+@[a-z]+\\.com");
+    defer freeProgram(gpa, &program);
+    var failing = std.testing.FailingAllocator.init(gpa, .{});
+    const fa = failing.allocator();
+    var sc = try Scratch.init(fa, &program);
+    defer sc.deinit(fa);
+    const input = "mail bob@example.com today";
+    failing.fail_index = failing.alloc_index; // the cache cannot grow at all now
+    failing.resize_fail_index = failing.resize_index;
+    try testing.expectError(error.OutOfMemory, trySearch(&program, &sc, input, .{}));
+    try testing.expectError(error.OutOfMemory, tryIsMatch(&program, &sc, input, .{}));
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    const m = (try trySearch(&program, &sc, input, .{})).?; // re-seeds, then answers correctly
+    try testing.expectEqualStrings("bob@example.com", m.slice(input));
+    try testing.expect(try tryIsMatch(&program, &sc, input, .{}));
+}
+
+test "a failure at ANY allocation mid-search leaks nothing and leaves the scratch consistent" {
+    // State interning used to own the key copy before growing the per-state lists, so a
+    // failed append orphaned it (a leak), and the reverse cache — which outlives a failed
+    // search — was left with lists out of step and a map key borrowing `work`.
+    const gpa = testing.allocator;
+    const cases = [_]struct { pat: []const u8, in: []const u8 }{
+        .{ .pat = "[\\PL]{6}", .in = "\n\xce\xf0\x9f\xb1\xc3\xcf\xce" },
+        .{ .pat = "[a-z]+@[a-z]+\\.com", .in = "mail bob@example.com today" },
+        .{ .pat = "\\w+!", .in = "h\xc3\xa9 w\xc3\xb6rld! \xe6\x97\xa5\xe6\x9c\xac!" },
+    };
+    for (cases) |c| {
+        var program = try buildFrom(gpa, c.pat);
+        defer freeProgram(gpa, &program);
+        var hs = try Scratch.init(gpa, &program);
+        defer hs.deinit(gpa);
+        const want = try trySearch(&program, &hs, c.in, .{});
+        var k: usize = 0;
+        while (true) : (k += 1) {
+            var failing = std.testing.FailingAllocator.init(gpa, .{});
+            const fa = failing.allocator();
+            var sc = try Scratch.init(fa, &program);
+            defer sc.deinit(fa);
+            failing.fail_index = failing.alloc_index + k;
+            failing.resize_fail_index = failing.resize_index + k;
+            const failed = if (trySearch(&program, &sc, c.in, .{})) |_| false else |_| true;
+            failing.fail_index = std.math.maxInt(usize);
+            failing.resize_fail_index = std.math.maxInt(usize);
+            const got = try trySearch(&program, &sc, c.in, .{}); // the same scratch, recovered
+            try testing.expectEqual(want, got);
+            if (!failed) break; // k passed the search's last allocation
+        }
+    }
 }

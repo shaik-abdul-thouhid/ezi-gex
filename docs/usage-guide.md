@@ -970,6 +970,10 @@ Fine print (see [`architecture.md`](architecture.md) §11 for the full treatment
   share a non-thread-safe allocator. Fixes: per-thread allocator, a thread-safe allocator,
   a **buffer** `Scratch` (`initBuffer`, never allocates), or the `pikevm` backend (ditto).
   Default `auto` + heap `Scratch` is therefore *not* strictly zero-allocation while matching.
+- If that mid-search allocation **fails**, `auto` falls back to the Pike VM and returns the
+  same answer. Driving `backtrack` or the lazy `dfa` directly, their plain `search`/`isMatch`
+  panic instead (the search API has no error channel): call `backtrack.reserve` first, or use
+  `dfa.trySearch`/`dfa.tryIsMatch`, to get `error.OutOfMemory` back.
 
 ---
 

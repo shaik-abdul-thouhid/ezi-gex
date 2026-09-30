@@ -977,6 +977,12 @@ _ = re.find(&sc, input);
   - use the `pikevm` backend directly — it never allocates during a search either.
 - **Corollary:** the default `auto` + heap `Scratch` is therefore **not** strictly
   zero-allocation during matching. A buffer-backed `Scratch` (or `pikevm`) is, if you need that.
+- **A failed mid-search allocation.** `auto` reserves the backtracker's visited set before
+  routing to it (`backtrack.reserve`) and drives the lazy DFA through its fallible entry points
+  (`dfa.trySearch`/`tryIsMatch`/`tryConfirmReach`); on `OutOfMemory` it falls back to the Pike
+  VM, which never allocates during a search — same answer, no panic. The bare `backtrack` /
+  `dfa` backends' plain `search`/`isMatch` cannot return an error (the contract), so they panic
+  on allocation failure unless the caller reserves first or uses the `try*` forms.
 - **Compilation allocates.** `compileRuntime` (parse → HIR → program) uses its allocator;
   concurrent compiles on a single shared allocator need it to be thread-safe (standard).
 - **The contract documents immutability but `verifyBackend` does not enforce it.** The
