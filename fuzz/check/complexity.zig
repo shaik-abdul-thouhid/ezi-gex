@@ -38,12 +38,21 @@ fn repeated(gpa: std.mem.Allocator, motif: []const u8, reps: usize, tail: u8) ![
     return out;
 }
 
+/// Whether every match of `pattern` ends at input end AND the pattern has no `\A`. `auto`
+/// finds such a pattern with one reverse pass from the end, never per-occurrence confirms. A
+/// `\A` rules that pass out (the reverse DFA can't evaluate it), so there the eager DFA's
+/// bounded confirms are the design — a prone `\A` pattern, where they would add up to Θ(n²),
+/// is declined off the DFAs entirely (conformance regression "a prone pattern with a partial
+/// \A…"). Those confirms are not counted here as a violation.
 fn anchoredEnd(gpa: std.mem.Allocator, pattern: []const u8) bool {
     var diag: gex.Diagnostic = .{};
     const ast = gex.parse(gpa, pattern, &diag) catch return false;
     defer ast.deinit(gpa);
     const h = gex.buildHir(gpa, ast, .{}) catch return false;
     defer gex.freeHir(gpa, h);
+    for (h.nodes) |n| {
+        if (n.tag == .anchor and n.data.anchor.kind == .text_start) return false;
+    }
     return h.analysis.anchored_end;
 }
 

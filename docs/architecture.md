@@ -618,6 +618,17 @@ match, so a prefilter or length gate built on them never yields a false negative
   per step (`caps.grapheme = false`) and reject such a program at build, so `auto`
   routes any `\X` pattern to the backtracker (whose memo bounds `\X` over very large
   inputs).
+- **A loop whose body can match empty is built the way Rust builds it.** `x*` over such a
+  body is `(x+)?` and `x{n,}` is `x{n-1} x+`, where `x+` is a do-while (body, then a split back
+  or out); an empty iteration reaches that split again at the same position and is pruned, so
+  the loop exits at the empty path's priority with the captures of the last *non-empty*
+  iteration (`nfa.compileRepetition`). Spans and captures match Rust `regex` on every
+  backend (`(a|)+` over `"a"` captures `[0,1]`; `(?:|.)+` over `"c"` is `""`). A body that
+  can't match empty keeps the leaner while-loop — the two agree there.
+- **A bare `(?flags)` applies from its position to the end of its group** (RE2/Rust), across
+  later `|` branches: `a(?i)b` does not match `"AB"`, and `(?-i)` under
+  `Options.case_insensitive` turns `i` off for what follows. The scanner lowers each directive
+  to a scoped group, so a leading `(?i)` costs nothing.
 - **No backreferences / lookaround / atomic / conditional / recursion / `\Q…\E`.**
   A Thompson NFA can't express them; each is rejected at parse with a precise code.
 - **`{m,n}` expands, capped by `Options.size_limit`.** The NFA compiler emits `n` copies;
@@ -806,9 +817,11 @@ Three design choices follow from the contract:
   or cut, just reachability of the forward start — cached like the forward ones, and
   results pinned leftmost-first to the Pike VM. The DFA also reuses `auto`'s sound
   prefilter (length gate, `^`/`\A` short-circuit, leading-literal **whole-run SIMD `memmem`**
-  start-skip, rarest-required-byte fast-reject). A pattern with an *interior* `text_start` (rare, not
-  fully `anchored_start`) keeps anchored restart so the cached reverse transitions stay
-  position-independent. It supports `\A` / non-multiline `^`, anchored-end `$`, **isolated
+  start-skip, rarest-required-byte fast-reject). A pattern with a *partial* `text_start` (`\A`
+  on some branches only — not fully `anchored_start`) can't use the reverse scan (its
+  transitions would be position-dependent) and would restart at every position, Θ(n²) when
+  prone, so both byte DFAs decline it (the eager DFA only when prone) and `auto` runs it on the
+  Pike VM. It supports `\A` / non-multiline `^`, anchored-end `$`, **isolated
   `\b`/`\B`** (Unicode word boundaries via the **decode-hybrid** — consumption stays the cached
   byte walk, boundary positions decode the adjacent code points), and **a single leading `(?m)^`**
   (line-gated forward re-seed at line starts + a reverse line-accept check — O(input), no anchored

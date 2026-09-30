@@ -57,9 +57,9 @@
 //!     now two linear passes. The reverse transitions are a plain subset construction (no
 //!     priority or cut — the end is already fixed, so we only need *reachability* of the
 //!     forward start), cached like the forward ones. A leading `\A`/`^` (`anchored_start`)
-//!     still tries only offset 0; a pattern with an *interior* `text_start` (rare, not
-//!     fully `anchored_start`) keeps anchored restart so the reverse transitions stay
-//!     position-independent.
+//!     still tries only offset 0; a pattern with a *partial* `text_start` (rare, not fully
+//!     `anchored_start`) would need an anchored restart at every position — Θ(n²) when prone —
+//!     so `supports` declines it (the reverse transitions must stay position-independent).
 //!   * **Trailing `$` (`end_anchored`) is O(input) via one reverse pass.** When every match
 //!     ends at input end the end is pinned, so `find`/`isMatch` skip the forward scan and run
 //!     a single reverse-DFA pass from `input.len` (`revFindEnd`) — the same quadratic-immune
@@ -360,6 +360,14 @@ pub fn supports(h: hir.Hir) bool {
     // (`anchored_end`), matched by the reverse-DFA-from-end pass. A mixed `$` would fall to the
     // Θ(n²) anchored restart, so decline it; `auto` then routes it to the linear Pike VM.
     if (has_text_end and !h.analysis.anchored_end) return false;
+    // Likewise `text_start` is linear here only when EVERY match starts at offset 0
+    // (`anchored_start`: one anchored attempt). A PARTIAL `\A` (`\Az|a+b`, `^abc|def`) keeps the
+    // anchored restart at every start position — the reverse DFA can't hold a position-dependent
+    // assertion — which is Θ(n²) on a prone pattern: `\Az|a+b` over 16 KB of `a` took ~100 ms
+    // (the Pike VM: 0.5 ms). The lazy DFA can't tell a prone pattern before it runs, so decline
+    // every partial `\A`; `auto` keeps the non-prone ones on the eager DFA (whose restarts are
+    // bounded) and sends the rest to the linear Pike VM.
+    if (has_text_start and !h.analysis.anchored_start) return false;
     // `\b`/`\B` are evaluated as **Unicode** word boundaries by decoding the adjacent code points
     // at match time (the decode-hybrid anchored-restart path — consumption stays DFA-cached, only
     // boundary positions decode). Admitted only in ISOLATION: combined with `$` the boundary-vs-
@@ -2327,15 +2335,18 @@ test "reverse-DFA find: O(n) leftmost-first on the anchored-restart-pathological
     try testing.expectEqual(@as(usize, 4000), re.find(big).?.start);
 }
 
-test "reverse-DFA find agrees with anchored restart (has_text_start) across a corpus" {
-    // The reverse-DFA path (assertion-free) and the anchored-restart path (`text_start`)
-    // must return identical spans. Pair each pattern with a `^`-prefixed variant that is
-    // semantically the same on these inputs but forced onto anchored restart.
+test "text_start: a fully anchored \\A agrees with the reverse path; a partial \\A is declined" {
+    // A leading `\A` on every branch (`anchored_start`) takes ONE anchored attempt at offset 0 and
+    // must return the reverse-DFA path's span.
     const pairs = [_]struct { rev: []const u8, anc: []const u8, in: []const u8, exp: ?[]const u8 }{
-        .{ .rev = "a.*c", .anc = "(?:a.*c|\\Az)", .in = "xabXcYc", .exp = "abXcYc" },
-        .{ .rev = "\\w+", .anc = "(?:\\w+|\\Az)", .in = "  héllo  ", .exp = "héllo" },
-        .{ .rev = "[0-9]+", .anc = "(?:[0-9]+|\\Az)", .in = "ab123cd", .exp = "123" },
+        .{ .rev = "a.*c", .anc = "\\Aa.*c", .in = "abXcYc", .exp = "abXcYc" },
+        .{ .rev = "\\w+", .anc = "\\A\\w+", .in = "héllo  ", .exp = "héllo" },
+        .{ .rev = "[0-9]+", .anc = "\\A[0-9]+", .in = "123cd", .exp = "123" },
     };
+    // A PARTIAL `\A` would keep the anchored restart at every position — Θ(n²) on a prone pattern
+    // (`\Az|a+b` over 16 KB of `a`: ~100 ms) — so `supports` declines it.
+    for ([_][]const u8{ "(?:a.*c|\\Az)", "(?:\\w+|\\Az)", "\\Az|a+b", "^abc|def" }) |p|
+        try testing.expectError(error.Unsupported, buildFrom(testing.allocator, p));
     for (pairs) |p| {
         var r = try Compiled.init(p.rev);
         defer r.deinit();

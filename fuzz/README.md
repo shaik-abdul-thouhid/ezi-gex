@@ -70,7 +70,7 @@ Any other backend that accepts a pattern must agree byte for byte. A backend tha
 | `api` | the whole public search / replace / split surface. |
 | `oom` | an allocation failure at a sampled point surfaces as `OutOfMemory` with nothing leaked; `auto` absorbs a mid-search failure and still returns the Pike VM's answer. |
 | `comptime_parity` | comptime-compiled programs agree with runtime-compiled ones. |
-| `complexity` | matching work stays linear (the backtracker's memo-probe counter, input doubling); `auto` never does per-occurrence confirms on an end-anchored pattern; compile bombs stay under a peak-memory budget **and** doubling the outer count at most ~doubles it. |
+| `complexity` | matching work stays linear (the backtracker's memo-probe counter, input doubling); `auto` never does per-occurrence confirms on an end-anchored pattern without `\A` (a `\A` rules out the reverse-from-end pass; there the confirms are bounded by design); compile bombs stay under a peak-memory budget **and** doubling the outer count at most ~doubles it. **Blind spot:** there is no counter for the work inside a byte DFA's anchored restart, so a quadratic there is caught only indirectly — as the partial-`\A` one was (see Findings). |
 | `utf8class` | byte-lowered UTF-8 classes against code-point ground truth. |
 | `chaos` | one generated case through every check that can take it. |
 
@@ -135,6 +135,13 @@ The fix history is in the [CHANGELOG](../CHANGELOG.md). The durable shape:
 - The **allocation-failure** and **compile-bomb** checks found resource bugs: search-time
   panics and a leak under OOM, quadratic compile memory from the one-pass accelerator
   (`(?:(a)){10000}` asked for 21 GB), and quadratic compile time from a per-state clear.
+- The **first real fuzzing** (campaign calibration and a one-minute campaign) found, within a
+  minute per group: bare `(?flags)` scoped over the whole pattern instead of the rest of the
+  group; empty loop iterations keeping the wrong captures (and, on nullable alternations, the
+  wrong span) against Rust; `auto` missing a lone U+FFFD in a class that starts in the surrogate
+  block; the lazy DFA mis-evaluating a chained `\B+`; and both byte DFAs going quadratic on a
+  partial `\A`. Every expected value was checked against Rust `regex` — two older conformance
+  rows that claimed "leftmost-first" answers turned out to disagree with Rust and were corrected.
 
 ## Cross-engine (external oracle)
 

@@ -615,10 +615,10 @@ repetition counts are capped (default 100,000, set via `Options.max_repetition`)
 `a{999999999}` fails to compile instead of blowing up. Both are written up in
 [`docs/limitations.md`](docs/limitations.md).
 
-Empty-width loops follow RE2/Rust leftmost-first semantics on every backend, at runtime and
-comptime — a deliberate semantic choice, pinned by the cross-backend conformance suite and the
-parallel fuzz differential (`fuzz/`, the full backend matrix against the Pike VM oracle) so it
-can't silently drift.
+Empty-width loops and inline flags follow RE2/Rust leftmost-first semantics on every backend, at
+runtime and comptime — spans *and* captures, checked against Rust `regex` — pinned by the
+cross-backend conformance suite and the fuzz suite (`fuzz/`: an independent reference matcher,
+metamorphic and oracle-free checks over the full backend matrix) so they can't silently drift.
 
 There are also a few **performance** shapes that are comparatively slow and won't be optimized —
 each fix would cost the linear-time guarantee, portability, or simplicity: a common single byte as

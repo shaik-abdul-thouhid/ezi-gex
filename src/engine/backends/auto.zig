@@ -152,6 +152,9 @@ fn tinyForComptimeEdfa(h: hir.Hir) bool {
         .any => return false, // `.` lowers to the whole-scalar-space byte automaton — not tiny
         .anchor => switch (n.data.anchor.kind) {
             .word_boundary, .not_word_boundary => return false, // `\b`/`\B` — not byte-DFA-able
+            // A partial `\A` (not every match at offset 0) may be prone, which the eager DFA
+            // declines with a `@compileError` at comptime; leave it to the Pike VM.
+            .text_start => if (!h.analysis.anchored_start) return false,
             else => {},
         },
         else => {},

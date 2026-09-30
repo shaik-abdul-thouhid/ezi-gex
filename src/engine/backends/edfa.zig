@@ -1753,6 +1753,11 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, opts: Options) BuildError!
     // shapes (`\bword\b`, `\b\w+\b`, `s\b`) are non-prone (their loop accepts via the word
     // lookahead, which `computeProne` honours), so they keep the fast anchored restart.
     if (has_word and prone) return error.Unsupported;
+    // Same for a PARTIAL `\A` (`\Az|a+b`: not every match starts at offset 0): anchored restart
+    // runs at every start position and the reverse DFA can't evaluate `text_start`, so a prone one
+    // is Θ(n²) — decline it to the linear Pike VM. A non-prone one (`^abc|def`) keeps anchored
+    // restart: each attempt is bounded, so O(input).
+    if (has_text_start and !h.analysis.anchored_start and prone) return error.Unsupported;
     // Caller (`auto`) has a start-skip prefilter, so a prone pattern's `find` is prefilter-driven —
     // the eager DFA's `utrans` + reverse table would be built but barely used. Decline now (before
     // those expensive phases) so `auto` falls back to the lazy DFA: same prefilter, same spans,
@@ -1831,8 +1836,9 @@ pub fn buildAlloc(gpa: std.mem.Allocator, h: hir.Hir, opts: Options) BuildError!
     // arm (one-pass `isMatch` + reverse-DFA `find`). A non-prone pattern runs entirely on
     // `trans` (anchored restart, O(input)), so neither is built — saving the bulk of the eager
     // DFA's memory on the common case (`\w+` skips ~850 KB of utrans + reverse). A `text_start`
-    // program additionally has no reverse table (its reverse transitions are position-dependent),
-    // so a prone `text_start` pattern keeps anchored restart.
+    // program additionally has no reverse table (its reverse transitions are position-dependent):
+    // a prone one reaching here is fully `anchored_start` (one attempt at offset 0) — a prone
+    // PARTIAL `\A` was declined above.
     const utrans: []const u32 = if (prone) try gpa.dupe(u32, det.utrans[0 .. n * nc]) else &.{};
     errdefer if (prone) gpa.free(utrans);
     // A trailing-`$` pattern (every match ends at input end — `supports` declined mixed `$`,
@@ -2021,6 +2027,8 @@ pub fn buildComptime(comptime h: hir.Hir, comptime _: Options) Program {
     // Same for a prone `\b` pattern (`\b.*x`): anchored restart would be Θ(n²) and the reverse DFA
     // can't evaluate `\b`. (Common `\b` shapes are non-prone — they keep anchored restart.)
     if (has_word and prone) @compileError("edfa: prone \\b pattern; route to the Pike VM (use compileComptime, not edfa directly)");
+    // And a prone PARTIAL `\A` (`\Az|a+b`): anchored restart at every position is Θ(n²).
+    if (has_text_start and !h.analysis.anchored_start and prone) @compileError("edfa: prone pattern with a partial \\A; route to the Pike VM (use compileComptime, not edfa directly)");
 
     // Phase 2 (prone, non-line only): re-determinize WITH the unanchored `utrans` table for the
     // O(input) reverse two-pass. A non-prone pattern runs on anchored restart (`trans` only), so it

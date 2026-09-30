@@ -108,6 +108,10 @@ hand-written per-architecture SIMD), or its simplicity.
   without risking quadratic time, so it falls back to a slower scan. Keeping the linear-time
   guarantee is worth more than the throughput here. (The *bounded* form,
   `(?i:Sherlock|Holmes|Watson)`, does take the fast path.)
+- **A partial `\A` on a pattern that can run far without matching** — `\Az|a.*b`, `^x|[a-z]+@`.
+  With `\A` on only some branches, the DFAs can't use their reverse scan and would retry from
+  every position (quadratic), so these run on the linear Pike VM instead. A partial `\A` with a
+  short reach (`^abc|def`) stays on the DFA; `\A` on every branch costs nothing.
 - **A line anchor inside an alternation** — `(?m)^...|...`. This routes to the linear
   Pike VM; the DFAs do not carry `(?m)` line context through an alternation. Correct, just not
   the fast path.

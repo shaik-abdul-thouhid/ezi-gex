@@ -1486,10 +1486,10 @@ fn expectIsMatchEqFind(comptime B: type, gpa: std.mem.Allocator, pattern: []cons
 test "regression: dfa isMatch agrees with find for optional-^ end anchors (^?\\z family)" {
     const gpa = testing.allocator;
     const cases = [_]struct { p: []const u8, i: []const u8 }{
-        .{ .p = "^?\\z", .i = "" },     .{ .p = "^?\\z", .i = "x" },
-        .{ .p = "^?\\z", .i = "ab" },   .{ .p = "(?:^)?\\z", .i = "" },
-        .{ .p = "^?$", .i = "" },       .{ .p = "^?$", .i = "ab" },
-        .{ .p = "\\z", .i = "" },       .{ .p = "a?\\z", .i = "" },
+        .{ .p = "^?\\z", .i = "" },   .{ .p = "^?\\z", .i = "x" },
+        .{ .p = "^?\\z", .i = "ab" }, .{ .p = "(?:^)?\\z", .i = "" },
+        .{ .p = "^?$", .i = "" },     .{ .p = "^?$", .i = "ab" },
+        .{ .p = "\\z", .i = "" },     .{ .p = "a?\\z", .i = "" },
     };
     inline for (.{ pikevm, dfa, edfa, bytepike, backtrack, auto }) |B| {
         for (cases) |c| try expectIsMatchEqFind(B, gpa, c.p, c.i, true); // each matches the empty span at the anchor
@@ -2092,7 +2092,6 @@ test "usage guide §11: documented escape and folding examples" {
     for (grapheme_cases) |c| try checkRuntime(auto, c);
 }
 
-
 // ── front-door Scratch wrapper across backends ────────────────────────────────────
 
 /// `re.initScratch` + find / count on backend `B`, cross-checked against the old
@@ -2176,7 +2175,6 @@ test "front door: Scratch.fromBackend wraps a dfa scratch built with non-default
     // `&sc.inner` is what Engine(dfa) takes — the same answer, no wrapper in the way.
     try testing.expectEqual(@as(usize, 2), backend.Engine(dfa).count(&re.program, &sc.inner, input, .{}));
 }
-
 
 // ── front door: a refilled buffer must never be served a stale input verdict ────────────
 
@@ -2329,6 +2327,37 @@ test "regression: a bare (?flags) applies from its position to the end of its gr
     }
 }
 
+test "regression: a prone pattern with a partial \\A never takes a DFA's anchored restart" {
+    // `\Az|a+b`: not every match starts at offset 0, so both byte DFAs searched by an anchored
+    // attempt at EVERY start position (their reverse scan can't evaluate `\A`) — Θ(n²) when an
+    // attempt can run far: 16 KB of `a` took ~100–150 ms on `dfa`/`edfa`/`auto` against 0.5 ms
+    // on the Pike VM. Both DFAs now decline it and `auto` routes it to the linear Pike VM.
+    // Found by the fuzz `complexity` group.
+    const gpa = testing.allocator;
+    var diag: regex.Diagnostic = .{};
+    const long = try gpa.alloc(u8, 16 * 1024);
+    defer gpa.free(long);
+    @memset(long, 'a');
+    inline for (.{ "\\Az|a+b", "(?:\\Az|a.*b)$", "(?:\\Az|a[^b]*b)" }) |p| {
+        try testing.expectError(error.Unsupported, regex.compileRuntimeWith(dfa, gpa, p, &diag, .{}));
+        try testing.expectError(error.Unsupported, regex.compileRuntimeWith(edfa, gpa, p, &diag, .{}));
+        var re = try regex.compileRuntimeWith(auto, gpa, p, &diag, .{});
+        defer re.deinit();
+        try testing.expect(re.program.edfa_prog == null and re.program.dfa_prog == null);
+        var sc = try re.initScratch(gpa);
+        defer sc.deinit(gpa);
+        try testing.expect(re.find(&sc, long) == null);
+        const cre = comptime regex.compileComptimeWith(auto, p, .{}); // no `@compileError`
+        try testing.expect(cre.program.edfa_prog == null);
+    }
+    // Controls: a NON-prone partial `\A` keeps the eager DFA (each restart is bounded); a fully
+    // anchored `\A` (one attempt at offset 0) keeps the lazy DFA.
+    var e = try regex.compileRuntimeWith(edfa, gpa, "^abc|def", &diag, .{});
+    e.deinit();
+    var d = try regex.compileRuntimeWith(dfa, gpa, "\\Aa.*b", &diag, .{});
+    d.deinit();
+}
+
 test "regression: the lazy DFA declines a chained word boundary (\\B+)" {
     // `(?:\B\n*b\B+)+` over "\nbbb" is [0,3] (Rust, Pike VM); the lazy DFA accepted the
     // chained `\B\B…` and stopped at [0,2]. It now declines, like the eager DFA, and `auto`
@@ -2430,7 +2459,3 @@ test "regression: findAll/count/split step one byte over a malformed lead after 
         try testing.expectEqual(@as(usize, 2), re2.count(&sc2, "\xC3"));
     }
 }
-
-
-
-

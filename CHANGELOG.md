@@ -59,6 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cases in `conformance.zig`; found by the fuzz reference check.
 
 ### Fixed
+- **A partial `\A` made both byte DFAs quadratic.** With `\A` on only some branches
+  (`\Az|a+b`, `(?:\Az|a.*b)$`), neither DFA can use its reverse scan, so each fell back to an
+  anchored attempt at every start position — Θ(n²) when an attempt can run far without matching:
+  16 KB of `a` took ~100–150 ms on `dfa`, `edfa` and `auto`, against 0.5 ms on the Pike VM. The lazy
+  DFA now declines every partial `\A`; the eager DFA declines it when prone (a short-reach one
+  like `^abc|def` keeps its bounded restarts); `auto` runs the rest on the Pike VM (0.54 ms at
+  16 KB). Found by the first fuzz campaign (`complexity`); pinned in `conformance.zig`.
 - **The lazy `dfa` mis-evaluated a chained word boundary.** A `\b`/`\B` whose continuation
   reaches another boundary (`\B+`, `\b\B`, or one boundary looping back to another) needs
   nested word-context resolution the DFA doesn't do; the eager DFA already declined it, the
