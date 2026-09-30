@@ -42,5 +42,19 @@ test {
     _ = @import("groups/captures.zig");
     _ = @import("groups/iter.zig");
     _ = @import("groups/search.zig");
+    _ = @import("groups/reference.zig");
+    _ = @import("groups/metamorphic.zig");
+    _ = @import("groups/invariants.zig");
+    _ = @import("groups/state.zig");
+    _ = @import("groups/large.zig");
+    _ = @import("groups/literals.zig");
+    _ = @import("groups/api.zig");
+    _ = @import("groups/oom.zig");
+    _ = @import("groups/comptime_parity.zig");
+    _ = @import("groups/complexity.zig");
+    _ = @import("groups/utf8class.zig");
+    _ = @import("groups/chaos.zig");
     _ = @import("health.zig");
+    _ = @import("findings.zig");
+    _ = @import("threads.zig");
 }

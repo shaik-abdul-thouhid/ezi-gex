@@ -21,7 +21,25 @@ pub const ref = @import("ref/root.zig");
 
 pub const check = struct {
     pub const common = @import("check/common.zig");
+    pub const known_open = @import("check/known_open.zig");
     pub const differential = @import("check/differential.zig");
+    pub const reference = @import("check/reference.zig");
+    pub const metamorphic = @import("check/metamorphic.zig");
+    pub const invariants = @import("check/invariants.zig");
+    pub const state = @import("check/state.zig");
+    pub const large = @import("check/large.zig");
+    /// Named `literal_sets` so it doesn't read as `gen.literals`.
+    pub const literal_sets = @import("check/literals.zig");
+    pub const api = @import("check/api.zig");
+    pub const oom = @import("check/oom.zig");
+    pub const comptime_parity = @import("check/comptime_parity.zig");
+    pub const complexity = @import("check/complexity.zig");
+    pub const utf8class = @import("check/utf8class.zig");
+    pub const scanner = @import("check/scanner.zig");
+    pub const grapheme = @import("check/grapheme.zig");
+    pub const chaos = @import("check/chaos.zig");
+    pub const registry = @import("check/registry.zig");
+    pub const minimize = @import("check/minimize.zig");
 };
 
 test {
@@ -37,5 +55,22 @@ test {
     _ = @import("ref/uni.zig");
     _ = @import("ref/selfcheck.zig");
     _ = @import("check/common.zig");
+    _ = @import("check/known_open.zig");
     _ = @import("check/differential.zig");
+    _ = @import("check/reference.zig");
+    _ = @import("check/metamorphic.zig");
+    _ = @import("check/invariants.zig");
+    _ = @import("check/state.zig");
+    _ = @import("check/large.zig");
+    _ = @import("check/literals.zig");
+    _ = @import("check/api.zig");
+    _ = @import("check/oom.zig");
+    _ = @import("check/comptime_parity.zig");
+    _ = @import("check/complexity.zig");
+    _ = @import("check/utf8class.zig");
+    _ = @import("check/scanner.zig");
+    _ = @import("check/grapheme.zig");
+    _ = @import("check/chaos.zig");
+    _ = @import("check/registry.zig");
+    _ = @import("check/minimize.zig");
 }

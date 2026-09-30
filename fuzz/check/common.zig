@@ -278,8 +278,7 @@ pub fn scalarLen(input: []const u8, i: usize) usize {
 
 /// Seed corpora for the fuzz groups: replay-word streams (see gen/replay.zig) so each
 /// finite `zig build test` replay drives the generators through non-trivial cases.
-const generic_corpus_arr = replay.corpus(10, 256, 0xC0FFEE);
-pub const generic_corpus: []const []const u8 = &generic_corpus_arr;
+pub const generic_corpus = replay.corpus(10, 256, 0xC0FFEE);
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Accounting (read by fuzz/health.zig)

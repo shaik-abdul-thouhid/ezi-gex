@@ -12,6 +12,10 @@ test "fuzz: repetition limit accept/reject is exact" {
     try std.testing.fuzz({}, h.repetitionLimit, .{ .corpus = &h.seed_corpus });
 }
 
+test "fuzz: mutated patterns — located diagnostics on reject, agreement on accept" {
+    try std.testing.fuzz({}, @import("fuzz_lib").check.scanner.fuzzOne, .{ .corpus = &h.seed_corpus });
+}
+
 test {
     std.testing.refAllDecls(@This());
 }

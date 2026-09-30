@@ -323,17 +323,21 @@ pub fn build(b: *std.Build) void {
 
     // ── fuzzing: one binary per group, run in PARALLEL by the build scheduler ───
     // Each file under `fuzz/groups/` compiles into its OWN test binary (its targets
-    // share the bodies in fuzz_lib (`fuzz/lib.zig`)). The `fuzz` step
+    // share the bodies in fuzz_lib (`fuzz/lib.zig`). The `fuzz` step
     // depends on all of them, and the build scheduler runs independent run-steps
     // concurrently — exactly like `zig build test` runs the 15 unit binaries at once
     // — so `zig build fuzz --fuzz=N` fuzzes every group in parallel, N iters EACH
-    // (7 groups × N). Bare `zig build fuzz` is a finite seed-replay smoke of all.
+    // (19 groups × N). Bare `zig build fuzz` is a finite seed-replay smoke of all.
     // Each group also gets a `zig build fuzz-<group>` step for a single session.
     // (The aggregate `fuzz` UNIT — fuzz/root.zig, run via `test-fuzz` and folded
     // into `zig build test` — still bundles every group into one binary for the
     // finite regression pass.)
     const fuzz_step = b.step("fuzz", "Fuzz every group in parallel (add --fuzz=N for N iters/group)");
-    const fuzz_groups = [_][]const u8{ "scanner", "diff", "anchors", "unicode", "captures", "iter", "search" };
+    const fuzz_groups = [_][]const u8{
+        "scanner",   "diff",            "anchors",    "unicode",   "captures", "iter",     "search",
+        "reference", "metamorphic",     "invariants", "state",     "large",    "literals", "api",
+        "oom",       "comptime_parity", "complexity", "utf8class", "chaos",
+    };
     for (fuzz_groups) |g| {
         const gmod = b.createModule(.{
             .root_source_file = b.path(b.fmt("fuzz/groups/{s}.zig", .{g})),
@@ -347,6 +351,20 @@ pub fn build(b: *std.Build) void {
         gstep.dependOn(&grun.step);
         fuzz_step.dependOn(&grun.step); // `zig build fuzz` → every group, in parallel
     }
+
+    // `zig build fuzz-min -- '<FUZZ-CASE line>'`: replay a failing fuzz case and shrink it.
+    const fuzz_min_exe = b.addExecutable(.{
+        .name = "fuzz-min",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("fuzz/min.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{fuzz_lib},
+        }),
+    });
+    const run_fuzz_min = b.addRunArtifact(fuzz_min_exe);
+    run_fuzz_min.addPassthruArgs();
+    b.step("fuzz-min", "Replay and shrink a FUZZ-CASE line: zig build fuzz-min -- '<line>'").dependOn(&run_fuzz_min.step);
 
     // ── Benchmarks ────────────────────────────────────────────────────────────
     // Built against an `ezi_gex` module in `fast` mode by default so the engine is

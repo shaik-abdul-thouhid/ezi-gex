@@ -154,3 +154,38 @@ test "health: every generator property name is scanner-accepted" {
     }
     try std.testing.expectEqual(@as(usize, 0), bad);
 }
+
+const known_open = lib.check.known_open;
+
+/// No active gate may account for more than 1 % of `runs` fuzz iterations.
+pub fn gateRatesOk(runs: usize) bool {
+    for (known_open.active, 0..) |g, i| {
+        if (i >= common.max_gates) break;
+        if (@as(usize, common.stats.gated[i]) * 100 > runs) {
+            std.debug.print("health: gate {s} swallowed {d} of {d} cases (> 1%)\n", .{ g.id, common.stats.gated[i], runs });
+            return false;
+        }
+    }
+    return true;
+}
+
+test "health: no known-open gate swallows more than 1% of cases" {
+    inline for (.{ d.backendsAgree, d.capturesAgree, lib.check.reference.fuzzOne, lib.check.invariants.fuzzOne, lib.check.state.fuzzOne, lib.check.api.fuzzOne }) |body| {
+        _ = measure(body, 0x6a7e);
+        try std.testing.expect(gateRatesOk(body_seeds));
+    }
+}
+
+test "health: the gate-rate guard fires on an over-broad gate" {
+    const saved = known_open.active;
+    defer known_open.active = saved;
+    const everything = struct {
+        fn f(_: *const common.Case) bool {
+            return true;
+        }
+    }.f;
+    const fake = [_]known_open.Gate{.{ .id = "fake-over-broad", .applies = everything }};
+    known_open.active = &fake;
+    _ = measure(lib.check.invariants.fuzzOne, 0x6a7e);
+    try std.testing.expect(!gateRatesOk(body_seeds));
+}

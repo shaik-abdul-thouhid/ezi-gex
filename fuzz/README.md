@@ -141,3 +141,24 @@ into 2-byte repros in seconds). Pin the minimized case as a `conformance.zig`
 regression before fixing — and decide first whether it is a real divergence or a
 **documented contract** (e.g. the ASCII-`\b` byte engines above), in which case the
 fix is a harness gate, not an engine change.
+
+## Open (to triage)
+
+Findings from building the stricter suite that are NOT fixed on this branch (fixes need an
+owner decision). Fixed ones are in the CHANGELOG.
+
+- **Search-time allocation panics on OOM.** The bare `backtrack` backend's heap `Scratch` grows
+  its visited set during a search, and the lazy `dfa` grows its transition cache; `auto` reaches
+  both. The search API returns `?Match`, so an allocation failure there panics ("input exceeds
+  buffer-backed scratch capacity" / "out of memory growing the lazy transition cache") instead of
+  surfacing `OutOfMemory`. This also contradicts the "zero allocation during matching" claim for
+  those backends. The `oom` group checks their compile + `Scratch.init` allocations only.
+- **`\b` treats a malformed byte asymmetrically** (`engine/nfa.zig` `cpBefore` falls back to the raw
+  byte as a code point — `0xC3` reads as `Ã`, a word character — while `wordAfter` decodes it as
+  U+FFFD, a non-word character): `\b` over `"\xC3"` matches at `[1,1]`. Spec question: the
+  word-ness of a malformed byte.
+- **Silently skipped conformance rows**: `src/engine/conformance.zig` `wide_cases` rows
+  `\p{Greek}+` and `\p{Han}+` use names the scanner rejects, and `findOutcome` maps the compile
+  error to `.skip`, so those rows test nothing.
+- A reference-vs-Pike-VM span divergence (`want {13,13} got {5,5}`) was printed once during a
+  health measurement; to be minimized and classified in the shakedown.

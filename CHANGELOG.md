@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 `0.8.0-dev` on `main`.
 
+### Added
+- **`Options.size_limit`** (default 1 000 000) and **`hir.expandedSize`**: a ceiling on the
+  pattern's unrolled size. `max_repetition` bounds each `{m,n}` count, but nested counts
+  multiply — `(?:(?:a{1000}){1000}){1000}` unrolled to ~10⁹ copies and exhausted memory at
+  compile time. The front door now sizes the pattern arithmetically from the HIR (O(pattern),
+  saturating) and rejects it with `error.PatternTooComplex` (`diag.code = .pattern_too_complex`)
+  or a `@compileError` before any program is built.
+- **A much stricter fuzz suite** (`fuzz/`): an independent reference matcher driven by a
+  semantic pattern tree, metamorphic printing, oracle-free invariants on every backend,
+  long-lived dirty-scratch scripts, 12 KiB inputs across `auto`'s 4096-byte cut, literal sets,
+  the full search/replace/split API, allocation-failure injection, comptime parity,
+  counter-based complexity and compile-bomb checks, UTF-8 class ground truth, a `\X`
+  grapheme oracle, vacuity guards, a known-open ledger, and `zig build fuzz-min`.
+
+### Fixed
+- **HIR length-bound analysis overflowed on nested counted repetitions.** `lenBounds`,
+  `byteBounds` and the fixed-length helpers multiplied repetition bounds in `u32`: a pattern
+  like `(?:(?:(?:a{100000}){100000}){100000}){100000}` (every count under `max_repetition`)
+  panicked with an integer overflow in safe builds and wrapped silently in `ReleaseFast`,
+  feeding wrong length bounds to the prefilters. Lower bounds now saturate (still sound) and an
+  overflowing upper bound becomes "unbounded".
+- **`findAll`/`count`/`split`/`replace` skipped a match after an empty match at a malformed
+  byte.** The post-empty-match advance used the lead byte's *claimed* length, so over a
+  truncated sequence it jumped past valid text: `a?` over `"\xE6a"` yielded only `[0,0]`.
+  It now steps one valid scalar or one byte over a malformed sequence — the unanchored scan's
+  own resync. Found by the new fuzz `invariants` group; pinned in `conformance.zig`.
+- **`onepass.buildAlloc` masked `OutOfMemory` as `Unsupported`, and double-freed on a failing
+  trim.** An allocation failure while building the scaffold NFA was reported as "not one-pass";
+  and when a later output trim (`realloc`) failed, the `errdefer` freed the original slice an
+  earlier successful trim had already released (a double free + leak). Both found by the new
+  fuzz `oom` group; pinned by an allocation-failure test in `onepass.zig`.
+- **`auto.buildAlloc` leaked its optional arms on `OutOfMemory`.** Its `errdefer` freed only the
+  NFA program, so an allocation failure after the eager/lazy DFA or one-pass arm was built
+  leaked them. It now frees the whole partial program.
+
 ## [0.7.0] - 2026-09-30
 
 A front-door and Unicode release with one correctness fix. Two changes are breaking: matching now

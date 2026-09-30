@@ -34,6 +34,8 @@ pub const pattern_smith = ps;
 
 const common = @import("common.zig");
 const inp = @import("../gen/input.zig");
+const known_open = @import("known_open.zig");
+const Case = common.Case;
 pub const Outcome = common.Outcome;
 const spanEq = common.spanEq;
 const byteEnginesSafe = common.byteEnginesSafe;
@@ -111,39 +113,8 @@ pub fn assertBackendsAgree(gpa: std.mem.Allocator, check: common.CheckId, patter
 
 // ── Target bodies (span) ──────────────────────────────────────────────────────
 
-pub fn backendsAgree(_: void, smith: *Smith) anyerror!void {
-    @disableInstrumentation();
-    const gpa = std.testing.allocator;
-    var pat = ps.gen(smith);
-    var ibuf: [max_input_len]u8 = undefined;
-    try assertBackendsAgree(gpa, .span, pat.slice(), genInput(smith, &ibuf));
-}
 
-pub fn anchorsAgree(_: void, smith: *Smith) anyerror!void {
-    @disableInstrumentation();
-    const gpa = std.testing.allocator;
-    var pat = ps.genAnchors(smith);
-    // Inputs over a tiny alphabet rich in newlines, so `^`/`$`/`(?m)` boundaries fire.
-    var ibuf: [24]u8 = undefined;
-    const n = @min(smith.slice(&ibuf), ibuf.len);
-    const alpha = "ab\n";
-    for (ibuf[0..n]) |*b| b.* = alpha[b.* % alpha.len];
-    try assertBackendsAgree(gpa, .anchors, pat.slice(), ibuf[0..n]);
-}
 
-pub fn unicodeAgree(_: void, smith: *Smith) anyerror!void {
-    @disableInstrumentation();
-    const gpa = std.testing.allocator;
-    var pat = ps.genUnicode(smith);
-    var ibuf: [max_input_len]u8 = undefined;
-    var input: []const u8 = undefined;
-    if (smith.boolWeighted(2, 1)) {
-        input = ibuf[0..ps.unicodeInput(smith, &ibuf)]; // valid multi-byte UTF-8
-    } else {
-        input = ibuf[0..smith.slice(&ibuf)]; // raw fuzzer bytes — often invalid UTF-8
-    }
-    try assertBackendsAgree(gpa, .unicode, pat.slice(), input);
-}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Scanner robustness + repetition ceiling
@@ -260,20 +231,6 @@ fn capResEq(a: CapRes, b: CapRes) bool {
 }
 
 
-pub fn capturesAgree(_: void, smith: *Smith) anyerror!void {
-    @disableInstrumentation();
-    const gpa = std.testing.allocator;
-    var pat = ps.gen(smith);
-    const pattern = pat.slice();
-    var ibuf: [max_input_len]u8 = undefined;
-    const input = genInput(smith, &ibuf);
-
-    const oracle = try capsWith(gex.backends.pikevm, gpa, pattern, input);
-    if (oracle.tag == .skip) return;
-    common.noteRun(.captures, oracle.tag != .invalid);
-    const byte_safe = byteEnginesSafe(gpa, pattern, input);
-    inline for (capture_backends) |B| try checkCaps(B, gpa, oracle, pattern, input, byte_safe);
-}
 
 fn checkCaps(comptime B: type, gpa: std.mem.Allocator, oracle: CapRes, pattern: []const u8, input: []const u8, byte_safe: bool) anyerror!void {
     @disableInstrumentation();
@@ -339,20 +296,6 @@ fn iterResEq(a: IterRes, b: IterRes) bool {
 }
 
 
-pub fn iterationAgree(_: void, smith: *Smith) anyerror!void {
-    @disableInstrumentation();
-    const gpa = std.testing.allocator;
-    var pat = ps.gen(smith);
-    const pattern = pat.slice();
-    var ibuf: [max_input_len]u8 = undefined;
-    const input = genInput(smith, &ibuf);
-
-    const oracle = try iterWith(gex.backends.pikevm, gpa, pattern, input);
-    if (oracle.tag == .skip) return;
-    common.noteRun(.iter, oracle.tag != .invalid);
-    const byte_safe = byteEnginesSafe(gpa, pattern, input);
-    inline for (iter_backends) |B| try checkIter(B, gpa, oracle, pattern, input, byte_safe);
-}
 
 fn checkIter(comptime B: type, gpa: std.mem.Allocator, oracle: IterRes, pattern: []const u8, input: []const u8, byte_safe: bool) anyerror!void {
     @disableInstrumentation();
@@ -414,23 +357,6 @@ fn replaceWith(comptime B: type, gpa: std.mem.Allocator, pattern: []const u8, in
 }
 
 
-pub fn replaceAgree(_: void, smith: *Smith) anyerror!void {
-    @disableInstrumentation();
-    const gpa = std.testing.allocator;
-    var pat = ps.gen(smith);
-    const pattern = pat.slice();
-    var ibuf: [max_input_len]u8 = undefined;
-    const input = genInput(smith, &ibuf);
-    var tbuf: [24]u8 = undefined;
-    const template = genTemplate(smith, &tbuf);
-
-    const oracle = try replaceWith(gex.backends.pikevm, gpa, pattern, input, template);
-    if (oracle.tag != .ok) return;
-    defer gpa.free(oracle.bytes);
-    common.noteRun(.replace, true);
-    const byte_safe = byteEnginesSafe(gpa, pattern, input);
-    inline for (replace_backends) |B| try checkReplace(B, gpa, oracle.bytes, pattern, input, template, byte_safe);
-}
 
 fn checkReplace(comptime B: type, gpa: std.mem.Allocator, oracle: []const u8, pattern: []const u8, input: []const u8, template: []const u8, byte_safe: bool) anyerror!void {
     @disableInstrumentation();
@@ -465,45 +391,6 @@ fn findAtOf(comptime B: type, gpa: std.mem.Allocator, pattern: []const u8, input
 }
 
 
-pub fn searchOffsetAgree(_: void, smith: *Smith) anyerror!void {
-    @disableInstrumentation();
-    const gpa = std.testing.allocator;
-    var pat = ps.gen(smith);
-    const pattern = pat.slice();
-    var ibuf: [max_input_len]u8 = undefined;
-    const input = genInput(smith, &ibuf);
-
-    // `smith.index(n)` ∈ [0, n) — so `index(len+1)` ∈ [0, len] gives every valid
-    // start (incl. len). (Smith can't range over `usize`, hence not valueRangeAtMost.)
-    const start = smith.index(input.len + 1);
-    const anchored = smith.boolWeighted(1, 1);
-    const span_end: ?usize = if (smith.boolWeighted(3, 1)) start + smith.index(input.len - start + 1) else null;
-    const opts: gex.SearchOptions = .{ .start = start, .anchored = anchored, .span_end = span_end };
-
-    const oracle = try findAtOf(gex.backends.pikevm, gpa, pattern, input, opts);
-    if (oracle == .skip or oracle == .invalid) return;
-    common.noteRun(.offset, true);
-
-    // Oracle self-invariants: anchored ⇒ match starts exactly at `start`; unanchored
-    // ⇒ at/after `start`; and no match may end past `span_end`.
-    if (oracle.span) |s| {
-        if (anchored and s[0] != start) {
-            std.debug.print("anchored findAt didn't start at {d} on /{s}/: got {any}\n", .{ start, pattern, s });
-            return error.AnchoredStartWrong;
-        }
-        if (!anchored and s[0] < start) {
-            std.debug.print("findAt(start={d}) matched before start on /{s}/: got {any}\n", .{ start, pattern, s });
-            return error.OffsetStartWrong;
-        }
-        if (span_end) |e| if (s[1] > e) {
-            std.debug.print("findAt(span_end={d}) ended past bound on /{s}/: got {any}\n", .{ e, pattern, s });
-            return error.SpanEndViolated;
-        };
-    }
-
-    const byte_safe = byteEnginesSafe(gpa, pattern, input);
-    inline for (offset_backends) |B| try checkOffset(B, gpa, oracle, pattern, input, opts, byte_safe);
-}
 
 fn checkOffset(comptime B: type, gpa: std.mem.Allocator, oracle: Outcome, pattern: []const u8, input: []const u8, opts: gex.SearchOptions, byte_safe: bool) anyerror!void {
     @disableInstrumentation();
@@ -536,32 +423,6 @@ fn matchWithOpts(comptime opts: gex.Options, gpa: std.mem.Allocator, pattern: []
     return .{ .span = if (m) |mm| .{ mm.start, mm.end } else null };
 }
 
-pub fn strategyInvariant(_: void, smith: *Smith) anyerror!void {
-    @disableInstrumentation();
-    const gpa = std.testing.allocator;
-    var pat = ps.gen(smith);
-    const pattern = pat.slice();
-    var ibuf: [max_input_len]u8 = undefined;
-    const input = genInput(smith, &ibuf);
-
-    const base = try matchWithOpts(.{}, gpa, pattern, input);
-    if (base == .skip or base == .invalid) return;
-    common.noteRun(.strategy, true);
-    const variants = .{
-        gex.Options{ .strategy = .{ .byte_engine = .disabled } },
-        gex.Options{ .strategy = .{ .byte_engine = .enabled } },
-        gex.Options{ .strategy = .{ .prefilter = false } },
-        gex.Options{ .strategy = .{ .simd = .off } },
-        gex.Options{ .strategy = .{ .byte_engine = .disabled, .prefilter = false, .simd = .off } },
-    };
-    inline for (variants) |opts| {
-        const r = try matchWithOpts(opts, gpa, pattern, input);
-        if (r != .skip and !spanEq(base.span, r.span)) {
-            std.debug.print("strategy NOT results-invariant on /{s}/ over \"{s}\"\n", .{ pattern, input });
-            return error.StrategyVaried;
-        }
-    }
-}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // `\X` (grapheme) — backtrack-only, so no differential partner: just no-crash.
@@ -592,14 +453,14 @@ pub fn graphemeNoCrash(_: void, smith: *Smith) anyerror!void {
 // deterministic smoke inputs for `zig build test`.
 // ══════════════════════════════════════════════════════════════════════════════
 
-pub const seed_corpus = [_][]const u8{
+const pattern_seeds = [_][]const u8{
     "abc",            "a|b|c",        "(a(b)c)*",       "[a-c]{2,4}",
     "\\d+\\w*\\s?",   "(?:ab)+",      "(?i:ABC)",       "^a.c$",
     "a{0,6}b{2}",     "\\b\\w+\\b",   "(?<name>a)b\\1", "(?i)aB(?-i)c",
     "[^a-c\\d]+",     "\\x61\\u{62}", "(a|)*b",         "(?P<x>.)+",
 };
 
-pub const unicode_seed_corpus = [_][]const u8{
+const unicode_pattern_seeds = [_][]const u8{
     "\\p{L}+",                   "\\w+",
     "(?i:stra\xC3\x9fe)",        "[\xCE\xB1-\xCF\x89]+",
     "\xE6\x97\xA5+",             "\\p{sc=Greek}",
@@ -608,8 +469,183 @@ pub const unicode_seed_corpus = [_][]const u8{
     "(?i:\xCE\xA9)",             "[a-z\\p{sc=Cyrl}]+",
 };
 
-pub const anchor_seed_corpus = [_][]const u8{
+const anchor_pattern_seeds = [_][]const u8{
     "^a$",      "(?m:^a$)",   "\\bword\\b", "a\\z",
     "\\Aa",     "(?:|a)+",    "(a|)*",      "^$",
     "(?m:$)\n", "\\b(?:a|)",  "(?m)^a",     "a$|b",
 };
+
+// The pattern strings above are the historical seeds; in finite replay a `Smith` reads them
+// as u64 words (mostly out of range → every draw its minimum), so each corpus also carries
+// replay-word streams (gen/replay.zig) that drive the generators through real cases.
+const replay = @import("../gen/replay.zig");
+pub const seed_corpus = pattern_seeds ++ replay.corpus(8, 256, 0x5EED_0001);
+pub const unicode_seed_corpus = unicode_pattern_seeds ++ replay.corpus(8, 256, 0x5EED_0002);
+pub const anchor_seed_corpus = anchor_pattern_seeds ++ replay.corpus(8, 256, 0x5EED_0003);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Case-based entry points (replayable by fuzz-min and the findings ledger)
+// ══════════════════════════════════════════════════════════════════════════════
+
+pub fn backendsAgree(_: void, smith: *Smith) anyerror!void {
+    @disableInstrumentation();
+    var pat = ps.gen(smith);
+    var ibuf: [max_input_len]u8 = undefined;
+    const case: Case = .{ .check = .span, .pattern = pat.slice(), .input = genInput(smith, &ibuf) };
+    try known_open.runOrGate(std.testing.allocator, &case, runSpan);
+}
+
+pub fn anchorsAgree(_: void, smith: *Smith) anyerror!void {
+    @disableInstrumentation();
+    var pat = ps.genAnchors(smith);
+    var ibuf: [24]u8 = undefined;
+    const n = @min(smith.slice(&ibuf), ibuf.len);
+    const alpha = "ab\n";
+    for (ibuf[0..n]) |*b| b.* = alpha[b.* % alpha.len];
+    const case: Case = .{ .check = .anchors, .pattern = pat.slice(), .input = ibuf[0..n] };
+    try known_open.runOrGate(std.testing.allocator, &case, runSpan);
+}
+
+pub fn unicodeAgree(_: void, smith: *Smith) anyerror!void {
+    @disableInstrumentation();
+    var pat = ps.genUnicode(smith);
+    var ibuf: [max_input_len]u8 = undefined;
+    const input: []const u8 = if (smith.boolWeighted(2, 1)) ibuf[0..ps.unicodeInput(smith, &ibuf)] else ibuf[0..smith.slice(&ibuf)];
+    const case: Case = .{ .check = .unicode, .pattern = pat.slice(), .input = input };
+    try known_open.runOrGate(std.testing.allocator, &case, runSpan);
+}
+
+pub fn runSpan(gpa: std.mem.Allocator, case: *const Case) anyerror!void {
+    return assertBackendsAgree(gpa, case.check, case.pattern, case.input);
+}
+
+pub fn capturesAgree(_: void, smith: *Smith) anyerror!void {
+    @disableInstrumentation();
+    var pat = ps.gen(smith);
+    var ibuf: [max_input_len]u8 = undefined;
+    const case: Case = .{ .check = .captures, .pattern = pat.slice(), .input = genInput(smith, &ibuf) };
+    try known_open.runOrGate(std.testing.allocator, &case, runCaptures);
+}
+
+pub fn runCaptures(gpa: std.mem.Allocator, case: *const Case) anyerror!void {
+    @disableInstrumentation();
+    const oracle = try capsWith(gex.backends.pikevm, gpa, case.pattern, case.input);
+    if (oracle.tag == .skip) return;
+    common.noteRun(.captures, oracle.tag != .invalid);
+    const byte_safe = byteEnginesSafe(gpa, case.pattern, case.input);
+    inline for (capture_backends) |B| try checkCaps(B, gpa, oracle, case.pattern, case.input, byte_safe);
+}
+
+pub fn iterationAgree(_: void, smith: *Smith) anyerror!void {
+    @disableInstrumentation();
+    var pat = ps.gen(smith);
+    var ibuf: [max_input_len]u8 = undefined;
+    const case: Case = .{ .check = .iter, .pattern = pat.slice(), .input = genInput(smith, &ibuf) };
+    try known_open.runOrGate(std.testing.allocator, &case, runIter);
+}
+
+pub fn runIter(gpa: std.mem.Allocator, case: *const Case) anyerror!void {
+    @disableInstrumentation();
+    const oracle = try iterWith(gex.backends.pikevm, gpa, case.pattern, case.input);
+    if (oracle.tag == .skip) return;
+    common.noteRun(.iter, oracle.tag != .invalid);
+    const byte_safe = byteEnginesSafe(gpa, case.pattern, case.input);
+    inline for (iter_backends) |B| try checkIter(B, gpa, oracle, case.pattern, case.input, byte_safe);
+}
+
+pub fn replaceAgree(_: void, smith: *Smith) anyerror!void {
+    @disableInstrumentation();
+    var pat = ps.gen(smith);
+    var ibuf: [max_input_len]u8 = undefined;
+    const input = genInput(smith, &ibuf);
+    var tbuf: [24]u8 = undefined;
+    const case: Case = .{ .check = .replace, .pattern = pat.slice(), .input = input, .template = genTemplate(smith, &tbuf) };
+    try known_open.runOrGate(std.testing.allocator, &case, runReplace);
+}
+
+pub fn runReplace(gpa: std.mem.Allocator, case: *const Case) anyerror!void {
+    @disableInstrumentation();
+    const oracle = try replaceWith(gex.backends.pikevm, gpa, case.pattern, case.input, case.template);
+    if (oracle.tag != .ok) return;
+    defer gpa.free(oracle.bytes);
+    common.noteRun(.replace, true);
+    const byte_safe = byteEnginesSafe(gpa, case.pattern, case.input);
+    inline for (replace_backends) |B| try checkReplace(B, gpa, oracle.bytes, case.pattern, case.input, case.template, byte_safe);
+}
+
+pub fn searchOffsetAgree(_: void, smith: *Smith) anyerror!void {
+    @disableInstrumentation();
+    var pat = ps.gen(smith);
+    var ibuf: [max_input_len]u8 = undefined;
+    const input = genInput(smith, &ibuf);
+    const start = smith.index(input.len + 1);
+    const anchored = smith.boolWeighted(1, 1);
+    const span_end: ?usize = if (smith.boolWeighted(3, 1)) start + smith.index(input.len - start + 1) else null;
+    const case: Case = .{ .check = .offset, .pattern = pat.slice(), .input = input, .start = start, .anchored = anchored, .span_end = span_end };
+    try known_open.runOrGate(std.testing.allocator, &case, runOffset);
+}
+
+pub fn runOffset(gpa: std.mem.Allocator, case: *const Case) anyerror!void {
+    @disableInstrumentation();
+    const pattern = case.pattern;
+    const input = case.input;
+    const opts = case.searchOptions();
+    const start = opts.start;
+    const anchored = opts.anchored;
+    const span_end = opts.span_end;
+
+    const oracle = try findAtOf(gex.backends.pikevm, gpa, pattern, input, opts);
+    if (oracle == .skip or oracle == .invalid) return;
+    common.noteRun(.offset, true);
+
+    // Oracle self-invariants: anchored ⇒ match starts exactly at `start`; unanchored
+    // ⇒ at/after `start`; and no match may end past `span_end`.
+    if (oracle.span) |sp| {
+        if (anchored and sp[0] != start) {
+            std.debug.print("anchored findAt didn't start at {d} on /{s}/: got {any}\n", .{ start, pattern, sp });
+            return error.AnchoredStartWrong;
+        }
+        if (!anchored and sp[0] < start) {
+            std.debug.print("findAt(start={d}) matched before start on /{s}/: got {any}\n", .{ start, pattern, sp });
+            return error.OffsetStartWrong;
+        }
+        if (span_end) |e| if (sp[1] > e) {
+            std.debug.print("findAt(span_end={d}) ended past bound on /{s}/: got {any}\n", .{ e, pattern, sp });
+            return error.SpanEndViolated;
+        };
+    }
+
+    const byte_safe = byteEnginesSafe(gpa, pattern, input);
+    inline for (offset_backends) |B| try checkOffset(B, gpa, oracle, pattern, input, opts, byte_safe);
+}
+
+pub fn strategyInvariant(_: void, smith: *Smith) anyerror!void {
+    @disableInstrumentation();
+    var pat = ps.gen(smith);
+    var ibuf: [max_input_len]u8 = undefined;
+    const case: Case = .{ .check = .strategy, .pattern = pat.slice(), .input = genInput(smith, &ibuf) };
+    try known_open.runOrGate(std.testing.allocator, &case, runStrategy);
+}
+
+pub fn runStrategy(gpa: std.mem.Allocator, case: *const Case) anyerror!void {
+    @disableInstrumentation();
+    const pattern = case.pattern;
+    const input = case.input;
+    const base = try matchWithOpts(.{}, gpa, pattern, input);
+    if (base == .skip or base == .invalid) return;
+    common.noteRun(.strategy, true);
+    const variants = .{
+        gex.Options{ .strategy = .{ .byte_engine = .disabled } },
+        gex.Options{ .strategy = .{ .byte_engine = .enabled } },
+        gex.Options{ .strategy = .{ .prefilter = false } },
+        gex.Options{ .strategy = .{ .simd = .off } },
+        gex.Options{ .strategy = .{ .byte_engine = .disabled, .prefilter = false, .simd = .off } },
+    };
+    inline for (variants) |opts| {
+        const r = try matchWithOpts(opts, gpa, pattern, input);
+        if (r != .skip and !spanEq(base.span, r.span)) {
+            std.debug.print("strategy NOT results-invariant on /{s}/ over \"{s}\"\n", .{ pattern, input });
+            return error.StrategyVaried;
+        }
+    }
+}

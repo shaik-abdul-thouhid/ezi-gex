@@ -13,6 +13,10 @@ test "fuzz: \\X grapheme patterns never crash on the backtracker" {
     try std.testing.fuzz({}, h.graphemeNoCrash, .{ .corpus = &.{ "\\X", "\\X+", "a\\X\\X", "(?:\\X)+" } });
 }
 
+test "fuzz: \\X tiles valid UTF-8 along ezi_code's grapheme clusters" {
+    try std.testing.fuzz({}, @import("fuzz_lib").check.grapheme.fuzzOne, .{ .corpus = &@import("fuzz_lib").check.common.generic_corpus });
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
