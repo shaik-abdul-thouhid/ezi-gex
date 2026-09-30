@@ -33,8 +33,17 @@ report and **chooses which to fix** (fixes are follow-ups, not part of this effo
 - **Structure:** approach B — tree-first generator, layered `fuzz/`, `chaos` as one group.
 - **Housekeeping:** branch `fuzz/cynical`; Conventional Commits, no trailers; the owner's uncommitted `src/main.zig` / `CLAUDE.md` are never staged.
 
-**Non-goals:** engine fixes (follow-ups); cross-language oracles (stay outside the repo per
-`fuzz/README.md`); new engine work counters; changing any public API.
+- **Engine hardening (added 2026-09-30, owner request):** one engine change is in scope — a program-size
+  limit. `Options.size_limit` (default 1 000 000) bounds `hir.expandedSize`, an O(pattern), saturating
+  upper bound on the unrolled program; a pattern over it is rejected with `error.PatternTooComplex` (or a
+  `@compileError`) before any backend walks or allocates the expansion. Motivation: `max_repetition` bounds
+  each `{m,n}` count, but nested counts multiply (`(?:(?:a{1000}){1000}){1000}` ≈ 10⁹ copies), so compiling
+  one untrusted pattern could exhaust memory. Additive: a new defaulted `Options` field, an existing error.
+  The fuzz suite gains a compile-bomb target that pins it (plan Task 32).
+
+**Non-goals:** engine fixes for fuzz findings (follow-ups the owner picks); cross-language oracles (stay
+outside the repo per `fuzz/README.md`); new engine work counters; any public-API change other than the
+additive `Options.size_limit` / `hir.expandedSize`.
 
 ## 4. Semantics the suite treats as spec
 
@@ -189,7 +198,7 @@ New groups:
 | `api` | `split/splitN`, `replace/replaceN`, `replaceAllWith`, `capturesAll`, `capturesAt`, `isMatchAt`, `groupIndex/groupName/named`; templates incl. `${name}`, bare `$`, `$99`, malformed `${` — cross-backend agreement + the reconstruction laws above. |
 | `oom` | `std.testing.checkAllAllocationFailures` over compile, `Scratch.init`, `replaceAllAlloc`: each failure point ⇒ `error.OutOfMemory` only, no panic, no leak; the following success is correct. |
 | `comptime` | ~40 patterns (seeds + conformance regressions) compiled at comptime, run on fuzzed inputs, must equal the runtime compile. Plus a finite test of `isMatchComptime`/`findComptime`/`countComptime`/`capturesComptime` vs runtime. |
-| `complexity` | Generated pattern × motif at n, 2n, 4n: `backtrack.steps` grows ≤ 2.25× per doubling; `auto` `confirm_probes == 0` where contracted. |
+| `complexity` | Generated pattern × motif at n, 2n, 4n: `backtrack.steps` grows ≤ 2.25× per doubling; `auto` `confirm_probes == 0` where contracted. Compile bombs (nested counted repetitions): rejected by `size_limit` having allocated < 1 MiB, or compiled within a memory budget proportional to `expandedSize`. |
 | `utf8class` | Classes with UTF-8-boundary endpoints (± negation), inputs = code points around each boundary + evil bytes; the harness knows the ranges, so **membership is checked directly** on every backend incl. byte DFAs. |
 | `chaos` | Random composition of the above generators, inputs, scratch policies, and API ops. |
 

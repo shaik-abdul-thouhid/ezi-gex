@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Turn `fuzz/` into a suite that trusts nothing — an independent tree-driven reference matcher, metamorphic printing, dirty-scratch scripts, large/evil inputs, OOM injection, comptime parity, counter-based complexity checks — plus vacuity guards, a known-open ledger, and a `fuzz-min` delta-debugger; then run a campaign and hand back a findings report.
+**Goal:** (plus one owner-requested engine hardening: a program-size limit, Task 32) Turn `fuzz/` into a suite that trusts nothing — an independent tree-driven reference matcher, metamorphic printing, dirty-scratch scripts, large/evil inputs, OOM injection, comptime parity, counter-based complexity checks — plus vacuity guards, a known-open ledger, and a `fuzz-min` delta-debugger; then run a campaign and hand back a findings report.
 
 **Architecture:** A new `fuzz_lib` module (`fuzz/lib.zig`) holds generators (`gen/`), an independent reference matcher (`ref/`), and check bodies (`check/`); each fuzz group under `fuzz/groups/` stays a thin `test` block compiled into its own binary. Every check is split into `run(gpa, *const Case)` (deterministic, replayable) and `fuzzOne(void, *Smith)` (generate a `Case`, call `run`), so any failure prints a `FUZZ-CASE` line that `zig build fuzz-min` can replay and shrink.
 
@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- **No engine/library changes.** Nothing under `src/` is edited; fixes are follow-ups the owner picks.
+- **No engine/library changes — except Task 32** (the owner-requested `Options.size_limit`). Nothing else under `src/` is edited; engine fixes for fuzz findings are follow-ups the owner picks.
 - **Never `std.unicode`** anywhere (workspace rule) — fuzz code decodes/encodes UTF-8 itself or via `ezi_code`.
 - `ezi_code` is imported by exactly two modules: `utils` (library seam, unchanged) and `fuzz_lib` (reference predicates).
 - **Commits:** Conventional Commits (`test(fuzz): …`, `build(fuzz): …`, `docs(fuzz): …`). **Never** a `Co-Authored-By` trailer or a "🤖 Generated with …" line.
@@ -63,6 +63,8 @@
 | `fuzz/threads.zig` (create) | shared-`Program` multi-thread parity |
 | `fuzz/min.zig` (create) | `fuzz-min` delta-debugger executable |
 | `fuzz/README.md` (rewrite) | suite documentation |
+| `src/core/hir.zig`, `src/engine/regex.zig` (modify, Task 32 only) | `hir.expandedSize` + `Options.size_limit` |
+| `docs/usage-guide.md`, `docs/limitations.md`, `docs/architecture.md`, `CHANGELOG.md` (modify, Task 32 only) | document the size limit |
 
 Common commands used throughout (run from the repo root `ezi_gex/`):
 
@@ -7529,6 +7531,352 @@ Expected: PASS / exit 0.
 ```sh
 git add fuzz/health.zig fuzz/README.md fuzz/root.zig fuzz/check/comptime_parity.zig
 git commit -m "test(fuzz): health floors for every check; README for the cynical suite"
+```
+
+---
+
+## Phase E′ — Engine hardening (owner-requested)
+
+> Numbered 32 because it was added after the plan was written. **Execute it after Task 29 and before
+> Task 30**, so the shakedown and the campaign run against the limit. It is the ONE task in this plan that
+> edits `src/` (the owner asked for it after the plan's "no engine changes" rule was set).
+
+### Task 32: A program-size limit — `Options.size_limit`
+
+**Why:** `Options.max_repetition` (default 100 000) bounds each `{m,n}` count on its own, but nested counts
+multiply: `(?:(?:a{1000}){1000}){1000}` unrolls to ~10⁹ copies. `nfa.measure` and `byte.measure` walk that
+expansion one copy at a time before allocating (CPU burn), then the program allocation grows until memory
+runs out — docs/architecture.md §8 says it outright: "there is no `size_limit` yet". Any service that compiles
+an untrusted pattern can be taken down by one short string.
+
+**Design (the ruling this task implements):**
+- `hir.expandedSize(h: Hir) u64` — an arithmetic **upper bound** on the unrolled program size, computed over
+  the HIR (which keeps repetitions un-expanded) with **saturating** arithmetic, so it costs O(pattern) and never
+  walks the expansion. Unit ≈ one code-point NFA instruction; a class counts `1 + ranges.len` so the byte
+  lowering (which spells each range as UTF-8 byte sequences) is covered too.
+- `Options.size_limit: u64 = hir.default_size_limit` (`1_000_000`), next to `max_repetition`. A pattern whose
+  `expandedSize` exceeds it fails with the existing `error.PatternTooComplex` (runtime; `diag.code =
+  .pattern_too_complex`, span = the whole pattern) or a `@compileError` (comptime) — **before** any backend
+  builds, so the rejection allocates nothing proportional to the expansion.
+- Enforced by the front door (`compileRuntimeWith` / `compileComptimeWith`). Code that drives a backend's
+  `buildAlloc` directly is documented to call `hir.expandedSize` itself.
+- Additive and non-breaking (a new defaulted `Options` field; an existing error).
+
+**Files:**
+- Modify: `src/core/hir.zig` (`default_size_limit`, `expandedSize`, unit tests)
+- Modify: `src/engine/regex.zig` (`Options.size_limit`, the check in both compile paths, tests)
+- Modify: `docs/usage-guide.md` (Options section), `docs/limitations.md` ("`{m,n}` repetition counts are bounded"), `docs/architecture.md` §8 (the "uncapped" bullet), `CHANGELOG.md` (`[Unreleased]` → Added)
+- Modify: `fuzz/check/common.zig` (`CheckId.compile_bomb`), `fuzz/check/complexity.zig` (compile-bomb target), `fuzz/groups/complexity.zig`, `fuzz/check/registry.zig`
+
+**Interfaces:**
+- Produces: `hir.default_size_limit: u64 = 1_000_000`; `hir.expandedSize(h: hir.Hir) u64`; `regex.Options.size_limit: u64`; `common.CheckId.compile_bomb`; `complexity.bombOne(void, *Smith) anyerror!void`, `complexity.runBomb(gpa, *const Case) anyerror!void`.
+- Public-surface names reachable as `gex.hir.expandedSize`, `gex.hir.default_size_limit`, `gex.Options{ .size_limit = … }`.
+
+- [ ] **Step 1: Write the failing engine tests**
+
+Append to the tests in `src/core/hir.zig`:
+
+```zig
+test "expandedSize: arithmetic, class weighting, saturation" {
+    const gpa = testing.allocator;
+    const Probe = struct { pat: []const u8, want: u64 };
+    for ([_]Probe{
+        .{ .pat = "a", .want = 1 },
+        .{ .pat = "abc", .want = 3 },
+        .{ .pat = "[a-c]", .want = 2 }, // 1 + one range
+        .{ .pat = "a{3}", .want = 3 * 2 + 2 }, // (child+1) × copies + 2
+    }) |p| {
+        var diag: errors.Diagnostic = .{};
+        const ast = try compile.parse(gpa, p.pat, &diag);
+        defer ast.deinit(gpa);
+        const h = try buildAlloc(gpa, ast, .{});
+        defer deinitHir(gpa, h);
+        try testing.expectEqual(p.want, expandedSize(h));
+    }
+    // A nested bomb is sized without walking it, and saturates instead of overflowing.
+    var diag: errors.Diagnostic = .{};
+    const ast = try compile.parse(gpa, "(?:(?:(?:a{100000}){100000}){100000}){100000}", &diag);
+    defer ast.deinit(gpa);
+    const h = try buildAlloc(gpa, ast, .{});
+    defer deinitHir(gpa, h);
+    try testing.expect(expandedSize(h) > default_size_limit);
+}
+```
+
+(If `compile`/`errors`/`testing`/`buildAlloc`/`deinitHir` are named differently at the bottom of `hir.zig`, use the
+names its existing tests use — e.g. search for `test "` in the file and mirror its parse → build → deinit calls.)
+
+Append to the tests in `src/engine/regex.zig` (next to the `Options.max_repetition` tests):
+
+```zig
+test "Options.size_limit: a nested repetition bomb is rejected before it is expanded" {
+    // Each count is under max_repetition; their product (10^9) is not under size_limit.
+    var counting = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var diag: Diagnostic = .{};
+    const r = compileRuntime(counting.allocator(), "(?:(?:a{1000}){1000}){1000}", &diag, .{});
+    try testing.expectError(error.PatternTooComplex, r);
+    try testing.expectEqual(core.errors.ErrorCode.pattern_too_complex, diag.code);
+    // Rejected from the HIR alone: nothing proportional to the expansion was allocated.
+    try testing.expect(counting.allocated_bytes < 1 << 20);
+}
+
+test "Options.size_limit: the default keeps large but sane patterns" {
+    var diag: Diagnostic = .{};
+    inline for (.{ "a{100000}", "\\w{200}", "(?:ab|cd){1000}", "\\p{L}{500}" }) |p| {
+        var re = try compileRuntime(testing.allocator, p, &diag, .{});
+        re.deinit();
+    }
+}
+
+test "Options.size_limit: a tightened limit rejects, and the error is located" {
+    var diag: Diagnostic = .{};
+    var ok = try compileRuntime(testing.allocator, "a{20}", &diag, .{ .size_limit = 50 });
+    ok.deinit();
+    const r = compileRuntime(testing.allocator, "a{40}", &diag, .{ .size_limit = 50 });
+    try testing.expectError(error.PatternTooComplex, r);
+    try testing.expectEqual(core.errors.ErrorCode.pattern_too_complex, diag.code);
+    try testing.expectEqual(@as(u32, 0), diag.span.start);
+    try testing.expectEqual(@as(u32, 5), diag.span.end);
+}
+
+test "Options.size_limit: threads through the comptime path" {
+    const re = comptime compileComptime("a{20}", .{ .size_limit = 50 });
+    try testing.expect(comptime re.isMatchComptime("aaaaaaaaaaaaaaaaaaaa"));
+    // An over-limit pattern here is a @compileError (not testable in-process); see the doc comment.
+}
+```
+
+- [ ] **Step 2: Run to verify they fail**
+
+Run: `zig build test-core -Doptimize=ReleaseSafe; zig build test-regex -Doptimize=ReleaseSafe`
+Expected: FAIL to compile — `use of undeclared identifier 'expandedSize'` / `no field named 'size_limit'`.
+
+- [ ] **Step 3: Implement `expandedSize` in `src/core/hir.zig`** (near `Hir`)
+
+```zig
+/// Default ceiling for `expandedSize` (see `regex.Options.size_limit`): about a million
+/// code-point instructions — every realistic hand-written pattern sits orders of magnitude
+/// below it, while a nested counted-repetition bomb sits orders above.
+///
+/// @stable-since: v0.8.0
+pub const default_size_limit: u64 = 1_000_000;
+
+/// An arithmetic UPPER BOUND on the size of the automaton `h` unrolls into — about one
+/// unit per code-point NFA instruction, with a class counted as `1 + ranges.len` so the
+/// byte lowering (one UTF-8 byte sequence per range) is bounded too. Computed over the
+/// HIR, which keeps `{m,n}` un-expanded, with saturating arithmetic: O(pattern) time,
+/// never proportional to the expansion, and it cannot overflow. The front door rejects
+/// a pattern whose size exceeds `Options.size_limit` BEFORE any backend walks or
+/// allocates the expansion; code that calls a backend's `buildAlloc` directly should
+/// apply the same check.
+///
+/// @stable-since: v0.8.0
+pub fn expandedSize(h: Hir) u64 {
+    return nodeExpandedSize(h, h.root);
+}
+
+fn nodeExpandedSize(h: Hir, i: u32) u64 {
+    const n = h.nodes[i];
+    return switch (n.tag) {
+        .empty => 0,
+        .literal => n.data.run.len,
+        .class => 1 +| @as(u64, n.data.class.len),
+        .any, .anchor, .grapheme => 1,
+        .concat => blk: {
+            const d = n.data.children;
+            var sum: u64 = 0;
+            for (h.children[d.start..][0..d.len]) |c| sum +|= nodeExpandedSize(h, c);
+            break :blk sum;
+        },
+        .alternation => blk: {
+            const d = n.data.children;
+            var sum: u64 = 2 *| @as(u64, d.len); // a split + a jump per branch
+            for (h.children[d.start..][0..d.len]) |c| sum +|= nodeExpandedSize(h, c);
+            break :blk sum;
+        },
+        .repetition => blk: {
+            const r = n.data.repetition;
+            const child = nodeExpandedSize(h, r.child) +| 1; // + the split guarding each copy
+            // {m,n}: n copies; {m,}: m copies + one looped copy; always ≥ 1 copy.
+            const copies: u64 = if (r.max) |mx| @max(@as(u64, mx), 1) else @as(u64, r.min) +| 1;
+            break :blk child *| copies +| 2;
+        },
+        .capture => nodeExpandedSize(h, n.data.capture.child) +| 2, // two saves
+    };
+}
+```
+
+(If `Tag` has a variant not listed above, add it with the cost its NFA lowering emits — `nfa.zig` `compileNode` is
+the reference; every variant must be handled or the switch won't compile.)
+
+- [ ] **Step 4: Add `Options.size_limit` and enforce it in `src/engine/regex.zig`**
+
+In `Options`, directly after `max_repetition`:
+
+```zig
+    /// Ceiling on the pattern's EXPANDED size (`hir.expandedSize` — about one unit per
+    /// code-point NFA instruction once counted repetitions are unrolled). `max_repetition`
+    /// bounds each `{m,n}` count on its own; nested counts multiply —
+    /// `(?:(?:a{1000}){1000}){1000}` unrolls to ~10⁹ copies — so this bounds the product.
+    /// A pattern over it fails with `error.PatternTooComplex` (`diag.code =
+    /// .pattern_too_complex`, spanning the whole pattern) or, on the comptime path, a
+    /// `@compileError` — BEFORE any program is built, so rejecting costs O(pattern) time
+    /// and no allocation proportional to the expansion. The default
+    /// (`hir.default_size_limit`, 1 000 000) clears realistic patterns (`a{100000}`,
+    /// `\p{L}{500}`) by a wide margin; lower it to harden a service that compiles
+    /// untrusted patterns, raise it for genuinely huge unrolled programs.
+    ///
+    /// @stable-since: v0.8.0
+    size_limit: u64 = hir.default_size_limit,
+```
+
+In `compileRuntimeWith`, right after `defer hir.deinitHir(allocator, h);`:
+
+```zig
+    if (hir.expandedSize(h) > opts.size_limit) {
+        diag.* = .{ .code = .pattern_too_complex, .span = .{ .start = 0, .end = @intCast(pattern.len) } };
+        return error.PatternTooComplex;
+    }
+```
+
+In `compileComptimeWith`, right after the `const h = comptime switch (…)` block:
+
+```zig
+    if (comptime hir.expandedSize(h) > opts.size_limit)
+        @compileError("ezi_gex: pattern \"" ++ pattern ++ "\" exceeds Options.size_limit (its counted repetitions unroll past the limit)");
+```
+
+- [ ] **Step 5: Run the engine tests, then the whole suite**
+
+Run: `zig build test-core test-regex -Doptimize=ReleaseSafe`
+Expected: PASS.
+
+Run: `zig build test -Doptimize=ReleaseSafe`
+Expected: PASS. If an existing test or conformance row now fails with `PatternTooComplex`, that pattern is
+legitimate and the default is too low: raise `default_size_limit` to the smallest round figure (2 000 000,
+5 000 000, …) that passes, and record the offending pattern and the new default in the commit message.
+
+Run: `zig build bench -Doptimize=ReleaseSafe -- --list` and `zig build bench -Doptimize=ReleaseSafe` (the corpus
+patterns must all still compile — a `PatternTooComplex` in bench output is the same "default too low" signal).
+
+- [ ] **Step 6: Document it**
+
+- `docs/usage-guide.md`, Options code block, after the `max_repetition` example:
+
+```zig
+// size_limit: ceiling on the EXPANDED pattern (hir.expandedSize ≈ NFA instructions once {m,n} unrolls;
+// default 1_000_000). max_repetition bounds each count; nested counts multiply, and this bounds the product.
+// Over it: error.PatternTooComplex before anything is built. Lower it when compiling untrusted patterns.
+_ = gex.compileRuntime(gpa, "(?:(?:a{1000}){1000}){1000}", &diag, .{}); // → error.PatternTooComplex (10^9 copies)
+_ = try gex.compileRuntime(gpa, "a{40}", &diag, .{ .size_limit = 100 });  // ok (82 units)
+```
+
+- `docs/limitations.md`, under "`{m,n}` repetition counts are bounded", add a paragraph: nested counts multiply;
+  `Options.size_limit` (default 1 000 000, measured by `hir.expandedSize`) bounds the unrolled size and rejects
+  bombs like `(?:(?:a{1000}){1000}){1000}` with `error.PatternTooComplex` before any program is built.
+- `docs/architecture.md` §8: replace the "**`{m,n}` expands, uncapped.**" bullet with "**`{m,n}` expands, capped
+  by `Options.size_limit`.** The NFA compiler emits `n` copies; the front door rejects a pattern whose
+  `hir.expandedSize` (an O(pattern) upper bound on the unrolled program) exceeds `size_limit` (default 1 000 000)
+  with `error.PatternTooComplex` before any backend builds. Backends driven directly via `buildAlloc` should apply
+  the same check."
+- `CHANGELOG.md` under `## [Unreleased]`:
+
+```markdown
+### Added
+- **`Options.size_limit`** (default 1 000 000) and **`hir.expandedSize`**: a ceiling on the pattern's unrolled
+  size. `max_repetition` bounds each `{m,n}` count, but nested counts multiply —
+  `(?:(?:a{1000}){1000}){1000}` unrolled to ~10⁹ copies and exhausted memory at compile time. The front door
+  now sizes the pattern arithmetically from the HIR (O(pattern), saturating) and rejects it with
+  `error.PatternTooComplex` (`diag.code = .pattern_too_complex`) or a `@compileError` before any program is built.
+```
+
+- [ ] **Step 7: Fuzz it — nested repetition must never blow compile memory**
+
+In `fuzz/check/common.zig` add `compile_bomb` to the end of `CheckId`. In `fuzz/check/registry.zig` add
+`.compile_bomb => @import("complexity.zig").runBomb(gpa, case),`. Append to `fuzz/check/complexity.zig`:
+
+```zig
+/// Compile bombs: nested counted repetitions (depth 1–3, counts up to 3000, each under
+/// max_repetition). Compiling under the default Options must either reject with
+/// PatternTooComplex having allocated < 1 MiB, or succeed within a memory budget
+/// proportional to size_limit — and success must imply expandedSize ≤ size_limit.
+pub fn bombOne(_: void, smith: *Smith) anyerror!void {
+    @disableInstrumentation();
+    const gpa = std.testing.allocator;
+    const bodies = [_][]const u8{ "a", "[a-z]", "\\p{L}", "(?:ab|c)", "\\w", "(a)", "." };
+    var buf: [96]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const depth = smith.valueRangeAtMost(u8, 1, 3);
+    var d: u8 = 0;
+    while (d < depth) : (d += 1) w.writeAll("(?:") catch return;
+    w.writeAll(bodies[smith.index(bodies.len)]) catch return;
+    d = 0;
+    while (d < depth) : (d += 1) {
+        const lo = smith.valueRangeAtMost(u16, 0, 3000);
+        const hi = smith.valueRangeAtMost(u16, lo, 3000);
+        w.print("){{{d},{d}}}", .{ lo, hi }) catch return;
+    }
+    const case: Case = .{ .check = .compile_bomb, .pattern = w.buffered() };
+    try known_open.runOrGate(gpa, &case, runBomb);
+}
+
+/// Bytes a successful compile may allocate per `expandedSize` unit (generous: the
+/// widest instruction plus its share of side tables and the byte/DFA arms of `auto`).
+const bytes_per_unit = 256;
+
+pub fn runBomb(gpa: std.mem.Allocator, case: *const Case) anyerror!void {
+    @disableInstrumentation();
+    common.noteRun(.compile_bomb, true);
+    var diag: gex.Diagnostic = .{};
+    const ast = gex.parse(gpa, case.pattern, &diag) catch return; // scanner-rejected: not a bomb
+    defer ast.deinit(gpa);
+    const h = try gex.buildHir(gpa, ast, .{});
+    defer gex.freeHir(gpa, h);
+    const size = gex.hir.expandedSize(h);
+    var counting = std.testing.FailingAllocator.init(gpa, .{});
+    var re = gex.compileRuntime(counting.allocator(), case.pattern, &diag, .{}) catch |e| switch (e) {
+        error.PatternTooComplex => {
+            if (size <= gex.hir.default_size_limit) return error.RejectedUnderLimit;
+            if (counting.allocated_bytes >= 1 << 20) {
+                std.debug.print("compile bomb /{s}/: rejected after allocating {d} bytes\n", .{ case.pattern, counting.allocated_bytes });
+                return error.RejectionAllocatedTooMuch;
+            }
+            return;
+        },
+        else => return e,
+    };
+    defer re.deinit();
+    common.noteCompared(.compile_bomb, gex.backends.auto);
+    if (size > gex.hir.default_size_limit) return error.AcceptedOverLimit;
+    if (counting.allocated_bytes > size * bytes_per_unit + (1 << 20)) {
+        std.debug.print("compile bomb /{s}/: size {d} but compile allocated {d} bytes\n", .{ case.pattern, size, counting.allocated_bytes });
+        return error.CompileMemoryOverBudget;
+    }
+}
+```
+
+(`re.deinit()` frees through `counting`, which forwards to `gpa`, so the testing allocator's leak check still holds.)
+
+Append to `fuzz/groups/complexity.zig`:
+
+```zig
+test "fuzz: nested counted repetition never blows compile memory (size_limit)" {
+    try std.testing.fuzz({}, lib.check.complexity.bombOne, .{ .corpus = &lib.check.common.generic_corpus });
+}
+```
+
+Run: `zig build test-fuzz -Doptimize=ReleaseSafe && zig build fuzz-complexity -Doptimize=ReleaseSafe --fuzz=20K`
+Expected: PASS / exit 0. A `CompileMemoryOverBudget` is a real finding (some backend allocates superlinearly in
+`expandedSize` — e.g. an eager DFA table): record it under *Open (to triage)*, and do not "fix" it by raising
+`bytes_per_unit` without the measured ratio and a reason in the commit message.
+
+- [ ] **Step 8: Commit** (two commits — engine, then fuzz)
+
+```sh
+git add src/core/hir.zig src/engine/regex.zig docs/usage-guide.md docs/limitations.md docs/architecture.md CHANGELOG.md
+git commit -m "feat(regex): Options.size_limit — reject patterns whose repetitions unroll past a ceiling"
+git add fuzz/check/common.zig fuzz/check/complexity.zig fuzz/check/registry.zig fuzz/groups/complexity.zig fuzz/README.md
+git commit -m "test(fuzz): compile-bomb target for Options.size_limit"
 ```
 
 ---
