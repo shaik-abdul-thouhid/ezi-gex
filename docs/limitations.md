@@ -5,14 +5,14 @@ expect, why, and what to do about it. For how the engine works see
 [`architecture.md`](architecture.md); for the public API see
 [`usage-guide.md`](usage-guide.md).
 
-Every entry below is **deliberate** — a behaviour or a performance trade-off ezi_gex makes on
-purpose. None of it is on the roadmap to change. The semantic choices are pinned by the
-cross-backend conformance suite and the fuzz differential (`fuzz/`) so they cannot silently
-change; the performance limitations are accepted shapes where the engine is and will remain
-comparatively slow.
+Every entry under **Deliberate** is a behaviour or a performance trade-off ezi_gex makes on
+purpose, and none of it is on the roadmap to change. The semantic choices are pinned by the
+cross-backend conformance suite and the fuzz suite (`fuzz/`) so they cannot silently change; the
+performance limitations are accepted shapes where the engine is and will remain comparatively
+slow.
 
-There are no open correctness limitations: every backend agrees on the leftmost-first match (RE2/Rust
-semantics), at runtime and comptime. This page lists only the deliberate trade-offs.
+Every backend agrees on the leftmost-first match (RE2/Rust semantics), at runtime and comptime.
+The one known gap — a Unicode property that is approximated — is under **Known gaps** at the end.
 
 ---
 
@@ -42,8 +42,46 @@ safeguard, not a matching limitation — within the ceiling, counted repetition 
 Nested counts multiply, though: `(?:(?:a{1000}){1000}){1000}` has every count under the
 ceiling yet unrolls to ~10⁹ copies. `Options.size_limit` (default `1_000_000`) bounds the
 unrolled size, measured arithmetically from the HIR by `hir.expandedSize` in O(pattern) time,
-and rejects such a pattern with `error.PatternTooComplex` before any program is built. Lower it
-when compiling untrusted patterns.
+and rejects such a pattern with `error.PatternTooComplex` before any program is built.
+
+Within the limit, compile time and memory are **linear** in the unrolled size: roughly 150 bytes
+of peak memory per unit, plus a few MB fixed for a large Unicode class's DFA construction. So the
+default limit admits a single compile of up to ~150 MB. Lower `size_limit` when compiling
+untrusted patterns.
+
+### Invalid UTF-8 in the haystack is dead
+
+A malformed byte in the input matches **nothing** — not `.`, not `[^a]`, not `\P{…}` — and no
+match spans it; the unanchored scan resyncs one byte past it. For `\b`/`\B` it counts as a
+non-word character from either side. There is no byte mode: to search binary or Latin-1 data,
+decode or transcode it first. (Pattern bytes must be valid UTF-8; an invalid pattern is a
+compile error.)
+
+### Some backends allocate during a search
+
+With the default `auto` backend and a heap `Scratch`, a search may allocate through the
+allocator you gave `initScratch`: the backtracker grows its visited set (inputs ≤ 4096 bytes)
+and the lazy DFA grows its transition cache. If that allocation fails, `auto` falls back to the
+Pike VM and returns the same answer. If you select **`backtrack`** or the lazy **`dfa`**
+directly, their plain `search`/`isMatch` **panic** on allocation failure, because the search API
+has no error channel. Call `backtrack.reserve` first, or use `dfa.trySearch`/`dfa.tryIsMatch`,
+to get `error.OutOfMemory` back instead. A buffer-backed `Scratch` (`initScratchBuffer`) or the
+`pikevm` backend never allocates while matching.
+
+### The byte engines evaluate `\b` as ASCII
+
+`bytepike`, `dfa` and `edfa` treat `\b`/`\B` as **ASCII** word boundaries: exact on ASCII
+input, but a non-ASCII letter counts as non-word. `auto` routes a `\b` search over non-ASCII
+input to the code-point engines, so the default front door is Unicode-correct; you only see the
+ASCII behaviour if you select a byte engine directly.
+
+### Case-insensitive classes use simple folding
+
+`Options.case_fold = .full` expands a **literal**'s 1→many foldings (`(?i)ß` also matches `ss`),
+but a character class always matches one code point, so `(?i)[ß]` does not match `ss`. A negated
+property folds **before** it negates, as in Rust and Perl: `(?i)\p{Lu}` matches `a`, and
+`(?i)\P{Ll}` matches no cased letter. (JavaScript's `u`-mode negates first, so there
+`/\P{Ll}/iu` matches every letter; ezi_gex does not.)
 
 ### Performance shapes ezi_gex does not chase
 
@@ -77,3 +115,15 @@ hand-written per-architecture SIMD), or its simplicity.
   (Teddy), but a hand-tuned per-architecture Teddy would scan faster, and that would mean
   per-architecture assembly, which ezi_gex deliberately avoids in favour of portable `@Vector`
   code.
+
+---
+
+## Known gaps
+
+### `\p{scx=…}` matches like `\p{sc=…}`
+
+Script_Extensions resolves to the plain Script ranges, because `ezi_code` does not yet expose
+the extension sets as enumerable ranges. A character shared between scripts is therefore missed:
+U+30FC KATAKANA-HIRAGANA PROLONGED SOUND MARK has Script=Common and Script_Extensions={Hira,
+Kana}, so `\p{scx=Hira}` should match it but does not. Use `\p{sc=…}` plus the shared
+characters you need, explicitly, until this is closed.

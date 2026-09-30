@@ -995,8 +995,9 @@ Read these before trusting edge cases (full list in [`architecture.md`](architec
   via `*With` on a `\X` pattern fails at build).
 - **No backreferences / lookaround / atomic / recursion / `\Q…\E`** — a Thompson NFA
   can't express them; each is rejected at parse with a precise diagnostic code.
-- **`{m,n}` expands, uncapped** — a huge counted repeat makes a large program (bounded by
-  allocation failure or the comptime quota, never UB).
+- **`{m,n}` expands** — each count is capped by `Options.max_repetition` (100 000) and the
+  whole unrolled pattern by `Options.size_limit` (1 000 000 units, ~150 MB of compile memory at
+  most); past either, compile fails with a diagnostic instead of building a huge program.
 - **Invalid UTF-8 input** is *dead-on-invalid*: a malformed byte matches nothing (no
   `U+FFFD` substitution — `.` won't match it), and the unanchored scan resyncs one byte
   past it, so a match never spans a bad byte. (Pattern bytes must be valid UTF-8 or
