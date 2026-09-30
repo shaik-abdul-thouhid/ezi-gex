@@ -68,23 +68,50 @@ pub fn genStats(comptime genFn: anytype) GenStats {
     };
 }
 
-/// Run `body` over `body_seeds` fixed seeds with fresh stats and reporting suppressed.
-/// Returns how many iterations returned an error (a divergence found while measuring —
-/// counted, not failed: finding bugs is the groups' job, measuring reach is ours).
-pub fn measure(comptime body: anytype, seed: u64) usize {
+/// Run `body` over `seeds` fixed seeds with fresh stats and per-case reporting suppressed.
+/// Returns how many iterations failed. The first few failures are then replayed LOUDLY — the
+/// replay line and the minimized case — so a divergence found while measuring is a report,
+/// never just a count (one such divergence once sat here unreported). Stats stay as measured.
+pub fn measure(comptime body: anytype, seed: u64, seeds: usize) usize {
     common.stats.reset();
     common.quiet = true;
-    defer common.quiet = false;
     var prng = std.Random.DefaultPrng.init(seed);
     var buf: [4096]u8 = undefined;
     var failures: usize = 0;
-    for (0..body_seeds) |_| {
+    var failed_at: [3]std.Random.DefaultPrng = undefined;
+    for (0..seeds) |_| {
+        const before = prng;
         var s = smithFrom(&prng, &buf);
         body({}, &s) catch {
+            if (failures < failed_at.len) failed_at[failures] = before;
             failures += 1;
         };
     }
+    common.quiet = false;
+    const measured = common.stats;
+    for (failed_at[0..@min(failures, failed_at.len)]) |p| {
+        var again = p;
+        var s = smithFrom(&again, &buf);
+        body({}, &s) catch {};
+    }
+    common.stats = measured;
     return failures;
+}
+
+fn expectClean(name: []const u8, failures: usize) !void {
+    if (failures == 0) return;
+    std.debug.print("health: {s} failed on {d} fixed-seed case(s), replayed above — triage it (fix, or gate + ledger entry)\n", .{ name, failures });
+    return error.FailureWhileMeasuring;
+}
+
+/// valid / seeds: how often the body got as far as its check at all.
+fn expectReach(check: common.CheckId, seeds: usize, min: f64) !void {
+    const got = @as(f64, @floatFromInt(common.stats.valid[@intFromEnum(check)])) / @as(f64, @floatFromInt(seeds));
+    if (got < min) {
+        std.debug.print("health: {s} reached its check on {d:.3} of cases (floor {d:.3}) — vacuous?\n", .{ @tagName(check), got, min });
+        printTable(check);
+        return error.VacuousCheck;
+    }
 }
 
 pub fn printTable(check: common.CheckId) void {
@@ -121,7 +148,7 @@ test "health: generators emit valid, non-trivial patterns" {
 }
 
 test "health: span differential compares every backend" {
-    _ = measure(d.backendsAgree, 0xd1ff);
+    try expectClean("span", measure(d.backendsAgree, 0xd1ff, body_seeds));
     try expectFloor(.span, "backtrack", 0.80);
     try expectFloor(.span, "auto", 0.80);
     try expectFloor(.span, "bytepike", 0.75);
@@ -131,7 +158,7 @@ test "health: span differential compares every backend" {
 }
 
 test "health: unicode differential compares the code-point engines" {
-    _ = measure(d.unicodeAgree, 0x0c0de);
+    try expectClean("unicode", measure(d.unicodeAgree, 0x0c0de, body_seeds));
     try expectFloor(.unicode, "backtrack", 0.80);
     try expectFloor(.unicode, "auto", 0.80);
 }
@@ -169,10 +196,52 @@ pub fn gateRatesOk(runs: usize) bool {
     return true;
 }
 
-test "health: no known-open gate swallows more than 1% of cases" {
-    inline for (.{ d.backendsAgree, d.capturesAgree, lib.check.reference.fuzzOne, lib.check.invariants.fuzzOne, lib.check.state.fuzzOne, lib.check.api.fuzzOne }) |body| {
-        _ = measure(body, 0x6a7e);
-        try std.testing.expect(gateRatesOk(body_seeds));
+const Floor = struct { backend: []const u8, min: f64 };
+const Row = struct {
+    check: common.CheckId,
+    /// Fixed seeds to run; the heavy checks run fewer so the suite stays in its time budget.
+    seeds: usize,
+    /// Floor on valid / seeds (`expectReach`).
+    reach: f64,
+    /// Floors on compared / valid per backend (`expectFloor`). A backend a check never runs
+    /// by design (the oracle, or one without the capability) has no row.
+    floors: []const Floor = &.{},
+};
+
+/// Every check body with its floors — each ~0.8 × the value measured at seed 0x6a7e over
+/// `seeds` (fuzz/README.md → Health). To re-measure after changing a body or generator, call
+/// `printTable(row.check)` (and print valid/seeds) in the test below, then set ~0.8× each.
+const rows = .{
+    .{ d.anchorsAgree, Row{ .check = .anchors, .seeds = 400, .reach = 0.80, .floors = &.{ .{ .backend = "backtrack", .min = 0.80 }, .{ .backend = "auto", .min = 0.80 }, .{ .backend = "bytepike", .min = 0.77 }, .{ .backend = "dfa", .min = 0.57 }, .{ .backend = "edfa", .min = 0.56 }, .{ .backend = "onepass", .min = 0.49 }, .{ .backend = "literal", .min = 0.43 } } } },
+    .{ d.capturesAgree, Row{ .check = .captures, .seeds = 200, .reach = 0.74, .floors = &.{ .{ .backend = "backtrack", .min = 0.86 }, .{ .backend = "auto", .min = 0.86 }, .{ .backend = "bytepike", .min = 0.82 }, .{ .backend = "onepass", .min = 0.50 } } } },
+    .{ d.iterationAgree, Row{ .check = .iter, .seeds = 100, .reach = 0.74, .floors = &.{ .{ .backend = "backtrack", .min = 0.86 }, .{ .backend = "auto", .min = 0.86 }, .{ .backend = "bytepike", .min = 0.84 }, .{ .backend = "dfa", .min = 0.79 }, .{ .backend = "edfa", .min = 0.76 } } } },
+    .{ d.replaceAgree, Row{ .check = .replace, .seeds = 200, .reach = 0.74, .floors = &.{ .{ .backend = "backtrack", .min = 0.80 }, .{ .backend = "auto", .min = 0.80 }, .{ .backend = "bytepike", .min = 0.76 } } } },
+    .{ d.searchOffsetAgree, Row{ .check = .offset, .seeds = 100, .reach = 0.74, .floors = &.{ .{ .backend = "backtrack", .min = 0.80 }, .{ .backend = "auto", .min = 0.80 }, .{ .backend = "bytepike", .min = 0.78 }, .{ .backend = "dfa", .min = 0.72 }, .{ .backend = "edfa", .min = 0.70 } } } },
+    .{ d.strategyInvariant, Row{ .check = .strategy, .seeds = 100, .reach = 0.74, .floors = &.{} } },
+    .{ lib.check.reference.fuzzOne, Row{ .check = .reference, .seeds = 400, .reach = 0.80, .floors = &.{ .{ .backend = "pikevm", .min = 0.80 }, .{ .backend = "backtrack", .min = 0.80 }, .{ .backend = "auto", .min = 0.80 } } } },
+    .{ lib.check.metamorphic.fuzzOne, Row{ .check = .metamorphic, .seeds = 200, .reach = 0.80, .floors = &.{ .{ .backend = "pikevm", .min = 0.80 }, .{ .backend = "backtrack", .min = 0.80 }, .{ .backend = "auto", .min = 0.80 }, .{ .backend = "bytepike", .min = 0.74 }, .{ .backend = "dfa", .min = 0.65 }, .{ .backend = "edfa", .min = 0.64 }, .{ .backend = "onepass", .min = 0.52 }, .{ .backend = "literal", .min = 0.32 } } } },
+    .{ lib.check.invariants.fuzzOne, Row{ .check = .invariants, .seeds = 100, .reach = 0.80, .floors = &.{ .{ .backend = "pikevm", .min = 0.73 }, .{ .backend = "backtrack", .min = 0.73 }, .{ .backend = "auto", .min = 0.73 }, .{ .backend = "bytepike", .min = 0.68 }, .{ .backend = "dfa", .min = 0.61 }, .{ .backend = "edfa", .min = 0.60 }, .{ .backend = "onepass", .min = 0.45 }, .{ .backend = "literal", .min = 0.22 } } } },
+    .{ lib.check.state.fuzzOne, Row{ .check = .state, .seeds = 100, .reach = 0.80, .floors = &.{ .{ .backend = "pikevm", .min = 0.73 }, .{ .backend = "backtrack", .min = 0.73 }, .{ .backend = "auto", .min = 0.73 }, .{ .backend = "bytepike", .min = 0.69 }, .{ .backend = "dfa", .min = 0.61 }, .{ .backend = "edfa", .min = 0.60 }, .{ .backend = "onepass", .min = 0.45 }, .{ .backend = "literal", .min = 0.22 } } } },
+    .{ lib.check.large.fuzzOne, Row{ .check = .large, .seeds = 200, .reach = 0.80, .floors = &.{ .{ .backend = "backtrack", .min = 0.43 }, .{ .backend = "auto", .min = 0.80 }, .{ .backend = "bytepike", .min = 0.69 }, .{ .backend = "dfa", .min = 0.64 }, .{ .backend = "edfa", .min = 0.64 }, .{ .backend = "onepass", .min = 0.52 }, .{ .backend = "literal", .min = 0.32 } } } },
+    .{ lib.check.literal_sets.fuzzOne, Row{ .check = .literals, .seeds = 400, .reach = 0.80, .floors = &.{ .{ .backend = "backtrack", .min = 0.44 }, .{ .backend = "auto", .min = 3.20 }, .{ .backend = "bytepike", .min = 0.80 }, .{ .backend = "dfa", .min = 0.80 }, .{ .backend = "edfa", .min = 0.80 }, .{ .backend = "literal", .min = 0.32 } } } },
+    .{ lib.check.api.fuzzOne, Row{ .check = .api, .seeds = 200, .reach = 0.73, .floors = &.{ .{ .backend = "backtrack", .min = 0.80 }, .{ .backend = "auto", .min = 0.80 }, .{ .backend = "bytepike", .min = 0.73 }, .{ .backend = "onepass", .min = 0.46 } } } },
+    .{ lib.check.oom.fuzzOne, Row{ .check = .oom, .seeds = 200, .reach = 0.71, .floors = &.{ .{ .backend = "pikevm", .min = 0.12 }, .{ .backend = "backtrack", .min = 0.12 }, .{ .backend = "auto", .min = 0.05 }, .{ .backend = "bytepike", .min = 0.08 }, .{ .backend = "dfa", .min = 0.07 }, .{ .backend = "edfa", .min = 0.12 }, .{ .backend = "onepass", .min = 0.09 }, .{ .backend = "literal", .min = 0.12 } } } },
+    .{ lib.check.comptime_parity.fuzzOne, Row{ .check = .comptime_parity, .seeds = 400, .reach = 0.80, .floors = &.{ .{ .backend = "pikevm", .min = 0.80 }, .{ .backend = "backtrack", .min = 0.80 }, .{ .backend = "auto", .min = 0.80 } } } },
+    .{ lib.check.complexity.fuzzOne, Row{ .check = .complexity, .seeds = 200, .reach = 0.73, .floors = &.{ .{ .backend = "backtrack", .min = 0.80 }, .{ .backend = "auto", .min = 0.79 } } } },
+    .{ lib.check.complexity.bombOne, Row{ .check = .compile_bomb, .seeds = 100, .reach = 0.80, .floors = &.{.{ .backend = "auto", .min = 0.80 }} } },
+    .{ lib.check.utf8class.fuzzOne, Row{ .check = .utf8class, .seeds = 400, .reach = 0.80, .floors = &.{ .{ .backend = "pikevm", .min = 0.80 }, .{ .backend = "backtrack", .min = 0.80 }, .{ .backend = "auto", .min = 0.80 }, .{ .backend = "bytepike", .min = 0.80 }, .{ .backend = "dfa", .min = 0.80 }, .{ .backend = "edfa", .min = 0.80 }, .{ .backend = "onepass", .min = 0.80 } } } },
+    .{ lib.check.chaos.fuzzOne, Row{ .check = .chaos, .seeds = 100, .reach = 0.80, .floors = &.{} } },
+    .{ lib.check.scanner.fuzzOne, Row{ .check = .scanner, .seeds = 200, .reach = 0.80, .floors = &.{} } },
+    .{ lib.check.grapheme.fuzzOne, Row{ .check = .grapheme, .seeds = 400, .reach = 0.80, .floors = &.{ .{ .backend = "backtrack", .min = 0.80 }, .{ .backend = "auto", .min = 0.80 } } } },
+};
+
+test "health: every check reaches its backends, fails nothing, and no gate swallows > 1%" {
+    inline for (rows) |r| {
+        const row: Row = r[1];
+        try expectClean(@tagName(row.check), measure(r[0], 0x6a7e, row.seeds));
+        try std.testing.expect(gateRatesOk(row.seeds));
+        try expectReach(row.check, row.seeds, row.reach);
+        for (row.floors) |f| try expectFloor(row.check, f.backend, f.min);
     }
 }
 
@@ -186,6 +255,6 @@ test "health: the gate-rate guard fires on an over-broad gate" {
     }.f;
     const fake = [_]known_open.Gate{.{ .id = "fake-over-broad", .applies = everything }};
     known_open.active = &fake;
-    _ = measure(lib.check.invariants.fuzzOne, 0x6a7e);
-    try std.testing.expect(!gateRatesOk(body_seeds));
+    _ = measure(lib.check.invariants.fuzzOne, 0x6a7e, 50);
+    try std.testing.expect(!gateRatesOk(50));
 }

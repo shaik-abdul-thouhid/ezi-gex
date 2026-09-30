@@ -18,19 +18,12 @@
 //!
 //! To actually fuzz, bound it with `=N` (N iterations PER group):
 //!
-//!     zig build fuzz --fuzz=1M                 # all groups in parallel, 1M each (7M total)
-//!     zig build fuzz-diff --fuzz=2M            # just the cross-backend differential
+//!     zig build fuzz --fuzz=100K               # all 19 groups in parallel, 100K each
+//!     zig build fuzz-reference --fuzz=1M       # one group
 //!
 //! ⚠️  Bare `--fuzz` (no `=N`) soaks forever by design — always pass `=N`.
 //!
-//! WHAT IS COVERED — see `check/differential.zig` (the differential bodies) and each group:
-//!   scanner   — parse robustness + the `{m,n}` repetition ceiling (parse-only).
-//!   diff      — span/find/isMatch across ALL backends (Pike VM oracle).
-//!   anchors   — anchors + zero-width across all backends.
-//!   unicode   — `\p{}`/scripts/folding over valid + raw UTF-8; `\X` no-crash.
-//!   captures  — full capture-slot arrays across the capture backends.
-//!   iter      — findAll sequence + count, and `$`-template replaceAll output.
-//!   search    — findAt offset/anchored/span_end, and strategy results-invariance.
+//! What each group checks, health floors, and triage: fuzz/README.md.
 
 const std = @import("std");
 

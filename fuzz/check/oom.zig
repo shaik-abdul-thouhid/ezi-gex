@@ -25,14 +25,20 @@ pub fn fuzzOne(_: void, smith: *Smith) anyerror!void {
     if (p.pattern.len > 48) return; // the scenario re-runs once per allocation
     var ibuf: [32]u8 = undefined;
     const input = input_gen.pickSmall(smith, &ibuf);
-    const case: Case = .{
+    var case: Case = .{
         .check = .oom,
         .pattern = p.pattern,
         .input = input,
         .opt = p.opt,
-        .n = smith.index(common.n_backends), // the one backend this case checks
         .seed = smith.value(u64), // which allocations fail (`sampleFailPoints`)
     };
+    // The one backend this case checks, hashed from the case rather than drawn: a replayed
+    // draw that is out of range (or past the end of the input) reads as 0, which skewed ~70%
+    // of cases onto pikevm. Stored in `n`, so the replay line still pins it.
+    var h = std.hash.Wyhash.init(case.seed);
+    h.update(case.pattern);
+    h.update(case.input);
+    case.n = @intCast(h.final() % common.n_backends);
     try known_open.runOrGate(gpa, &case, run);
 }
 
