@@ -9,7 +9,7 @@ backend architecture.
   Unicode-correct. Classes resolve once to sorted code-point ranges and match by a range check,
   with no per-character table lookup; `\b` and `\X` read `ezi_code`'s property tables directly.
   All Unicode comes from [`ezi_code`](https://github.com/shaik-abdul-thouhid/ezi-code); ezi_gex
-  never touches `std.unicode`. `main` pins `ezi_code` `v0.5.0`, which tracks **Unicode 18.0.0**
+  never touches `std.unicode`. `main` pins `ezi_code` `v0.6.0`, which tracks **Unicode 18.0.0**
   (see [Unicode version](#unicode-version)). Every supported escape, property and script is listed
   in the [Unicode syntax reference](docs/usage-guide.md#11-unicode-syntax-reference).
 - **Comptime-capable.** You can compile a pattern and run the match at compile time: the program
@@ -29,8 +29,9 @@ backend architecture.
 The latest release is `v0.7.0`; `main` is the development branch (`0.8.0-dev`). See
 [Installing](#installing) for pinning the tag versus tracking `main`. It is pre-1.0, so the API
 can still change, though everything public is annotated `@stable-since: vX.Y.Z` and follows
-SemVer. It needs a recent Zig dev build (`0.17.0-dev.2320+1e770dbef` or newer, the same minimum as
-its `ezi_code` dependency) and will not compile on stable 0.16.
+SemVer. It needs **Zig 0.17.0** or newer, the stable release (the same minimum as its `ezi_code`
+dependency). Releases up to `v0.7.0` tracked 0.17.0 dev builds instead; no release compiles on
+0.16.
 
 The default `auto` engine is byte-DFA-first: a Hopcroft-minimized eager DFA as the primary span
 engine, a lazy DFA as the fallback. It runs in O(input) on every pattern, is leftmost-first,
@@ -85,7 +86,7 @@ scripts, case folding, `\w` and `\b`, so the Unicode version depends on the ezi_
 | ezi_gex | Pinned `ezi_code` | Unicode |
 | ------- | ----------------- | ------- |
 | `v0.1.0` – `v0.6.2` | `main` commits, then `v0.4.1` (from `v0.3.0`) | 17.0.0 |
-| `v0.7.0`, `main` (`0.8.0-dev`) | `v0.5.0` | 18.0.0 |
+| `v0.7.0` – `main` | `v0.5.0`, then `v0.6.0` (from `0.8.0-dev`) | 18.0.0 |
 
 With Unicode 18, `\p{Script=…}` accepts the new scripts (`Jurchen`/`Jurc`, `Proto_Cuneiform`/`Pcun`,
 `Seal`), and the classes and case folding cover the newly assigned characters. To stay on Unicode 17,
@@ -531,20 +532,20 @@ a one-time build cost; match time stays O(input). For the details see
 
 As a reference point, here is the bundled `main.zig` demo — which exercises runtime and comptime
 compilation, classes, captures, replace, split, `\p{L}`, scripts, and all three byte backends —
-built with Zig `0.17.0-dev.2320+1e770dbef` against `ezi_code` `v0.5.0` (Unicode 18.0.0) on
+built with Zig `0.17.0` against `ezi_code` `v0.6.0` (Unicode 18.0.0) on
 macOS arm64:
 
 | Optimize mode | Demo binary |
 |---|---|
-| `debug` | 3.69 MB (3,870,904 B) |
-| `safe` | 1.38 MB (1,448,184 B) |
-| `fast` | 1.23 MB (1,293,176 B) |
-| `small` | 0.81 MB (847,592 B) |
+| `debug` | 3.74 MB (3,919,128 B) |
+| `safe` | 1.38 MB (1,449,112 B) |
+| `fast` | 1.23 MB (1,294,696 B) |
+| `small` | 0.81 MB (848,872 B) |
 
-On the same toolchain, moving from Unicode 17 to 18 adds about 1 KB to the `safe` and `fast`
-builds and about 16 KB to `small`.
+Measured on Zig `0.17.0-dev.2320`, moving from Unicode 17 to 18 added about 1 KB to the `safe` and
+`fast` builds and about 16 KB to `small`.
 
-Most of the `Debug` figure is Zig's debug runtime, not regex data. Your own binary will come in
+Most of the `debug` figure is Zig's debug runtime, not regex data. Your own binary will come in
 under the demo: it won't link the demo's full spread of backends and Unicode features, and
 `compileRuntime` adds nothing beyond the shared tables.
 

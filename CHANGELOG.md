@@ -36,6 +36,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backends' plain entry points keep a documented panic on allocation failure.
 
 ### Changed
+- **Minimum Zig is now `0.17.0`**, the stable release, and `ezi_code` moves to its tagged
+  `v0.6.0`, which needs the same Zig. BREAKING for 0.17.0 dev toolchains, which are no longer
+  accepted. `ezi_code` 0.6.0 is the same Unicode 18.0.0 data and API on the new toolchain, so
+  no match result changes.
+- **Nothing deprecated in Zig 0.17.0 is used.** `@intFromEnum`/`@enumFromInt` become
+  `@backingInt`/`@fromBackingInt`. The SIMD feature probes read `@import("builtin").target.cpu`
+  in place of the deprecated `cpu`. The std aliases (`ArrayListUnmanaged`, `mem.indexOf*`,
+  `mem.copyForwards`/`copyBackwards`, `fmt.bufPrint`, `fmt.allocPrint`) and the build script's
+  `Run.addFileArg` give way to their 0.17.0 names, and the usage guide's example backend calls
+  `std.mem.findPos`. Two 0.17.0 semantic changes can break code silently; both were audited and
+  need no change here. Every array/vector `@bitCast` is a `@Vector(N, bool)` movemask, which
+  0.17.0 now defines as lane 0 → bit 0 on every target, as the SIMD scans already assumed. The
+  backend-contract `@hasDecl` probes only ever look for `pub` decls. The library still compiles
+  for `wasm32-freestanding`, `wasm32-wasi`, `riscv64-freestanding` and `aarch64-linux`, and the
+  x86-64 AVX2 build compiles.
 - **A bare `(?flags)` now applies from its position to the end of its group** (RE2/Rust),
   BREAKING for patterns that place one mid-pattern or inside a group. It used to set a single
   whole-pattern flag set: `a(?i)b` matched `"AB"` (the flag reached backward), `x((?i)a)` did

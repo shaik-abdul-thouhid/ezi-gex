@@ -852,7 +852,7 @@ delegates; `searchCaptures` additionally writes group 0 into `slots[0..2]`. That
 
 ```zig
     // First occurrence of `needle` in `input` at/after `start`, or null. Fast SIMD
-    // substring search at runtime; a plain scan at comptime — `std.mem.indexOfPos`
+    // substring search at runtime; a plain scan at comptime — `std.mem.findPos`
     // pulls @Vector into const-eval, which the project keeps out of comptime paths, so
     // guard with @inComptime() if you want findComptime/isMatchComptime to work.
     fn firstAt(input: []const u8, start: usize, needle: []const u8) ?usize {
@@ -864,7 +864,7 @@ delegates; `searchCaptures` additionally writes group 0 into `slots[0..2]`. That
                 if (std.mem.eql(u8, input[i..][0..needle.len], needle)) return i;
             return null;
         }
-        return std.mem.indexOfPos(u8, input, start, needle); // SIMD memchr / BMH
+        return std.mem.findPos(u8, input, start, needle); // SIMD memchr / BMH
     }
 
     pub fn search(p: *const Program, _: *Scratch, input: []const u8, o: Be.SearchOptions) ?Be.Match {
