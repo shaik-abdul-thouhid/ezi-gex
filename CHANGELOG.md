@@ -5,9 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0] - 2026-10-03
 
-`0.8.0-dev` on `main`.
+A Zig 0.17.0 and correctness release. Three changes are breaking. The minimum Zig is now the
+stable `0.17.0`, and `ezi_code` moves to `v0.6.0`, the same Unicode 18.0.0 data on the new
+toolchain. A bare `(?flags)` now applies from its position to the end of its group, as in RE2
+and Rust. Loops whose body can match empty now give Rust's spans and captures. A much stricter
+fuzz suite found most of the fixes, among them a quadratic partial `\A` on the byte DFAs, `(?i)`
+ignoring Unicode property classes, panics and leaks when an allocation fails, and quadratic
+compile memory for unrolled captures. `Options.size_limit` now rejects patterns whose nested
+repetitions unroll past a ceiling. There is also a wasm and bare-metal demo,
+`zig build freestanding`.
 
 ### Added
 - **A wasm and bare-metal demo, `src/freestanding.zig`, and `zig build freestanding`.** The demo

@@ -27,7 +27,7 @@ backend architecture.
 
 ## Status
 
-The latest release is `v0.7.0`; `main` is the development branch (`0.8.0-dev`). See
+The latest release is `v0.8.0`; `main` is the development branch (`0.9.0-dev`). See
 [Installing](#installing) for pinning the tag versus tracking `main`. It is pre-1.0, so the API
 can still change, though everything public is annotated `@stable-since: vX.Y.Z` and follows
 SemVer. It needs **Zig 0.17.0** or newer, the stable release (the same minimum as its `ezi_code`
@@ -46,20 +46,20 @@ hardened, parallel **fuzz** suite (`fuzz/` — every backend differenced against
 
 ## Installing
 
-The latest **tagged** release is **`v0.7.0`** — the recommended choice for reproducible
+The latest **tagged** release is **`v0.8.0`** — the recommended choice for reproducible
 builds. Via git ref (resolves the tag and pins its content hash in `build.zig.zon`):
 
 ```sh
-zig fetch --save git+https://github.com/shaik-abdul-thouhid/ezi-gex.git#v0.7.0
+zig fetch --save git+https://github.com/shaik-abdul-thouhid/ezi-gex.git#v0.8.0
 ```
 
 Or via plain HTTP tarball (also pins the content hash):
 
 ```sh
-zig fetch --save https://github.com/shaik-abdul-thouhid/ezi-gex/archive/refs/tags/v0.7.0.tar.gz
+zig fetch --save https://github.com/shaik-abdul-thouhid/ezi-gex/archive/refs/tags/v0.8.0.tar.gz
 ```
 
-**Tracking `main` (unreleased `0.8.0-dev`)** — if you want the latest in-development surface
+**Tracking `main` (unreleased `0.9.0-dev`)** — if you want the latest in-development surface
 before it's tagged, fetch the branch instead of a tag. This resolves `main`'s current commit
 and pins its hash in `build.zig.zon`; re-run it to move up:
 
@@ -68,7 +68,7 @@ zig fetch --save git+https://github.com/shaik-abdul-thouhid/ezi-gex.git#main
 ```
 
 `main` is the development branch: it builds and is tested, but APIs there are not yet covered
-by a tag, so they can still change before `0.8.0`. For reproducible builds prefer the `v0.7.0`
+by a tag, so they can still change before `0.9.0`. For reproducible builds prefer the `v0.8.0`
 tag; reach for `main` only when you specifically need unreleased work.
 
 Then in `build.zig` (the `ezi_code` dependency is resolved transitively — you only
@@ -87,7 +87,7 @@ scripts, case folding, `\w` and `\b`, so the Unicode version depends on the ezi_
 | ezi_gex | Pinned `ezi_code` | Unicode |
 | ------- | ----------------- | ------- |
 | `v0.1.0` – `v0.6.2` | `main` commits, then `v0.4.1` (from `v0.3.0`) | 17.0.0 |
-| `v0.7.0` – `main` | `v0.5.0`, then `v0.6.0` (from `0.8.0-dev`) | 18.0.0 |
+| `v0.7.0` – `main` | `v0.5.0`, then `v0.6.0` (from `v0.8.0`) | 18.0.0 |
 
 With Unicode 18, `\p{Script=…}` accepts the new scripts (`Jurchen`/`Jurc`, `Proto_Cuneiform`/`Pcun`,
 `Seal`), and the classes and case folding cover the newly assigned characters. To stay on Unicode 17,
