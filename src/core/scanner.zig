@@ -1885,7 +1885,7 @@ test "script long-name table covers every ezi_code ScriptType" {
             return error.UnknownScriptCode;
         };
         try std.testing.expectEqual(@as(?scripts.ScriptType, by_code), token.resolveScriptType(e.key));
-        covered[@intFromEnum(by_code)] = true;
+        covered[@backingInt(by_code)] = true;
     }
     for (all, covered) |st, seen| {
         if (!seen) {

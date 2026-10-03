@@ -186,7 +186,7 @@ pub fn litMatches(x: u21, c: u21, ci: bool) bool {
 fn itemBase(it: tree.Item, y: u21, unicode: bool) bool {
     return switch (it.kind) {
         .range => y >= it.lo and y <= it.hi,
-        .perl => perl(@enumFromInt(it.which), y, unicode),
+        .perl => perl(@fromBackingInt(it.which), y, unicode),
         .prop => prop(it.which, y),
     };
 }

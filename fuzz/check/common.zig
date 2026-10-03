@@ -308,20 +308,20 @@ pub const Stats = struct {
 pub var stats: Stats = .{};
 
 pub fn noteRun(c: CheckId, valid: bool) void {
-    stats.runs[@intFromEnum(c)] += 1;
-    if (valid) stats.valid[@intFromEnum(c)] += 1;
+    stats.runs[@backingInt(c)] += 1;
+    if (valid) stats.valid[@backingInt(c)] += 1;
 }
 pub fn noteCompared(c: CheckId, comptime B: type) void {
-    stats.compared[@intFromEnum(c)][backendIndex(B)] += 1;
+    stats.compared[@backingInt(c)][backendIndex(B)] += 1;
 }
 pub fn noteSkipped(c: CheckId, comptime B: type) void {
-    stats.skipped[@intFromEnum(c)][backendIndex(B)] += 1;
+    stats.skipped[@backingInt(c)][backendIndex(B)] += 1;
 }
 /// compared / valid for (check, backend); 0 when the check saw no valid case.
 pub fn comparedFraction(c: CheckId, bi: usize) f64 {
-    const v = stats.valid[@intFromEnum(c)];
+    const v = stats.valid[@backingInt(c)];
     if (v == 0) return 0;
-    return @as(f64, @floatFromInt(stats.compared[@intFromEnum(c)][bi])) / @as(f64, @floatFromInt(v));
+    return @as(f64, @floatFromInt(stats.compared[@backingInt(c)][bi])) / @as(f64, @floatFromInt(v));
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -519,8 +519,8 @@ test "stats count compared and skipped per check and backend" {
     noteRun(.span, true);
     noteCompared(.span, gex.backends.dfa);
     noteSkipped(.span, gex.backends.literal);
-    try testing.expectEqual(@as(u32, 1), stats.compared[@intFromEnum(CheckId.span)][backendIndex(gex.backends.dfa)]);
-    try testing.expectEqual(@as(u32, 1), stats.skipped[@intFromEnum(CheckId.span)][backendIndex(gex.backends.literal)]);
+    try testing.expectEqual(@as(u32, 1), stats.compared[@backingInt(CheckId.span)][backendIndex(gex.backends.dfa)]);
+    try testing.expectEqual(@as(u32, 1), stats.skipped[@backingInt(CheckId.span)][backendIndex(gex.backends.literal)]);
     try testing.expectEqual(@as(f64, 1.0), comparedFraction(.span, backendIndex(gex.backends.dfa)));
     stats.reset();
 }

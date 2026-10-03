@@ -39,7 +39,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const arch = builtin.cpu.arch;
+const arch = builtin.target.cpu.arch;
 
 /// User-facing SIMD policy (front-door `Options.strategy.simd`, projected to the backends).
 /// A **permission, not a command**: `auto` uses the native dynamic shuffle (Teddy) when the
@@ -57,13 +57,13 @@ pub const SimdMode = enum { auto, off };
 /// name, or a baseline build SIGILLs on the rare pre-2008 CPU.
 ///
 /// @stable-since: v0.4.0
-pub const has_pshufb = arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .ssse3);
+pub const has_pshufb = arch == .x86_64 and std.Target.x86.featureSetHas(builtin.target.cpu.features, .ssse3);
 
 /// x86-64 with AVX2 (the 256-bit `vpshufb`). AVX2 is x86-64-**v3**. Enables **fat**
 /// Teddy (the 16-bucket variant, `shuffle32`).
 ///
 /// @stable-since: v0.4.0
-pub const has_vpshufb = arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx2);
+pub const has_vpshufb = arch == .x86_64 and std.Target.x86.featureSetHas(builtin.target.cpu.features, .avx2);
 
 /// aarch64 (the `tbl` instruction). NEON/AdvSIMD is mandatory in ARMv8-A, so the arch
 /// gate is sufficient — no feature probe needed. NEON is 128-bit only, so there is no

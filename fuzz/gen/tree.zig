@@ -215,11 +215,11 @@ pub const Tree = extern struct {
         if (b.len != @sizeOf(Tree)) return null;
         for (0..max_nodes) |i| {
             const off = @offsetOf(Tree, "nodes") + i * @sizeOf(Node) + @offsetOf(Node, "kind");
-            if (b[off] > @intFromEnum(Kind.flags)) return null;
+            if (b[off] > @backingInt(Kind.flags)) return null;
         }
         for (0..max_items) |i| {
             const base = @offsetOf(Tree, "items") + i * @sizeOf(Item);
-            if (b[base + @offsetOf(Item, "kind")] > @intFromEnum(ItemKind.prop)) return null;
+            if (b[base + @offsetOf(Item, "kind")] > @backingInt(ItemKind.prop)) return null;
             if (b[base + @offsetOf(Item, "neg")] > 1) return null;
         }
         var t: Tree = undefined;
@@ -243,11 +243,11 @@ pub const Tree = extern struct {
                     if (n.len == 0 or @as(usize, n.first) + n.len > t.n_items) return false;
                     for (t.itemsOf(n)) |it| switch (it.kind) {
                         .range => if (it.lo > it.hi or !isScalar(it.lo) or !isScalar(it.hi)) return false,
-                        .perl => if (it.which > @intFromEnum(Perl.space)) return false,
+                        .perl => if (it.which > @backingInt(Perl.space)) return false,
                         .prop => if (it.which >= props.table.len) return false,
                     };
                 },
-                .assert => if (n.a > @intFromEnum(Assert.not_word_boundary)) return false,
+                .assert => if (n.a > @backingInt(Assert.not_word_boundary)) return false,
                 .lit => if (!isScalar(n.cp)) return false,
                 .empty, .dot => {},
             }
@@ -307,13 +307,13 @@ pub const Builder = struct {
         return b.t.add(.{ .kind = .dot, .flags = b.f });
     }
     pub fn assert(b: *Builder, k: Assert) u16 {
-        return b.t.add(.{ .kind = .assert, .flags = b.f, .a = @intFromEnum(k) });
+        return b.t.add(.{ .kind = .assert, .flags = b.f, .a = @backingInt(k) });
     }
     pub fn range(lo: u21, hi: u21) Item {
         return .{ .kind = .range, .lo = lo, .hi = hi };
     }
     pub fn perl(p: Perl, neg: bool) Item {
-        return .{ .kind = .perl, .which = @intFromEnum(p), .neg = neg };
+        return .{ .kind = .perl, .which = @backingInt(p), .neg = neg };
     }
     pub fn prop(short: []const u8, neg: bool) Item {
         return .{ .kind = .prop, .which = props.indexOf(short).?, .neg = neg };
@@ -486,7 +486,7 @@ const Gen = struct {
             4 => .word_boundary,
             else => .not_word_boundary,
         };
-        return g.t.add(.{ .kind = .assert, .flags = f, .a = @intFromEnum(k) });
+        return g.t.add(.{ .kind = .assert, .flags = f, .a = @backingInt(k) });
     }
 };
 
@@ -527,12 +527,12 @@ test "generated trees are well-formed and round-trip through bytes" {
         const opt = pickOpt(&s);
         const t = generate(&s, opt);
         try std.testing.expect(t.wellFormed());
-        for (t.nodes[0..t.n_nodes]) |n| kinds_seen[@intFromEnum(n.kind)] = true;
+        for (t.nodes[0..t.n_nodes]) |n| kinds_seen[@backingInt(n.kind)] = true;
         const back = Tree.fromBytes(t.bytes()) orelse return error.RoundTripRejected;
         try std.testing.expectEqualSlices(u8, t.bytes(), back.bytes());
     }
     for (kinds_seen, 0..) |seen, k| if (!seen) {
-        std.debug.print("generator never produced kind {s}\n", .{@tagName(@as(Kind, @enumFromInt(k)))});
+        std.debug.print("generator never produced kind {s}\n", .{@tagName(@as(Kind, @fromBackingInt(@intCast(k))))});
         return error.KindUnreached;
     };
 }

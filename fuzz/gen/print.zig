@@ -348,7 +348,7 @@ const P = struct {
     }
 
     fn assertion(p: *P, n: Node) void {
-        const k: tree.Assert = @enumFromInt(n.a);
+        const k: tree.Assert = @fromBackingInt(n.a);
         p.puts(switch (k) {
             .text_start => if (!p.pf.m and p.chance(1, 2)) "^" else "\\A",
             .text_end => if (!p.pf.m and p.chance(1, 3)) "$" else if (p.chance(1, 2)) "\\Z" else "\\z",

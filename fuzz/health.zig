@@ -106,7 +106,7 @@ fn expectClean(name: []const u8, failures: usize) !void {
 
 /// valid / seeds: how often the body got as far as its check at all.
 fn expectReach(check: common.CheckId, seeds: usize, min: f64) !void {
-    const got = @as(f64, @floatFromInt(common.stats.valid[@intFromEnum(check)])) / @as(f64, @floatFromInt(seeds));
+    const got = @as(f64, @floatFromInt(common.stats.valid[@backingInt(check)])) / @as(f64, @floatFromInt(seeds));
     if (got < min) {
         std.debug.print("health: {s} reached its check on {d:.3} of cases (floor {d:.3}) — vacuous?\n", .{ @tagName(check), got, min });
         printTable(check);
@@ -115,7 +115,7 @@ fn expectReach(check: common.CheckId, seeds: usize, min: f64) !void {
 }
 
 pub fn printTable(check: common.CheckId) void {
-    std.debug.print("health[{s}] runs={d} valid={d}:", .{ @tagName(check), common.stats.runs[@intFromEnum(check)], common.stats.valid[@intFromEnum(check)] });
+    std.debug.print("health[{s}] runs={d} valid={d}:", .{ @tagName(check), common.stats.runs[@backingInt(check)], common.stats.valid[@backingInt(check)] });
     for (common.backend_names, 0..) |name, bi| std.debug.print(" {s}={d:.2}", .{ name, common.comparedFraction(check, bi) });
     std.debug.print("\n", .{});
 }

@@ -168,7 +168,7 @@ pub const Vm = struct {
                                 pc = inst.x;
                             },
                             .assert => {
-                                if (!assertHolds(@enumFromInt(inst.arg), input, at)) break;
+                                if (!assertHolds(@fromBackingInt(@intCast(inst.arg)), input, at)) break;
                                 pc = inst.x;
                             },
                         }

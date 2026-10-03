@@ -1121,7 +1121,7 @@ fn Builder(comptime mode: Mode) type {
         }
 
         fn addDerived(self: *Self, prop: props.DerivedProperty) BuildError!void {
-            const bit = @intFromEnum(prop);
+            const bit = @backingInt(prop);
             for (props.derived_runs) |run| {
                 if (run.mask & bit != 0) try self.addMember(run.start, run.end);
             }

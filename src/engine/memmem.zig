@@ -42,8 +42,8 @@ const simd = @import("simd.zig");
 /// Portable vector width: 256-bit on AVX2 (one `vpcmpeqb`/`vpmovmskb` over 32 starts),
 /// else 128-bit. Wider on AVX2 only — NEON has no 256-bit register and no cheap 32-lane
 /// movemask, so 16 lowers better there.
-pub const W: usize = if (builtin.cpu.arch == .x86_64 and
-    std.Target.x86.featureSetHas(builtin.cpu.features, .avx2)) 32 else 16;
+pub const W: usize = if (builtin.target.cpu.arch == .x86_64 and
+    std.Target.x86.featureSetHas(builtin.target.cpu.features, .avx2)) 32 else 16;
 
 const V = @Vector(W, u8);
 /// Movemask integer: one bit per vector lane (`@bitCast` of a `@Vector(W, bool)`).
