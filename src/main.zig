@@ -14,7 +14,7 @@ pub fn main(init: std.process.Init) !void {
     const stdout_buffer = try gpa.alloc(u8, 1024 * 4);
     defer gpa.free(stdout_buffer);
 
-    var stdout_writer: std.Io.File.Writer = .init(.stdout(), init.io, stdout_buffer);
+    var stdout_writer: std.Io.File.Writer = .initStreaming(.stdout(), init.io, stdout_buffer);
     const writer = &stdout_writer.interface;
     defer writer.flush() catch {};
 
@@ -321,11 +321,9 @@ fn demoDfa(gpa: std.mem.Allocator, writer: *std.Io.Writer, pat: []const u8, inpu
 /// formatting over the public `Diagnostic` API — nothing here can fail or crash.
 fn printDiagnostic(writer: *std.Io.Writer, pattern: []const u8, diag: ezi_gex.Diagnostic) !void {
     try writer.print("invalid regex: {s}\n  {s}\n  ", .{ diag.message(), pattern });
-    var col: usize = 0;
-    while (col < diag.span.start) : (col += 1) std.debug.print(" ", .{});
+    try writer.splatByteAll(' ', diag.span.start);
     const width = @max(diag.span.end - diag.span.start, 1); // point spans still get one caret
-    var k: usize = 0;
-    while (k < width) : (k += 1) std.debug.print("^", .{});
+    try writer.splatByteAll('^', width);
     try writer.print("  [{s}] at bytes {d}..{d} (\"{s}\")\n", .{
         @tagName(diag.code), diag.span.start, diag.span.end, diag.faultySlice(pattern),
     });
