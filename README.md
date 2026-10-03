@@ -21,8 +21,9 @@ backend architecture.
   [*write your own backend*](docs/usage-guide.md#8-writing-your-own-backend) walkthrough.
 - **Target-agnostic.** It's pure computation over caller-provided memory: no syscalls, no global
   allocator, no platform assumptions in the library code. It compiles anywhere Zig (plus
-  `ezi_code`) does, including `wasm32-freestanding`/`wasm32-wasi` and bare-metal `*-freestanding`
-  (all four are verified to compile).
+  `ezi_code`) does, including wasm and bare metal: `zig build freestanding` builds a demo for
+  `wasm32-freestanding` and bare-metal `aarch64`, `riscv64` and Cortex-M4. See
+  [wasm and bare metal](#wasm-and-bare-metal).
 
 ## Status
 
@@ -549,6 +550,64 @@ Most of the `debug` figure is Zig's debug runtime, not regex data. Your own bina
 under the demo: it won't link the demo's full spread of backends and Unicode features, and
 `compileRuntime` adds nothing beyond the shared tables.
 
+## wasm and bare metal
+
+`src/freestanding.zig` is a second demo, next to `main.zig`, for running with no operating system:
+no syscalls, no libc, no heap. `zig build freestanding` builds it for each target into
+`zig-out/freestanding/<target>/` (`small` by default; `-Dfreestanding-optimize` changes it):
+
+| Target | Artifact |
+|---|---|
+| `wasm32-freestanding` | `ezi_gex.wasm`: no imports; exports `memory` and the `ezi_*` functions |
+| `aarch64-freestanding` | `libezi_gex.a`, a static library for 64-bit Arm firmware |
+| `riscv64-freestanding` | `libezi_gex.a`, built `medany` so it links at `0x8000_0000`, where RISC-V boards put RAM |
+| `thumb-freestanding-cortex_m4` | `libezi_gex.a`, for a Cortex-M4F microcontroller |
+| `wasm32-wasi` | `ezi_gex.wasm`: `main.zig`, the full demo, for any WASI runtime |
+
+The demo shows both ways to run without an allocator from the OS:
+
+- **Comptime regexes** (an ISO date, `\p{L}+`) are compiled during the build into read-only data.
+  A search needs only a scratch, which is a stack array. There is no allocator at all.
+- **A runtime regex**, from a pattern the host supplies, is compiled into a fixed 1 MiB arena (a
+  `FixedBufferAllocator` over a static buffer). Its scratch and capture slots come from the same
+  arena at compile time, so a search never allocates. When a pattern's DFA tables don't fit (a
+  Unicode class like `\w` needs 4–5 MB), `ezi_compile` recompiles it without the byte DFA and
+  returns `1`. The NFA engines that remain are slower but still linear-time.
+
+The `ezi_*` functions are a C ABI: the host copies a pattern or input into
+`ezi_pattern_buffer()` / `ezi_input_buffer()` and passes its length. From JavaScript:
+
+```js
+const { instance } = await WebAssembly.instantiate(wasmBytes);
+const ezi = instance.exports;
+const put = (ptr, text) => {
+  const bytes = new TextEncoder().encode(text);
+  new Uint8Array(ezi.memory.buffer, ptr, bytes.length).set(bytes);
+  return bytes.length;
+};
+ezi.ezi_compile(put(ezi.ezi_pattern_buffer(), "(\\w+)@(\\w+)")); // 0 or 1: compiled
+const len = put(ezi.ezi_input_buffer(), "mail bob@example now");
+if (ezi.ezi_captures(len, 0) === 1) {
+  console.log(ezi.ezi_group_start(1), ezi.ezi_group_end(1)); // 5 8 ("bob")
+}
+ezi.ezi_iso_date(put(ezi.ezi_input_buffer(), "2026-10-03")); // 20261003
+```
+
+C firmware calls the same functions. The file's doc comments list every function and its return
+codes. Two things to know when you link the library into your own firmware:
+
+- Any runtime compile needs about 400 KB of arena, mostly class scratch the HIR builder allocates
+  up front. On a microcontroller with less RAM, use comptime regexes and shrink or drop the
+  arena (`arena_size`).
+- On aarch64, turn the MMU on before calling in. With it off, every access is to Device memory,
+  where the unaligned loads that ordinary compiled code makes fault.
+
+Each target has been run: the `.wasm` modules under Node.js, and the three static libraries linked
+into small firmware images on QEMU (`virt` for riscv64 and aarch64, `mps2-an386` for the
+Cortex-M4). Each gave the same results as the native tests. `zig build test-freestanding` runs those
+tests natively, including a check that the arena-compiled regex agrees with the heap Pike VM at
+every start offset.
+
 ## Documentation
 
 - [`docs/usage-guide.md`](docs/usage-guide.md) — **the hands-on guide**: copy-paste
@@ -572,15 +631,16 @@ under the demo: it won't link the demo's full spread of backends and Unicode fea
 zig build                                   # build the demo exe (zig-out/bin/ezi_gex)
 zig build run                               # build + run it
 zig build bench                             # benchmarks (`fast` by default)
-zig build test -Doptimize=safe              # full suite (safe mode is faster than Debug)
+zig build freestanding                      # wasm + bare-metal demo (zig-out/freestanding/)
+zig build test -Doptimize=safe              # full suite (safe mode is faster than debug)
 ```
 
-The test suite is split into **16 independently-cacheable units** — one named module per area, so a
+The test suite is split into **17 independently-cacheable units** — one named module per area, so a
 test binary only ever contains its own `test {}` blocks (Zig pulls a file's tests into every module
 that reaches it via a *relative* import, but never across a *named*-module boundary). Editing one
 file recompiles and re-runs only the unit(s) whose inputs changed; the rest stay cached. The units:
 `utils`, `core`, `engine_base`, the eight backends (`backtrack`, `pikevm`, `bytepike`, `dfa`, `edfa`,
-`onepass`, `literal`, `auto`), `regex`, `conformance`, `redos`, `fuzz`, and `exe`.
+`onepass`, `literal`, `auto`), `regex`, `conformance`, `redos`, `fuzz`, `exe` and `freestanding`.
 
 ```sh
 zig build test-core                         # run ONE unit (cached; also test-auto, test-edfa, …)

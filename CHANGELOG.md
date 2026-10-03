@@ -10,6 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 `0.8.0-dev` on `main`.
 
 ### Added
+- **A wasm and bare-metal demo, `src/freestanding.zig`, and `zig build freestanding`.** The demo
+  runs with no OS, libc or heap. Comptime regexes (an ISO date, `\p{L}+`) search with a stack
+  scratch and no allocator. A runtime regex, from a host-supplied pattern, compiles into a fixed
+  1 MiB arena whose scratch and capture slots are carved up front, so searches never allocate.
+  When a pattern's DFA tables don't fit, it recompiles without the byte DFA (`ezi_compile`
+  returns 1). The `ezi_*` C ABI serves a JavaScript page, a WASI runtime and C firmware alike.
+  The step builds a `.wasm` module for `wasm32-freestanding`, static libraries for bare-metal
+  `aarch64`, `riscv64` (`medany`) and Cortex-M4, and `main.zig` for `wasm32-wasi`, into
+  `zig-out/freestanding/`. The `freestanding` test unit runs the demo natively, including a check
+  that its arena-compiled regex agrees with the heap Pike VM at every start offset. Each artifact
+  was also run: under Node.js, and on QEMU for the three CPUs.
 - **`Options.size_limit`** (default 1 000 000) and **`hir.expandedSize`**: a ceiling on the
   pattern's unrolled size. `max_repetition` bounds each `{m,n}` count, but nested counts
   multiply — `(?:(?:a{1000}){1000}){1000}` unrolled to ~10⁹ copies and exhausted memory at
@@ -74,6 +85,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cases in `conformance.zig`; found by the fuzz reference check.
 
 ### Fixed
+- **The `main.zig` demo printed nothing on `wasm32-wasi`, and its error caret landed on the wrong
+  line.** Its stdout writer was positional, which a WASI stream rejects, and the failed flush was
+  swallowed; it now streams, and the WASI output matches the native run. The caret under a
+  rejected pattern went to stderr and appeared above all the output; it now prints under the
+  pattern.
 - **A partial `\A` made both byte DFAs quadratic.** With `\A` on only some branches
   (`\Az|a+b`, `(?:\Az|a.*b)$`), neither DFA can use its reverse scan, so each fell back to an
   anchored attempt at every start position — Θ(n²) when an attempt can run far without matching:

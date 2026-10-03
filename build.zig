@@ -13,7 +13,8 @@ fn some(comptime T: type, context: anytype, elements: []const T, predicate: fn (
 /// One test unit per independently-cacheable test binary. `all` selects every
 /// unit. Each non-`all` tag names exactly one `b.addTest` artifact, so a flag
 /// like `-Dinclude-test=auto,conformance` runs only those — a genuine partial
-/// run, not a slice of one giant binary. `exe` is `src/main.zig`'s own tests.
+/// run, not a slice of one giant binary. `exe` is `src/main.zig`'s own tests and
+/// `freestanding` is `src/freestanding.zig`'s, run natively.
 const TestEnum = enum {
     all,
     utils,
@@ -32,6 +33,7 @@ const TestEnum = enum {
     redos,
     fuzz,
     exe,
+    freestanding,
 };
 
 /// True if `tag` (or `all`) is in the selected `include-test` list.
@@ -75,8 +77,8 @@ const fuzz_groups = [_]FuzzGroup{
 
 /// The library's module graph, wired for one target and optimize mode. `build` makes it for the
 /// host with `publish` set, so the tests and a downstream `dep.module("…")` can import each
-/// module by name. It makes it again, unpublished, for the bench (its own optimize mode): a
-/// distinct `ezi_code` instance needs its own wrappers.
+/// module by name. It makes it again, unpublished, for the bench (its own optimize mode) and
+/// for every `freestanding` target: a distinct `ezi_code` instance needs its own wrappers.
 const Modules = struct {
     ezi_code: *std.Build.Module,
     utils: *std.Build.Module,
@@ -271,6 +273,27 @@ fn addModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lan
     };
 }
 
+/// Where `zig build freestanding` builds `src/freestanding.zig`: wasm with no host OS, and
+/// three bare-metal CPUs (a 64-bit Arm application core, a 64-bit RISC-V core, and a 32-bit
+/// Cortex-M4F microcontroller). `dir` names the install directory under `zig-out/freestanding/`.
+const FreestandingTarget = struct {
+    dir: []const u8,
+    query: std.Target.Query,
+    code_model: std.lang.CodeModel = .default,
+};
+const freestanding_targets = [_]FreestandingTarget{
+    .{ .dir = "wasm32-freestanding", .query = .{ .cpu_arch = .wasm32, .os_tag = .freestanding } },
+    .{ .dir = "aarch64-freestanding", .query = .{ .cpu_arch = .aarch64, .os_tag = .freestanding } },
+    // `medany`: RISC-V boards put RAM at 0x8000_0000, beyond `medlow`'s ±2 GiB around address 0.
+    .{ .dir = "riscv64-freestanding", .query = .{ .cpu_arch = .riscv64, .os_tag = .freestanding }, .code_model = .medany },
+    .{ .dir = "thumb-freestanding-cortex_m4", .query = .{
+        .cpu_arch = .thumb,
+        .os_tag = .freestanding,
+        .abi = .eabihf,
+        .cpu_model = .{ .explicit = &std.Target.arm.cpu.cortex_m4 },
+    } },
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -330,6 +353,15 @@ pub fn build(b: *std.Build) void {
     run_cmd.addPassthruArgs();
     run_step.dependOn(&run_cmd.step);
 
+    // ── freestanding demo, built for the host so its tests run natively ───────
+    // Its exports are ordinary functions; `zig build freestanding` (below) cross-builds it.
+    const freestanding_mod = b.createModule(.{
+        .root_source_file = b.path("src/freestanding.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "ezi_gex", .module = mod }},
+    });
+
     // ── per-unit test artifacts ───────────────────────────────────────────────
     // One `addTest` per module → one independently-cacheable test binary. Editing a
     // file only recompiles/re-runs the unit(s) whose inputs changed; the rest stay
@@ -351,6 +383,7 @@ pub fn build(b: *std.Build) void {
     const redos_tests = b.addTest(.{ .root_module = lib.redos });
     const fuzz_tests = b.addTest(.{ .root_module = fuzz_mod });
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
+    const freestanding_tests = b.addTest(.{ .root_module = freestanding_mod });
 
     const run_utils_tests = b.addRunArtifact(utils_tests);
     const run_core_tests = b.addRunArtifact(core_tests);
@@ -373,6 +406,7 @@ pub fn build(b: *std.Build) void {
     const fuzz_lib_tests = b.addTest(.{ .root_module = fuzz_lib_mod });
     run_fuzz_tests.step.dependOn(&b.addRunArtifact(fuzz_lib_tests).step);
     const run_exe_tests = b.addRunArtifact(exe_tests);
+    const run_freestanding_tests = b.addRunArtifact(freestanding_tests);
 
     // Pair each unit's tag with its run step, so the `test` step gates them by
     // `-Dinclude-test`, and so each gets a `test-<unit>` convenience step.
@@ -394,6 +428,7 @@ pub fn build(b: *std.Build) void {
         .{ .tag = .redos, .run = &run_redos_tests.step, .name = "test-redos" },
         .{ .tag = .fuzz, .run = &run_fuzz_tests.step, .name = "test-fuzz" },
         .{ .tag = .exe, .run = &run_exe_tests.step, .name = "test-exe" },
+        .{ .tag = .freestanding, .run = &run_freestanding_tests.step, .name = "test-freestanding" },
     };
 
     const test_step = b.step("test", "Run tests (gate units with -Dinclude-test=...)");
@@ -409,7 +444,7 @@ pub fn build(b: *std.Build) void {
     // Each file under `fuzz/groups/` compiles into its OWN test binary (its targets
     // share the bodies in fuzz_lib (`fuzz/lib.zig`). The `fuzz` step
     // depends on all of them, and the build scheduler runs independent run-steps
-    // concurrently — exactly like `zig build test` runs the 15 unit binaries at once
+    // concurrently — exactly like `zig build test` runs its unit binaries at once
     // — so `zig build fuzz --fuzz=N` fuzzes every group in parallel, N iters EACH
     // (19 groups × N). Bare `zig build fuzz` is a finite seed-replay smoke of all.
     // Each group also gets a `zig build fuzz-<group>` step for a single session.
@@ -492,6 +527,54 @@ pub fn build(b: *std.Build) void {
     const run_fuzz_min = b.addRunArtifact(fuzz_min_exe);
     run_fuzz_min.addPassthruArgs();
     b.step("fuzz-min", "Replay and shrink a FUZZ-CASE line: zig build fuzz-min -- '<line>'").dependOn(&run_fuzz_min.step);
+
+    // ── freestanding: the demo with no OS, for wasm and bare metal ─────────────
+    // `src/freestanding.zig` becomes a `.wasm` module for `wasm32-freestanding` (no entry point;
+    // its `ezi_*` C-ABI functions and its memory are exported for the host) and a static
+    // library for each bare-metal target. `src/main.zig`, the full demo, is also built for
+    // `wasm32-wasi`, where any WASI runtime can run it. Each lands in
+    // `zig-out/freestanding/<target>/`. The library graph is rebuilt per target, since the
+    // modules (and `ezi_code`) are compiled for one target at a time.
+    const freestanding_optimize = b.option(
+        std.lang.Optimize,
+        "freestanding-optimize",
+        "Optimization level for `zig build freestanding` (default small)",
+    ) orelse .small;
+    const freestanding_step = b.step("freestanding", "Build the no-OS demo for wasm32 and bare metal, and the main demo for wasm32-wasi");
+    for (freestanding_targets) |ft| {
+        const ft_target = b.resolveTargetQuery(ft.query);
+        const ft_mod = b.createModule(.{
+            .root_source_file = b.path("src/freestanding.zig"),
+            .target = ft_target,
+            .optimize = freestanding_optimize,
+            .code_model = ft.code_model,
+            .imports = &.{.{ .name = "ezi_gex", .module = addModules(b, ft_target, freestanding_optimize, false).ezi_gex }},
+        });
+        const artifact = if (ft.query.cpu_arch == .wasm32) wasm: {
+            const wasm = b.addExecutable(.{ .name = "ezi_gex", .root_module = ft_mod });
+            wasm.entry = .disabled;
+            wasm.rdynamic = true;
+            wasm.export_memory = true;
+            break :wasm wasm;
+        } else b.addLibrary(.{ .name = "ezi_gex", .linkage = .static, .root_module = ft_mod });
+        const install = b.addInstallArtifact(artifact, .{
+            .dest_dir = .{ .override = .{ .custom = b.fmt("freestanding/{s}", .{ft.dir}) } },
+        });
+        freestanding_step.dependOn(&install.step);
+    }
+    const wasi_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi });
+    const wasi_exe = b.addExecutable(.{
+        .name = "ezi_gex",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = wasi_target,
+            .optimize = freestanding_optimize,
+            .imports = &.{.{ .name = "ezi_gex", .module = addModules(b, wasi_target, freestanding_optimize, false).ezi_gex }},
+        }),
+    });
+    freestanding_step.dependOn(&b.addInstallArtifact(wasi_exe, .{
+        .dest_dir = .{ .override = .{ .custom = "freestanding/wasm32-wasi" } },
+    }).step);
 
     // ── Benchmarks ────────────────────────────────────────────────────────────
     // Built against an `ezi_gex` module in `fast` mode by default so the engine is
