@@ -73,16 +73,37 @@ const fuzz_groups = [_]FuzzGroup{
     .{ .name = "chaos", .per_minute = 140 },
 };
 
-pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+/// The library's module graph, wired for one target and optimize mode. `build` makes it for the
+/// host with `publish` set, so the tests and a downstream `dep.module("…")` can import each
+/// module by name. It makes it again, unpublished, for the bench (its own optimize mode): a
+/// distinct `ezi_code` instance needs its own wrappers.
+const Modules = struct {
+    ezi_code: *std.Build.Module,
+    utils: *std.Build.Module,
+    core: *std.Build.Module,
+    engine_base: *std.Build.Module,
+    pikevm: *std.Build.Module,
+    backtrack: *std.Build.Module,
+    bytepike: *std.Build.Module,
+    literal: *std.Build.Module,
+    onepass: *std.Build.Module,
+    dfa: *std.Build.Module,
+    edfa: *std.Build.Module,
+    auto: *std.Build.Module,
+    regex: *std.Build.Module,
+    conformance: *std.Build.Module,
+    redos: *std.Build.Module,
+    engine: *std.Build.Module,
+    /// `src/root.zig`, the module users import as `ezi_gex`.
+    ezi_gex: *std.Build.Module,
+};
 
-    const include_tests = b.option(
-        []const TestEnum,
-        "include-test",
-        "Test units to run with `zig build test` (default: all)",
-    ) orelse &[_]TestEnum{.all};
+/// `b.addModule`, published under `name`, when `publish`; otherwise an anonymous `b.createModule`.
+fn libModule(b: *std.Build, publish: bool, name: []const u8, options: std.Build.Module.CreateOptions) *std.Build.Module {
+    return if (publish) b.addModule(name, options) else b.createModule(options);
+}
 
+fn addModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, publish: bool) Modules {
     const ezi_code = b.dependency("ezi_code", .{
         .target = target,
         .optimize = optimize,
@@ -103,7 +124,7 @@ pub fn build(b: *std.Build) void {
     const utils: std.Build.Module.Import = .{ .name = "utils", .module = utils_mod };
 
     // ── core: front end (token, ast, error, scanner, compile, hir) ────────────
-    const core_mod = b.addModule("core", .{
+    const core_mod = libModule(b, publish, "core", .{
         .root_source_file = b.path("src/core/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -112,7 +133,7 @@ pub fn build(b: *std.Build) void {
     const core: std.Build.Module.Import = .{ .name = "core", .module = core_mod };
 
     // ── engine_base: the shared engine substrate (7 files behind one boundary) ─
-    const engine_base_mod = b.addModule("engine_base", .{
+    const engine_base_mod = libModule(b, publish, "engine_base", .{
         .root_source_file = b.path("src/engine/base.zig"),
         .target = target,
         .optimize = optimize,
@@ -121,7 +142,7 @@ pub fn build(b: *std.Build) void {
     const engine_base: std.Build.Module.Import = .{ .name = "engine_base", .module = engine_base_mod };
 
     // ── backends: each its own module (so each caches/tests independently) ─────
-    const pikevm_mod = b.addModule("pikevm", .{
+    const pikevm_mod = libModule(b, publish, "pikevm", .{
         .root_source_file = b.path("src/engine/backends/pikevm.zig"),
         .target = target,
         .optimize = optimize,
@@ -129,7 +150,7 @@ pub fn build(b: *std.Build) void {
     });
     const pikevm: std.Build.Module.Import = .{ .name = "pikevm", .module = pikevm_mod };
 
-    const backtrack_mod = b.addModule("backtrack", .{
+    const backtrack_mod = libModule(b, publish, "backtrack", .{
         .root_source_file = b.path("src/engine/backends/backtrack.zig"),
         .target = target,
         .optimize = optimize,
@@ -137,7 +158,7 @@ pub fn build(b: *std.Build) void {
     });
     const backtrack: std.Build.Module.Import = .{ .name = "backtrack", .module = backtrack_mod };
 
-    const bytepike_mod = b.addModule("bytepike", .{
+    const bytepike_mod = libModule(b, publish, "bytepike", .{
         .root_source_file = b.path("src/engine/backends/bytepike.zig"),
         .target = target,
         .optimize = optimize,
@@ -145,7 +166,7 @@ pub fn build(b: *std.Build) void {
     });
     const bytepike: std.Build.Module.Import = .{ .name = "bytepike", .module = bytepike_mod };
 
-    const literal_mod = b.addModule("literal", .{
+    const literal_mod = libModule(b, publish, "literal", .{
         .root_source_file = b.path("src/engine/backends/literal.zig"),
         .target = target,
         .optimize = optimize,
@@ -153,7 +174,7 @@ pub fn build(b: *std.Build) void {
     });
     const literal: std.Build.Module.Import = .{ .name = "literal", .module = literal_mod };
 
-    const onepass_mod = b.addModule("onepass", .{
+    const onepass_mod = libModule(b, publish, "onepass", .{
         .root_source_file = b.path("src/engine/backends/onepass.zig"),
         .target = target,
         .optimize = optimize,
@@ -161,7 +182,7 @@ pub fn build(b: *std.Build) void {
     });
     const onepass: std.Build.Module.Import = .{ .name = "onepass", .module = onepass_mod };
 
-    const dfa_mod = b.addModule("dfa", .{
+    const dfa_mod = libModule(b, publish, "dfa", .{
         .root_source_file = b.path("src/engine/backends/dfa.zig"),
         .target = target,
         .optimize = optimize,
@@ -169,7 +190,7 @@ pub fn build(b: *std.Build) void {
     });
     const dfa: std.Build.Module.Import = .{ .name = "dfa", .module = dfa_mod };
 
-    const edfa_mod = b.addModule("edfa", .{
+    const edfa_mod = libModule(b, publish, "edfa", .{
         .root_source_file = b.path("src/engine/backends/edfa.zig"),
         .target = target,
         .optimize = optimize,
@@ -177,7 +198,7 @@ pub fn build(b: *std.Build) void {
     });
     const edfa: std.Build.Module.Import = .{ .name = "edfa", .module = edfa_mod };
 
-    const auto_mod = b.addModule("auto", .{
+    const auto_mod = libModule(b, publish, "auto", .{
         .root_source_file = b.path("src/engine/backends/auto.zig"),
         .target = target,
         .optimize = optimize,
@@ -186,7 +207,7 @@ pub fn build(b: *std.Build) void {
     const auto: std.Build.Module.Import = .{ .name = "auto", .module = auto_mod };
 
     // ── regex: the front door (depends on auto) ───────────────────────────────
-    const regex_mod = b.addModule("regex", .{
+    const regex_mod = libModule(b, publish, "regex", .{
         .root_source_file = b.path("src/engine/regex.zig"),
         .target = target,
         .optimize = optimize,
@@ -195,7 +216,7 @@ pub fn build(b: *std.Build) void {
     const regex: std.Build.Module.Import = .{ .name = "regex", .module = regex_mod };
 
     // ── conformance: cross-backend differential (drives every backend) ────────
-    const conformance_mod = b.addModule("conformance", .{
+    const conformance_mod = libModule(b, publish, "conformance", .{
         .root_source_file = b.path("src/engine/conformance.zig"),
         .target = target,
         .optimize = optimize,
@@ -204,7 +225,7 @@ pub fn build(b: *std.Build) void {
     const conformance: std.Build.Module.Import = .{ .name = "conformance", .module = conformance_mod };
 
     // ── redos: ReDoS-immunity regression suite ────────────────────────────────
-    const redos_mod = b.addModule("redos", .{
+    const redos_mod = libModule(b, publish, "redos", .{
         .root_source_file = b.path("src/engine/redos.zig"),
         .target = target,
         .optimize = optimize,
@@ -213,7 +234,7 @@ pub fn build(b: *std.Build) void {
     const redos: std.Build.Module.Import = .{ .name = "redos", .module = redos_mod };
 
     // ── engine aggregate: thin re-export over the units (no tests of its own) ──
-    const engine_mod = b.addModule("engine", .{
+    const engine_mod = libModule(b, publish, "engine", .{
         .root_source_file = b.path("src/engine/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -222,12 +243,46 @@ pub fn build(b: *std.Build) void {
     const engine: std.Build.Module.Import = .{ .name = "engine", .module = engine_mod };
 
     // ── ezi_gex facade: the published module (exe + bench + downstream use it) ─
-    const mod = b.addModule("ezi_gex", .{
+    const mod = libModule(b, publish, "ezi_gex", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{ utils, core, engine },
     });
+
+    return .{
+        .ezi_code = ezi_code.module("ezi_code"),
+        .utils = utils_mod,
+        .core = core_mod,
+        .engine_base = engine_base_mod,
+        .pikevm = pikevm_mod,
+        .backtrack = backtrack_mod,
+        .bytepike = bytepike_mod,
+        .literal = literal_mod,
+        .onepass = onepass_mod,
+        .dfa = dfa_mod,
+        .edfa = edfa_mod,
+        .auto = auto_mod,
+        .regex = regex_mod,
+        .conformance = conformance_mod,
+        .redos = redos_mod,
+        .engine = engine_mod,
+        .ezi_gex = mod,
+    };
+}
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const include_tests = b.option(
+        []const TestEnum,
+        "include-test",
+        "Test units to run with `zig build test` (default: all)",
+    ) orelse &[_]TestEnum{.all};
+
+    const lib = addModules(b, target, optimize, true);
+    const mod = lib.ezi_gex;
 
     // ── fuzz: coverage-guided fuzz targets (Smith-driven) over the facade ──────
     // `fuzz_lib` (fuzz/lib.zig) holds what every fuzz binary shares: generators
@@ -243,7 +298,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "ezi_gex", .module = mod },
-            .{ .name = "ezi_code", .module = ezi_code.module("ezi_code") },
+            .{ .name = "ezi_code", .module = lib.ezi_code },
         },
     });
     const fuzz_lib: std.Build.Module.Import = .{ .name = "fuzz_lib", .module = fuzz_lib_mod };
@@ -280,20 +335,20 @@ pub fn build(b: *std.Build) void {
     // file only recompiles/re-runs the unit(s) whose inputs changed; the rest stay
     // cached. The facade module (`ezi_gex`) is NOT tested here — its relative-free
     // surface re-exports the units, so testing it would just re-run them.
-    const utils_tests = b.addTest(.{ .root_module = utils_mod });
-    const core_tests = b.addTest(.{ .root_module = core_mod });
-    const engine_base_tests = b.addTest(.{ .root_module = engine_base_mod });
-    const backtrack_tests = b.addTest(.{ .root_module = backtrack_mod });
-    const pikevm_tests = b.addTest(.{ .root_module = pikevm_mod });
-    const bytepike_tests = b.addTest(.{ .root_module = bytepike_mod });
-    const dfa_tests = b.addTest(.{ .root_module = dfa_mod });
-    const edfa_tests = b.addTest(.{ .root_module = edfa_mod });
-    const onepass_tests = b.addTest(.{ .root_module = onepass_mod });
-    const literal_tests = b.addTest(.{ .root_module = literal_mod });
-    const auto_tests = b.addTest(.{ .root_module = auto_mod });
-    const regex_tests = b.addTest(.{ .root_module = regex_mod });
-    const conformance_tests = b.addTest(.{ .root_module = conformance_mod });
-    const redos_tests = b.addTest(.{ .root_module = redos_mod });
+    const utils_tests = b.addTest(.{ .root_module = lib.utils });
+    const core_tests = b.addTest(.{ .root_module = lib.core });
+    const engine_base_tests = b.addTest(.{ .root_module = lib.engine_base });
+    const backtrack_tests = b.addTest(.{ .root_module = lib.backtrack });
+    const pikevm_tests = b.addTest(.{ .root_module = lib.pikevm });
+    const bytepike_tests = b.addTest(.{ .root_module = lib.bytepike });
+    const dfa_tests = b.addTest(.{ .root_module = lib.dfa });
+    const edfa_tests = b.addTest(.{ .root_module = lib.edfa });
+    const onepass_tests = b.addTest(.{ .root_module = lib.onepass });
+    const literal_tests = b.addTest(.{ .root_module = lib.literal });
+    const auto_tests = b.addTest(.{ .root_module = lib.auto });
+    const regex_tests = b.addTest(.{ .root_module = lib.regex });
+    const conformance_tests = b.addTest(.{ .root_module = lib.conformance });
+    const redos_tests = b.addTest(.{ .root_module = lib.redos });
     const fuzz_tests = b.addTest(.{ .root_module = fuzz_mod });
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
 
@@ -440,146 +495,14 @@ pub fn build(b: *std.Build) void {
 
     // ── Benchmarks ────────────────────────────────────────────────────────────
     // Built against an `ezi_gex` module in `fast` mode by default so the engine is
-    // measured optimized. The seam (and the whole module tree) is rebuilt at the
-    // bench optimize level — a distinct ezi_code instance needs distinct wrappers.
+    // measured optimized: `addModules` rebuilds the whole module graph at that level.
     const bench_optimize = b.option(
         std.lang.Optimize,
         "bench-optimize",
         "Optimization level for the bench executable (default fast)",
     ) orelse .fast;
 
-    const ezi_code_bench = b.dependency("ezi_code", .{
-        .target = target,
-        .optimize = bench_optimize,
-    });
-    const bench_utils_mod = b.createModule(.{
-        .root_source_file = b.path("src/utils/root.zig"),
-        .target = target,
-        .optimize = bench_optimize,
-        .imports = &.{
-            .{ .name = "ezi_code", .module = ezi_code_bench.module("ezi_code") },
-        },
-    });
-    const bench_utils: std.Build.Module.Import = .{ .name = "utils", .module = bench_utils_mod };
-
-    const bench_core_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/root.zig"),
-        .target = target,
-        .optimize = bench_optimize,
-        .imports = &.{bench_utils},
-    });
-    const bench_core: std.Build.Module.Import = .{ .name = "core", .module = bench_core_mod };
-
-    const bench_engine_base_mod = b.createModule(.{
-        .root_source_file = b.path("src/engine/base.zig"),
-        .target = target,
-        .optimize = bench_optimize,
-        .imports = &.{ bench_utils, bench_core },
-    });
-    const bench_engine_base: std.Build.Module.Import = .{ .name = "engine_base", .module = bench_engine_base_mod };
-
-    const bench_pikevm_mod = b.createModule(.{
-        .root_source_file = b.path("src/engine/backends/pikevm.zig"),
-        .target = target,
-        .optimize = bench_optimize,
-        .imports = &.{ bench_utils, bench_core, bench_engine_base },
-    });
-    const bench_pikevm: std.Build.Module.Import = .{ .name = "pikevm", .module = bench_pikevm_mod };
-
-    const bench_backtrack_mod = b.createModule(.{
-        .root_source_file = b.path("src/engine/backends/backtrack.zig"),
-        .target = target,
-        .optimize = bench_optimize,
-        .imports = &.{ bench_utils, bench_core, bench_engine_base },
-    });
-    const bench_backtrack: std.Build.Module.Import = .{ .name = "backtrack", .module = bench_backtrack_mod };
-
-    const bench_bytepike_mod = b.createModule(.{
-        .root_source_file = b.path("src/engine/backends/bytepike.zig"),
-        .target = target,
-        .optimize = bench_optimize,
-        .imports = &.{ bench_utils, bench_core, bench_engine_base },
-    });
-    const bench_bytepike: std.Build.Module.Import = .{ .name = "bytepike", .module = bench_bytepike_mod };
-
-    const bench_literal_mod = b.createModule(.{
-        .root_source_file = b.path("src/engine/backends/literal.zig"),
-        .target = target,
-        .optimize = bench_optimize,
-        .imports = &.{ bench_utils, bench_core, bench_engine_base },
-    });
-    const bench_literal: std.Build.Module.Import = .{ .name = "literal", .module = bench_literal_mod };
-
-    const bench_onepass_mod = b.createModule(.{
-        .root_source_file = b.path("src/engine/backends/onepass.zig"),
-        .target = target,
-        .optimize = bench_optimize,
-        .imports = &.{ bench_utils, bench_core, bench_engine_base, bench_pikevm },
-    });
-    const bench_onepass: std.Build.Module.Import = .{ .name = "onepass", .module = bench_onepass_mod };
-
-    const bench_dfa_mod = b.createModule(.{
-        .root_source_file = b.path("src/engine/backends/dfa.zig"),
-        .target = target,
-        .optimize = bench_optimize,
-        .imports = &.{ bench_utils, bench_core, bench_engine_base, bench_pikevm },
-    });
-    const bench_dfa: std.Build.Module.Import = .{ .name = "dfa", .module = bench_dfa_mod };
-
-    const bench_edfa_mod = b.createModule(.{
-        .root_source_file = b.path("src/engine/backends/edfa.zig"),
-        .target = target,
-        .optimize = bench_optimize,
-        .imports = &.{ bench_utils, bench_core, bench_engine_base, bench_dfa, bench_pikevm },
-    });
-    const bench_edfa: std.Build.Module.Import = .{ .name = "edfa", .module = bench_edfa_mod };
-
-    const bench_auto_mod = b.createModule(.{
-        .root_source_file = b.path("src/engine/backends/auto.zig"),
-        .target = target,
-        .optimize = bench_optimize,
-        .imports = &.{ bench_utils, bench_core, bench_engine_base, bench_literal, bench_pikevm, bench_backtrack, bench_dfa, bench_edfa, bench_onepass },
-    });
-    const bench_auto: std.Build.Module.Import = .{ .name = "auto", .module = bench_auto_mod };
-
-    const bench_regex_mod = b.createModule(.{
-        .root_source_file = b.path("src/engine/regex.zig"),
-        .target = target,
-        .optimize = bench_optimize,
-        .imports = &.{ bench_utils, bench_core, bench_engine_base, bench_auto },
-    });
-    const bench_regex: std.Build.Module.Import = .{ .name = "regex", .module = bench_regex_mod };
-
-    const bench_conformance_mod = b.createModule(.{
-        .root_source_file = b.path("src/engine/conformance.zig"),
-        .target = target,
-        .optimize = bench_optimize,
-        .imports = &.{ bench_utils, bench_core, bench_engine_base, bench_regex, bench_pikevm, bench_backtrack, bench_literal, bench_bytepike, bench_dfa, bench_edfa, bench_onepass, bench_auto },
-    });
-    const bench_conformance: std.Build.Module.Import = .{ .name = "conformance", .module = bench_conformance_mod };
-
-    const bench_redos_mod = b.createModule(.{
-        .root_source_file = b.path("src/engine/redos.zig"),
-        .target = target,
-        .optimize = bench_optimize,
-        .imports = &.{ bench_utils, bench_core, bench_engine_base, bench_regex, bench_pikevm, bench_backtrack, bench_auto, bench_edfa, bench_dfa },
-    });
-    const bench_redos: std.Build.Module.Import = .{ .name = "redos", .module = bench_redos_mod };
-
-    const bench_engine_mod = b.createModule(.{
-        .root_source_file = b.path("src/engine/root.zig"),
-        .target = target,
-        .optimize = bench_optimize,
-        .imports = &.{ bench_engine_base, bench_pikevm, bench_backtrack, bench_bytepike, bench_literal, bench_dfa, bench_edfa, bench_onepass, bench_auto, bench_regex, bench_conformance, bench_redos },
-    });
-    const bench_engine: std.Build.Module.Import = .{ .name = "engine", .module = bench_engine_mod };
-
-    const bench_mod = b.createModule(.{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = bench_optimize,
-        .imports = &.{ bench_utils, bench_core, bench_engine },
-    });
+    const bench_mod = addModules(b, target, bench_optimize, false).ezi_gex;
 
     const bench_exe = b.addExecutable(.{
         .name = "bench",
