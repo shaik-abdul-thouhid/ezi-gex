@@ -281,7 +281,7 @@ fn litByte(smith: *Smith) u8 {
 /// Append `v` in decimal (v <= 255, so at most 3 digits).
 fn putUint(p: *PatternSmith, v: u8) void {
     var buf: [3]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable;
+    const s = std.mem.print(&buf, "{d}", .{v}) catch unreachable;
     p.puts(s);
 }
 
@@ -511,7 +511,7 @@ test "gen reaches the widened syntax" {
         var s = replay.smith(&prng, &buf);
         const p = gen(&s);
         for (needles, 0..) |nd, k| {
-            if (std.mem.indexOf(u8, p.slice(), nd) != null) seen[k] = true;
+            if (std.mem.find(u8, p.slice(), nd) != null) seen[k] = true;
         }
     }
     for (needles, seen) |nd, ok| {

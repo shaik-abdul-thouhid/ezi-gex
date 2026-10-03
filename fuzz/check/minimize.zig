@@ -179,7 +179,7 @@ test "minimize reports a case that does not reproduce" {
 test "minimize shrinks pattern and input to the essential bytes" {
     const fake = struct {
         fn f(_: std.mem.Allocator, c: *const Case) anyerror!void {
-            if (std.mem.indexOfScalar(u8, c.pattern, 'b') != null and std.mem.indexOf(u8, c.input, "xy") != null) return error.Boom;
+            if (std.mem.findScalar(u8, c.pattern, 'b') != null and std.mem.find(u8, c.input, "xy") != null) return error.Boom;
         }
     }.f;
     const m = (try minimize(testing.allocator, &.{ .check = .span, .pattern = "aabbb", .input = "qqxyzz" }, fake)).?;
@@ -193,7 +193,7 @@ test "minimize shrinks a tree node by node" {
         fn f(_: std.mem.Allocator, c: *const Case) anyerror!void {
             const t = tree.Tree.fromBytes(c.tree) orelse return;
             const pr = print.canonical(&t, t.opt) orelse return;
-            if (std.mem.indexOfScalar(u8, pr.slice(), 'z') != null) return error.Boom;
+            if (std.mem.findScalar(u8, pr.slice(), 'z') != null) return error.Boom;
         }
     }.f;
     var b = tree.Builder.init(0);

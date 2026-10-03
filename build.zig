@@ -419,7 +419,7 @@ pub fn build(b: *std.Build) void {
         run.has_side_effects = true; // fuzzing is never "up to date"
         const report = b.addRunArtifact(campaign_report);
         report.addArgs(&.{ fg.name, b.fmt("{d}", .{n}) });
-        report.addFileArg(run.captureStdErr(.{}));
+        report.addFileArg2(run.captureStdErr(.{}), .{});
         report.has_side_effects = true;
         campaign_step.dependOn(&report.step);
     }

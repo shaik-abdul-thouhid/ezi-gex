@@ -1668,7 +1668,7 @@ fn preferBacktrack(p: *const nfa.Program, back: *const backtrack.Scratch, input:
 }
 
 /// First byte offset `≥ start` at which `byte` appears in `input`, or null. Runtime
-/// uses `std.mem.indexOfScalarPos` (SIMD memchr); comptime uses a plain scan (the
+/// uses `std.mem.findScalarPos` (SIMD memchr); comptime uses a plain scan (the
 /// project keeps `@Vector` out of const-eval). The prefilter's start-skip primitive.
 fn memchrFrom(input: []const u8, start: usize, b: u8) ?usize {
     if (@inComptime()) {
@@ -1676,7 +1676,7 @@ fn memchrFrom(input: []const u8, start: usize, b: u8) ?usize {
         while (i < input.len) : (i += 1) if (input[i] == b) return i;
         return null;
     }
-    return std.mem.indexOfScalarPos(u8, input, start, b);
+    return std.mem.findScalarPos(u8, input, start, b);
 }
 
 /// First byte offset `≥ start` at which `needle` occurs in `input`, or null — the prefilter's
@@ -1687,7 +1687,7 @@ fn memchrFrom(input: []const u8, start: usize, b: u8) ?usize {
 /// than scanning the single rarest byte (the prefilter sees "the"/"http"/"foo"-sized needles,
 /// where one common lead byte leaves a candidate almost everywhere).
 ///
-/// We deliberately do **NOT** call `std.mem.indexOfPos`: it falls back to a *non-SIMD* linear
+/// We deliberately do **NOT** call `std.mem.findPos`: it falls back to a *non-SIMD* linear
 /// scan for needles `≤ 4` bytes (`std.mem.findPos`) — exactly the sizes here. A one-byte needle
 /// is exactly `memchrFrom`; an empty needle matches at `start`. Comptime routes to the scalar
 /// fallback (`Finder.find` handles `@inComptime()` internally — no `@Vector` in const-eval).

@@ -1910,9 +1910,9 @@ test "usage guide §11: every documented property spelling resolves, and the rej
     for (token.gc_map_entries) |e| {
         try expectResolves(e.key);
         if (e.key.len == 1) {
-            const pat = try std.fmt.bufPrint(&buf, "\\p{s}", .{e.key});
+            const pat = try std.mem.print(&buf, "\\p{s}", .{e.key});
             try expectSexpr(pat, "(uprop)");
-            const neg = try std.fmt.bufPrint(&buf, "\\P{s}", .{e.key});
+            const neg = try std.mem.print(&buf, "\\P{s}", .{e.key});
             try expectSexpr(neg, "(unprop)");
         }
     }
@@ -1921,8 +1921,8 @@ test "usage guide §11: every documented property spelling resolves, and the rej
     // Every script, by long name and by code, under all four prefixes.
     for (token.script_long_name_entries) |e| {
         inline for (.{ "Script=", "sc=", "Script_Extensions=", "scx=" }) |prefix| {
-            try expectResolves(try std.fmt.bufPrint(&buf, "{s}{s}", .{ prefix, e.key }));
-            try expectResolves(try std.fmt.bufPrint(&buf, "{s}{s}", .{ prefix, e.abbr }));
+            try expectResolves(try std.mem.print(&buf, "{s}{s}", .{ prefix, e.key }));
+            try expectResolves(try std.mem.print(&buf, "{s}{s}", .{ prefix, e.abbr }));
         }
     }
 

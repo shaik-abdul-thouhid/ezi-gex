@@ -35,7 +35,7 @@ pub const LitSet = struct {
         for (0..self.n) |i| {
             if (i > 0 and !put(out, &len, '|')) return null;
             for (self.get(i)) |c| {
-                if (c < 0x80 and std.mem.indexOfScalar(u8, ".^$|?*+()[]{}\\#", c) != null) {
+                if (c < 0x80 and std.mem.findScalar(u8, ".^$|?*+()[]{}\\#", c) != null) {
                     if (!put(out, &len, '\\')) return null;
                 }
                 if (!put(out, &len, c)) return null;

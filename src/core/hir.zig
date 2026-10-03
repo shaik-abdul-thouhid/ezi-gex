@@ -3779,7 +3779,7 @@ test "comptime resolves a unicode property class in ro_data" {
     const sexpr = comptime comptimeHirSExpr("\\w", .{});
     // \w begins with the ASCII run 0-9 (the decimal-number block) — proves the
     // range tables were enumerated at comptime.
-    try testing.expect(std.mem.indexOf(u8, sexpr, "0-9") != null);
+    try testing.expect(std.mem.find(u8, sexpr, "0-9") != null);
 }
 
 test {

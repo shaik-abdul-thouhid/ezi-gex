@@ -75,7 +75,7 @@ fn isComposite(k: tree.Kind) bool {
 }
 
 fn isMeta(c: u8) bool {
-    return std.mem.indexOfScalar(u8, ".^$|?*+()[]{}\\", c) != null;
+    return std.mem.findScalar(u8, ".^$|?*+()[]{}\\", c) != null;
 }
 
 fn namedEscape(cp: u21) ?[]const u8 {
@@ -130,7 +130,7 @@ const P = struct {
 
     fn printf(p: *P, comptime fmt: []const u8, args: anytype) void {
         var b: [48]u8 = undefined;
-        p.puts(std.fmt.bufPrint(&b, fmt, args) catch unreachable);
+        p.puts(std.mem.print(&b, fmt, args) catch unreachable);
     }
 
     fn raw(p: *P, cp: u21) void {
@@ -446,7 +446,7 @@ const P = struct {
         };
         if (cp < 0x80) {
             const c: u8 = @intCast(cp);
-            if (std.mem.indexOfScalar(u8, "]\\[-^", c) != null) {
+            if (std.mem.findScalar(u8, "]\\[-^", c) != null) {
                 p.put('\\');
                 return p.put(c);
             }

@@ -292,7 +292,7 @@ test "fold orbits" {
     var buf: [8]u21 = undefined;
     const has = struct {
         fn f(o: []const u21, c: u21) bool {
-            return std.mem.indexOfScalar(u21, o, c) != null;
+            return std.mem.findScalar(u21, o, c) != null;
         }
     }.f;
     const k = orbit('k', &buf);

@@ -170,7 +170,7 @@ test "health: every generator property name is scanner-accepted" {
     var buf: [64]u8 = undefined;
     var bad: usize = 0;
     for (ps.uni_props) |name| {
-        const pat = std.fmt.bufPrint(&buf, "\\p{{{s}}}", .{name}) catch unreachable;
+        const pat = std.mem.print(&buf, "\\p{{{s}}}", .{name}) catch unreachable;
         var diag: gex.Diagnostic = .{};
         if (gex.parse(gpa, pat, &diag)) |a| {
             a.deinit(gpa);

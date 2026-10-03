@@ -89,7 +89,7 @@ pub fn run(gpa: std.mem.Allocator, case: *const Case) anyerror!void {
     // group scopes any inline flags, so the appended `$` is always text-end (opt 4 is `(?m)`).
     if (case.opt != 4) {
         var ebuf: [4096]u8 = undefined;
-        const ep = if (anchoredEnd(gpa, case.pattern)) case.pattern else std.fmt.bufPrint(&ebuf, "(?:{s})$", .{case.pattern}) catch return;
+        const ep = if (anchoredEnd(gpa, case.pattern)) case.pattern else std.mem.print(&ebuf, "(?:{s})$", .{case.pattern}) catch return;
         if (!anchoredEnd(gpa, ep)) return;
         var ab = try common.build(gex.backends.auto, gpa, ep, case.opt);
         if (ab != .ok) return;
@@ -206,12 +206,12 @@ fn compilePeak(gpa: std.mem.Allocator, pattern: []const u8) !Compiled {
 /// when the pattern doesn't end that way (a minimized variant) or won't fit `buf`.
 fn doubledOuter(pattern: []const u8, buf: []u8) ?[]const u8 {
     if (pattern.len < 2 or pattern[pattern.len - 1] != '}') return null;
-    const open = std.mem.lastIndexOfScalar(u8, pattern, '{') orelse return null;
+    const open = std.mem.findScalarLast(u8, pattern, '{') orelse return null;
     const body = pattern[open + 1 .. pattern.len - 1];
-    const comma = std.mem.indexOfScalar(u8, body, ',') orelse return null;
+    const comma = std.mem.findScalar(u8, body, ',') orelse return null;
     const lo = std.fmt.parseInt(u32, body[0..comma], 10) catch return null;
     const hi = std.fmt.parseInt(u32, body[comma + 1 ..], 10) catch return null;
-    return std.fmt.bufPrint(buf, "{s}{{{d},{d}}}", .{ pattern[0..open], 2 * lo, 2 * hi }) catch null;
+    return std.mem.print(buf, "{s}{{{d},{d}}}", .{ pattern[0..open], 2 * lo, 2 * hi }) catch null;
 }
 
 pub fn runBomb(gpa: std.mem.Allocator, case: *const Case) anyerror!void {

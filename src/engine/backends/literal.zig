@@ -54,7 +54,7 @@ pub const caps = Caps{ .captures = true, .stateless = true, .grapheme = false };
 pub const Options = struct {
     /// Whether the unanchored alternation scan may use the Teddy SIMD accelerator. `.auto`
     /// (default) builds it on a runtime program when the target has a native dynamic shuffle
-    /// and the set benefits; `.off` keeps the portable `indexOfAny` scan. Results-invariant.
+    /// and the set benefits; `.off` keeps the portable `findAny` scan. Results-invariant.
     ///
     /// @stable-since: v0.4.0
     simd: simd.SimdMode = .auto,
@@ -240,7 +240,7 @@ fn buildMem(program: Program, opts: Options) ?memmem.Finder {
 /// Choose and build the Teddy accelerator for an unanchored scan, or `.none`. **Runtime
 /// only** (the dynamic shuffle is asm; the comptime builder never calls this). Declines —
 /// keeping the portable scan — when SIMD is off, the target has no native shuffle (scalar
-/// Teddy would lose to `indexOfAny`/BMH), there is a lone needle (BMH wins), or any branch
+/// Teddy would lose to `findAny`/BMH), there is a lone needle (BMH wins), or any branch
 /// is empty (the scalar path handles the match-everywhere case). Picks **fat** (16 buckets)
 /// over **slim** only with AVX2 and a set larger than slim's buckets.
 fn buildTeddy(gpa: std.mem.Allocator, program: Program, opts: Options) BuildError!TeddyArm {
@@ -293,11 +293,11 @@ pub fn freeProgram(gpa: std.mem.Allocator, program: *Program) void {
 /// First byte offset `≥ start` at which `needle` occurs in `input`, or null. An
 /// empty needle occurs at `start` (the empty string matches everywhere).
 ///
-/// At **runtime** this is `std.mem.indexOfPos` — a memchr (`indexOfScalarPos`) for a
+/// At **runtime** this is `std.mem.findPos` — a memchr (`findScalarPos`) for a
 /// one-byte needle and Boyer–Moore–Horspool with a skip table for longer ones, both
 /// SIMD-accelerated. That is the "absurd fast" path: it skips whole runs of input
 /// instead of re-comparing at every byte (the old `O(input × needle)` scan). At
-/// **comptime** it falls back to a plain `eql` scan — `std.mem.indexOfPos` would pull
+/// **comptime** it falls back to a plain `eql` scan — `std.mem.findPos` would pull
 /// `@Vector` code into const-eval, which the project keeps out of comptime paths.
 ///
 /// Byte scanning is sound for UTF-8: a needle is a whole-code-point sequence, and its
@@ -312,14 +312,14 @@ fn firstMatchPos(input: []const u8, start: usize, needle: []const u8) ?usize {
         }
         return null;
     }
-    return std.mem.indexOfPos(u8, input, start, needle);
+    return std.mem.findPos(u8, input, start, needle);
 }
 
 /// First offset `≥ start` whose byte is **any** of `set` (the distinct first bytes of the
-/// alternation's needles), or null. Runtime is `std.mem.indexOfAnyPos` (a SIMD multi-byte
+/// alternation's needles), or null. Runtime is `std.mem.findAnyPos` (a SIMD multi-byte
 /// memchr); comptime is a plain scan (the project keeps `@Vector` out of const-eval). This
 /// is what lets a literal alternation skip to the next candidate in **one** pass instead of
-/// one `indexOfPos` per branch — the latter re-scans toward the *rarest* needle on every
+/// one `findPos` per branch — the latter re-scans toward the *rarest* needle on every
 /// `count` step, an accidental Θ(input²) when one branch is sparse.
 fn firstAnyPos(input: []const u8, start: usize, set: []const u8) ?usize {
     if (@inComptime()) {
@@ -329,7 +329,7 @@ fn firstAnyPos(input: []const u8, start: usize, set: []const u8) ?usize {
         }
         return null;
     }
-    return std.mem.indexOfAnyPos(u8, input, start, set);
+    return std.mem.findAnyPos(u8, input, start, set);
 }
 
 /// The leftmost-first match **at exactly** `pos`: the first branch (in alternation/priority
@@ -385,9 +385,9 @@ pub fn search(program: *const Program, _: *Scratch, input: []const u8, opts: Sea
     // (highest priority) branch.
     //
     // We collect the distinct first bytes of the branches and skip to the next position
-    // holding any of them with a single SIMD `indexOfAny` pass (`firstAnyPos`), then verify
+    // holding any of them with a single SIMD `findAny` pass (`firstAnyPos`), then verify
     // the branches in priority order there (`matchAtPos`). This is O(input) per search —
-    // unlike one `indexOfPos` per branch, which scans toward each needle's next occurrence
+    // unlike one `findPos` per branch, which scans toward each needle's next occurrence
     // and so re-scans the whole region looking for a *rare* branch on every `count` step (an
     // accidental Θ(input²): `foo|bar|baz|qux` with a sparse `qux` was the worst cell).
     var lead: [64]u8 = undefined;

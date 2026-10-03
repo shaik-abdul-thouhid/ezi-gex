@@ -216,7 +216,7 @@ pub fn summarize(comptime B: type, gpa: std.mem.Allocator, re: *const gex.Compil
 pub fn printOpt(smith: *Smith, tree_opt: u8) u8 {
     @disableInstrumentation();
     const flag_only = [_]u8{ 0, 3, 4, 5 };
-    if (std.mem.indexOfScalar(u8, &flag_only, tree_opt) == null) return tree_opt;
+    if (std.mem.findScalar(u8, &flag_only, tree_opt) == null) return tree_opt;
     return flag_only[smith.index(flag_only.len)];
 }
 
@@ -384,13 +384,13 @@ pub const Case = struct {
     /// byte slices — release with `deinitOwned`.
     pub fn parse(gpa: std.mem.Allocator, line_in: []const u8) !Case {
         const line = std.mem.trim(u8, line_in, " \r\n\t");
-        const at = std.mem.indexOf(u8, line, "FUZZ-CASE ") orelse return error.BadCaseLine;
+        const at = std.mem.find(u8, line, "FUZZ-CASE ") orelse return error.BadCaseLine;
         var c: Case = .{ .check = .span };
         var seen: u16 = 0;
         var it = std.mem.tokenizeScalar(u8, line[at + "FUZZ-CASE ".len ..], ' ');
         errdefer c.deinitOwned(gpa);
         while (it.next()) |kv| {
-            const eq = std.mem.indexOfScalar(u8, kv, '=') orelse return error.BadCaseLine;
+            const eq = std.mem.findScalar(u8, kv, '=') orelse return error.BadCaseLine;
             const k = kv[0..eq];
             const v = kv[eq + 1 ..];
             if (std.mem.eql(u8, k, "check")) {

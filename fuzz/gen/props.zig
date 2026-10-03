@@ -80,7 +80,7 @@ test "every property spelling is accepted by the scanner" {
     var buf: [64]u8 = undefined;
     for (table) |p| {
         for ([_][]const u8{ p.short, p.long }) |name| {
-            const pat = try std.fmt.bufPrint(&buf, "\\p{{{s}}}", .{name});
+            const pat = try std.mem.print(&buf, "\\p{{{s}}}", .{name});
             var diag: gex.Diagnostic = .{};
             const a = gex.parse(gpa, pat, &diag) catch {
                 std.debug.print("scanner rejected {s}: {s}\n", .{ pat, @tagName(diag.code) });

@@ -152,11 +152,11 @@ pub fn repetitionLimit(_: void, smith: *Smith) anyerror!void {
 
     var buf: [32]u8 = undefined;
     const pattern = if (max) |mx|
-        std.fmt.bufPrint(&buf, "a{{{d},{d}}}", .{ min, mx }) catch unreachable
+        std.mem.print(&buf, "a{{{d},{d}}}", .{ min, mx }) catch unreachable
     else if (has_max)
-        std.fmt.bufPrint(&buf, "a{{{d},}}", .{min}) catch unreachable
+        std.mem.print(&buf, "a{{{d},}}", .{min}) catch unreachable
     else
-        std.fmt.bufPrint(&buf, "a{{{d}}}", .{min}) catch unreachable;
+        std.mem.print(&buf, "a{{{d}}}", .{min}) catch unreachable;
 
     const over_limit = min > limit or (max != null and max.? > limit);
     const out_of_order = max != null and min > max.?;

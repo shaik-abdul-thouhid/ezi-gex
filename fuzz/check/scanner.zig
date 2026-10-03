@@ -25,12 +25,12 @@ pub fn mutate(smith: *Smith, base: []const u8, out: []u8) []const u8 {
         const c = edit_chars[smith.index(edit_chars.len)];
         switch (smith.valueRangeAtMost(u8, 0, 2)) {
             0 => if (len < out.len) { // insert
-                std.mem.copyBackwards(u8, out[at + 1 .. len + 1], out[at..len]);
+                @memmove(out[at + 1 .. len + 1], out[at..len]);
                 out[at] = c;
                 len += 1;
             },
             1 => if (at < len) { // delete
-                std.mem.copyForwards(u8, out[at .. len - 1], out[at + 1 .. len]);
+                @memmove(out[at .. len - 1], out[at + 1 .. len]);
                 len -= 1;
             },
             else => if (at < len) {

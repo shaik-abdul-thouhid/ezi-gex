@@ -309,7 +309,7 @@ test "bounded-large-prefix a{N}b is linear (not Θ(n·k)) at scale" {
     const no_b = try worstCase(gpa, N_input, 'a', '!'); // dense 'a', no 'b' → no match
     defer gpa.free(no_b);
     for ([_]usize{ 100, 1000, 4000 }) |k| {
-        const pat = try std.fmt.allocPrint(gpa, "a{{{d}}}b", .{k});
+        const pat = try gpa.print("a{{{d}}}b", .{k});
         defer gpa.free(pat);
         var diag: regex.Diagnostic = .{};
         var re = try regex.compileRuntimeWith(auto, gpa, pat, &diag, .{});

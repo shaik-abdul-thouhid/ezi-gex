@@ -50,7 +50,7 @@ pub fn parseClass(s: []const u8) ?Class {
         for (&pair, 0..) |*v, k| {
             if (!std.mem.startsWith(u8, s[i..], "\\x{")) return null;
             i += 3;
-            const close = std.mem.indexOfScalarPos(u8, s, i, '}') orelse return null;
+            const close = std.mem.findScalarPos(u8, s, i, '}') orelse return null;
             v.* = std.fmt.parseInt(u21, s[i..close], 16) catch return null;
             i = close + 1;
             if (k == 0) {

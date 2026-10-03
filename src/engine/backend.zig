@@ -841,7 +841,7 @@ fn templateRefsGroup(template: []const u8) bool {
         switch (n) {
             '$' => i += 2, // escaped literal `$`
             '{' => {
-                const close = std.mem.indexOfScalarPos(u8, template, i + 2, '}') orelse {
+                const close = std.mem.findScalarPos(u8, template, i + 2, '}') orelse {
                     i += 1;
                     continue;
                 };
@@ -889,7 +889,7 @@ fn expandTemplate(writer: *std.Io.Writer, template: []const u8, caps: Captures) 
                 i += 2;
             },
             '{' => {
-                const close = std.mem.indexOfScalarPos(u8, template, i + 2, '}') orelse {
+                const close = std.mem.findScalarPos(u8, template, i + 2, '}') orelse {
                     try writer.writeByte('$'); // unterminated ${ — emit literally
                     i += 1;
                     continue;

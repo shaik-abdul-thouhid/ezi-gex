@@ -307,7 +307,7 @@ fn nextNewline(input: []const u8, from: usize) ?usize {
         while (i < input.len) : (i += 1) if (input[i] == '\n') return i;
         return null;
     }
-    return std.mem.indexOfScalarPos(u8, input, from, '\n');
+    return std.mem.findScalarPos(u8, input, from, '\n');
 }
 
 // ── The VM ───────────────────────────────────────────────────────────────────────

@@ -725,22 +725,22 @@ pub const Scratch = struct {
     intern: InternMap = .empty,
     /// `states.items[id]` is state `id`'s owned, priority-ordered pc list (also the
     /// key the intern map points at). `id == DEAD` is the empty set.
-    states: std.ArrayListUnmanaged([]const u32) = .empty,
+    states: std.ArrayList([]const u32) = .empty,
     /// `state_match.items[id]` — does state `id` contain the `match` pc (accepting)?
-    state_match: std.ArrayListUnmanaged(bool) = .empty,
+    state_match: std.ArrayList(bool) = .empty,
     /// `state_match_eoi.items[id]` — is state `id` accepting **at end of input**
     /// (`accept_eoi`): `state_match` OR it parks on a pending `text_end` (`$`/`\z`) whose
     /// continuation reaches `match`. Equal to `state_match` for a `$`-free program, so the
     /// extra end-of-input check `runAnchored` does is a no-op there.
     ///
     /// @stable-since: v0.4.0
-    state_match_eoi: std.ArrayListUnmanaged(bool) = .empty,
+    state_match_eoi: std.ArrayList(bool) = .empty,
     /// `state_has_wb.items[id]` — does state `id` hold a pending `\b`/`\B` member? Such a state is
     /// **boundary-resolved at match time** (`resolveWb`) by decoding the adjacent code points, rather
     /// than via a cached transition. All-false for a non-`\b` program (the decode path is dormant).
     ///
     /// @stable-since: v0.4.0
-    state_has_wb: std.ArrayListUnmanaged(bool) = .empty,
+    state_has_wb: std.ArrayList(bool) = .empty,
     /// Memoized boundary resolution for the decode-hybrid: `wb_cache.items[id*2 + b]` is the
     /// boundary-free effective state `resolveWb` produces for raw `\b` state `id` when the word
     /// boundary `b` (= `\b` holds at the position; `\B` is its negation) is the resolution outcome.
@@ -751,14 +751,14 @@ pub const Scratch = struct {
     /// All-empty for a non-`\b` program.
     ///
     /// @stable-since: v0.4.0
-    wb_cache: std.ArrayListUnmanaged(u32) = .empty,
+    wb_cache: std.ArrayList(u32) = .empty,
     /// Flat `id * nclass + class` **anchored** transition table; `UNKNOWN` until first
     /// computed. Used by `search` (anchored restart from each start).
-    trans: std.ArrayListUnmanaged(u32) = .empty,
+    trans: std.ArrayList(u32) = .empty,
     /// Flat `id * nclass + class` **unanchored** transition table — each edge re-seeds
     /// the start (`startN`) into the successors, giving the implicit `.*?`-prefix
     /// automaton that drives one-pass `isMatch`.
-    utrans: std.ArrayListUnmanaged(u32) = .empty,
+    utrans: std.ArrayList(u32) = .empty,
     /// Start closure with `text_start` TRUE (used at offset 0).
     start0: u32 = DEAD,
     /// Start closure with `text_start` FALSE (used at offset > 0, and as the
@@ -802,10 +802,10 @@ pub const Scratch = struct {
     // a forward eviction never invalidates them. The work buffers above are reused (a
     // `find` runs the forward scan to completion, then the reverse — never interleaved).
     r_intern: InternMap = .empty,
-    r_states: std.ArrayListUnmanaged([]const u32) = .empty,
-    r_accept: std.ArrayListUnmanaged(bool) = .empty, // does the state contain pc 0 (reverse accept)?
-    r_accept_line: std.ArrayListUnmanaged(bool) = .empty, // (?m)^: accepts ONLY where the position is a line start
-    r_trans: std.ArrayListUnmanaged(u32) = .empty, // r_state × nclass, UNKNOWN until computed
+    r_states: std.ArrayList([]const u32) = .empty,
+    r_accept: std.ArrayList(bool) = .empty, // does the state contain pc 0 (reverse accept)?
+    r_accept_line: std.ArrayList(bool) = .empty, // (?m)^: accepts ONLY where the position is a line start
+    r_trans: std.ArrayList(u32) = .empty, // r_state × nclass, UNKNOWN until computed
     r_start: u32 = DEAD,
     r_start_ready: bool = false,
 

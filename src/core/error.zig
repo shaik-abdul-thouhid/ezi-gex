@@ -387,9 +387,9 @@ test "Diagnostic.render draws a caret under the span" {
     try d.render(pat, &w);
     const out = w.buffered();
     // Message line, the pattern, then a caret line with two carets after one space.
-    try testing.expect(std.mem.indexOf(u8, out, "unknown or unsupported escape sequence") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "a\\qb") != null);
-    try testing.expect(std.mem.indexOf(u8, out, " ^^") != null);
+    try testing.expect(std.mem.find(u8, out, "unknown or unsupported escape sequence") != null);
+    try testing.expect(std.mem.find(u8, out, "a\\qb") != null);
+    try testing.expect(std.mem.find(u8, out, " ^^") != null);
 }
 
 test "Diagnostic.render uses a single caret for a zero-width span" {
@@ -399,7 +399,7 @@ test "Diagnostic.render uses a single caret for a zero-width span" {
     var w = std.Io.Writer.fixed(&buf);
     try d.render(pat, &w);
     const out = w.buffered();
-    try testing.expect(std.mem.indexOf(u8, out, "^") != null);
+    try testing.expect(std.mem.find(u8, out, "^") != null);
 }
 
 test "diagnostics work at comptime" {

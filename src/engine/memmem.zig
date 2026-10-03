@@ -65,7 +65,7 @@ const THREE_PROBE_MIN_DENSITY: u32 = 18000;
 const HEAD_CHUNKS: usize = 16;
 
 /// Shortest needle the two-byte filter applies to. A 1-byte needle is a plain memchr
-/// (already SIMD via `std.mem.indexOfScalarPos`), so the `literal` backend keeps that on
+/// (already SIMD via `std.mem.findScalarPos`), so the `literal` backend keeps that on
 /// the existing path and only builds a `Finder` at length ≥ 2.
 ///
 /// @stable-since: v0.4.0
@@ -465,7 +465,7 @@ test "memmem: 4x-unroll seam — matches straddling the unroll/tail boundary" {
     var off: usize = 0;
     while (off < 80) : (off += 1) {
         const pad = filler[0..off];
-        const hay = std.fmt.bufPrint(&buf, "{s}Sherlock and {s}Sherlock end", .{ pad, filler }) catch unreachable;
+        const hay = std.mem.print(&buf, "{s}Sherlock and {s}Sherlock end", .{ pad, filler }) catch unreachable;
         try expectAgreesEverywhere("Sherlock", hay);
     }
 }

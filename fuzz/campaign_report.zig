@@ -35,7 +35,7 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(log);
 
     for (failure_markers) |marker| {
-        if (std.mem.indexOf(u8, log, marker) == null) continue;
+        if (std.mem.find(u8, log, marker) == null) continue;
         std.debug.print("\n══ campaign {s}: FAILED ({s} iterations) ══\n{s}\n", .{ group, iterations, log });
         std.process.exit(1);
     }
@@ -45,7 +45,7 @@ pub fn main(init: std.process.Init) !void {
 /// The rest of the fuzzing report's first line that starts with `label` (e.g. "0 -> 2792"),
 /// or "?" when the report has none.
 fn field(log: []const u8, label: []const u8) []const u8 {
-    const at = std.mem.indexOf(u8, log, label) orelse return "?";
-    const end = std.mem.indexOfScalarPos(u8, log, at, '\n') orelse log.len;
+    const at = std.mem.find(u8, log, label) orelse return "?";
+    const end = std.mem.findScalarPos(u8, log, at, '\n') orelse log.len;
     return log[at + label.len .. end];
 }
